@@ -1,0 +1,23 @@
+#!/usr/bin/env sh
+set -eu
+
+if ! git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+  echo "error: not inside a Git work tree" >&2
+  exit 2
+fi
+
+if git diff --cached --quiet; then
+  echo "No staged changes."
+  exit 1
+fi
+
+echo "## Staged files"
+git diff --cached --name-status
+
+echo
+echo "## Staged summary"
+git diff --cached --stat
+
+echo
+echo "## Staged diff"
+git diff --cached --find-renames --find-copies --submodule=short
