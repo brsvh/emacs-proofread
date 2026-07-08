@@ -125,7 +125,7 @@ keys."
   :type 'number
   :group 'proofread)
 
-(defcustom proofread-prompt-version "1"
+(defcustom proofread-prompt-version "2"
   "Prompt contract version used to invalidate diagnostic cache entries."
   :type 'string
   :group 'proofread)
@@ -168,6 +168,23 @@ property has a non-nil value is not included in request-ready chunks."
   '( :id :buffer :beg :end :text :context-before :context-after
      :language :major-mode :modified-tick :backend)
   "Required keys for proofread backend request plists.")
+
+(defconst proofread--ollama-json-prompt-contract
+  (concat
+   "Return only one JSON object.  Do not include Markdown, comments, "
+   "prose, or reasoning outside the JSON object.\n"
+   "The JSON object must have this shape:\n"
+   "{\"diagnostics\":[{\"kind\":\"spelling|grammar|style|other\","
+   "\"message\":\"short explanation\","
+   "\"text\":\"exact original text\","
+   "\"range\":{\"beg\":0,\"end\":0},"
+   "\"suggestions\":[\"replacement\"],"
+   "\"confidence\":0.0,"
+   "\"source\":\"optional source\"}]}\n"
+   "Use zero-based chunk-relative offsets; range end is exclusive.\n"
+   "The text field must exactly equal the substring selected by range.\n"
+   "Use {\"diagnostics\":[]} when there are no diagnostics.\n")
+  "Prompt contract for Ollama JSON diagnostics.")
 
 (defconst proofread--overlay-category 'proofread-overlay
   "Overlay category used for proofread-owned overlays.")
@@ -634,12 +651,14 @@ When BACKEND is nil, check the selected `proofread-backend'."
 (defun proofread--ollama-prompt (request)
   "Return the Ollama prompt for backend REQUEST."
   (format
-   (concat "Proofread the following text and return JSON diagnostics.\n\n"
+   (concat "Proofread the following text.\n\n"
+           "%s\n"
            "Language: %S\n"
            "Major mode: %S\n\n"
            "Context before:\n%s\n\n"
            "Text:\n%s\n\n"
            "Context after:\n%s\n")
+   proofread--ollama-json-prompt-contract
    (plist-get request :language)
    (plist-get request :major-mode)
    (or (plist-get request :context-before) "")
@@ -706,23 +725,69 @@ When BACKEND is nil, check the selected `proofread-backend'."
   "Return generated content from Ollama response PAYLOAD."
   (plist-get payload :response))
 
+(defun proofread--ollama-json-object-substrings (string)
+  "Return top-level JSON object substrings found in STRING."
+  (let ((index 0)
+        (length (length string))
+        (depth 0)
+        start
+        in-string
+        escape
+        objects)
+    (while (< index length)
+      (let ((char (aref string index)))
+        (cond
+         ((and (> depth 0) escape)
+          (setq escape nil))
+         ((and (> depth 0) in-string (eq char ?\\))
+          (setq escape t))
+         ((and (> depth 0) (eq char ?\"))
+          (setq in-string (not in-string)))
+         (in-string nil)
+         ((eq char ?{)
+          (when (= depth 0)
+            (setq start index))
+          (setq depth (1+ depth)))
+         ((and (> depth 0) (eq char ?}))
+          (setq depth (1- depth))
+          (when (= depth 0)
+            (push (substring string start (1+ index)) objects)
+            (setq start nil)))))
+      (setq index (1+ index)))
+    (nreverse objects)))
+
+(defun proofread--ollama-parse-diagnostic-json (content)
+  "Parse one JSON diagnostic object from CONTENT."
+  (let ((objects (proofread--ollama-json-object-substrings content)))
+    (unless (= (length objects) 1)
+      (error "Expected exactly one Ollama diagnostic JSON object"))
+    (proofread--json-read-string (car objects))))
+
 (defun proofread--ollama-diagnostic-payload (content)
   "Return parsed diagnostic payload from Ollama CONTENT."
   (cond
    ((stringp content)
-    (proofread--json-read-string content))
+    (proofread--ollama-parse-diagnostic-json content))
    ((listp content) content)
    (t (error "Invalid Ollama response content"))))
 
 (defun proofread--ollama-diagnostic-candidates (payload)
   "Return diagnostic candidates from parsed Ollama PAYLOAD."
-  (let ((diagnostics (cond
-                      ((plist-member payload :diagnostics)
-                       (plist-get payload :diagnostics))
-                      ((listp payload) payload))))
+  (unless (plist-member payload :diagnostics)
+    (error "Missing Ollama diagnostics payload"))
+  (let ((diagnostics (plist-get payload :diagnostics)))
     (unless (listp diagnostics)
       (error "Invalid Ollama diagnostics payload"))
     diagnostics))
+
+(defun proofread--ollama-diagnostic-range (candidate)
+  "Return CANDIDATE's chunk-relative range as a cons cell."
+  (let ((range (plist-get candidate :range)))
+    (when (and (listp range)
+               (plist-member range :beg)
+               (plist-member range :end))
+      (cons (plist-get range :beg)
+            (plist-get range :end)))))
 
 (defun proofread--ollama-diagnostic-range-valid-p (request beg end)
   "Return non-nil if relative BEG and END are valid for REQUEST."
@@ -746,33 +811,64 @@ When BACKEND is nil, check the selected `proofread-backend'."
 (defun proofread--ollama-diagnostic-kind (value)
   "Return normalized diagnostic kind for VALUE."
   (cond
-   ((symbolp value) value)
-   ((stringp value) (intern value))))
+   ((and (symbolp value)
+         (not (keywordp value)))
+    value)
+   ((and (stringp value)
+         (string-match-p "\\`[[:alnum:]_-]+\\'" value))
+    (intern value))))
+
+(defun proofread--ollama-diagnostic-confidence (value)
+  "Return normalized diagnostic confidence for VALUE, or nil."
+  (when (and (numberp value)
+             (<= 0 value)
+             (<= value 1))
+    value))
+
+(defun proofread--ollama-diagnostic-source (candidate)
+  "Return normalized diagnostic source from CANDIDATE."
+  (let ((value (plist-get candidate :source)))
+    (cond
+     ((and (plist-member candidate :source)
+           (symbolp value)
+           (not (keywordp value)))
+      value)
+     ((and (plist-member candidate :source)
+           (stringp value)
+           (not (string= value "")))
+      value)
+     (t 'ollama))))
 
 (defun proofread--ollama-diagnostic-from-candidate (request candidate)
   "Return proofread diagnostic for REQUEST and CANDIDATE, or nil."
-  (let* ((relative-beg (plist-get candidate :beg))
-         (relative-end (plist-get candidate :end))
+  (let* ((range (proofread--ollama-diagnostic-range candidate))
+         (relative-beg (car-safe range))
+         (relative-end (cdr-safe range))
          (request-beg (plist-get request :beg))
          (request-text (plist-get request :text))
-         (text (plist-get candidate :text)))
+         (text (plist-get candidate :text))
+         (kind (proofread--ollama-diagnostic-kind
+                (plist-get candidate :kind)))
+         (message (plist-get candidate :message)))
     (when (and (proofread--ollama-diagnostic-range-valid-p
                 request relative-beg relative-end)
                (integerp request-beg)
                (stringp text)
+               kind
+               (stringp message)
                (equal text
                       (substring request-text relative-beg relative-end)))
       (proofread--make-diagnostic
        :beg (+ request-beg relative-beg)
        :end (+ request-beg relative-end)
        :text text
-       :kind (proofread--ollama-diagnostic-kind
-              (plist-get candidate :kind))
-       :message (plist-get candidate :message)
+       :kind kind
+       :message message
        :suggestions (proofread--ollama-diagnostic-suggestions
                      (plist-get candidate :suggestions))
-       :confidence (plist-get candidate :confidence)
-       :source 'ollama))))
+       :confidence (proofread--ollama-diagnostic-confidence
+                    (plist-get candidate :confidence))
+       :source (proofread--ollama-diagnostic-source candidate)))))
 
 (defun proofread--ollama-diagnostics-from-payload (request payload)
   "Return proofread diagnostics for REQUEST from parsed PAYLOAD."

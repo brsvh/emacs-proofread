@@ -97,18 +97,26 @@
 
 (defun proofread-test--ollama-json-response (&rest diagnostics)
   "Return an Ollama JSON body containing DIAGNOSTICS."
+  (proofread-test--ollama-body-for-content
+   (proofread-test--ollama-diagnostics-content diagnostics)))
+
+(defun proofread-test--ollama-diagnostics-content (diagnostics)
+  "Return an Ollama generated content string containing DIAGNOSTICS."
   (proofread--json-encode
-   `(("response" . ,(proofread--json-encode
-                     `(("diagnostics" . ,(vconcat diagnostics))))))))
+   `(("diagnostics" . ,(vconcat diagnostics)))))
+
+(defun proofread-test--ollama-body-for-content (content)
+  "Return an Ollama response body with generated CONTENT."
+  (proofread--json-encode `(("response" . ,content))))
 
 (defun proofread-test--ollama-diagnostic-json
     (beg end text &optional suggestions)
   "Return an Ollama diagnostic alist for BEG, END, TEXT, and SUGGESTIONS."
-  `(("beg" . ,beg)
-    ("end" . ,end)
-    ("text" . ,text)
-    ("kind" . "spelling")
+  `(("kind" . "spelling")
     ("message" . "Possible misspelling")
+    ("text" . ,text)
+    ("range" . (("beg" . ,beg)
+                ("end" . ,end)))
     ("suggestions" . ,(vconcat (or suggestions '("hello"))))
     ("confidence" . 0.9)))
 
@@ -966,6 +974,24 @@
   (let ((proofread-ollama-model ""))
     (should-not (proofread-backend-available-p 'ollama))))
 
+(ert-deftest proofread-test-ollama-prompt-requests-json-contract ()
+  "Ollama prompts request JSON diagnostics with chunk-relative ranges."
+  (with-temp-buffer
+    (insert "helo")
+    (let* ((proofread-ollama-model "qwen3:1.7b")
+           (chunk (car (proofread--request-ready-chunks-for-ranges
+                        (list (cons (point-min) (point-max))))))
+           (request (proofread--make-backend-request chunk 'ollama))
+           (prompt (proofread--ollama-prompt request)))
+      (should (string-match-p "Return only one JSON object" prompt))
+      (should (string-match-p (regexp-quote "\"diagnostics\"") prompt))
+      (should (string-match-p "zero-based chunk-relative offsets" prompt))
+      (should (string-match-p "range end is exclusive" prompt))
+      (dolist (field '("\"kind\"" "\"message\"" "\"text\"" "\"range\""
+                       "\"suggestions\"" "\"confidence\""))
+        (should (string-match-p (regexp-quote field) prompt)))
+      (should-not (string-match-p "absolute buffer" prompt)))))
+
 (ert-deftest proofread-test-ollama-payload-uses-request-and-options ()
   "Ollama payload uses request text, model, options, and non-streaming mode."
   (with-temp-buffer
@@ -1058,6 +1084,240 @@
           (should (equal (plist-get diagnostic :suggestions)
                          '("hello" "hullo")))
           (should (eq (plist-get diagnostic :source) 'ollama)))))))
+
+(ert-deftest proofread-test-ollama-extra-text-around-json-payload ()
+  "Ollama parser accepts extra text around one JSON diagnostic payload."
+  (with-temp-buffer
+    (insert "helo")
+    (let* ((chunk (car (proofread--request-ready-chunks-for-ranges
+                        (list (cons (point-min) (point-max))))))
+           (request (proofread--make-backend-request chunk 'ollama))
+           (content
+            (concat "Result follows:\n"
+                    (proofread-test--ollama-diagnostics-content
+                     (list (proofread-test--ollama-diagnostic-json
+                            0 4 "helo")))
+                    "\nDone."))
+           (buffer
+            (proofread-test--ollama-response-buffer
+             200 (proofread-test--ollama-body-for-content content))))
+      (unwind-protect
+          (let ((result
+                 (proofread--ollama-result-from-response
+                  request nil buffer)))
+            (should (eq (plist-get result :status) 'ok))
+            (should (= (length (plist-get result :diagnostics)) 1)))
+        (when (buffer-live-p buffer)
+          (kill-buffer buffer))))))
+
+(ert-deftest proofread-test-ollama-ambiguous-extra-json-is-error ()
+  "Ollama parser rejects response text with more than one JSON payload."
+  (with-temp-buffer
+    (insert "helo")
+    (let* ((chunk (car (proofread--request-ready-chunks-for-ranges
+                        (list (cons (point-min) (point-max))))))
+           (request (proofread--make-backend-request chunk 'ollama))
+           (payload
+            (proofread-test--ollama-diagnostics-content
+             (list (proofread-test--ollama-diagnostic-json 0 4 "helo"))))
+           (buffer
+            (proofread-test--ollama-response-buffer
+             200
+             (proofread-test--ollama-body-for-content
+              (concat payload "\n" payload)))))
+      (unwind-protect
+          (let ((result
+                 (proofread--ollama-result-from-response
+                  request nil buffer)))
+            (should (eq (plist-get result :status) 'error))
+            (should (eq (plist-get result :error)
+                        'ollama-invalid-response)))
+        (when (buffer-live-p buffer)
+          (kill-buffer buffer))))))
+
+(ert-deftest proofread-test-ollama-non-json-content-is-error ()
+  "Ollama non-JSON generated content becomes a backend error."
+  (with-temp-buffer
+    (insert "helo")
+    (let* ((chunk (car (proofread--request-ready-chunks-for-ranges
+                        (list (cons (point-min) (point-max))))))
+           (request (proofread--make-backend-request chunk 'ollama))
+           (buffer
+            (proofread-test--ollama-response-buffer
+             200
+             (proofread-test--ollama-body-for-content
+              "I found a spelling issue."))))
+      (unwind-protect
+          (let ((result
+                 (proofread--ollama-result-from-response
+                  request nil buffer)))
+            (should (eq (plist-get result :status) 'error))
+            (should (eq (plist-get result :error)
+                        'ollama-invalid-response)))
+        (when (buffer-live-p buffer)
+          (kill-buffer buffer))))))
+
+(ert-deftest proofread-test-ollama-malformed-json-content-is-error ()
+  "Ollama malformed generated JSON content becomes a backend error."
+  (with-temp-buffer
+    (insert "helo")
+    (let* ((chunk (car (proofread--request-ready-chunks-for-ranges
+                        (list (cons (point-min) (point-max))))))
+           (request (proofread--make-backend-request chunk 'ollama))
+           (buffer
+            (proofread-test--ollama-response-buffer
+             200
+             (proofread-test--ollama-body-for-content
+              "Before {\"diagnostics\":[} after"))))
+      (unwind-protect
+          (let ((result
+                 (proofread--ollama-result-from-response
+                  request nil buffer)))
+            (should (eq (plist-get result :status) 'error))
+            (should (eq (plist-get result :error)
+                        'ollama-invalid-response)))
+        (when (buffer-live-p buffer)
+          (kill-buffer buffer))))))
+
+(ert-deftest proofread-test-ollama-out-of-range-diagnostic-is-dropped ()
+  "Ollama diagnostics outside the request chunk are dropped."
+  (with-temp-buffer
+    (insert "helo")
+    (let* ((chunk (car (proofread--request-ready-chunks-for-ranges
+                        (list (cons (point-min) (point-max))))))
+           (request (proofread--make-backend-request chunk 'ollama))
+           (body (proofread-test--ollama-json-response
+                  (proofread-test--ollama-diagnostic-json
+                   0 99 "helo")))
+           (diagnostics (proofread--ollama-parse-success request body)))
+      (should-not diagnostics))))
+
+(ert-deftest proofread-test-ollama-text-mismatch-diagnostic-is-dropped ()
+  "Ollama diagnostics whose text does not match the range are dropped."
+  (with-temp-buffer
+    (insert "helo")
+    (let* ((chunk (car (proofread--request-ready-chunks-for-ranges
+                        (list (cons (point-min) (point-max))))))
+           (request (proofread--make-backend-request chunk 'ollama))
+           (body (proofread-test--ollama-json-response
+                  (proofread-test--ollama-diagnostic-json
+                   0 4 "hola")))
+           (diagnostics (proofread--ollama-parse-success request body)))
+      (should-not diagnostics))))
+
+(ert-deftest proofread-test-ollama-invalid-candidate-preserves-valid-one ()
+  "One invalid Ollama diagnostic does not discard valid diagnostics."
+  (with-temp-buffer
+    (insert "helo wrld")
+    (let* ((chunk (car (proofread--request-ready-chunks-for-ranges
+                        (list (cons (point-min) (point-max))))))
+           (request (proofread--make-backend-request chunk 'ollama))
+           (body (proofread-test--ollama-json-response
+                  (proofread-test--ollama-diagnostic-json
+                   0 99 "helo")
+                  (proofread-test--ollama-diagnostic-json
+                   5 9 "wrld" '("world"))))
+           (diagnostics (proofread--ollama-parse-success request body)))
+      (should (= (length diagnostics) 1))
+      (should (equal (plist-get (car diagnostics) :text) "wrld")))))
+
+(ert-deftest proofread-test-ollama-suggestions-preserve-string-order ()
+  "Ollama suggestions keep string order and ignore non-strings."
+  (with-temp-buffer
+    (insert "helo")
+    (let* ((chunk (car (proofread--request-ready-chunks-for-ranges
+                        (list (cons (point-min) (point-max))))))
+           (request (proofread--make-backend-request chunk 'ollama))
+           (candidate
+            '(("kind" . "spelling")
+              ("message" . "Possible misspelling")
+              ("text" . "helo")
+              ("range" . (("beg" . 0)
+                          ("end" . 4)))
+              ("suggestions" . ["hello" 42 "hullo" nil "help"])
+              ("confidence" . 0.9)))
+           (body (proofread-test--ollama-json-response candidate))
+           (diagnostic
+            (car (proofread--ollama-parse-success request body))))
+      (should (equal (plist-get diagnostic :suggestions)
+                     '("hello" "hullo" "help"))))))
+
+(ert-deftest proofread-test-ollama-optional-fields-are-conservative ()
+  "Ollama optional confidence and source fields are validated."
+  (with-temp-buffer
+    (insert "helo wrld")
+    (let* ((chunk (car (proofread--request-ready-chunks-for-ranges
+                        (list (cons (point-min) (point-max))))))
+           (request (proofread--make-backend-request chunk 'ollama))
+           (valid-optional
+            '(("kind" . "spelling")
+              ("message" . "Possible misspelling")
+              ("text" . "helo")
+              ("range" . (("beg" . 0)
+                          ("end" . 4)))
+              ("suggestions" . ["hello"])
+              ("confidence" . 0.75)
+              ("source" . "qwen3")))
+           (invalid-optional
+            '(("kind" . "spelling")
+              ("message" . "Possible misspelling")
+              ("text" . "wrld")
+              ("range" . (("beg" . 5)
+                          ("end" . 9)))
+              ("suggestions" . ["world"])
+              ("confidence" . 3)
+              ("source" . 42)))
+           (body (proofread-test--ollama-json-response
+                  valid-optional invalid-optional))
+           (diagnostics (proofread--ollama-parse-success request body)))
+      (should (= (length diagnostics) 2))
+      (should (= (plist-get (car diagnostics) :confidence) 0.75))
+      (should (equal (plist-get (car diagnostics) :source) "qwen3"))
+      (should-not (plist-get (cadr diagnostics) :confidence))
+      (should (eq (plist-get (cadr diagnostics) :source) 'ollama)))))
+
+(ert-deftest proofread-test-ollama-parsed-diagnostics-still-stale-check ()
+  "Parsed Ollama diagnostics still require stale validation."
+  (with-temp-buffer
+    (insert "helo")
+    (proofread-mode 1)
+    (let* ((chunk (car (proofread--request-ready-chunks-for-ranges
+                        (list (cons (point-min) (point-max))))))
+           (request (proofread--make-backend-request chunk 'ollama))
+           (body (proofread-test--ollama-json-response
+                  (proofread-test--ollama-diagnostic-json
+                   0 4 "helo")))
+           (diagnostics (proofread--ollama-parse-success request body)))
+      (goto-char (point-max))
+      (insert "!")
+      (should (eq (proofread--handle-backend-result
+                   (proofread--backend-success-result
+                    request diagnostics))
+                  'stale))
+      (should-not proofread--diagnostics)
+      (should-not proofread--overlays)
+      (should (equal (buffer-string) "helo!")))))
+
+(ert-deftest proofread-test-ollama-prompt-version-cache-miss ()
+  "Ollama cache entries miss when the prompt version changes."
+  (with-temp-buffer
+    (insert "helo")
+    (proofread-mode 1)
+    (let* ((proofread-backend 'ollama)
+           (proofread-ollama-model "qwen3:1.7b")
+           (proofread-ollama-base-url "http://localhost:11434/api")
+           (proofread-prompt-version "ollama-json-v1")
+           (chunk (car (proofread--request-ready-chunks-for-ranges
+                        (list (cons (point-min) (point-max))))))
+           (request (proofread--make-backend-request chunk))
+           (diagnostic
+            (proofread-test--diagnostic-for-range 1 5 "helo")))
+      (proofread--cache-write-request request (list diagnostic))
+      (should (proofread--cache-read-request
+               (proofread--make-backend-request chunk)))
+      (let ((proofread-prompt-version "ollama-json-v2"))
+        (should-not (proofread--cache-read-request
+                     (proofread--make-backend-request chunk)))))))
 
 (ert-deftest proofread-test-ollama-fresh-result-enters-overlay-pipeline ()
   "Fresh Ollama diagnostics are applied through the existing result handler."
