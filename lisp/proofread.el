@@ -102,8 +102,8 @@ property has a non-nil value is not included in request-ready chunks."
   "Required keys for proofread diagnostic plists.")
 
 (defconst proofread--backend-request-keys
-  '(:id :buffer :beg :end :text :context-before :context-after
-	:language :major-mode :modified-tick)
+  '( :id :buffer :beg :end :text :context-before :context-after
+     :language :major-mode :modified-tick)
   "Required keys for proofread backend request plists.")
 
 (defconst proofread--overlay-category 'proofread-overlay
@@ -126,6 +126,8 @@ property has a non-nil value is not included in request-ready chunks."
 
 (defvar-local proofread--cache nil
   "Proofread cache for the current buffer.")
+
+(defvar proofread-mode)
 
 (defun proofread--make-diagnostic (&rest properties)
   "Return a proofread diagnostic plist from PROPERTIES.
@@ -555,19 +557,81 @@ handle, such as a timer object for the built-in mock backend."
 (defun proofread--dispatch-backend-request (request callback &optional backend)
   "Register REQUEST, submit it to BACKEND, and invoke CALLBACK on completion."
   (let ((buffer (plist-get request :buffer)))
-    (if (buffer-live-p buffer)
-        (with-current-buffer buffer
-          (proofread--register-active-request request))
-      (proofread--register-active-request request)))
-  (let ((wrapped-callback (proofread--wrap-backend-callback request callback)))
-    (condition-case err
-        (proofread-backend-check request wrapped-callback backend)
-      (error
-       (proofread--invoke-backend-callback
-        wrapped-callback
-        (proofread--backend-error-result
-         request err (error-message-string err)))
-       nil))))
+    (when (buffer-live-p buffer)
+      (with-current-buffer buffer
+        (proofread--register-active-request request))
+      (let ((wrapped-callback
+             (proofread--wrap-backend-callback request callback)))
+        (condition-case err
+            (proofread-backend-check request wrapped-callback backend)
+          (error
+           (proofread--invoke-backend-callback
+            wrapped-callback
+            (proofread--backend-error-result
+             request err (error-message-string err)))
+           nil))))))
+
+(defun proofread--request-range-valid-p (request)
+  "Return non-nil if REQUEST range is valid in the current buffer."
+  (let ((beg (proofread--position-integer (plist-get request :beg)))
+        (end (proofread--position-integer (plist-get request :end))))
+    (and beg end
+         (<= (point-min) beg)
+         (<= beg end)
+         (<= end (point-max)))))
+
+(defun proofread--request-text-matches-p (request)
+  "Return non-nil if REQUEST text still matches the current buffer."
+  (let ((beg (proofread--position-integer (plist-get request :beg)))
+        (end (proofread--position-integer (plist-get request :end))))
+    (and beg end
+         (equal (buffer-substring-no-properties beg end)
+                (plist-get request :text)))))
+
+(defun proofread--fresh-request-p (request)
+  "Return non-nil if REQUEST still matches its originating buffer."
+  (let ((buffer (plist-get request :buffer)))
+    (and (buffer-live-p buffer)
+         (with-current-buffer buffer
+           (and proofread-mode
+                (equal (buffer-chars-modified-tick)
+                       (plist-get request :modified-tick))
+                (proofread--request-range-valid-p request)
+                (proofread--request-text-matches-p request))))))
+
+(defun proofread--apply-backend-diagnostics (diagnostics)
+  "Record DIAGNOSTICS and create proofread-owned overlays for them."
+  (setq proofread--diagnostics
+        (append proofread--diagnostics diagnostics))
+  (dolist (diagnostic diagnostics)
+    (proofread--create-overlay diagnostic)))
+
+(defun proofread--handle-backend-result (result)
+  "Handle backend RESULT and return an internal status symbol."
+  (let* ((request (plist-get result :request))
+         (buffer (plist-get request :buffer)))
+    (pcase (plist-get result :status)
+      ('ok
+       (if (proofread--fresh-request-p request)
+           (with-current-buffer buffer
+             (proofread--apply-backend-diagnostics
+              (plist-get result :diagnostics))
+             'applied)
+         'stale))
+      ('error 'error)
+      (_ 'error))))
+
+(defun proofread--dispatch-request-ready-chunks (chunks &optional backend)
+  "Dispatch request-ready CHUNKS through BACKEND.
+When BACKEND is nil, use `proofread-backend'.  Return dispatched requests."
+  (when (proofread-backend-available-p backend)
+    (let (requests)
+      (dolist (chunk chunks)
+        (let ((request (proofread--make-backend-request chunk)))
+          (when (proofread--dispatch-backend-request
+                 request #'proofread--handle-backend-result backend)
+            (push request requests))))
+      (nreverse requests))))
 
 (defun proofread--overlay-p (overlay)
   "Return non-nil if OVERLAY is a live proofread-owned overlay."
@@ -663,9 +727,17 @@ not create overlays, timers, requests, or other background state."
   "Check visible text in the current buffer for proofreading diagnostics."
   (interactive)
   (setq proofread--pending-ranges (proofread--visible-ranges))
-  (message "proofread: collected %d visible range%s"
-           (length proofread--pending-ranges)
-           (if (= (length proofread--pending-ranges) 1) "" "s")))
+  (if (proofread-backend-available-p)
+      (let* ((chunks (proofread--request-ready-visible-chunks))
+             (requests (proofread--dispatch-request-ready-chunks chunks)))
+        (message "proofread: dispatched %d request%s from %d visible range%s"
+                 (length requests)
+                 (if (= (length requests) 1) "" "s")
+                 (length proofread--pending-ranges)
+                 (if (= (length proofread--pending-ranges) 1) "" "s")))
+    (message "proofread: collected %d visible range%s; no available backend"
+             (length proofread--pending-ranges)
+             (if (= (length proofread--pending-ranges) 1) "" "s"))))
 
 ;;;###autoload
 (defun proofread-check-buffer ()

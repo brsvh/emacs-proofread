@@ -35,6 +35,18 @@
    :confidence 0.9
    :source 'test))
 
+(defun proofread-test--diagnostic-for-range (beg end text)
+  "Return a sample diagnostic for BEG, END, and TEXT."
+  (proofread--make-diagnostic
+   :beg beg
+   :end end
+   :text text
+   :kind 'spelling
+   :message "Possible misspelling"
+   :suggestions '("hello")
+   :confidence 0.9
+   :source 'test))
+
 (defun proofread-test--chunk-texts (chunks)
   "Return the text payloads from CHUNKS."
   (mapcar (lambda (chunk)
@@ -527,6 +539,290 @@
       (should (equal (buffer-string) before-text))
       (should-not active-at-callback)
       (should-not (proofread--active-request-p request)))))
+
+(ert-deftest proofread-test-check-visible-dispatches-request-ready-chunks ()
+  "`proofread-check-visible' dispatches filtered visible chunks."
+  (save-window-excursion
+    (let ((buffer (generate-new-buffer " *proofread-visible-dispatch*")))
+      (unwind-protect
+          (progn
+            (switch-to-buffer buffer)
+            (insert "Alpha http://example.com/path Beta")
+            (proofread-mode 1)
+            (let ((proofread-backend 'mock)
+                  (proofread-context-size 0)
+                  requests
+                  callbacks)
+              (cl-letf (((symbol-function 'window-start)
+                         (lambda (&optional _window) (point-min)))
+                        ((symbol-function 'window-end)
+                         (lambda (&optional _window _update) (point-max)))
+                        ((symbol-function 'proofread-backend-check)
+                         (lambda (request callback &optional _backend)
+                           (push request requests)
+                           (push callback callbacks)
+                           'proofread-test-handle)))
+                (proofread-check-visible)
+                (setq requests (nreverse requests))
+                (should (equal proofread--pending-ranges
+                               (list (cons (point-min) (point-max)))))
+                (should (equal (mapcar (lambda (request)
+                                         (plist-get request :text))
+                                       requests)
+                               '("Alpha " " Beta")))
+                (should (= (length callbacks) 2))
+                (should (= (length proofread--requests) 2))
+                (should-not proofread--diagnostics)
+                (should-not proofread--overlays))))
+        (kill-buffer buffer)))))
+
+(ert-deftest proofread-test-active-requests-remain-buffer-local ()
+  "Active request state is isolated between buffers."
+  (let ((first-buffer (generate-new-buffer " *proofread-requests-a*"))
+        (second-buffer (generate-new-buffer " *proofread-requests-b*")))
+    (unwind-protect
+        (let ((proofread-backend 'mock))
+          (cl-letf (((symbol-function 'proofread-backend-check)
+                     (lambda (_request _callback &optional _backend)
+                       'proofread-test-handle)))
+            (with-current-buffer first-buffer
+              (insert "Alpha")
+              (proofread-mode 1)
+              (proofread--dispatch-request-ready-chunks
+               (proofread--request-ready-chunks-for-ranges
+                (list (cons (point-min) (point-max))))))
+            (with-current-buffer second-buffer
+              (insert "Beta")
+              (proofread-mode 1)
+              (proofread--dispatch-request-ready-chunks
+               (proofread--request-ready-chunks-for-ranges
+                (list (cons (point-min) (point-max))))))
+            (with-current-buffer first-buffer
+              (should (= (length proofread--requests) 1))
+              (should (eq (plist-get (car proofread--requests) :buffer)
+                          first-buffer)))
+            (with-current-buffer second-buffer
+              (should (= (length proofread--requests) 1))
+              (should (eq (plist-get (car proofread--requests) :buffer)
+                          second-buffer)))))
+      (kill-buffer first-buffer)
+      (kill-buffer second-buffer))))
+
+(ert-deftest proofread-test-fresh-result-records-diagnostics-and-overlays ()
+  "Fresh successful results record diagnostics and create overlays."
+  (save-window-excursion
+    (let ((buffer (generate-new-buffer " *proofread-fresh-result*")))
+      (unwind-protect
+          (progn
+            (switch-to-buffer buffer)
+            (insert "helo world")
+            (proofread-mode 1)
+            (let ((proofread-backend 'mock)
+                  request
+                  callback)
+              (cl-letf (((symbol-function 'window-start)
+                         (lambda (&optional _window) (point-min)))
+                        ((symbol-function 'window-end)
+                         (lambda (&optional _window _update) (point-max)))
+                        ((symbol-function 'proofread-backend-check)
+                         (lambda (backend-request backend-callback
+                                                  &optional _backend)
+                           (setq request backend-request)
+                           (setq callback backend-callback)
+                           'proofread-test-handle)))
+                (proofread-check-visible)
+                (should (proofread--active-request-p request))
+                (let ((diagnostic
+                       (proofread-test--diagnostic-for-range 1 5 "helo")))
+                  (should (eq (funcall
+                               callback
+                               (proofread--backend-success-result
+                                request (list diagnostic)))
+                              'applied))
+                  (should (equal proofread--diagnostics (list diagnostic)))
+                  (should (= (length proofread--overlays) 1))
+                  (should (overlay-buffer (car proofread--overlays)))
+                  (should-not (proofread--active-request-p request))))))
+        (kill-buffer buffer)))))
+
+(ert-deftest proofread-test-killed-buffer-result-is-dropped ()
+  "Results for killed buffers are dropped without recreating state."
+  (save-window-excursion
+    (let ((buffer (generate-new-buffer " *proofread-killed-result*"))
+          request
+          callback)
+      (switch-to-buffer buffer)
+      (insert "helo world")
+      (proofread-mode 1)
+      (let ((proofread-backend 'mock))
+        (cl-letf (((symbol-function 'window-start)
+                   (lambda (&optional _window) (point-min)))
+                  ((symbol-function 'window-end)
+                   (lambda (&optional _window _update) (point-max)))
+                  ((symbol-function 'proofread-backend-check)
+                   (lambda (backend-request backend-callback
+                                            &optional _backend)
+                     (setq request backend-request)
+                     (setq callback backend-callback)
+                     'proofread-test-handle)))
+          (proofread-check-visible)))
+      (kill-buffer buffer)
+      (should-not (buffer-live-p buffer))
+      (should (eq (funcall
+                   callback
+                   (proofread--backend-success-result
+                    request
+                    (list (proofread-test--diagnostic-for-range 1 5 "helo"))))
+                  'stale)))))
+
+(ert-deftest proofread-test-disabled-mode-result-is-dropped ()
+  "Results after disabling `proofread-mode' do not mutate proofread state."
+  (save-window-excursion
+    (let ((buffer (generate-new-buffer " *proofread-disabled-result*")))
+      (unwind-protect
+          (progn
+            (switch-to-buffer buffer)
+            (insert "helo world")
+            (proofread-mode 1)
+            (let ((proofread-backend 'mock)
+                  request
+                  callback)
+              (cl-letf (((symbol-function 'window-start)
+                         (lambda (&optional _window) (point-min)))
+                        ((symbol-function 'window-end)
+                         (lambda (&optional _window _update) (point-max)))
+                        ((symbol-function 'proofread-backend-check)
+                         (lambda (backend-request backend-callback
+                                                  &optional _backend)
+                           (setq request backend-request)
+                           (setq callback backend-callback)
+                           'proofread-test-handle)))
+                (proofread-check-visible)
+                (proofread-mode -1)
+                (should (eq (funcall
+                             callback
+                             (proofread--backend-success-result
+                              request
+                              (list (proofread-test--diagnostic-for-range
+                                     1 5 "helo"))))
+                            'stale))
+                (should-not proofread--diagnostics)
+                (should-not proofread--overlays)
+                (should-not proofread--requests))))
+        (kill-buffer buffer)))))
+
+(ert-deftest proofread-test-modified-tick-result-is-dropped ()
+  "Results are stale after any buffer modified tick change."
+  (save-window-excursion
+    (let ((buffer (generate-new-buffer " *proofread-tick-result*")))
+      (unwind-protect
+          (progn
+            (switch-to-buffer buffer)
+            (insert "helo world")
+            (proofread-mode 1)
+            (let ((proofread-backend 'mock)
+                  request
+                  callback)
+              (cl-letf (((symbol-function 'window-start)
+                         (lambda (&optional _window) (point-min)))
+                        ((symbol-function 'window-end)
+                         (lambda (&optional _window _update) 5))
+                        ((symbol-function 'proofread-backend-check)
+                         (lambda (backend-request backend-callback
+                                                  &optional _backend)
+                           (setq request backend-request)
+                           (setq callback backend-callback)
+                           'proofread-test-handle)))
+                (proofread-check-visible)
+                (goto-char (point-max))
+                (insert "!")
+                (should (eq (funcall
+                             callback
+                             (proofread--backend-success-result
+                              request
+                              (list (proofread-test--diagnostic-for-range
+                                     1 5 "helo"))))
+                            'stale))
+                (should-not proofread--diagnostics)
+                (should-not proofread--overlays)
+                (should-not (proofread--active-request-p request)))))
+        (kill-buffer buffer)))))
+
+(ert-deftest proofread-test-text-mismatch-result-is-dropped ()
+  "Results are stale when the request range text no longer matches."
+  (save-window-excursion
+    (let ((buffer (generate-new-buffer " *proofread-text-result*")))
+      (unwind-protect
+          (progn
+            (switch-to-buffer buffer)
+            (insert "helo world")
+            (proofread-mode 1)
+            (let ((proofread-backend 'mock)
+                  request
+                  callback)
+              (cl-letf (((symbol-function 'window-start)
+                         (lambda (&optional _window) (point-min)))
+                        ((symbol-function 'window-end)
+                         (lambda (&optional _window _update) 5))
+                        ((symbol-function 'proofread-backend-check)
+                         (lambda (backend-request backend-callback
+                                                  &optional _backend)
+                           (setq request backend-request)
+                           (setq callback backend-callback)
+                           'proofread-test-handle)))
+                (proofread-check-visible)
+                (delete-region 1 5)
+                (insert "hello")
+                (let ((mismatched-request
+                       (plist-put (copy-sequence request)
+                                  :modified-tick
+                                  (buffer-chars-modified-tick))))
+                  (should (eq (funcall
+                               callback
+                               (proofread--backend-success-result
+                                mismatched-request
+                                (list (proofread-test--diagnostic-for-range
+                                       1 6 "hello"))))
+                              'stale)))
+                (should-not proofread--diagnostics)
+                (should-not proofread--overlays)
+                (should-not (proofread--active-request-p request)))))
+        (kill-buffer buffer)))))
+
+(ert-deftest proofread-test-backend-error-result-creates-no-overlays ()
+  "Backend error results preserve text and create no overlays."
+  (save-window-excursion
+    (let ((buffer (generate-new-buffer " *proofread-error-result*")))
+      (unwind-protect
+          (progn
+            (switch-to-buffer buffer)
+            (insert "helo world")
+            (proofread-mode 1)
+            (let ((proofread-backend 'mock)
+                  (before-text (buffer-string))
+                  request
+                  callback)
+              (cl-letf (((symbol-function 'window-start)
+                         (lambda (&optional _window) (point-min)))
+                        ((symbol-function 'window-end)
+                         (lambda (&optional _window _update) (point-max)))
+                        ((symbol-function 'proofread-backend-check)
+                         (lambda (backend-request backend-callback
+                                                  &optional _backend)
+                           (setq request backend-request)
+                           (setq callback backend-callback)
+                           'proofread-test-handle)))
+                (proofread-check-visible)
+                (should (eq (funcall
+                             callback
+                             (proofread--backend-error-result
+                              request 'mock-failure "Mock failure"))
+                            'error))
+                (should (equal (buffer-string) before-text))
+                (should-not proofread--diagnostics)
+                (should-not proofread--overlays)
+                (should-not (proofread--active-request-p request)))))
+        (kill-buffer buffer)))))
 
 (provide 'proofread-tests)
 
