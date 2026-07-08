@@ -116,8 +116,11 @@ GNU Coding Standards section "Style of Change Logs" and ends with the required
   shorthand such as `{insert,jump-to}-register`.
 - Do not put blank lines between individual file entries in the same change
   entry.
-- Do not omit the filename and leading asterisk for successive entries in the
-  same file; write a complete `* file: ...` entry each time.
+- For multiple changed entities in the same file, write the first entry as
+  `* file: (entity): Description.` and write each subsequent same-file entity as
+  `(entity): Description.` starting at column 1.
+- Repeat `* file:` only when switching to a different file or writing a
+  file-level entry.
 - For simple comment or documentation-only edits, a file-level entry such as
   `Doc fixes.` is acceptable.
 - For broad mechanical changes, describe the underlying change instead of

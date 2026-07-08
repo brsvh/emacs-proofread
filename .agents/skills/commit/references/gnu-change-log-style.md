@@ -15,6 +15,7 @@ between changed files, moved or deleted code, issue discussion, or other
 context not obvious from the diff.
 
 * path/to/file: (changed-entity): Description of the specific change.
+(other-entity): Description of another change in the same file.
 Continuation lines start at column 1 with no leading whitespace.
 * path/to/other-file: Description of a file-level change.
 
@@ -65,8 +66,11 @@ fields.
 - Do not put blank lines between individual changes in one entry.
 - For long lists of function names, keep each complete entity name searchable
   and avoid hanging indentation.
-- Do not omit the filename and leading asterisk for successive entries in the
-  same file; write a complete `* file: ...` entry each time.
+- For multiple changed entities in the same file, write the first entry as
+  `* file: (entity): Description.` and write each subsequent same-file entity as
+  `(entity): Description.` starting at column 1.
+- Repeat `* file:` only when switching to a different file or writing a
+  file-level entry.
 - For simple changes, the file entry can be the whole description.
 - For comments or doc strings, a file-level `Doc fixes.` style entry is enough.
 - For a calling sequence change where all callers are updated, write the change
@@ -88,8 +92,8 @@ decoded string is eight-bit characters.  Do not save the string for
 next iteration in that case.
 * test/lisp/term-tests.el: (term-decode-partial): Test partial
 input handling so the decoder regression stays covered.
-* test/lisp/term-tests.el: (term-undecodable-input): Test
-undecodable input handling so the decoder regression stays covered.
+(term-undecodable-input): Test undecodable input handling so the
+decoder regression stays covered.
 
 Assisted-by: Codex:gpt-5.5
 ```
