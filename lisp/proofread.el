@@ -70,9 +70,22 @@ The backend protocol is defined in later implementation steps."
                  symbol)
   :group 'proofread)
 
+(defface proofread-face
+  '((t :underline (:style wave)))
+  "Face for proofreading diagnostics."
+  :group 'proofread)
+
+(defface proofread-current-face
+  '((t :inherit proofread-face :weight bold))
+  "Face for the current proofreading diagnostic."
+  :group 'proofread)
+
 (defconst proofread--diagnostic-keys
   '(:beg :end :text :kind :message :suggestions :confidence :source)
   "Required keys for proofread diagnostic plists.")
+
+(defconst proofread--overlay-category 'proofread-overlay
+  "Overlay category used for proofread-owned overlays.")
 
 (defvar-local proofread--diagnostics nil
   "Proofread diagnostics for the current buffer.")
@@ -100,6 +113,61 @@ The returned plist contains the keys in `proofread--diagnostic-keys'."
   "Return PROPERTY from DIAGNOSTIC."
   (plist-get diagnostic property))
 
+(defun proofread--overlay-p (overlay)
+  "Return non-nil if OVERLAY is a live proofread-owned overlay."
+  (and (overlayp overlay)
+       (overlay-buffer overlay)
+       (eq (overlay-get overlay 'category) proofread--overlay-category)))
+
+(defun proofread--current-buffer-overlay-p (overlay)
+  "Return non-nil if OVERLAY is proofread-owned in the current buffer."
+  (and (proofread--overlay-p overlay)
+       (eq (overlay-buffer overlay) (current-buffer))))
+
+(defun proofread--prune-overlays ()
+  "Remove stale or foreign overlay references from `proofread--overlays'."
+  (let (overlays)
+    (dolist (overlay proofread--overlays)
+      (when (proofread--current-buffer-overlay-p overlay)
+        (push overlay overlays)))
+    (setq proofread--overlays (nreverse overlays))))
+
+(defun proofread--delete-overlay (overlay)
+  "Delete proofread-owned OVERLAY when it is live."
+  (when (proofread--overlay-p overlay)
+    (delete-overlay overlay)))
+
+(defun proofread--overlay-modified (overlay after _beg _end &optional _length)
+  "Delete proofread-owned OVERLAY when its text is modified.
+AFTER is non-nil for the after-change notification."
+  (unless after
+    (proofread--delete-overlay overlay)))
+
+(defun proofread--create-overlay (diagnostic)
+  "Create and return a proofread overlay for DIAGNOSTIC."
+  (let ((beg (proofread--diagnostic-get diagnostic :beg))
+        (end (proofread--diagnostic-get diagnostic :end)))
+    (unless (and (integer-or-marker-p beg)
+                 (integer-or-marker-p end)
+                 (<= beg end))
+      (error "Invalid proofread diagnostic range: %S" diagnostic))
+    (proofread--prune-overlays)
+    (let ((overlay (make-overlay beg end)))
+      (overlay-put overlay 'category proofread--overlay-category)
+      (overlay-put overlay 'face 'proofread-face)
+      (overlay-put overlay 'proofread-diagnostic diagnostic)
+      (overlay-put overlay 'modification-hooks
+                   '(proofread--overlay-modified))
+      (push overlay proofread--overlays)
+      overlay)))
+
+(defun proofread--clear-overlays ()
+  "Delete proofread-owned overlays in the current buffer."
+  (dolist (overlay proofread--overlays)
+    (when (proofread--current-buffer-overlay-p overlay)
+      (delete-overlay overlay)))
+  (setq proofread--overlays nil))
+
 (defun proofread--initialize-buffer-state ()
   "Initialize proofread-owned state for the current buffer."
   (setq-local proofread--diagnostics nil)
@@ -110,8 +178,8 @@ The returned plist contains the keys in `proofread--diagnostic-keys'."
 
 (defun proofread--clear-buffer-state ()
   "Clear proofread-owned state for the current buffer."
+  (proofread--clear-overlays)
   (setq proofread--diagnostics nil)
-  (setq proofread--overlays nil)
   (setq proofread--pending-ranges nil)
   (setq proofread--requests nil)
   (setq proofread--cache nil))
@@ -176,9 +244,9 @@ not create overlays, timers, requests, or other background state."
 
 ;;;###autoload
 (defun proofread-clear ()
-  "Clear proofreading diagnostics from the current buffer."
+  "Clear proofreading overlays from the current buffer."
   (interactive)
-  (proofread--command-placeholder 'proofread-clear))
+  (proofread--clear-overlays))
 
 (provide 'proofread)
 
