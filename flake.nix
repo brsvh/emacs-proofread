@@ -47,13 +47,13 @@
         ];
 
         partitionedAttrs = {
-          devShells = "tools";
-          formatter = "tools";
+          devShells = "tool";
+          formatter = "tool";
         };
 
         partitions = {
-          tools = {
-            extraInputsFlake = projectRoot + /tools;
+          tool = {
+            extraInputsFlake = projectRoot + /tool;
 
             module =
               {
@@ -61,7 +61,7 @@
               }:
               {
                 imports = [
-                  (projectRoot + /tools/flake-module.nix)
+                  (projectRoot + /tool/flake-module.nix)
                 ];
               };
           };

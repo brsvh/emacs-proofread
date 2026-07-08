@@ -241,8 +241,8 @@ in
           markdown = {
             command = "mdformat";
 
-            exclude = [
-              "/.specify/**/*"
+            excludes = [
+              ".agents/skills/openspec-*/*.md"
             ];
 
             includes = [
@@ -255,6 +255,7 @@ in
               "--extensions=gfm"
               "--extensions=gfm_alerts"
               "--extensions=tables"
+              "--number"
               "--wrap=80"
             ];
           };
