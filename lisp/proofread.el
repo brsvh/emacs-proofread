@@ -159,6 +159,105 @@ are discarded.  Overlapping or adjacent ranges are merged."
   "Return normalized visible ranges for the current buffer."
   (proofread--normalize-ranges (proofread--visible-window-ranges)))
 
+(defun proofread--range-nonblank-p (beg end)
+  "Return non-nil if text between BEG and END contains non-whitespace."
+  (save-excursion
+    (goto-char beg)
+    (re-search-forward "\\S-" end t)))
+
+(defun proofread--chunk-context-before (beg)
+  "Return bounded context before BEG without text properties."
+  (let* ((size (max 0 proofread-context-size))
+         (context-beg (max (point-min) (- beg size))))
+    (buffer-substring-no-properties context-beg beg)))
+
+(defun proofread--chunk-context-after (end)
+  "Return bounded context after END without text properties."
+  (let* ((size (max 0 proofread-context-size))
+         (context-end (min (point-max) (+ end size))))
+    (buffer-substring-no-properties end context-end)))
+
+(defun proofread--make-chunk (beg end)
+  "Return a proofread chunk plist for text between BEG and END."
+  (list :beg beg
+        :end end
+        :text (buffer-substring-no-properties beg end)
+        :major-mode major-mode
+        :language proofread-language
+        :context-before (proofread--chunk-context-before beg)
+        :context-after (proofread--chunk-context-after end)
+        :modified-tick (buffer-chars-modified-tick)))
+
+(defun proofread--paragraph-spans-in-range (beg end)
+  "Return nonblank paragraph spans between BEG and END.
+Paragraphs are nonblank runs of lines separated by one or more blank lines."
+  (let ((beg (max (point-min) beg))
+        (end (min (point-max) end))
+        paragraph-beg
+        paragraph-end
+        spans)
+    (when (< beg end)
+      (save-excursion
+        (goto-char beg)
+        (while (< (point) end)
+          (let ((line-beg (point))
+                (line-end (min (line-end-position) end)))
+            (if (proofread--range-nonblank-p line-beg line-end)
+                (progn
+                  (unless paragraph-beg
+                    (setq paragraph-beg line-beg))
+                  (setq paragraph-end line-end))
+              (when paragraph-beg
+                (push (cons paragraph-beg paragraph-end) spans)
+                (setq paragraph-beg nil)
+                (setq paragraph-end nil)))
+            (forward-line 1)
+            (when (> (point) end)
+              (goto-char end))))
+        (when paragraph-beg
+          (push (cons paragraph-beg paragraph-end) spans))))
+    (nreverse spans)))
+
+(defun proofread--paragraph-spans-for-ranges (ranges)
+  "Return nonblank paragraph spans for normalized RANGES."
+  (let (spans)
+    (dolist (range (proofread--normalize-ranges ranges))
+      (dolist (span (proofread--paragraph-spans-in-range
+                     (car range) (cdr range)))
+        (push span spans)))
+    (nreverse spans)))
+
+(defun proofread--split-span-by-chunk-size (span)
+  "Split SPAN into ranges no larger than `proofread-max-chunk-size'."
+  (let ((beg (car span))
+        (end (cdr span))
+        (size (max 1 proofread-max-chunk-size))
+        ranges)
+    (while (< beg end)
+      (let ((next (min end (+ beg size))))
+        (push (cons beg next) ranges)
+        (setq beg next)))
+    (nreverse ranges)))
+
+(defun proofread--chunk-spans-for-ranges (ranges)
+  "Return bounded chunk spans for visible RANGES."
+  (let (spans)
+    (dolist (span (proofread--paragraph-spans-for-ranges ranges))
+      (dolist (chunk-span (proofread--split-span-by-chunk-size span))
+        (push chunk-span spans)))
+    (nreverse spans)))
+
+(defun proofread--chunks-for-ranges (ranges)
+  "Return paragraph chunks for visible RANGES in the current buffer."
+  (let (chunks)
+    (dolist (span (proofread--chunk-spans-for-ranges ranges))
+      (push (proofread--make-chunk (car span) (cdr span)) chunks))
+    (nreverse chunks)))
+
+(defun proofread--visible-chunks ()
+  "Return paragraph chunks for `proofread--pending-ranges'."
+  (proofread--chunks-for-ranges proofread--pending-ranges))
+
 (defun proofread--overlay-p (overlay)
   "Return non-nil if OVERLAY is a live proofread-owned overlay."
   (and (overlayp overlay)
