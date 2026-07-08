@@ -556,6 +556,192 @@
           (should-not (string-match-p "http://example.com"
                                       (plist-get chunk :context-after))))))))
 
+(ert-deftest proofread-test-cache-key-varies-by-identity ()
+  "Cache keys change when text or environment identity changes."
+  (with-temp-buffer
+    (text-mode)
+    (let ((proofread-language "en")
+          (proofread-prompt-version "prompt-a")
+          (proofread-cache-configuration-version 1))
+      (insert "Alpha")
+      (let* ((chunk (car (proofread--request-ready-chunks-for-ranges
+                          (list (cons (point-min) (point-max))))))
+             (base-key (proofread--cache-key chunk 'mock)))
+        (should-not (equal base-key
+                           (proofread--cache-key chunk 'other-backend)))
+        (let ((proofread-prompt-version "prompt-b"))
+          (should-not (equal base-key
+                             (proofread--cache-key chunk 'mock))))
+        (let ((proofread-cache-configuration-version 2))
+          (should-not (equal base-key
+                             (proofread--cache-key chunk 'mock))))
+        (let ((changed-language (copy-sequence chunk)))
+          (setq changed-language
+                (plist-put changed-language :language "fr"))
+          (should-not (equal base-key
+                             (proofread--cache-key changed-language 'mock))))
+        (let ((changed-mode (copy-sequence chunk)))
+          (setq changed-mode
+                (plist-put changed-mode :major-mode 'org-mode))
+          (should-not (equal base-key
+                             (proofread--cache-key changed-mode 'mock))))
+        (let ((changed-text (copy-sequence chunk)))
+          (setq changed-text
+                (plist-put changed-text :text "Beta"))
+          (should-not (equal base-key
+                             (proofread--cache-key changed-text 'mock))))))))
+
+(ert-deftest proofread-test-cache-read-write-hit-and-miss ()
+  "Cache helpers read and write entries only for active proofread buffers."
+  (with-temp-buffer
+    (insert "Alpha")
+    (should-not (proofread--cache-write 'key 'value))
+    (should-not proofread--cache)
+    (proofread-mode 1)
+    (should (proofread--cache-write 'key 'value))
+    (should (equal (proofread--cache-read 'key) 'value))
+    (should-not (proofread--cache-read 'missing-key))
+    (proofread-mode -1)
+    (should-not proofread--cache)
+    (should-not (proofread--cache-read 'key))))
+
+(ert-deftest proofread-test-cache-relative-diagnostic-conversion ()
+  "Cached diagnostics convert exactly between absolute and relative ranges."
+  (let* ((request '(:beg 10 :end 20 :text "0123456789" :backend mock))
+         (diagnostic
+          (proofread-test--diagnostic-for-range 12 15 "234"))
+         (relative
+          (proofread--diagnostic-to-relative diagnostic request))
+         (absolute
+          (proofread--diagnostic-to-absolute relative request)))
+    (should (= (plist-get relative :beg) 2))
+    (should (= (plist-get relative :end) 5))
+    (should-not (= (plist-get relative :beg)
+                   (plist-get diagnostic :beg)))
+    (should-not (= (plist-get relative :end)
+                   (plist-get diagnostic :end)))
+    (should (equal absolute diagnostic))))
+
+(ert-deftest proofread-test-cache-hit-skips-backend-dispatch ()
+  "Unchanged visible text reuses cached diagnostics without backend dispatch."
+  (save-window-excursion
+    (let ((buffer (generate-new-buffer " *proofread-cache-hit*")))
+      (unwind-protect
+          (progn
+            (switch-to-buffer buffer)
+            (insert "helo world")
+            (proofread-mode 1)
+            (let ((proofread-backend 'mock)
+                  request
+                  callback
+                  backend-calls)
+              (cl-letf (((symbol-function 'window-start)
+                         (lambda (&optional _window) (point-min)))
+                        ((symbol-function 'window-end)
+                         (lambda (&optional _window _update) 5))
+                        ((symbol-function 'proofread-backend-check)
+                         (lambda (backend-request backend-callback
+                                                  &optional _backend)
+                           (setq backend-calls
+                                 (1+ (or backend-calls 0)))
+                           (setq request backend-request)
+                           (setq callback backend-callback)
+                           'proofread-test-handle)))
+                (proofread-check-visible)
+                (should (= backend-calls 1))
+                (let ((diagnostic
+                       (proofread-test--diagnostic-for-range 1 5 "helo")))
+                  (should (eq (funcall
+                               callback
+                               (proofread--backend-success-result
+                                request (list diagnostic)))
+                              'applied))
+                  (should (= (hash-table-count proofread--cache) 1))
+                  (proofread-clear)
+                  (setq proofread--diagnostics nil)
+                  (proofread-check-visible)
+                  (should (= backend-calls 1))
+                  (should (equal proofread--diagnostics
+                                 (list diagnostic)))
+                  (should (= (length proofread--overlays) 1))))))
+        (kill-buffer buffer)))))
+
+(ert-deftest proofread-test-cache-invalidation-misses ()
+  "Backend, prompt, configuration, and text changes miss old cache entries."
+  (with-temp-buffer
+    (insert "Alpha")
+    (proofread-mode 1)
+    (let* ((proofread-prompt-version "prompt-a")
+           (proofread-cache-configuration-version 1)
+           (chunk (car (proofread--request-ready-chunks-for-ranges
+                        (list (cons (point-min) (point-max))))))
+           (request (proofread--make-backend-request chunk))
+           (diagnostic
+            (proofread-test--diagnostic-for-range 1 6 "Alpha")))
+      (setq request (plist-put request :backend 'mock))
+      (proofread--cache-write-request request (list diagnostic))
+      (let ((other-backend (plist-put (copy-sequence request)
+                                      :backend 'other-backend)))
+        (should-not (proofread--cache-read-request other-backend)))
+      (let ((proofread-prompt-version "prompt-b"))
+        (should-not (proofread--cache-read-request request)))
+      (let ((proofread-cache-configuration-version 2))
+        (should-not (proofread--cache-read-request request)))
+      (let ((changed-text (plist-put (copy-sequence request)
+                                     :text "Beta")))
+        (should-not (proofread--cache-read-request changed-text))))))
+
+(ert-deftest proofread-test-stale-and-error-results-are-not-cached ()
+  "Stale and error backend results do not write diagnostics to the cache."
+  (with-temp-buffer
+    (insert "helo")
+    (proofread-mode 1)
+    (let* ((chunk (car (proofread--request-ready-chunks-for-ranges
+                        (list (cons (point-min) (point-max))))))
+           (request (proofread--make-backend-request chunk))
+           (diagnostic
+            (proofread-test--diagnostic-for-range 1 5 "helo")))
+      (setq request (plist-put request :backend 'mock))
+      (insert "!")
+      (should (eq (proofread--handle-backend-result
+                   (proofread--backend-success-result
+                    request (list diagnostic)))
+                  'stale))
+      (should (= (hash-table-count proofread--cache) 0))
+      (let ((fresh-request (proofread--make-backend-request
+                            (car (proofread--request-ready-chunks-for-ranges
+                                  (list (cons (point-min)
+                                              (point-max))))))))
+        (setq fresh-request (plist-put fresh-request :backend 'mock))
+        (should (eq (proofread--handle-backend-result
+                     (proofread--backend-error-result
+                      fresh-request 'mock-failure "Mock failure"))
+                    'error))
+        (should (= (hash-table-count proofread--cache) 0))))))
+
+(ert-deftest proofread-test-cache-hit-validates-current-text ()
+  "Cached diagnostics are dropped when current text no longer matches."
+  (with-temp-buffer
+    (insert "helo")
+    (proofread-mode 1)
+    (let* ((chunk (car (proofread--request-ready-chunks-for-ranges
+                        (list (cons (point-min) (point-max))))))
+           (request (proofread--make-backend-request chunk))
+           (diagnostic
+            (proofread-test--diagnostic-for-range 1 5 "helo"))
+           (entry (proofread--make-cache-entry request (list diagnostic))))
+      (setq request (plist-put request :backend 'mock))
+      (delete-region 1 5)
+      (insert "hello")
+      (let ((stale-request
+             (plist-put (copy-sequence request)
+                        :modified-tick
+                        (buffer-chars-modified-tick))))
+        (should (eq (proofread--apply-cache-entry stale-request entry)
+                    'stale))
+        (should-not proofread--diagnostics)
+        (should-not proofread--overlays)))))
+
 (ert-deftest proofread-test-backend-availability ()
   "Backend availability reports support for the built-in mock backend."
   (let ((proofread-backend 'mock))

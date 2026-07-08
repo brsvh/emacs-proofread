@@ -72,6 +72,16 @@ disables backend dispatch."
                  symbol)
   :group 'proofread)
 
+(defcustom proofread-prompt-version "1"
+  "Prompt contract version used to invalidate diagnostic cache entries."
+  :type 'string
+  :group 'proofread)
+
+(defcustom proofread-cache-configuration-version 1
+  "Configuration version data used to invalidate diagnostic cache entries."
+  :type 'sexp
+  :group 'proofread)
+
 (defcustom proofread-ignored-faces nil
   "Faces whose text should be skipped before proofreading requests.
 The `face' text property is inspected directly.  When its value is a symbol or
@@ -611,6 +621,108 @@ handle, such as a timer object for the built-in mock backend."
                 (proofread--request-range-valid-p request)
                 (proofread--request-text-matches-p request))))))
 
+(defun proofread--cache-backend-identity (&optional backend)
+  "Return BACKEND identity for cache keys.
+When BACKEND is nil, use the currently selected `proofread-backend'."
+  (or backend proofread-backend))
+
+(defun proofread--chunk-text-hash (text)
+  "Return a deterministic cache hash for chunk TEXT."
+  (secure-hash 'sha1 (or text "")))
+
+(defun proofread--cache-key (chunk &optional backend)
+  "Return diagnostic cache key for CHUNK and BACKEND."
+  (list :text-hash
+        (proofread--chunk-text-hash (plist-get chunk :text))
+        :language (plist-get chunk :language)
+        :major-mode (plist-get chunk :major-mode)
+        :backend (proofread--cache-backend-identity
+                  (or (plist-get chunk :backend) backend))
+        :prompt-version proofread-prompt-version
+        :configuration-version proofread-cache-configuration-version))
+
+(defun proofread--ensure-cache ()
+  "Return the current buffer's cache table when `proofread-mode' is active."
+  (when proofread-mode
+    (unless (hash-table-p proofread--cache)
+      (setq proofread--cache (make-hash-table :test #'equal)))
+    proofread--cache))
+
+(defun proofread--cache-read (key)
+  "Return diagnostic cache entry for KEY in the current buffer."
+  (let ((cache (proofread--ensure-cache)))
+    (when cache
+      (gethash key cache))))
+
+(defun proofread--cache-write (key value)
+  "Store VALUE under KEY in the current buffer diagnostic cache."
+  (let ((cache (proofread--ensure-cache)))
+    (when cache
+      (puthash key value cache)
+      value)))
+
+(defun proofread--diagnostic-to-relative (diagnostic request)
+  "Return DIAGNOSTIC with ranges relative to REQUEST start."
+  (let* ((base (plist-get request :beg))
+         (beg (proofread--diagnostic-get diagnostic :beg))
+         (end (proofread--diagnostic-get diagnostic :end))
+         (relative (copy-sequence diagnostic)))
+    (setq relative (plist-put relative :beg (- beg base)))
+    (setq relative (plist-put relative :end (- end base)))
+    relative))
+
+(defun proofread--diagnostic-to-absolute (diagnostic request)
+  "Return cached DIAGNOSTIC with ranges absolute to REQUEST start."
+  (let* ((base (plist-get request :beg))
+         (beg (proofread--diagnostic-get diagnostic :beg))
+         (end (proofread--diagnostic-get diagnostic :end))
+         (absolute (copy-sequence diagnostic)))
+    (setq absolute (plist-put absolute :beg (+ base beg)))
+    (setq absolute (plist-put absolute :end (+ base end)))
+    absolute))
+
+(defun proofread--diagnostics-to-relative (diagnostics request)
+  "Return DIAGNOSTICS converted to chunk-relative ranges for REQUEST."
+  (mapcar (lambda (diagnostic)
+            (proofread--diagnostic-to-relative diagnostic request))
+          diagnostics))
+
+(defun proofread--diagnostics-to-absolute (diagnostics request)
+  "Return cached DIAGNOSTICS converted to absolute ranges for REQUEST."
+  (mapcar (lambda (diagnostic)
+            (proofread--diagnostic-to-absolute diagnostic request))
+          diagnostics))
+
+(defun proofread--make-cache-entry (request diagnostics)
+  "Return cache entry for REQUEST and accepted DIAGNOSTICS."
+  (list :text (plist-get request :text)
+        :diagnostics
+        (proofread--diagnostics-to-relative diagnostics request)))
+
+(defun proofread--cache-read-request (request)
+  "Return cache entry matching REQUEST in the current buffer."
+  (proofread--cache-read
+   (proofread--cache-key request (plist-get request :backend))))
+
+(defun proofread--cache-write-request (request diagnostics)
+  "Write DIAGNOSTICS for REQUEST to the current buffer cache."
+  (proofread--cache-write
+   (proofread--cache-key request (plist-get request :backend))
+   (proofread--make-cache-entry request diagnostics)))
+
+(defun proofread--apply-cache-entry (request entry)
+  "Apply cached diagnostics from ENTRY for REQUEST when still valid."
+  (when (equal (plist-get entry :text)
+               (plist-get request :text))
+    (proofread--handle-backend-result
+     (list :status 'ok
+           :source 'cache
+           :request request
+           :diagnostics
+           (proofread--diagnostics-to-absolute
+            (plist-get entry :diagnostics)
+            request)))))
+
 (defun proofread--apply-backend-diagnostics (diagnostics)
   "Record DIAGNOSTICS and create proofread-owned overlays for them."
   (setq proofread--diagnostics
@@ -626,8 +738,10 @@ handle, such as a timer object for the built-in mock backend."
       ('ok
        (if (proofread--fresh-request-p request)
            (with-current-buffer buffer
-             (proofread--apply-backend-diagnostics
-              (plist-get result :diagnostics))
+             (let ((diagnostics (plist-get result :diagnostics)))
+               (proofread--apply-backend-diagnostics diagnostics)
+               (unless (eq (plist-get result :source) 'cache)
+                 (proofread--cache-write-request request diagnostics)))
              'applied)
          'stale))
       ('error 'error)
@@ -637,12 +751,17 @@ handle, such as a timer object for the built-in mock backend."
   "Dispatch request-ready CHUNKS through BACKEND.
 When BACKEND is nil, use `proofread-backend'.  Return dispatched requests."
   (when (proofread-backend-available-p backend)
-    (let (requests)
+    (let ((backend-identity (proofread--cache-backend-identity backend))
+          requests)
       (dolist (chunk chunks)
         (let ((request (proofread--make-backend-request chunk)))
-          (when (proofread--dispatch-backend-request
-                 request #'proofread--handle-backend-result backend)
-            (push request requests))))
+          (setq request (plist-put request :backend backend-identity))
+          (let ((entry (proofread--cache-read-request request)))
+            (if entry
+                (proofread--apply-cache-entry request entry)
+              (when (proofread--dispatch-backend-request
+                     request #'proofread--handle-backend-result backend)
+                (push request requests))))))
       (nreverse requests))))
 
 (defun proofread--cancel-idle-timer ()
