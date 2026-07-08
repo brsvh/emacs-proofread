@@ -26,15 +26,15 @@ GNU Coding Standards section "Style of Change Logs" and ends with the required
 
    If this exits `0`, stop and report that there are no staged changes.
 
-1. Gather staged-only context:
+2. Gather staged-only context:
 
    ```bash
    scripts/staged-commit-context
    ```
 
-1. Read `references/gnu-change-log-style.md`.
+3. Read `references/gnu-change-log-style.md`.
 
-1. Determine trailer fields before drafting the final message:
+4. Determine trailer fields before drafting the final message:
 
    - `AGENT_CONFIG`: Locate the current agent's active configuration through the
      runtime-provided config path, config-home environment variable, CLI or
@@ -57,7 +57,7 @@ GNU Coding Standards section "Style of Change Logs" and ends with the required
      tokens. Do not record Git, shell, file read/search/edit helpers, commit
      helper scripts, formatters, or the final `git commit` command as tools.
 
-1. Draft a commit message that uses the staged diff only and ends with one
+5. Draft a commit message that uses the staged diff only and ends with one
    trailer line:
 
    ```text
@@ -67,9 +67,9 @@ GNU Coding Standards section "Style of Change Logs" and ends with the required
    If there are no tool tokens, write only
    `Assisted-by: AGENT_NAME:MODEL_VERSION`.
 
-1. Write the message to a temporary file.
+6. Write the message to a temporary file.
 
-1. Validate the message line lengths before committing:
+7. Validate the message line lengths before committing:
 
    ```bash
    awk 'NR == 1 && (length($0) > 68 || $0 !~ /\.$/) { exit 1 }
@@ -79,13 +79,13 @@ GNU Coding Standards section "Style of Change Logs" and ends with the required
    If validation fails, rewrite the message so the header is at most 68
    characters and every body line is at most 72 characters.
 
-1. Commit with:
+8. Commit with:
 
    ```bash
    git commit -F /tmp/commit-message
    ```
 
-1. Report the new commit hash and subject. If `git commit` fails, report the
+9. Report the new commit hash and subject. If `git commit` fails, report the
    error and stop.
 
 ## Message Requirements
