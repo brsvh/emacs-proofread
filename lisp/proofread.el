@@ -70,6 +70,21 @@ The backend protocol is defined in later implementation steps."
                  symbol)
   :group 'proofread)
 
+(defcustom proofread-ignored-faces nil
+  "Faces whose text should be skipped before proofreading requests.
+The `face' text property is inspected directly.  When its value is a symbol or
+a list containing any face in this option, that text is not included in
+request-ready chunks."
+  :type '(repeat symbol)
+  :group 'proofread)
+
+(defcustom proofread-ignored-properties nil
+  "Text properties whose non-nil values should be skipped.
+Each property is inspected with `get-text-property'.  Text where any configured
+property has a non-nil value is not included in request-ready chunks."
+  :type '(repeat symbol)
+  :group 'proofread)
+
 (defface proofread-face
   '((t :underline (:style wave)))
   "Face for proofreading diagnostics."
@@ -257,6 +272,159 @@ Paragraphs are nonblank runs of lines separated by one or more blank lines."
 (defun proofread--visible-chunks ()
   "Return paragraph chunks for `proofread--pending-ranges'."
   (proofread--chunks-for-ranges proofread--pending-ranges))
+
+(defconst proofread--url-regexp
+  "\\_<https?://[^[:space:]<>(){}\"']+"
+  "Regular expression matching URL text ignored before backend requests.")
+
+(defconst proofread--email-regexp
+  "\\_<[[:alnum:]._%+-]+@[[:alnum:].-]+\\.[[:alpha:]][[:alnum:].-]*\\_>"
+  "Regular expression matching email text ignored before backend requests.")
+
+(defun proofread--regexp-ranges-in-region (regexp beg end)
+  "Return ranges matching REGEXP between BEG and END."
+  (let (ranges)
+    (save-excursion
+      (goto-char beg)
+      (while (re-search-forward regexp end t)
+        (push (cons (match-beginning 0) (match-end 0)) ranges)))
+    (nreverse ranges)))
+
+(defun proofread--face-ignored-p (face)
+  "Return non-nil when FACE matches `proofread-ignored-faces'."
+  (cond
+   ((symbolp face)
+    (memq face proofread-ignored-faces))
+   ((consp face)
+    (catch 'ignored
+      (dolist (item face)
+        (when (and (symbolp item)
+                   (memq item proofread-ignored-faces))
+          (throw 'ignored t)))))))
+
+(defun proofread--property-ranges-in-region (property predicate beg end)
+  "Return PROPERTY ranges matching PREDICATE between BEG and END."
+  (let ((pos beg)
+        ranges)
+    (while (< pos end)
+      (let* ((value (get-text-property pos property))
+             (next (or (next-single-property-change pos property nil end)
+                       end)))
+        (when (funcall predicate value)
+          (push (cons pos next) ranges))
+        (setq pos next)))
+    (nreverse ranges)))
+
+(defun proofread--ignored-face-ranges (beg end)
+  "Return configured ignored face ranges between BEG and END."
+  (when proofread-ignored-faces
+    (proofread--property-ranges-in-region
+     'face #'proofread--face-ignored-p beg end)))
+
+(defun proofread--ignored-property-ranges (beg end)
+  "Return configured ignored text property ranges between BEG and END."
+  (let (ranges)
+    (dolist (property proofread-ignored-properties)
+      (dolist (range (proofread--property-ranges-in-region
+                      property #'identity beg end))
+        (push range ranges)))
+    (nreverse ranges)))
+
+(defun proofread--invisible-ranges (beg end)
+  "Return invisible text ranges between BEG and END."
+  (proofread--property-ranges-in-region 'invisible #'identity beg end))
+
+(defun proofread--ignored-ranges-in-region (beg end)
+  "Return normalized ignored ranges between BEG and END."
+  (proofread--normalize-ranges
+   (append
+    (proofread--regexp-ranges-in-region proofread--url-regexp beg end)
+    (proofread--regexp-ranges-in-region proofread--email-regexp beg end)
+    (proofread--ignored-face-ranges beg end)
+    (proofread--ignored-property-ranges beg end)
+    (proofread--invisible-ranges beg end))))
+
+(defun proofread--retained-ranges (beg end ignored-ranges)
+  "Return ranges between BEG and END after subtracting IGNORED-RANGES."
+  (let ((pos beg)
+        ranges)
+    (dolist (ignored (proofread--normalize-ranges ignored-ranges))
+      (let ((ignored-beg (max beg (car ignored)))
+            (ignored-end (min end (cdr ignored))))
+        (when (< ignored-beg ignored-end)
+          (when (< pos ignored-beg)
+            (push (cons pos ignored-beg) ranges))
+          (setq pos (max pos ignored-end)))))
+    (when (< pos end)
+      (push (cons pos end) ranges))
+    (nreverse ranges)))
+
+(defun proofread--substring-excluding-ranges (beg end ignored-ranges)
+  "Return text between BEG and END excluding IGNORED-RANGES."
+  (mapconcat
+   (lambda (range)
+     (buffer-substring-no-properties (car range) (cdr range)))
+   (proofread--retained-ranges beg end ignored-ranges)
+   ""))
+
+(defun proofread--request-ready-context-before (beg)
+  "Return filtered context before BEG without text properties."
+  (let* ((size (max 0 proofread-context-size))
+         (context-beg (max (point-min) (- beg size))))
+    (proofread--substring-excluding-ranges
+     context-beg beg
+     (proofread--ignored-ranges-in-region context-beg beg))))
+
+(defun proofread--request-ready-context-after (end)
+  "Return filtered context after END without text properties."
+  (let* ((size (max 0 proofread-context-size))
+         (context-end (min (point-max) (+ end size))))
+    (proofread--substring-excluding-ranges
+     end context-end
+     (proofread--ignored-ranges-in-region end context-end))))
+
+(defun proofread--make-request-ready-chunk (beg end)
+  "Return a request-ready proofread chunk for text between BEG and END."
+  (list :beg beg
+        :end end
+        :text (buffer-substring-no-properties beg end)
+        :major-mode major-mode
+        :language proofread-language
+        :context-before (proofread--request-ready-context-before beg)
+        :context-after (proofread--request-ready-context-after end)
+        :modified-tick (buffer-chars-modified-tick)))
+
+(defun proofread--request-ready-chunks-from-chunk (chunk)
+  "Return request-ready chunks split from paragraph CHUNK."
+  (let* ((beg (plist-get chunk :beg))
+         (end (plist-get chunk :end))
+         (ignored-ranges (proofread--ignored-ranges-in-region beg end))
+         chunks)
+    (dolist (range (proofread--retained-ranges beg end ignored-ranges))
+      (when (proofread--range-nonblank-p (car range) (cdr range))
+        (push (proofread--make-request-ready-chunk
+               (car range) (cdr range))
+              chunks)))
+    (nreverse chunks)))
+
+(defun proofread--request-ready-chunks-from-chunks (chunks)
+  "Return request-ready chunks filtered from paragraph CHUNKS."
+  (let (request-chunks)
+    (dolist (chunk chunks)
+      (dolist (request-chunk (proofread--request-ready-chunks-from-chunk chunk))
+        (push request-chunk request-chunks)))
+    (nreverse request-chunks)))
+
+(defun proofread--request-ready-chunks-for-ranges (ranges)
+  "Return request-ready chunks for visible RANGES.
+This is the internal boundary future cache lookup and backend dispatch should
+consume."
+  (proofread--request-ready-chunks-from-chunks
+   (proofread--chunks-for-ranges ranges)))
+
+(defun proofread--request-ready-visible-chunks ()
+  "Return request-ready chunks for `proofread--pending-ranges'."
+  (proofread--request-ready-chunks-for-ranges proofread--pending-ranges))
 
 (defun proofread--overlay-p (overlay)
   "Return non-nil if OVERLAY is a live proofread-owned overlay."

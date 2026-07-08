@@ -35,6 +35,12 @@
    :confidence 0.9
    :source 'test))
 
+(defun proofread-test--chunk-texts (chunks)
+  "Return the text payloads from CHUNKS."
+  (mapcar (lambda (chunk)
+            (plist-get chunk :text))
+          chunks))
+
 (ert-deftest proofread-test-normalize-ranges-merges-adjacent-ranges ()
   "Visible range normalization discards invalid ranges and merges duplicates."
   (should (equal (proofread--normalize-ranges
@@ -264,6 +270,112 @@
         (should-not proofread--overlays)
         (should-not proofread--requests)
         (should (= (hash-table-count proofread--cache) 0))))))
+
+(ert-deftest proofread-test-request-ready-chunks-filter-url ()
+  "Request-ready chunks exclude URLs while retaining surrounding text."
+  (with-temp-buffer
+    (insert "Alpha http://example.com/path Beta")
+    (let* ((proofread-context-size 0)
+           (chunks (proofread--request-ready-chunks-for-ranges
+                    (list (cons (point-min) (point-max)))))
+           (texts (proofread-test--chunk-texts chunks)))
+      (should (equal texts '("Alpha " " Beta")))
+      (should-not (string-match-p "http://example.com/path"
+                                  (mapconcat #'identity texts ""))))))
+
+(ert-deftest proofread-test-request-ready-chunks-filter-email ()
+  "Request-ready chunks exclude email addresses while retaining text."
+  (with-temp-buffer
+    (insert "Alpha user@example.com Beta")
+    (let* ((proofread-context-size 0)
+           (chunks (proofread--request-ready-chunks-for-ranges
+                    (list (cons (point-min) (point-max)))))
+           (texts (proofread-test--chunk-texts chunks)))
+      (should (equal texts '("Alpha " " Beta")))
+      (should-not (string-match-p "user@example.com"
+                                  (mapconcat #'identity texts ""))))))
+
+(ert-deftest proofread-test-request-ready-chunks-filter-ignored-face ()
+  "Request-ready chunks exclude text with ignored faces."
+  (with-temp-buffer
+    (insert "Alpha SKIP Beta")
+    (let ((skip-beg (progn
+                      (goto-char (point-min))
+                      (search-forward "SKIP")
+                      (match-beginning 0)))
+          (skip-end (match-end 0))
+          (proofread-ignored-faces '(proofread-test-ignore))
+          (proofread-context-size 0))
+      (add-text-properties skip-beg skip-end
+                           '(face (bold proofread-test-ignore)))
+      (should (equal
+               (proofread-test--chunk-texts
+                (proofread--request-ready-chunks-for-ranges
+                 (list (cons (point-min) (point-max)))))
+               '("Alpha " " Beta"))))))
+
+(ert-deftest proofread-test-request-ready-chunks-filter-ignored-property ()
+  "Request-ready chunks exclude text with ignored properties."
+  (with-temp-buffer
+    (insert "Alpha SKIP Beta")
+    (let ((skip-beg (progn
+                      (goto-char (point-min))
+                      (search-forward "SKIP")
+                      (match-beginning 0)))
+          (skip-end (match-end 0))
+          (proofread-ignored-properties '(proofread-test-ignore))
+          (proofread-context-size 0))
+      (add-text-properties skip-beg skip-end
+                           '(proofread-test-ignore t))
+      (should (equal
+               (proofread-test--chunk-texts
+                (proofread--request-ready-chunks-for-ranges
+                 (list (cons (point-min) (point-max)))))
+               '("Alpha " " Beta"))))))
+
+(ert-deftest proofread-test-request-ready-chunks-filter-invisible ()
+  "Request-ready chunks exclude invisible text by default."
+  (with-temp-buffer
+    (insert "Alpha HIDDEN Beta")
+    (let ((hidden-beg (progn
+                        (goto-char (point-min))
+                        (search-forward "HIDDEN")
+                        (match-beginning 0)))
+          (hidden-end (match-end 0))
+          (proofread-context-size 0))
+      (add-text-properties hidden-beg hidden-end '(invisible t))
+      (should (equal
+               (proofread-test--chunk-texts
+                (proofread--request-ready-chunks-for-ranges
+                 (list (cons (point-min) (point-max)))))
+               '("Alpha " " Beta"))))))
+
+(ert-deftest proofread-test-request-ready-chunks-preserve-metadata ()
+  "Filtered chunks preserve exact text and stale-result metadata."
+  (with-temp-buffer
+    (text-mode)
+    (let ((proofread-language "en")
+          (proofread-context-size 80))
+      (insert "Keep http://example.com TARGET tail")
+      (let* ((tick (buffer-chars-modified-tick))
+             (chunks (proofread--request-ready-chunks-for-ranges
+                      (list (cons (point-min) (point-max))))))
+        (should (equal (proofread-test--chunk-texts chunks)
+                       '("Keep " " TARGET tail")))
+        (dolist (chunk chunks)
+          (should (equal (plist-get chunk :text)
+                         (buffer-substring-no-properties
+                          (plist-get chunk :beg)
+                          (plist-get chunk :end))))
+          (should (eq (plist-get chunk :major-mode) 'text-mode))
+          (should (equal (plist-get chunk :language) "en"))
+          (should (= (plist-get chunk :modified-tick) tick))
+          (should-not (string-match-p "http://example.com"
+                                      (plist-get chunk :text)))
+          (should-not (string-match-p "http://example.com"
+                                      (plist-get chunk :context-before)))
+          (should-not (string-match-p "http://example.com"
+                                      (plist-get chunk :context-after))))))))
 
 (provide 'proofread-tests)
 
