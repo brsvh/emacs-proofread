@@ -203,6 +203,30 @@
                               -f ert-run-tests-batch-and-exit
                           '';
                         };
+
+                    "emacs${version}-byte-compile-proofread" =
+                      writeShellApplication
+                        {
+                          name = "emacs${version}-byte-compile-proofread";
+
+                          runtimeInputs = [
+                            emacs
+                          ];
+
+                          text = ''
+                            initdir="$(mktemp --tmpdir -d emacs-proofread-byte-compile-XXXXXX)"
+                            workdir="$(mktemp --tmpdir -d emacs-proofread-byte-compile-src-XXXXXX)"
+                            trap 'rm -rf "$initdir" "$workdir"' EXIT
+
+                            cp lisp/proofread.el "$workdir/proofread.el"
+
+                            emacs --batch \
+                              --init-directory "$initdir" \
+                              --eval '(setq byte-compile-error-on-warn t)' \
+                              -f batch-byte-compile \
+                              "$workdir/proofread.el"
+                          '';
+                        };
                   }
                 )
                 { }

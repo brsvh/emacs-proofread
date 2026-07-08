@@ -79,6 +79,21 @@
       (accept-process-output nil 0.01))
     result))
 
+(defun proofread-test--make-backend-recorder ()
+  "Return a plist containing a backend recorder and accessors."
+  (let (requests callbacks)
+    (list :function
+          (lambda (request callback &optional _backend)
+            (push request requests)
+            (push callback callbacks)
+            'proofread-test-handle)
+          :requests
+          (lambda ()
+            (reverse requests))
+          :callbacks
+          (lambda ()
+            (reverse callbacks)))))
+
 (ert-deftest proofread-test-normalize-ranges-merges-adjacent-ranges ()
   "Visible range normalization discards invalid ranges and merges duplicates."
   (should (equal (proofread--normalize-ranges
@@ -681,6 +696,74 @@
                   (should (equal proofread--diagnostics
                                  (list diagnostic)))
                   (should (= (length proofread--overlays) 1))))))
+        (kill-buffer buffer)))))
+
+(ert-deftest proofread-test-cache-miss-calls-backend ()
+  "A visible chunk with no cache entry is sent to the backend."
+  (save-window-excursion
+    (let ((buffer (generate-new-buffer " *proofread-cache-miss*")))
+      (unwind-protect
+          (progn
+            (switch-to-buffer buffer)
+            (insert "helo")
+            (proofread-mode 1)
+            (let* ((proofread-backend 'mock)
+                   (recorder (proofread-test--make-backend-recorder)))
+              (cl-letf (((symbol-function 'window-start)
+                         (lambda (&optional _window) (point-min)))
+                        ((symbol-function 'window-end)
+                         (lambda (&optional _window _update) (point-max)))
+                        ((symbol-function 'proofread-backend-check)
+                         (plist-get recorder :function)))
+                (proofread-check-visible)
+                (should (= (length (funcall
+                                    (plist-get recorder :requests)))
+                           1))
+                (should (equal (plist-get
+                                (car (funcall
+                                      (plist-get recorder :requests)))
+                                :text)
+                               "helo")))))
+        (kill-buffer buffer)))))
+
+(ert-deftest proofread-test-filtering-precedes-cache-and-backend-dispatch ()
+  "Filtered chunks are used for cache lookup and backend dispatch."
+  (save-window-excursion
+    (let ((buffer (generate-new-buffer " *proofread-filter-cache*")))
+      (unwind-protect
+          (progn
+            (switch-to-buffer buffer)
+            (insert "Alpha http://example.com/path Beta")
+            (proofread-mode 1)
+            (let* ((proofread-backend 'mock)
+                   (proofread-context-size 0)
+                   (chunks (proofread--request-ready-chunks-for-ranges
+                            (list (cons (point-min) (point-max)))))
+                   (cached-request
+                    (proofread--make-backend-request (car chunks)))
+                   (cached-diagnostic
+                    (proofread-test--diagnostic-with-kind
+                     1 6 "Alpha" 'spelling))
+                   (recorder (proofread-test--make-backend-recorder)))
+              (setq cached-request
+                    (plist-put cached-request :backend 'mock))
+              (proofread--cache-write-request
+               cached-request (list cached-diagnostic))
+              (cl-letf (((symbol-function 'window-start)
+                         (lambda (&optional _window) (point-min)))
+                        ((symbol-function 'window-end)
+                         (lambda (&optional _window _update) (point-max)))
+                        ((symbol-function 'proofread-backend-check)
+                         (plist-get recorder :function)))
+                (proofread-check-visible)
+                (should (equal (mapcar
+                                (lambda (request)
+                                  (plist-get request :text))
+                                (funcall (plist-get recorder :requests)))
+                               '(" Beta")))
+                (should (equal proofread--diagnostics
+                               (list cached-diagnostic)))
+                (should (= (length proofread--overlays) 1)))))
         (kill-buffer buffer)))))
 
 (ert-deftest proofread-test-cache-invalidation-misses ()
