@@ -10,6 +10,7 @@
 
 ;;; Code:
 
+(require 'cl-lib)
 (require 'ert)
 (require 'proofread)
 
@@ -33,6 +34,16 @@
    :suggestions '("hello")
    :confidence 0.9
    :source 'test))
+
+(ert-deftest proofread-test-normalize-ranges-merges-adjacent-ranges ()
+  "Visible range normalization discards invalid ranges and merges duplicates."
+  (should (equal (proofread--normalize-ranges
+                  '((30 . 35)
+                    (1 . 1)
+                    (10 . 20)
+                    (40 . 39)
+                    (20 . 30)))
+                 '((10 . 35)))))
 
 (ert-deftest proofread-test-face-defaults-avoid-fixed-colors ()
   "Proofread faces are defined without fixed color attributes."
@@ -106,6 +117,61 @@
       (should (overlay-buffer foreign-overlay))
       (should-not proofread--diagnostics)
       (should-not proofread--overlays))))
+
+(ert-deftest proofread-test-check-visible-collects-single-window-range ()
+  "`proofread-check-visible' records the selected visible window range."
+  (save-window-excursion
+    (let ((buffer (generate-new-buffer " *proofread-visible-single*")))
+      (unwind-protect
+          (progn
+            (switch-to-buffer buffer)
+            (insert "hello visible world")
+            (proofread-mode 1)
+            (cl-letf (((symbol-function 'window-start)
+                       (lambda (&optional _window) 3))
+                      ((symbol-function 'window-end)
+                       (lambda (&optional _window _update) 16)))
+              (proofread-check-visible)
+              (should (equal proofread--pending-ranges '((3 . 16))))
+              (should-not proofread--diagnostics)
+              (should-not proofread--overlays)
+              (should-not proofread--requests)
+              (should (= (hash-table-count proofread--cache) 0))))
+        (kill-buffer buffer)))))
+
+(ert-deftest proofread-test-check-visible-deduplicates-multiple-windows ()
+  "`proofread-check-visible' merges overlapping ranges from visible windows."
+  (save-window-excursion
+    (let ((buffer (generate-new-buffer " *proofread-visible-multiple*")))
+      (unwind-protect
+          (progn
+            (switch-to-buffer buffer)
+            (insert "hello visible world")
+            (proofread-mode 1)
+            (let* ((first-window (selected-window))
+                   (second-window (split-window-right))
+                   (window-ranges
+                    `((,first-window . (3 . 12))
+                      (,second-window . (8 . 16)))))
+              (set-window-buffer second-window buffer)
+              (cl-letf (((symbol-function 'window-start)
+                         (lambda (&optional window)
+                           (car (cdr (assq window window-ranges)))))
+                        ((symbol-function 'window-end)
+                         (lambda (&optional window _update)
+                           (cdr (cdr (assq window window-ranges))))))
+                (proofread-check-visible)
+                (should (equal proofread--pending-ranges '((3 . 16)))))))
+        (kill-buffer buffer)))))
+
+(ert-deftest proofread-test-check-visible-no-window-produces-no-ranges ()
+  "`proofread-check-visible' does not fall back to the whole buffer."
+  (with-temp-buffer
+    (insert "hello hidden world")
+    (proofread-mode 1)
+    (setq proofread--pending-ranges '((1 . 7)))
+    (proofread-check-visible)
+    (should-not proofread--pending-ranges)))
 
 (provide 'proofread-tests)
 

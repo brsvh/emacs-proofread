@@ -113,6 +113,52 @@ The returned plist contains the keys in `proofread--diagnostic-keys'."
   "Return PROPERTY from DIAGNOSTIC."
   (plist-get diagnostic property))
 
+(defun proofread--position-integer (position)
+  "Return POSITION as an integer, or nil if it is not a buffer position."
+  (cond
+   ((integerp position) position)
+   ((markerp position) (marker-position position))))
+
+(defun proofread--normalize-ranges (ranges)
+  "Return sorted, deduplicated RANGES.
+Each range is a cons cell of the form (BEG . END).  Empty or invalid ranges
+are discarded.  Overlapping or adjacent ranges are merged."
+  (let (normalized)
+    (dolist (range
+             (sort
+              (delq nil
+                    (mapcar
+                     (lambda (range)
+                       (when (consp range)
+                         (let ((beg (proofread--position-integer (car range)))
+                               (end (proofread--position-integer (cdr range))))
+                           (when (and beg end (< beg end))
+                             (cons beg end)))))
+                     ranges))
+              (lambda (a b)
+                (< (car a) (car b)))))
+      (if (and normalized (<= (car range) (cdar normalized)))
+          (setcdr (car normalized) (max (cdar normalized) (cdr range)))
+        (push range normalized)))
+    (nreverse normalized)))
+
+(defun proofread--visible-window-ranges ()
+  "Return raw visible ranges for live windows showing the current buffer."
+  (let ((buffer (current-buffer))
+        ranges)
+    (dolist (window (get-buffer-window-list buffer nil t))
+      (when (and (window-live-p window)
+                 (eq (window-buffer window) buffer))
+        (let ((beg (window-start window))
+              (end (window-end window t)))
+          (when end
+            (push (cons beg end) ranges)))))
+    (nreverse ranges)))
+
+(defun proofread--visible-ranges ()
+  "Return normalized visible ranges for the current buffer."
+  (proofread--normalize-ranges (proofread--visible-window-ranges)))
+
 (defun proofread--overlay-p (overlay)
   "Return non-nil if OVERLAY is a live proofread-owned overlay."
   (and (overlayp overlay)
@@ -204,7 +250,10 @@ not create overlays, timers, requests, or other background state."
 (defun proofread-check-visible ()
   "Check visible text in the current buffer for proofreading diagnostics."
   (interactive)
-  (proofread--command-placeholder 'proofread-check-visible))
+  (setq proofread--pending-ranges (proofread--visible-ranges))
+  (message "proofread: collected %d visible range%s"
+           (length proofread--pending-ranges)
+           (if (= (length proofread--pending-ranges) 1) "" "s")))
 
 ;;;###autoload
 (defun proofread-check-buffer ()
