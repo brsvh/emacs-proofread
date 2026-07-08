@@ -623,6 +623,71 @@
           (should-not (equal base-key
                              (proofread--cache-key changed-text 'mock))))))))
 
+(ert-deftest proofread-test-model-backend-identity-fields ()
+  "Model backend identity records stable configuration fields only."
+  (let ((proofread-backend 'model-backend)
+        (proofread-backend-model "qwen3:1.7b")
+        (proofread-backend-endpoint "http://localhost:11434/api")
+        (proofread-prompt-version "prompt-a")
+        (proofread-backend-options '((temperature . 0.2))))
+    (let ((identity (proofread--backend-identity)))
+      (should (eq (plist-get identity :backend) 'model-backend))
+      (should (equal (plist-get identity :model) "qwen3:1.7b"))
+      (should (equal (plist-get identity :endpoint)
+                     "http://localhost:11434/api"))
+      (should (equal (plist-get identity :prompt-version) "prompt-a"))
+      (should (equal (plist-get identity :options)
+                     '((temperature . 0.2))))
+      (dolist (volatile-key '(:id :buffer :callback :timer :beg :end))
+        (should-not (plist-member identity volatile-key))))))
+
+(ert-deftest proofread-test-mock-backend-identity-remains-compatible ()
+  "Mock backend identity remains the symbol used by existing cache entries."
+  (with-temp-buffer
+    (insert "Alpha")
+    (proofread-mode 1)
+    (let* ((proofread-backend 'mock)
+           (chunk (car (proofread--request-ready-chunks-for-ranges
+                        (list (cons (point-min) (point-max))))))
+           (request (proofread--make-backend-request chunk))
+           (diagnostic
+            (proofread-test--diagnostic-for-range 1 6 "Alpha")))
+      (should (eq (proofread--backend-identity) 'mock))
+      (should (eq (plist-get request :backend) 'mock))
+      (proofread--cache-write-request request (list diagnostic))
+      (should (proofread--cache-read-request request)))))
+
+(ert-deftest proofread-test-model-backend-cache-invalidation-misses ()
+  "Model-aware backend configuration changes miss old cache entries."
+  (with-temp-buffer
+    (insert "Alpha")
+    (proofread-mode 1)
+    (let* ((proofread-backend 'model-backend)
+           (proofread-backend-model "model-a")
+           (proofread-backend-endpoint "endpoint-a")
+           (proofread-backend-options '((temperature . 0.2)))
+           (proofread-prompt-version "prompt-a")
+           (chunk (car (proofread--request-ready-chunks-for-ranges
+                        (list (cons (point-min) (point-max))))))
+           (request (proofread--make-backend-request chunk))
+           (diagnostic
+            (proofread-test--diagnostic-for-range 1 6 "Alpha")))
+      (proofread--cache-write-request request (list diagnostic))
+      (let ((same-request (proofread--make-backend-request chunk)))
+        (should (proofread--cache-read-request same-request)))
+      (let ((proofread-backend-model "model-b"))
+        (should-not (proofread--cache-read-request
+                     (proofread--make-backend-request chunk))))
+      (let ((proofread-backend-endpoint "endpoint-b"))
+        (should-not (proofread--cache-read-request
+                     (proofread--make-backend-request chunk))))
+      (let ((proofread-backend-options '((temperature . 0.8))))
+        (should-not (proofread--cache-read-request
+                     (proofread--make-backend-request chunk))))
+      (let ((proofread-prompt-version "prompt-b"))
+        (should-not (proofread--cache-read-request
+                     (proofread--make-backend-request chunk)))))))
+
 (ert-deftest proofread-test-cache-read-write-hit-and-miss ()
   "Cache helpers read and write entries only for active proofread buffers."
   (with-temp-buffer

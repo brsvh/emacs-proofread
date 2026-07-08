@@ -72,6 +72,30 @@ disables backend dispatch."
                  symbol)
   :group 'proofread)
 
+(defcustom proofread-backend-model nil
+  "Model name used by configurable proofread backends.
+This value participates in model-aware backend identity for non-mock backends.
+The built-in mock backend ignores it."
+  :type '(choice (const :tag "Unspecified" nil)
+                 string)
+  :group 'proofread)
+
+(defcustom proofread-backend-endpoint nil
+  "Endpoint used by configurable proofread backends.
+This value participates in model-aware backend identity for non-mock backends.
+The built-in mock backend ignores it."
+  :type '(choice (const :tag "Unspecified" nil)
+                 string)
+  :group 'proofread)
+
+(defcustom proofread-backend-options nil
+  "Cache-relevant options used by configurable proofread backends.
+Put only options that can affect returned diagnostics here.  Runtime-only
+controls, such as timeouts, should use backend-specific variables and are not
+part of model-aware cache identity."
+  :type 'sexp
+  :group 'proofread)
+
 (defcustom proofread-prompt-version "1"
   "Prompt contract version used to invalidate diagnostic cache entries."
   :type 'string
@@ -113,7 +137,7 @@ property has a non-nil value is not included in request-ready chunks."
 
 (defconst proofread--backend-request-keys
   '( :id :buffer :beg :end :text :context-before :context-after
-     :language :major-mode :modified-tick)
+     :language :major-mode :modified-tick :backend)
   "Required keys for proofread backend request plists.")
 
 (defconst proofread--overlay-category 'proofread-overlay
@@ -473,14 +497,16 @@ consume."
   "Return a fresh backend request id for the current buffer."
   (setq proofread--next-request-id (1+ proofread--next-request-id)))
 
-(defun proofread--make-backend-request (chunk)
-  "Return a backend request plist for request-ready CHUNK."
+(defun proofread--make-backend-request (chunk &optional backend)
+  "Return a backend request plist for request-ready CHUNK.
+When BACKEND is non-nil, store its canonical identity in the request."
   (mapcan
    (lambda (key)
      (list key
            (pcase key
              (:id (proofread--next-request-id))
              (:buffer (current-buffer))
+             (:backend (proofread--backend-identity backend))
              (_ (plist-get chunk key)))))
    proofread--backend-request-keys))
 
@@ -630,10 +656,41 @@ handle, such as a timer object for the built-in mock backend."
                 (proofread--request-range-valid-p request)
                 (proofread--request-text-matches-p request))))))
 
+(defun proofread--backend-identity-p (value)
+  "Return non-nil when VALUE is a structured proofread backend identity."
+  (and (listp value)
+       (plist-member value :backend)
+       (plist-member value :prompt-version)))
+
+(defun proofread--backend-cache-relevant-options (&optional _backend)
+  "Return cache-relevant options for BACKEND.
+Runtime-only options are intentionally excluded from this value."
+  (copy-tree proofread-backend-options))
+
+(defun proofread--model-backend-identity (backend)
+  "Return structured identity for configurable model BACKEND."
+  (list :backend backend
+        :model proofread-backend-model
+        :endpoint proofread-backend-endpoint
+        :prompt-version proofread-prompt-version
+        :options (proofread--backend-cache-relevant-options backend)))
+
+(defun proofread--backend-identity (&optional backend)
+  "Return canonical identity for BACKEND.
+When BACKEND is nil, use the selected `proofread-backend'.  The mock backend
+keeps its symbol identity for compatibility; configurable model backends use a
+structured identity that excludes volatile request state."
+  (let ((backend (or backend proofread-backend)))
+    (cond
+     ((proofread--backend-identity-p backend) backend)
+     ((null backend) nil)
+     ((eq backend 'mock) 'mock)
+     (t (proofread--model-backend-identity backend)))))
+
 (defun proofread--cache-backend-identity (&optional backend)
   "Return BACKEND identity for cache keys.
 When BACKEND is nil, use the currently selected `proofread-backend'."
-  (or backend proofread-backend))
+  (proofread--backend-identity backend))
 
 (defun proofread--chunk-text-hash (text)
   "Return a deterministic cache hash for chunk TEXT."
@@ -764,7 +821,7 @@ When BACKEND is nil, use `proofread-backend'.  Return dispatched requests."
     (let ((backend-identity (proofread--cache-backend-identity backend))
           requests)
       (dolist (chunk chunks)
-        (let ((request (proofread--make-backend-request chunk)))
+        (let ((request (proofread--make-backend-request chunk backend)))
           (setq request (plist-put request :backend backend-identity))
           (let ((entry (proofread--cache-read-request request)))
             (if entry
