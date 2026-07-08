@@ -1027,12 +1027,119 @@ navigation order."
    (t (format "%S" value))))
 
 (defun proofread--diagnostic-suggestions (diagnostic)
-  "Return DIAGNOSTIC suggestions as a list."
+  "Return DIAGNOSTIC suggestions as strings in stored order."
   (let ((suggestions (proofread--diagnostic-get diagnostic :suggestions)))
     (cond
      ((null suggestions) nil)
-     ((listp suggestions) suggestions)
-     (t (list suggestions)))))
+     ((listp suggestions)
+      (mapcar #'proofread--format-diagnostic-field suggestions))
+     (t (list (proofread--format-diagnostic-field suggestions))))))
+
+(defun proofread--select-diagnostic-suggestion (diagnostic)
+  "Return the selected suggestion string for DIAGNOSTIC."
+  (let ((suggestions (proofread--diagnostic-suggestions diagnostic)))
+    (cond
+     ((null suggestions)
+      (user-error "No proofread suggestion available"))
+     ((null (cdr suggestions))
+      (car suggestions))
+     (t
+      (completing-read "Apply suggestion: " suggestions nil t)))))
+
+(defun proofread--application-range (diagnostic)
+  "Return DIAGNOSTIC's valid in-buffer application range."
+  (let ((range (proofread--diagnostic-range diagnostic)))
+    (unless (and range
+                 (<= (point-min) (car range))
+                 (<= (car range) (cdr range))
+                 (<= (cdr range) (point-max)))
+      (user-error "Invalid proofread diagnostic range"))
+    range))
+
+(defun proofread--validate-suggestion-application (diagnostic)
+  "Validate DIAGNOSTIC for suggestion application and return its range."
+  (let* ((range (proofread--application-range diagnostic))
+         (beg (car range))
+         (end (cdr range))
+         (text (proofread--diagnostic-get diagnostic :text)))
+    (unless (proofread--overlay-for-diagnostic diagnostic)
+      (user-error "Proofread diagnostic is stale"))
+    (unless (stringp text)
+      (user-error "Invalid proofread diagnostic text"))
+    (unless (equal (buffer-substring-no-properties beg end) text)
+      (user-error "Proofread diagnostic text no longer matches"))
+    range))
+
+(defun proofread--ranges-intersect-p (beg end other-beg other-end)
+  "Return non-nil if BEG to END intersects OTHER-BEG to OTHER-END."
+  (and (< beg other-end)
+       (< other-beg end)))
+
+(defun proofread--overlays-intersecting-range (beg end)
+  "Return proofread-owned overlays intersecting BEG to END."
+  (let (overlays)
+    (proofread--prune-overlays)
+    (dolist (overlay proofread--overlays)
+      (let ((overlay-beg (overlay-start overlay))
+            (overlay-end (overlay-end overlay)))
+        (when (and overlay-beg
+                   overlay-end
+                   (proofread--ranges-intersect-p
+                    beg end overlay-beg overlay-end))
+          (push overlay overlays))))
+    (nreverse overlays)))
+
+(defun proofread--diagnostic-intersects-range-p (diagnostic beg end)
+  "Return non-nil if DIAGNOSTIC intersects BEG to END."
+  (let ((range (proofread--diagnostic-range diagnostic)))
+    (and range
+         (proofread--ranges-intersect-p
+          beg end (car range) (cdr range)))))
+
+(defun proofread--diagnostics-intersecting-range (beg end)
+  "Return proofread diagnostics intersecting BEG to END."
+  (let (diagnostics)
+    (dolist (diagnostic proofread--diagnostics)
+      (when (proofread--diagnostic-intersects-range-p diagnostic beg end)
+        (push diagnostic diagnostics)))
+    (nreverse diagnostics)))
+
+(defun proofread--remove-diagnostics (diagnostics)
+  "Remove DIAGNOSTICS from current buffer proofread state."
+  (setq proofread--diagnostics
+        (delq nil
+              (mapcar (lambda (diagnostic)
+                        (unless (member diagnostic diagnostics)
+                          diagnostic))
+                      proofread--diagnostics))))
+
+(defun proofread--invalidate-affected-diagnostics (overlays diagnostics)
+  "Invalidate proofread-owned OVERLAYS and DIAGNOSTICS after text changes."
+  (dolist (overlay overlays)
+    (proofread--delete-overlay overlay))
+  (proofread--remove-diagnostics diagnostics)
+  (when (and proofread--current-diagnostic
+             (member proofread--current-diagnostic diagnostics))
+    (setq proofread--current-diagnostic nil))
+  (proofread--prune-overlays))
+
+(defun proofread--apply-suggestion-to-diagnostic (diagnostic suggestion)
+  "Replace DIAGNOSTIC's range with SUGGESTION and invalidate stale state."
+  (let* ((range (proofread--validate-suggestion-application diagnostic))
+         (beg (car range))
+         (end (cdr range))
+         (affected-overlays (proofread--overlays-intersecting-range beg end))
+         (affected-diagnostics
+          (proofread--diagnostics-intersecting-range beg end)))
+    (undo-boundary)
+    (delete-region beg end)
+    (goto-char beg)
+    (insert suggestion)
+    (proofread--invalidate-affected-diagnostics
+     affected-overlays affected-diagnostics)
+    (undo-boundary)
+    (message "proofread: applied suggestion")
+    'applied))
 
 (defun proofread--format-diagnostic-description (diagnostic)
   "Return a stable plain-text description for DIAGNOSTIC."
@@ -1239,7 +1346,12 @@ configured backend."
 (defun proofread-apply-suggestion ()
   "Apply a proofreading suggestion at point."
   (interactive)
-  (proofread--command-placeholder 'proofread-apply-suggestion))
+  (let ((diagnostic (proofread--diagnostic-at-point)))
+    (unless diagnostic
+      (user-error "No proofread diagnostic at point"))
+    (proofread--apply-suggestion-to-diagnostic
+     diagnostic
+     (proofread--select-diagnostic-suggestion diagnostic))))
 
 ;;;###autoload
 (defun proofread-ignore ()

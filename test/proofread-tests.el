@@ -1553,6 +1553,231 @@
         (dolist (overlay overlays)
           (should (overlay-buffer overlay)))))))
 
+(ert-deftest proofread-test-apply-target-overlay-lookup ()
+  "Suggestion application uses proofread-owned diagnostic and overlay state."
+  (with-temp-buffer
+    (insert "helo")
+    (proofread-mode 1)
+    (let* ((diagnostic
+            (proofread-test--diagnostic-for-range 1 5 "helo"))
+           (proofread-overlay
+            (car (proofread-test--install-diagnostics
+                  (list diagnostic))))
+           (foreign-overlay (make-overlay 1 5)))
+      (overlay-put foreign-overlay 'category 'foreign-overlay)
+      (overlay-put foreign-overlay 'proofread-diagnostic diagnostic)
+      (goto-char 2)
+      (should (eq (proofread--diagnostic-at-point) diagnostic))
+      (should (eq (proofread--overlay-for-diagnostic diagnostic)
+                  proofread-overlay))
+      (delete-overlay proofread-overlay)
+      (should-not (proofread--overlay-for-diagnostic diagnostic))
+      (should (overlay-buffer foreign-overlay)))))
+
+(ert-deftest proofread-test-apply-suggestion-helper-returns-strings ()
+  "Suggestion extraction returns strings in stored order."
+  (let ((diagnostic
+         (proofread--make-diagnostic
+          :beg 1
+          :end 5
+          :text "helo"
+          :suggestions '(hello "hullo" 42))))
+    (should (equal (proofread--diagnostic-suggestions diagnostic)
+                   '("hello" "hullo" "42")))))
+
+(ert-deftest proofread-test-apply-single-suggestion-replaces-range ()
+  "`proofread-apply-suggestion' applies one suggestion without prompting."
+  (with-temp-buffer
+    (insert "aa helo zz")
+    (proofread-mode 1)
+    (let ((diagnostic
+           (proofread--make-diagnostic
+            :beg 4
+            :end 8
+            :text "helo"
+            :kind 'spelling
+            :message "Possible misspelling"
+            :suggestions '("hello"))))
+      (proofread-test--install-diagnostics (list diagnostic))
+      (goto-char 5)
+      (cl-letf (((symbol-function 'completing-read)
+                 (lambda (&rest _args)
+                   (error "Unexpected completion prompt"))))
+        (should (eq (proofread-apply-suggestion) 'applied)))
+      (should (equal (buffer-string) "aa hello zz")))))
+
+(ert-deftest proofread-test-apply-multiple-suggestions-uses-completion ()
+  "`proofread-apply-suggestion' preserves candidate order for completion."
+  (with-temp-buffer
+    (insert "aa helo zz")
+    (proofread-mode 1)
+    (let ((diagnostic
+           (proofread--make-diagnostic
+            :beg 4
+            :end 8
+            :text "helo"
+            :kind 'spelling
+            :message "Possible misspelling"
+            :suggestions '("hello" "hullo" "hallo")))
+          candidates-seen)
+      (proofread-test--install-diagnostics (list diagnostic))
+      (goto-char 5)
+      (cl-letf (((symbol-function 'completing-read)
+                 (lambda (_prompt candidates &rest _args)
+                   (setq candidates-seen candidates)
+                   "hullo")))
+        (should (eq (proofread-apply-suggestion) 'applied)))
+      (should (equal candidates-seen '("hello" "hullo" "hallo")))
+      (should (equal (buffer-string) "aa hullo zz")))))
+
+(ert-deftest proofread-test-apply-no-suggestion-reports-unavailable ()
+  "Suggestion application reports no available suggestion without editing."
+  (with-temp-buffer
+    (insert "helo")
+    (proofread-mode 1)
+    (let ((diagnostic
+           (proofread--make-diagnostic
+            :beg 1
+            :end 5
+            :text "helo"
+            :kind 'spelling
+            :message "Possible misspelling")))
+      (proofread-test--install-diagnostics (list diagnostic))
+      (goto-char 2)
+      (should-error (proofread-apply-suggestion) :type 'user-error)
+      (should (equal (buffer-string) "helo")))))
+
+(ert-deftest proofread-test-apply-invalid-range-rejected ()
+  "Suggestion application rejects out-of-buffer diagnostic ranges."
+  (with-temp-buffer
+    (insert "helo")
+    (proofread-mode 1)
+    (let ((diagnostic
+           (proofread--make-diagnostic
+            :beg 1
+            :end 999
+            :text "helo"
+            :kind 'spelling
+            :suggestions '("hello"))))
+      (setq proofread--diagnostics (list diagnostic))
+      (goto-char 2)
+      (should-error (proofread-apply-suggestion) :type 'user-error)
+      (should (equal (buffer-string) "helo")))))
+
+(ert-deftest proofread-test-apply-stale-overlay-rejected ()
+  "Suggestion application rejects diagnostics without a live proofread overlay."
+  (with-temp-buffer
+    (insert "helo")
+    (proofread-mode 1)
+    (let* ((diagnostic
+            (proofread--make-diagnostic
+             :beg 1
+             :end 5
+             :text "helo"
+             :kind 'spelling
+             :suggestions '("hello")))
+           (overlay
+            (car (proofread-test--install-diagnostics
+                  (list diagnostic)))))
+      (delete-overlay overlay)
+      (goto-char 2)
+      (should-error (proofread-apply-suggestion) :type 'user-error)
+      (should (equal (buffer-string) "helo")))))
+
+(ert-deftest proofread-test-apply-text-mismatch-rejected ()
+  "Suggestion application rejects changed text before replacing anything."
+  (with-temp-buffer
+    (insert "hell")
+    (proofread-mode 1)
+    (let ((diagnostic
+           (proofread--make-diagnostic
+            :beg 1
+            :end 5
+            :text "helo"
+            :kind 'spelling
+            :suggestions '("hello"))))
+      (proofread-test--install-diagnostics (list diagnostic))
+      (goto-char 2)
+      (should-error (proofread-apply-suggestion) :type 'user-error)
+      (should (equal (buffer-string) "hell")))))
+
+(ert-deftest proofread-test-apply-undo-restores-original-text ()
+  "Undo restores text replaced by `proofread-apply-suggestion'."
+  (with-temp-buffer
+    (insert "aa helo zz")
+    (buffer-enable-undo)
+    (setq buffer-undo-list nil)
+    (proofread-mode 1)
+    (let ((diagnostic
+           (proofread--make-diagnostic
+            :beg 4
+            :end 8
+            :text "helo"
+            :kind 'spelling
+            :suggestions '("hello"))))
+      (proofread-test--install-diagnostics (list diagnostic))
+      (goto-char 5)
+      (proofread-apply-suggestion)
+      (should (equal (buffer-string) "aa hello zz"))
+      (undo)
+      (should (equal (buffer-string) "aa helo zz")))))
+
+(ert-deftest proofread-test-apply-invalidates-proofread-overlays ()
+  "Suggestion application removes affected proofread overlays only."
+  (with-temp-buffer
+    (insert "aa helo zz")
+    (proofread-mode 1)
+    (let* ((target
+            (proofread--make-diagnostic
+             :beg 4
+             :end 8
+             :text "helo"
+             :kind 'spelling
+             :suggestions '("hello")))
+           (overlap
+            (proofread-test--diagnostic-for-range 5 8 "elo"))
+           (outside
+            (proofread-test--diagnostic-for-range 9 11 "zz"))
+           (overlays
+            (proofread-test--install-diagnostics
+             (list target overlap outside)))
+           (target-overlay (nth 0 overlays))
+           (overlap-overlay (nth 1 overlays))
+           (outside-overlay (nth 2 overlays))
+           (foreign-overlay (make-overlay 3 9)))
+      (overlay-put foreign-overlay 'category 'foreign-overlay)
+      (proofread--mark-current-diagnostic target)
+      (goto-char 5)
+      (proofread-apply-suggestion)
+      (should-not (overlay-buffer target-overlay))
+      (should-not (overlay-buffer overlap-overlay))
+      (should (overlay-buffer outside-overlay))
+      (should (overlay-buffer foreign-overlay))
+      (should-not proofread--current-diagnostic)
+      (should (equal proofread--diagnostics (list outside))))))
+
+(ert-deftest proofread-test-non-apply-commands-do-not-apply-suggestions ()
+  "Navigation and description do not apply suggestions automatically."
+  (save-window-excursion
+    (with-temp-buffer
+      (insert " helo world")
+      (proofread-mode 1)
+      (let ((diagnostic
+             (proofread--make-diagnostic
+              :beg 2
+              :end 6
+              :text "helo"
+              :kind 'spelling
+              :message "Possible misspelling"
+              :suggestions '("hello")))
+            (text (buffer-string)))
+        (proofread-test--install-diagnostics (list diagnostic))
+        (goto-char 1)
+        (proofread-next)
+        (should (equal (buffer-string) text))
+        (proofread-describe)
+        (should (equal (buffer-string) text))))))
+
 (provide 'proofread-tests)
 
 ;;; proofread-tests.el ends here
