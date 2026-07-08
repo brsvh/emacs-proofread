@@ -41,6 +41,15 @@
             (plist-get chunk :text))
           chunks))
 
+(defun proofread-test--wait-for (predicate &optional timeout)
+  "Wait until PREDICATE returns non-nil or TIMEOUT seconds pass."
+  (let ((deadline (+ (float-time) (or timeout 1.0)))
+        result)
+    (while (and (not (setq result (funcall predicate)))
+                (< (float-time) deadline))
+      (accept-process-output nil 0.01))
+    result))
+
 (ert-deftest proofread-test-normalize-ranges-merges-adjacent-ranges ()
   "Visible range normalization discards invalid ranges and merges duplicates."
   (should (equal (proofread--normalize-ranges
@@ -376,6 +385,148 @@
                                       (plist-get chunk :context-before)))
           (should-not (string-match-p "http://example.com"
                                       (plist-get chunk :context-after))))))))
+
+(ert-deftest proofread-test-backend-availability ()
+  "Backend availability reports support for the built-in mock backend."
+  (let ((proofread-backend 'mock))
+    (should (proofread-backend-available-p))
+    (should (proofread-backend-available-p 'mock))
+    (should-not (proofread-backend-available-p 'unknown-backend))))
+
+(ert-deftest proofread-test-backend-request-records-chunk-fields ()
+  "Backend requests preserve request-ready chunk metadata."
+  (with-temp-buffer
+    (text-mode)
+    (let ((proofread-language "en")
+          (proofread-context-size 3))
+      (insert "abcTARGETxyz")
+      (let* ((tick (buffer-chars-modified-tick))
+             (chunk (car (proofread--request-ready-chunks-for-ranges
+                          '((4 . 10)))))
+             (request (proofread--make-backend-request chunk)))
+        (dolist (key proofread--backend-request-keys)
+          (should (plist-member request key)))
+        (should (integerp (plist-get request :id)))
+        (should (eq (plist-get request :buffer) (current-buffer)))
+        (should (= (plist-get request :beg) 4))
+        (should (= (plist-get request :end) 10))
+        (should (equal (plist-get request :text) "TARGET"))
+        (should (equal (plist-get request :context-before) "abc"))
+        (should (equal (plist-get request :context-after) "xyz"))
+        (should (equal (plist-get request :language) "en"))
+        (should (eq (plist-get request :major-mode) 'text-mode))
+        (should (= (plist-get request :modified-tick) tick))))))
+
+(ert-deftest proofread-test-mock-backend-success-is-asynchronous ()
+  "Mock backend success callbacks happen after dispatch returns."
+  (with-temp-buffer
+    (insert "Alpha")
+    (let* ((chunk (car (proofread--request-ready-chunks-for-ranges
+                        (list (cons (point-min) (point-max))))))
+           (request (proofread--make-backend-request chunk))
+           result)
+      (should (proofread-backend-check
+               request
+               (lambda (backend-result)
+                 (setq result backend-result))
+               'mock))
+      (should-not result)
+      (should (proofread-test--wait-for (lambda () result)))
+      (should (eq (plist-get result :status) 'ok))
+      (should (eq (plist-get result :request) request))
+      (should (listp (plist-get result :diagnostics))))))
+
+(ert-deftest proofread-test-mock-backend-error-is-asynchronous ()
+  "Mock backend error callbacks happen after dispatch returns."
+  (with-temp-buffer
+    (insert "Alpha")
+    (let* ((chunk (car (proofread--request-ready-chunks-for-ranges
+                        (list (cons (point-min) (point-max))))))
+           (request (proofread--make-backend-request chunk))
+           result)
+      (setq request (plist-put request :mock-error 'mock-failure))
+      (setq request (plist-put request :mock-message "Mock failure"))
+      (should (proofread-backend-check
+               request
+               (lambda (backend-result)
+                 (setq result backend-result))
+               'mock))
+      (should-not result)
+      (should (proofread-test--wait-for (lambda () result)))
+      (should (eq (plist-get result :status) 'error))
+      (should (eq (plist-get result :request) request))
+      (should (eq (plist-get result :error) 'mock-failure))
+      (should (equal (plist-get result :message) "Mock failure")))))
+
+(ert-deftest proofread-test-unsupported-backend-error-is-asynchronous ()
+  "Unsupported backends report an asynchronous protocol error."
+  (with-temp-buffer
+    (insert "Alpha")
+    (let* ((chunk (car (proofread--request-ready-chunks-for-ranges
+                        (list (cons (point-min) (point-max))))))
+           (request (proofread--make-backend-request chunk))
+           result)
+      (should (proofread-backend-check
+               request
+               (lambda (backend-result)
+                 (setq result backend-result))
+               'unknown-backend))
+      (should-not result)
+      (should (proofread-test--wait-for (lambda () result)))
+      (should (eq (plist-get result :status) 'error))
+      (should (eq (plist-get result :request) request))
+      (should (eq (plist-get result :error) 'unsupported-backend)))))
+
+(ert-deftest proofread-test-backend-success-clears-active-request ()
+  "Successful backend callbacks clear active request state first."
+  (with-temp-buffer
+    (insert "Alpha")
+    (proofread-mode 1)
+    (let* ((buffer (current-buffer))
+           (chunk (car (proofread--request-ready-chunks-for-ranges
+                        (list (cons (point-min) (point-max))))))
+           (request (proofread--make-backend-request chunk))
+           result
+           active-at-callback)
+      (should (proofread--dispatch-backend-request
+               request
+               (lambda (backend-result)
+                 (setq result backend-result)
+                 (with-current-buffer buffer
+                   (setq active-at-callback proofread--requests)))
+               'mock))
+      (should (proofread--active-request-p request))
+      (should (proofread-test--wait-for (lambda () result)))
+      (should (eq (plist-get result :status) 'ok))
+      (should-not active-at-callback)
+      (should-not (proofread--active-request-p request)))))
+
+(ert-deftest proofread-test-backend-error-preserves-buffer-and-clears-request ()
+  "Backend error callbacks preserve text and clear active request state."
+  (with-temp-buffer
+    (insert "Alpha")
+    (proofread-mode 1)
+    (let* ((buffer (current-buffer))
+           (before-text (buffer-string))
+           (chunk (car (proofread--request-ready-chunks-for-ranges
+                        (list (cons (point-min) (point-max))))))
+           (request (proofread--make-backend-request chunk))
+           result
+           active-at-callback)
+      (setq request (plist-put request :mock-error 'mock-failure))
+      (should (proofread--dispatch-backend-request
+               request
+               (lambda (backend-result)
+                 (setq result backend-result)
+                 (with-current-buffer buffer
+                   (setq active-at-callback proofread--requests)))
+               'mock))
+      (should (proofread--active-request-p request))
+      (should (proofread-test--wait-for (lambda () result)))
+      (should (eq (plist-get result :status) 'error))
+      (should (equal (buffer-string) before-text))
+      (should-not active-at-callback)
+      (should-not (proofread--active-request-p request)))))
 
 (provide 'proofread-tests)
 

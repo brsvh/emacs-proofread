@@ -64,9 +64,11 @@ configuration."
   :group 'proofread)
 
 (defcustom proofread-backend nil
-  "Backend used to produce proofreading diagnostics.
-The backend protocol is defined in later implementation steps."
+  "Selected backend used to produce proofreading diagnostics.
+The built-in mock backend is selected with the symbol `mock'.  A nil value
+disables backend dispatch."
   :type '(choice (const :tag "None" nil)
+                 (const :tag "Mock backend" mock)
                  symbol)
   :group 'proofread)
 
@@ -99,6 +101,11 @@ property has a non-nil value is not included in request-ready chunks."
   '(:beg :end :text :kind :message :suggestions :confidence :source)
   "Required keys for proofread diagnostic plists.")
 
+(defconst proofread--backend-request-keys
+  '(:id :buffer :beg :end :text :context-before :context-after
+	:language :major-mode :modified-tick)
+  "Required keys for proofread backend request plists.")
+
 (defconst proofread--overlay-category 'proofread-overlay
   "Overlay category used for proofread-owned overlays.")
 
@@ -113,6 +120,9 @@ property has a non-nil value is not included in request-ready chunks."
 
 (defvar-local proofread--requests nil
   "Active proofread requests for the current buffer.")
+
+(defvar-local proofread--next-request-id 0
+  "Next proofread backend request id for the current buffer.")
 
 (defvar-local proofread--cache nil
   "Proofread cache for the current buffer.")
@@ -426,6 +436,139 @@ consume."
   "Return request-ready chunks for `proofread--pending-ranges'."
   (proofread--request-ready-chunks-for-ranges proofread--pending-ranges))
 
+(defun proofread--next-request-id ()
+  "Return a fresh backend request id for the current buffer."
+  (setq proofread--next-request-id (1+ proofread--next-request-id)))
+
+(defun proofread--make-backend-request (chunk)
+  "Return a backend request plist for request-ready CHUNK."
+  (mapcan
+   (lambda (key)
+     (list key
+           (pcase key
+             (:id (proofread--next-request-id))
+             (:buffer (current-buffer))
+             (_ (plist-get chunk key)))))
+   proofread--backend-request-keys))
+
+(defun proofread--backend-requests-from-chunks (chunks)
+  "Return backend request plists for request-ready CHUNKS."
+  (mapcar #'proofread--make-backend-request chunks))
+
+(defun proofread--backend-success-result (request diagnostics)
+  "Return a successful backend result for REQUEST and DIAGNOSTICS."
+  (list :status 'ok
+        :request request
+        :diagnostics diagnostics))
+
+(defun proofread--backend-error-result (request error &optional message)
+  "Return an error backend result for REQUEST and ERROR.
+When MESSAGE is non-nil, include it as caller-readable error text."
+  (let ((result (list :status 'error
+                      :request request
+                      :error error)))
+    (if message
+        (append result (list :message message))
+      result)))
+
+(defun proofread--active-request-p (request)
+  "Return non-nil if REQUEST is active in the current buffer."
+  (let ((id (plist-get request :id))
+        active)
+    (dolist (candidate proofread--requests)
+      (when (equal id (plist-get candidate :id))
+        (setq active t)))
+    active))
+
+(defun proofread--register-active-request (request)
+  "Register REQUEST as active in the current buffer."
+  (push request proofread--requests)
+  request)
+
+(defun proofread--remove-active-request (request)
+  "Remove REQUEST from active request state in the current buffer."
+  (let ((id (plist-get request :id))
+        retained)
+    (dolist (candidate proofread--requests)
+      (unless (equal id (plist-get candidate :id))
+        (push candidate retained)))
+    (setq proofread--requests (nreverse retained))))
+
+(defun proofread--invoke-backend-callback (callback result)
+  "Invoke CALLBACK with backend RESULT when CALLBACK is non-nil."
+  (when callback
+    (funcall callback result)))
+
+(defun proofread--wrap-backend-callback (request callback)
+  "Return a callback that cleans REQUEST state before CALLBACK."
+  (lambda (result)
+    (let ((buffer (plist-get request :buffer)))
+      (when (buffer-live-p buffer)
+        (with-current-buffer buffer
+          (proofread--remove-active-request request))))
+    (proofread--invoke-backend-callback callback result)))
+
+(defun proofread-backend-available-p (&optional backend)
+  "Return non-nil if BACKEND can accept proofreading requests.
+When BACKEND is nil, check the selected `proofread-backend'."
+  (pcase (or backend proofread-backend)
+    ('mock t)
+    (_ nil)))
+
+(defun proofread--mock-backend-complete (request callback)
+  "Complete mock backend REQUEST by invoking CALLBACK."
+  (if (plist-get request :mock-error)
+      (proofread--invoke-backend-callback
+       callback
+       (proofread--backend-error-result
+        request
+        (plist-get request :mock-error)
+        (plist-get request :mock-message)))
+    (proofread--invoke-backend-callback
+     callback
+     (proofread--backend-success-result request nil))))
+
+(defun proofread--mock-backend-check (request callback)
+  "Submit REQUEST to the asynchronous mock backend."
+  (run-at-time 0 nil #'proofread--mock-backend-complete request callback))
+
+(defun proofread--unsupported-backend-check (backend request callback)
+  "Report unsupported BACKEND for REQUEST through CALLBACK asynchronously."
+  (run-at-time
+   0 nil
+   #'proofread--invoke-backend-callback
+   callback
+   (proofread--backend-error-result
+    request
+    'unsupported-backend
+    (format "Unsupported proofread backend: %S" backend))))
+
+(defun proofread-backend-check (request callback &optional backend)
+  "Submit REQUEST to BACKEND and invoke CALLBACK asynchronously.
+When BACKEND is nil, use `proofread-backend'.  The return value is a backend
+handle, such as a timer object for the built-in mock backend."
+  (let ((backend (or backend proofread-backend)))
+    (pcase backend
+      ('mock (proofread--mock-backend-check request callback))
+      (_ (proofread--unsupported-backend-check backend request callback)))))
+
+(defun proofread--dispatch-backend-request (request callback &optional backend)
+  "Register REQUEST, submit it to BACKEND, and invoke CALLBACK on completion."
+  (let ((buffer (plist-get request :buffer)))
+    (if (buffer-live-p buffer)
+        (with-current-buffer buffer
+          (proofread--register-active-request request))
+      (proofread--register-active-request request)))
+  (let ((wrapped-callback (proofread--wrap-backend-callback request callback)))
+    (condition-case err
+        (proofread-backend-check request wrapped-callback backend)
+      (error
+       (proofread--invoke-backend-callback
+        wrapped-callback
+        (proofread--backend-error-result
+         request err (error-message-string err)))
+       nil))))
+
 (defun proofread--overlay-p (overlay)
   "Return non-nil if OVERLAY is a live proofread-owned overlay."
   (and (overlayp overlay)
@@ -487,6 +630,7 @@ AFTER is non-nil for the after-change notification."
   (setq-local proofread--overlays nil)
   (setq-local proofread--pending-ranges nil)
   (setq-local proofread--requests nil)
+  (setq-local proofread--next-request-id 0)
   (setq-local proofread--cache (make-hash-table :test #'equal)))
 
 (defun proofread--clear-buffer-state ()
@@ -495,6 +639,7 @@ AFTER is non-nil for the after-change notification."
   (setq proofread--diagnostics nil)
   (setq proofread--pending-ranges nil)
   (setq proofread--requests nil)
+  (setq proofread--next-request-id 0)
   (setq proofread--cache nil))
 
 (defun proofread--command-placeholder (command)
