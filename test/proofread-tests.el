@@ -47,6 +47,11 @@
    :confidence 0.9
    :source 'test))
 
+(defun proofread-test--install-diagnostics (diagnostics)
+  "Install DIAGNOSTICS and return their proofread overlays."
+  (setq proofread--diagnostics diagnostics)
+  (mapcar #'proofread--create-overlay diagnostics))
+
 (defun proofread-test--chunk-texts (chunks)
   "Return the text payloads from CHUNKS."
   (mapcar (lambda (chunk)
@@ -1167,6 +1172,191 @@
                 (should-not proofread--overlays)
                 (should-not (proofread--active-request-p request)))))
         (kill-buffer buffer)))))
+
+(ert-deftest proofread-test-navigation-sorts-and-filters-diagnostics ()
+  "Navigation diagnostics are valid and sorted by start and end position."
+  (with-temp-buffer
+    (insert "abcdefghij")
+    (let* ((marker (copy-marker 2))
+           (first (proofread-test--diagnostic-for-range marker 5 "bcd"))
+           (same-start-short
+            (proofread-test--diagnostic-for-range 4 6 "de"))
+           (same-start-long
+            (proofread-test--diagnostic-for-range 4 9 "defgh"))
+           (last (proofread-test--diagnostic-for-range 8 10 "hi"))
+           (invalid-beg
+            (proofread-test--diagnostic-for-range 'not-a-position 3 ""))
+           (invalid-backward
+            (proofread-test--diagnostic-for-range 7 6 "")))
+      (setq proofread--diagnostics
+            (list same-start-long invalid-beg last invalid-backward
+                  same-start-short first))
+      (should (equal (mapcar #'proofread--diagnostic-range
+                             (proofread--navigation-diagnostics))
+                     '((2 . 5) (4 . 6) (4 . 9) (8 . 10)))))))
+
+(ert-deftest proofread-test-navigation-target-selection-around-point ()
+  "Next and previous target helpers select strict non-wrapping targets."
+  (with-temp-buffer
+    (let* ((first (proofread-test--diagnostic-for-range 3 4 "c"))
+           (second (proofread-test--diagnostic-for-range 6 7 "f"))
+           (third (proofread-test--diagnostic-for-range 9 10 "i"))
+           (invalid (proofread-test--diagnostic-for-range 12 11 "")))
+      (setq proofread--diagnostics (list third invalid first second))
+      (should (eq (proofread--next-diagnostic-after 1) first))
+      (should (eq (proofread--next-diagnostic-after 3) second))
+      (should (eq (proofread--next-diagnostic-after 6) third))
+      (should-not (proofread--next-diagnostic-after 9))
+      (should-not (proofread--previous-diagnostic-before 3))
+      (should (eq (proofread--previous-diagnostic-before 6) first))
+      (should (eq (proofread--previous-diagnostic-before 9) second))
+      (should (eq (proofread--previous-diagnostic-before 11) third)))))
+
+(ert-deftest proofread-test-proofread-next-moves-to-nearest-diagnostic ()
+  "`proofread-next' moves point to the nearest later diagnostic."
+  (with-temp-buffer
+    (insert "abcdefghij")
+    (proofread-mode 1)
+    (let ((first (proofread-test--diagnostic-for-range 3 4 "c"))
+          (second (proofread-test--diagnostic-for-range 7 8 "g")))
+      (proofread-test--install-diagnostics (list second first))
+      (goto-char 1)
+      (proofread-next)
+      (should (= (point) 3))
+      (should (equal proofread--current-diagnostic first))
+      (proofread-next)
+      (should (= (point) 7))
+      (should (equal proofread--current-diagnostic second)))))
+
+(ert-deftest proofread-test-proofread-previous-moves-to-nearest-diagnostic ()
+  "`proofread-previous' moves point to the nearest earlier diagnostic."
+  (with-temp-buffer
+    (insert "abcdefghij")
+    (proofread-mode 1)
+    (let ((first (proofread-test--diagnostic-for-range 3 4 "c"))
+          (second (proofread-test--diagnostic-for-range 7 8 "g")))
+      (proofread-test--install-diagnostics (list second first))
+      (goto-char (point-max))
+      (proofread-previous)
+      (should (= (point) 7))
+      (should (equal proofread--current-diagnostic second))
+      (proofread-previous)
+      (should (= (point) 3))
+      (should (equal proofread--current-diagnostic first)))))
+
+(ert-deftest proofread-test-navigation-empty-diagnostics-keeps-point ()
+  "Navigation with no diagnostics reports an error and leaves point unchanged."
+  (with-temp-buffer
+    (insert "abcdefghij")
+    (proofread-mode 1)
+    (goto-char 5)
+    (let ((position (point))
+          (text (buffer-string)))
+      (should-error (proofread-next) :type 'user-error)
+      (should (= (point) position))
+      (should-error (proofread-previous) :type 'user-error)
+      (should (= (point) position))
+      (should (equal (buffer-string) text)))))
+
+(ert-deftest proofread-test-navigation-boundaries-do-not-wrap ()
+  "Navigation commands use a no-wrap boundary policy."
+  (with-temp-buffer
+    (insert "abcdefghij")
+    (proofread-mode 1)
+    (let ((first (proofread-test--diagnostic-for-range 3 4 "c"))
+          (second (proofread-test--diagnostic-for-range 7 8 "g")))
+      (proofread-test--install-diagnostics (list first second))
+      (goto-char 7)
+      (should-error (proofread-next) :type 'user-error)
+      (should (= (point) 7))
+      (goto-char 3)
+      (should-error (proofread-previous) :type 'user-error)
+      (should (= (point) 3)))))
+
+(ert-deftest proofread-test-navigation-ignores-foreign-overlays ()
+  "Navigation uses proofread diagnostics instead of unrelated overlays."
+  (with-temp-buffer
+    (insert "abcdefghij")
+    (proofread-mode 1)
+    (let* ((foreign-overlay (make-overlay 2 3))
+           (diagnostic (proofread-test--diagnostic-for-range 6 7 "f")))
+      (overlay-put foreign-overlay 'category 'foreign-overlay)
+      (proofread-test--install-diagnostics (list diagnostic))
+      (goto-char 1)
+      (proofread-next)
+      (should (= (point) 6))
+      (should (overlay-buffer foreign-overlay)))))
+
+(ert-deftest proofread-test-navigation-marks-one-current-diagnostic ()
+  "Navigating marks exactly one proofread-owned diagnostic as current."
+  (with-temp-buffer
+    (insert "abcdefghij")
+    (proofread-mode 1)
+    (let* ((first (proofread-test--diagnostic-for-range 3 4 "c"))
+           (second (proofread-test--diagnostic-for-range 7 8 "g"))
+           (foreign-overlay (make-overlay 1 2)))
+      (overlay-put foreign-overlay 'face 'bold)
+      (proofread-test--install-diagnostics (list first second))
+      (goto-char 1)
+      (proofread-next)
+      (should (eq (overlay-get (proofread--overlay-for-diagnostic first)
+                               'face)
+                  'proofread-current-face))
+      (should (eq (overlay-get (proofread--overlay-for-diagnostic second)
+                               'face)
+                  'proofread-face))
+      (should (eq (overlay-get foreign-overlay 'face) 'bold))
+      (proofread-next)
+      (should (eq (overlay-get (proofread--overlay-for-diagnostic first)
+                               'face)
+                  'proofread-face))
+      (should (eq (overlay-get (proofread--overlay-for-diagnostic second)
+                               'face)
+                  'proofread-current-face))
+      (should (= (cl-count 'proofread-current-face
+                           (mapcar (lambda (overlay)
+                                     (overlay-get overlay 'face))
+                                   proofread--overlays))
+                 1))
+      (should (eq (overlay-get foreign-overlay 'face) 'bold)))))
+
+(ert-deftest proofread-test-navigation-preserves-buffer-text ()
+  "Navigation commands move point without changing buffer text."
+  (with-temp-buffer
+    (insert "abcdefghij")
+    (proofread-mode 1)
+    (let ((first (proofread-test--diagnostic-for-range 3 4 "c"))
+          (second (proofread-test--diagnostic-for-range 7 8 "g"))
+          (text (buffer-string)))
+      (proofread-test--install-diagnostics (list first second))
+      (goto-char 1)
+      (proofread-next)
+      (goto-char (point-max))
+      (proofread-previous)
+      (should (equal (buffer-string) text)))))
+
+(ert-deftest proofread-test-navigation-clears-current-state ()
+  "Clearing overlays or disabling mode removes current diagnostic state."
+  (with-temp-buffer
+    (insert "abcdefghij")
+    (proofread-mode 1)
+    (let ((diagnostic (proofread-test--diagnostic-for-range 3 4 "c")))
+      (proofread-test--install-diagnostics (list diagnostic))
+      (proofread--mark-current-diagnostic diagnostic)
+      (should proofread--current-diagnostic)
+      (proofread-clear)
+      (should-not proofread--current-diagnostic)
+      (should-not proofread--overlays)))
+  (with-temp-buffer
+    (insert "abcdefghij")
+    (proofread-mode 1)
+    (let* ((diagnostic (proofread-test--diagnostic-for-range 3 4 "c"))
+           (overlay (car (proofread-test--install-diagnostics
+                          (list diagnostic)))))
+      (proofread--mark-current-diagnostic diagnostic)
+      (proofread-mode -1)
+      (should-not proofread--current-diagnostic)
+      (should-not (overlay-buffer overlay)))))
 
 (provide 'proofread-tests)
 

@@ -125,6 +125,9 @@ property has a non-nil value is not included in request-ready chunks."
 (defvar-local proofread--overlays nil
   "Proofread-owned overlays for the current buffer.")
 
+(defvar-local proofread--current-diagnostic nil
+  "Currently selected proofread diagnostic in the current buffer.")
+
 (defvar-local proofread--pending-ranges nil
   "Pending proofread ranges for the current buffer.")
 
@@ -906,6 +909,93 @@ AFTER is non-nil for the after-change notification."
   (unless after
     (proofread--delete-overlay overlay)))
 
+(defun proofread--diagnostic-range (diagnostic)
+  "Return DIAGNOSTIC's valid range as a cons cell, or nil."
+  (let ((beg (proofread--position-integer
+              (proofread--diagnostic-get diagnostic :beg)))
+        (end (proofread--position-integer
+              (proofread--diagnostic-get diagnostic :end))))
+    (when (and beg end (<= beg end))
+      (cons beg end))))
+
+(defun proofread--navigation-entry< (a b)
+  "Return non-nil when navigation entry A should sort before B."
+  (let ((a-beg (nth 1 a))
+        (b-beg (nth 1 b))
+        (a-end (nth 2 a))
+        (b-end (nth 2 b))
+        (a-index (nth 3 a))
+        (b-index (nth 3 b)))
+    (cond
+     ((< a-beg b-beg) t)
+     ((> a-beg b-beg) nil)
+     ((< a-end b-end) t)
+     ((> a-end b-end) nil)
+     (t (< a-index b-index)))))
+
+(defun proofread--navigation-entries ()
+  "Return sorted navigation entries for current buffer diagnostics."
+  (let ((index 0)
+        entries)
+    (dolist (diagnostic proofread--diagnostics)
+      (let ((range (proofread--diagnostic-range diagnostic)))
+        (when range
+          (push (list diagnostic (car range) (cdr range) index)
+                entries)))
+      (setq index (1+ index)))
+    (sort (nreverse entries)
+          #'proofread--navigation-entry<)))
+
+(defun proofread--navigation-diagnostics ()
+  "Return valid proofread diagnostics sorted for navigation."
+  (mapcar #'car (proofread--navigation-entries)))
+
+(defun proofread--next-diagnostic-after (position)
+  "Return the nearest diagnostic strictly after POSITION."
+  (catch 'found
+    (let ((point-position (proofread--position-integer position)))
+      (when point-position
+        (dolist (entry (proofread--navigation-entries))
+          (when (> (nth 1 entry) point-position)
+            (throw 'found (car entry))))))))
+
+(defun proofread--previous-diagnostic-before (position)
+  "Return the nearest diagnostic strictly before POSITION."
+  (let ((point-position (proofread--position-integer position))
+        previous)
+    (when point-position
+      (dolist (entry (proofread--navigation-entries))
+        (when (< (nth 1 entry) point-position)
+          (setq previous (car entry))))
+      previous)))
+
+(defun proofread--clear-current-diagnostic ()
+  "Clear current diagnostic state and proofread-owned highlight faces."
+  (proofread--prune-overlays)
+  (dolist (overlay proofread--overlays)
+    (overlay-put overlay 'face 'proofread-face))
+  (setq proofread--current-diagnostic nil))
+
+(defun proofread--overlay-for-diagnostic (diagnostic)
+  "Return the proofread-owned overlay for DIAGNOSTIC in the current buffer."
+  (let (found)
+    (proofread--prune-overlays)
+    (dolist (overlay proofread--overlays)
+      (when (and (not found)
+                 (equal (overlay-get overlay 'proofread-diagnostic)
+                        diagnostic))
+        (setq found overlay)))
+    found))
+
+(defun proofread--mark-current-diagnostic (diagnostic)
+  "Mark DIAGNOSTIC as current and update proofread-owned overlay faces."
+  (proofread--clear-current-diagnostic)
+  (setq proofread--current-diagnostic diagnostic)
+  (let ((overlay (proofread--overlay-for-diagnostic diagnostic)))
+    (when overlay
+      (overlay-put overlay 'face 'proofread-current-face)))
+  diagnostic)
+
 (defun proofread--create-overlay (diagnostic)
   "Create and return a proofread overlay for DIAGNOSTIC."
   (let ((beg (proofread--diagnostic-get diagnostic :beg))
@@ -929,12 +1019,14 @@ AFTER is non-nil for the after-change notification."
   (dolist (overlay proofread--overlays)
     (when (proofread--current-buffer-overlay-p overlay)
       (delete-overlay overlay)))
-  (setq proofread--overlays nil))
+  (setq proofread--overlays nil)
+  (setq proofread--current-diagnostic nil))
 
 (defun proofread--initialize-buffer-state ()
   "Initialize proofread-owned state for the current buffer."
   (setq-local proofread--diagnostics nil)
   (setq-local proofread--overlays nil)
+  (setq-local proofread--current-diagnostic nil)
   (setq-local proofread--pending-ranges nil)
   (setq-local proofread--requests nil)
   (setq-local proofread--next-request-id 0)
@@ -947,6 +1039,7 @@ AFTER is non-nil for the after-change notification."
   (proofread--clear-scheduled-work)
   (proofread--clear-overlays)
   (setq proofread--diagnostics nil)
+  (setq proofread--current-diagnostic nil)
   (setq proofread--pending-ranges nil)
   (setq proofread--requests nil)
   (setq proofread--next-request-id 0)
@@ -1010,13 +1103,31 @@ configured backend."
 (defun proofread-next ()
   "Move point to the next proofreading diagnostic."
   (interactive)
-  (proofread--command-placeholder 'proofread-next))
+  (let ((diagnostic (proofread--next-diagnostic-after (point))))
+    (cond
+     (diagnostic
+      (goto-char (car (proofread--diagnostic-range diagnostic)))
+      (proofread--mark-current-diagnostic diagnostic)
+      (message "proofread: moved to next diagnostic"))
+     ((proofread--navigation-diagnostics)
+      (user-error "No next proofread diagnostic"))
+     (t
+      (user-error "No proofread diagnostics")))))
 
 ;;;###autoload
 (defun proofread-previous ()
   "Move point to the previous proofreading diagnostic."
   (interactive)
-  (proofread--command-placeholder 'proofread-previous))
+  (let ((diagnostic (proofread--previous-diagnostic-before (point))))
+    (cond
+     (diagnostic
+      (goto-char (car (proofread--diagnostic-range diagnostic)))
+      (proofread--mark-current-diagnostic diagnostic)
+      (message "proofread: moved to previous diagnostic"))
+     ((proofread--navigation-diagnostics)
+      (user-error "No previous proofread diagnostic"))
+     (t
+      (user-error "No proofread diagnostics")))))
 
 ;;;###autoload
 (defun proofread-describe ()
