@@ -127,7 +127,19 @@ property has a non-nil value is not included in request-ready chunks."
 (defvar-local proofread--cache nil
   "Proofread cache for the current buffer.")
 
+(defvar-local proofread--pending-work nil
+  "Non-nil when visible proofreading work is scheduled for this buffer.")
+
+(defvar-local proofread--idle-timer nil
+  "Idle timer scheduled for pending proofreading work in this buffer.")
+
 (defvar proofread-mode)
+
+(defvar proofread--mode-buffers nil
+  "Live buffers where `proofread-mode' has installed local hooks.")
+
+(defvar proofread--window-hooks-installed nil
+  "Non-nil when proofread global window activity hooks are installed.")
 
 (defun proofread--make-diagnostic (&rest properties)
   "Return a proofread diagnostic plist from PROPERTIES.
@@ -633,6 +645,118 @@ When BACKEND is nil, use `proofread-backend'.  Return dispatched requests."
             (push request requests))))
       (nreverse requests))))
 
+(defun proofread--cancel-idle-timer ()
+  "Cancel the current buffer's scheduled idle timer."
+  (when (timerp proofread--idle-timer)
+    (cancel-timer proofread--idle-timer))
+  (setq proofread--idle-timer nil))
+
+(defun proofread--clear-scheduled-work ()
+  "Clear pending scheduled proofreading work in the current buffer."
+  (setq proofread--pending-work nil)
+  (proofread--cancel-idle-timer))
+
+(defun proofread--idle-timer-run (buffer)
+  "Run pending visible proofreading work for BUFFER when still valid."
+  (when (buffer-live-p buffer)
+    (with-current-buffer buffer
+      (when proofread-mode
+        (if proofread--pending-work
+            (progn
+              (setq proofread--pending-work nil)
+              (setq proofread--idle-timer nil)
+              (proofread-check-visible)
+              'ran)
+          (setq proofread--idle-timer nil)
+          nil)))))
+
+(defun proofread--schedule-idle-timer ()
+  "Schedule an idle timer for pending proofreading work if needed."
+  (unless proofread--idle-timer
+    (setq proofread--idle-timer
+          (run-with-idle-timer
+           (max 0 proofread-idle-delay)
+           nil
+           #'proofread--idle-timer-run
+           (current-buffer)))))
+
+(defun proofread--mark-pending-work ()
+  "Mark the current buffer as needing scheduled visible proofreading."
+  (when proofread-mode
+    (setq proofread--pending-work t)
+    (proofread--schedule-idle-timer)))
+
+(defun proofread--after-change (_beg _end _length)
+  "Mark proofreading work pending after a buffer change."
+  (proofread--mark-pending-work))
+
+(defun proofread--mark-window-buffer-pending (window)
+  "Mark WINDOW's buffer pending when it has active `proofread-mode'."
+  (when (and (window-live-p window)
+             (not (window-minibuffer-p window)))
+    (let ((buffer (window-buffer window)))
+      (when (buffer-live-p buffer)
+        (with-current-buffer buffer
+          (proofread--mark-pending-work))))))
+
+(defun proofread--window-scroll (window _display-start)
+  "Mark WINDOW's buffer pending after scroll activity."
+  (proofread--mark-window-buffer-pending window))
+
+(defun proofread--window-configuration-change ()
+  "Mark proofread buffers pending after window configuration changes."
+  (dolist (window (window-list nil nil t))
+    (proofread--mark-window-buffer-pending window)))
+
+(defun proofread--install-window-hooks ()
+  "Install global window activity hooks used by `proofread-mode'."
+  (unless proofread--window-hooks-installed
+    (add-hook 'window-scroll-functions #'proofread--window-scroll)
+    (add-hook 'window-configuration-change-hook
+              #'proofread--window-configuration-change)
+    (setq proofread--window-hooks-installed t)))
+
+(defun proofread--live-mode-buffer-p (buffer)
+  "Return non-nil if BUFFER is live and has `proofread-mode' enabled."
+  (and (buffer-live-p buffer)
+       (with-current-buffer buffer
+         proofread-mode)))
+
+(defun proofread--prune-mode-buffers ()
+  "Remove dead or inactive buffers from `proofread--mode-buffers'."
+  (let (buffers)
+    (dolist (buffer proofread--mode-buffers)
+      (when (proofread--live-mode-buffer-p buffer)
+        (push buffer buffers)))
+    (setq proofread--mode-buffers (nreverse buffers))))
+
+(defun proofread--uninstall-window-hooks-if-unused ()
+  "Uninstall global window hooks when no proofread buffers remain."
+  (proofread--prune-mode-buffers)
+  (unless proofread--mode-buffers
+    (remove-hook 'window-scroll-functions #'proofread--window-scroll)
+    (remove-hook 'window-configuration-change-hook
+                 #'proofread--window-configuration-change)
+    (setq proofread--window-hooks-installed nil)))
+
+(defun proofread--register-mode-buffer ()
+  "Register the current buffer as using `proofread-mode' hooks."
+  (setq proofread--mode-buffers
+        (delq (current-buffer) proofread--mode-buffers))
+  (push (current-buffer) proofread--mode-buffers)
+  (proofread--install-window-hooks))
+
+(defun proofread--unregister-mode-buffer ()
+  "Unregister the current buffer from `proofread-mode' hooks."
+  (setq proofread--mode-buffers
+        (delq (current-buffer) proofread--mode-buffers))
+  (proofread--uninstall-window-hooks-if-unused))
+
+(defun proofread--kill-buffer ()
+  "Clean up proofread scheduling state before killing the current buffer."
+  (proofread--clear-scheduled-work)
+  (proofread--unregister-mode-buffer))
+
 (defun proofread--overlay-p (overlay)
   "Return non-nil if OVERLAY is a live proofread-owned overlay."
   (and (overlayp overlay)
@@ -695,16 +819,33 @@ AFTER is non-nil for the after-change notification."
   (setq-local proofread--pending-ranges nil)
   (setq-local proofread--requests nil)
   (setq-local proofread--next-request-id 0)
-  (setq-local proofread--cache (make-hash-table :test #'equal)))
+  (setq-local proofread--cache (make-hash-table :test #'equal))
+  (setq-local proofread--pending-work nil)
+  (setq-local proofread--idle-timer nil))
 
 (defun proofread--clear-buffer-state ()
   "Clear proofread-owned state for the current buffer."
+  (proofread--clear-scheduled-work)
   (proofread--clear-overlays)
   (setq proofread--diagnostics nil)
   (setq proofread--pending-ranges nil)
   (setq proofread--requests nil)
   (setq proofread--next-request-id 0)
   (setq proofread--cache nil))
+
+(defun proofread--enable-buffer ()
+  "Enable proofread buffer-local hooks and state in the current buffer."
+  (proofread--initialize-buffer-state)
+  (add-hook 'after-change-functions #'proofread--after-change nil t)
+  (add-hook 'kill-buffer-hook #'proofread--kill-buffer nil t)
+  (proofread--register-mode-buffer))
+
+(defun proofread--disable-buffer ()
+  "Disable proofread buffer-local hooks and state in the current buffer."
+  (remove-hook 'after-change-functions #'proofread--after-change t)
+  (remove-hook 'kill-buffer-hook #'proofread--kill-buffer t)
+  (proofread--clear-buffer-state)
+  (proofread--unregister-mode-buffer))
 
 (defun proofread--command-placeholder (command)
   "Report that COMMAND has not been implemented yet."
@@ -714,13 +855,14 @@ AFTER is non-nil for the after-change notification."
 (define-minor-mode proofread-mode
   "Toggle context-aware proofreading in the current buffer.
 
-This initial skeleton only installs the mode entry point.  It deliberately does
-not create overlays, timers, requests, or other background state."
+When enabled, proofread schedules visible-buffer checks after editing and
+window activity, then dispatches request-ready visible chunks through the
+configured backend."
   :lighter " Proofread"
   :group 'proofread
   (if proofread-mode
-      (proofread--initialize-buffer-state)
-    (proofread--clear-buffer-state)))
+      (proofread--enable-buffer)
+    (proofread--disable-buffer)))
 
 ;;;###autoload
 (defun proofread-check-visible ()

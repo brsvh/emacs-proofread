@@ -200,6 +200,164 @@
     (proofread-check-visible)
     (should-not proofread--pending-ranges)))
 
+(ert-deftest proofread-test-edit-schedules-idle-work ()
+  "Editing in `proofread-mode' marks pending work and schedules a timer."
+  (with-temp-buffer
+    (insert "Alpha")
+    (proofread-mode 1)
+    (let ((proofread-idle-delay 7)
+          scheduled)
+      (cl-letf (((symbol-function 'run-with-idle-timer)
+                 (lambda (seconds repeat function &rest args)
+                   (setq scheduled (list seconds repeat function args))
+                   'proofread-test-timer)))
+        (insert "!")
+        (should proofread--pending-work)
+        (should (eq proofread--idle-timer 'proofread-test-timer))
+        (should (equal scheduled
+                       (list 7 nil #'proofread--idle-timer-run
+                             (list (current-buffer)))))))))
+
+(ert-deftest proofread-test-edit-does-not-call-backend-synchronously ()
+  "Editing schedules work without calling the backend inline."
+  (with-temp-buffer
+    (insert "Alpha")
+    (proofread-mode 1)
+    (let ((proofread-backend 'mock)
+          backend-calls)
+      (cl-letf (((symbol-function 'run-with-idle-timer)
+                 (lambda (_seconds _repeat _function &rest _args)
+                   'proofread-test-timer))
+                ((symbol-function 'proofread-backend-check)
+                 (lambda (_request _callback &optional _backend)
+                   (setq backend-calls (1+ (or backend-calls 0))))))
+        (insert "!")
+        (should proofread--pending-work)
+        (should-not backend-calls)))))
+
+(ert-deftest proofread-test-repeated-edits-coalesce-before-idle ()
+  "Repeated edits before idle time reuse one timer and run one check."
+  (with-temp-buffer
+    (insert "Alpha")
+    (proofread-mode 1)
+    (let ((buffer (current-buffer))
+          timer-count
+          visible-checks)
+      (cl-letf (((symbol-function 'run-with-idle-timer)
+                 (lambda (_seconds _repeat _function &rest _args)
+                   (setq timer-count (1+ (or timer-count 0)))
+                   (intern (format "proofread-test-timer-%d"
+                                   timer-count))))
+                ((symbol-function 'proofread-check-visible)
+                 (lambda ()
+                   (setq visible-checks (1+ (or visible-checks 0))))))
+        (insert "!")
+        (insert "?")
+        (should (= timer-count 1))
+        (should proofread--pending-work)
+        (should (eq (proofread--idle-timer-run buffer) 'ran))
+        (should (= visible-checks 1))
+        (should-not proofread--pending-work)
+        (should-not proofread--idle-timer)))))
+
+(ert-deftest proofread-test-activity-after-idle-can-reschedule ()
+  "Activity after an idle callback can schedule later work."
+  (with-temp-buffer
+    (insert "Alpha")
+    (proofread-mode 1)
+    (let ((buffer (current-buffer))
+          timer-count
+          visible-checks)
+      (cl-letf (((symbol-function 'run-with-idle-timer)
+                 (lambda (_seconds _repeat _function &rest _args)
+                   (setq timer-count (1+ (or timer-count 0)))
+                   (intern (format "proofread-test-timer-%d"
+                                   timer-count))))
+                ((symbol-function 'proofread-check-visible)
+                 (lambda ()
+                   (setq visible-checks (1+ (or visible-checks 0))))))
+        (insert "!")
+        (should (eq (proofread--idle-timer-run buffer) 'ran))
+        (insert "?")
+        (should (= timer-count 2))
+        (should (= visible-checks 1))
+        (should proofread--pending-work)))))
+
+(ert-deftest proofread-test-window-activity-marks-proofread-buffer ()
+  "Window activity marks only live buffers with `proofread-mode' enabled."
+  (save-window-excursion
+    (let ((proofread-buffer
+           (generate-new-buffer " *proofread-window-mode*"))
+          (plain-buffer
+           (generate-new-buffer " *proofread-window-plain*")))
+      (unwind-protect
+          (let (timer-count)
+            (with-current-buffer proofread-buffer
+              (insert "Alpha")
+              (proofread-mode 1))
+            (with-current-buffer plain-buffer
+              (insert "Beta"))
+            (cl-letf (((symbol-function 'run-with-idle-timer)
+                       (lambda (_seconds _repeat _function &rest _args)
+                         (setq timer-count (1+ (or timer-count 0)))
+                         (intern (format "proofread-test-window-timer-%d"
+                                         timer-count)))))
+              (switch-to-buffer proofread-buffer)
+              (proofread--window-scroll (selected-window) (point-min))
+              (with-current-buffer proofread-buffer
+                (should proofread--pending-work))
+              (switch-to-buffer plain-buffer)
+              (proofread--window-scroll (selected-window) (point-min))
+              (with-current-buffer plain-buffer
+                (should-not proofread--pending-work))
+              (should (= timer-count 1))))
+        (kill-buffer proofread-buffer)
+        (kill-buffer plain-buffer)))))
+
+(ert-deftest proofread-test-disable-mode-clears-scheduled-work ()
+  "Disabling `proofread-mode' clears pending work and timer state."
+  (with-temp-buffer
+    (insert "Alpha")
+    (proofread-mode 1)
+    (cl-letf (((symbol-function 'run-with-idle-timer)
+               (lambda (_seconds _repeat _function &rest _args)
+                 'proofread-test-timer)))
+      (insert "!")
+      (should proofread--pending-work)
+      (should proofread--idle-timer)
+      (proofread-mode -1)
+      (should-not proofread--pending-work)
+      (should-not proofread--idle-timer)
+      (should-not (memq #'proofread--after-change after-change-functions)))))
+
+(ert-deftest proofread-test-disabled-mode-stale-timer-does-not-check-visible ()
+  "A stale timer after mode disable does not run visible checking."
+  (with-temp-buffer
+    (insert "Alpha")
+    (proofread-mode 1)
+    (let ((buffer (current-buffer))
+          visible-checks)
+      (cl-letf (((symbol-function 'run-with-idle-timer)
+                 (lambda (_seconds _repeat _function &rest _args)
+                   'proofread-test-timer))
+                ((symbol-function 'proofread-check-visible)
+                 (lambda ()
+                   (setq visible-checks (1+ (or visible-checks 0))))))
+        (insert "!")
+        (proofread-mode -1)
+        (should-not (proofread--idle-timer-run buffer))
+        (should-not visible-checks)))))
+
+(ert-deftest proofread-test-killed-buffer-idle-timer-is-ignored ()
+  "An idle timer targeting a killed buffer is ignored without error."
+  (let ((buffer (generate-new-buffer " *proofread-idle-killed*")))
+    (with-current-buffer buffer
+      (insert "Alpha")
+      (proofread-mode 1))
+    (kill-buffer buffer)
+    (should-not (buffer-live-p buffer))
+    (should-not (proofread--idle-timer-run buffer))))
+
 (ert-deftest proofread-test-chunks-for-ranges-ordinary-paragraph ()
   "Paragraph chunking records exact boundaries and text."
   (with-temp-buffer
