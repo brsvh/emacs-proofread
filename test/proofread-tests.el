@@ -47,6 +47,18 @@
    :confidence 0.9
    :source 'test))
 
+(defun proofread-test--diagnostic-with-kind (beg end text kind)
+  "Return a sample diagnostic for BEG, END, TEXT, and KIND."
+  (proofread--make-diagnostic
+   :beg beg
+   :end end
+   :text text
+   :kind kind
+   :message "Possible issue"
+   :suggestions '("fixed")
+   :confidence 0.9
+   :source 'test))
+
 (defun proofread-test--install-diagnostics (diagnostics)
   "Install DIAGNOSTICS and return their proofread overlays."
   (setq proofread--diagnostics diagnostics)
@@ -1777,6 +1789,140 @@
         (should (equal (buffer-string) text))
         (proofread-describe)
         (should (equal (buffer-string) text))))))
+
+(ert-deftest proofread-test-ignore-key-exact-text-and-kind ()
+  "Ignore keys match exact diagnostic text and kind only."
+  (let ((proofread--ignored-diagnostics (make-hash-table :test #'equal)))
+    (let ((diagnostic
+           (proofread-test--diagnostic-with-kind
+            1 5 "helo" 'spelling))
+          (same
+           (proofread-test--diagnostic-with-kind
+            10 14 "helo" 'spelling))
+          (different-kind
+           (proofread-test--diagnostic-with-kind
+            10 14 "helo" 'grammar))
+          (different-text
+           (proofread-test--diagnostic-with-kind
+            10 14 "wrld" 'spelling)))
+      (should (equal (proofread--diagnostic-ignore-key diagnostic)
+                     '(:text "helo" :kind spelling)))
+      (proofread--record-ignored-diagnostic diagnostic)
+      (should (proofread--diagnostic-ignored-p same))
+      (should-not (proofread--diagnostic-ignored-p different-kind))
+      (should-not (proofread--diagnostic-ignored-p different-text)))))
+
+(ert-deftest proofread-test-ignore-command-removes-matching-overlays ()
+  "`proofread-ignore' records a key and removes matching proofread overlays."
+  (let ((proofread--ignored-diagnostics (make-hash-table :test #'equal)))
+    (with-temp-buffer
+      (insert "helo wrld helo")
+      (proofread-mode 1)
+      (let* ((target
+              (proofread-test--diagnostic-with-kind
+               1 5 "helo" 'spelling))
+             (unrelated
+              (proofread-test--diagnostic-with-kind
+               6 10 "wrld" 'spelling))
+             (same-key
+              (proofread-test--diagnostic-with-kind
+               11 15 "helo" 'spelling))
+             (overlays
+              (proofread-test--install-diagnostics
+               (list target unrelated same-key)))
+             (target-overlay (nth 0 overlays))
+             (unrelated-overlay (nth 1 overlays))
+             (same-key-overlay (nth 2 overlays))
+             (foreign-overlay (make-overlay 1 15))
+             (text (buffer-string)))
+        (overlay-put foreign-overlay 'category 'foreign-overlay)
+        (proofread--mark-current-diagnostic target)
+        (goto-char 2)
+        (should (eq (proofread-ignore) 'ignored))
+        (should (proofread--diagnostic-ignored-p target))
+        (should-not (overlay-buffer target-overlay))
+        (should-not (overlay-buffer same-key-overlay))
+        (should (overlay-buffer unrelated-overlay))
+        (should (overlay-buffer foreign-overlay))
+        (should-not proofread--current-diagnostic)
+        (should (equal proofread--diagnostics (list unrelated)))
+        (should (equal (buffer-string) text))))))
+
+(ert-deftest proofread-test-ignore-command-away-from-diagnostic ()
+  "`proofread-ignore' away from diagnostics reports no target."
+  (let ((proofread--ignored-diagnostics (make-hash-table :test #'equal)))
+    (with-temp-buffer
+      (insert "helo wrld")
+      (proofread-mode 1)
+      (let ((diagnostic
+             (proofread-test--diagnostic-with-kind
+              1 5 "helo" 'spelling))
+            (text (buffer-string)))
+        (proofread-test--install-diagnostics (list diagnostic))
+        (goto-char 8)
+        (should-error (proofread-ignore) :type 'user-error)
+        (should (equal (buffer-string) text))
+        (should-not (proofread--diagnostic-ignored-p diagnostic))
+        (should (= (length proofread--overlays) 1))))))
+
+(ert-deftest proofread-test-ignore-filter-preserves-different-key ()
+  "Ignored diagnostics are filtered before creating proofread overlays."
+  (let ((proofread--ignored-diagnostics (make-hash-table :test #'equal)))
+    (with-temp-buffer
+      (insert "helo helo wrld")
+      (proofread-mode 1)
+      (let ((ignored
+             (proofread-test--diagnostic-with-kind
+              1 5 "helo" 'spelling))
+            (different-kind
+             (proofread-test--diagnostic-with-kind
+              6 10 "helo" 'grammar))
+            (different-text
+             (proofread-test--diagnostic-with-kind
+              11 15 "wrld" 'spelling)))
+        (proofread--record-ignored-diagnostic ignored)
+        (proofread--apply-backend-diagnostics
+         (list ignored different-kind different-text))
+        (should (equal proofread--diagnostics
+                       (list different-kind different-text)))
+        (should (= (length proofread--overlays) 2))
+        (let ((displayed (mapcar (lambda (overlay)
+                                   (overlay-get overlay
+                                                'proofread-diagnostic))
+                                 proofread--overlays)))
+          (should (member different-kind displayed))
+          (should (member different-text displayed))
+          (should-not (member ignored displayed)))))))
+
+(ert-deftest proofread-test-ignore-filters-backend-and-cache-results ()
+  "Ignored diagnostics from backend results or cache hits create no overlays."
+  (let ((proofread--ignored-diagnostics (make-hash-table :test #'equal)))
+    (with-temp-buffer
+      (insert "helo")
+      (proofread-mode 1)
+      (let* ((request
+              (list :buffer (current-buffer)
+                    :beg 1
+                    :end 5
+                    :text "helo"
+                    :modified-tick (buffer-chars-modified-tick)
+                    :backend 'mock))
+             (diagnostic
+              (proofread-test--diagnostic-with-kind
+               1 5 "helo" 'spelling))
+             (entry (proofread--make-cache-entry
+                     request (list diagnostic))))
+        (proofread--record-ignored-diagnostic diagnostic)
+        (should (eq (proofread--handle-backend-result
+                     (proofread--backend-success-result
+                      request (list diagnostic)))
+                    'applied))
+        (should-not proofread--diagnostics)
+        (should-not proofread--overlays)
+        (should (eq (proofread--apply-cache-entry request entry)
+                    'applied))
+        (should-not proofread--diagnostics)
+        (should-not proofread--overlays)))))
 
 (provide 'proofread-tests)
 

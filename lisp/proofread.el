@@ -122,6 +122,9 @@ property has a non-nil value is not included in request-ready chunks."
 (defconst proofread--description-buffer-name "*Proofread Diagnostic*"
   "Buffer name used to display proofread diagnostic descriptions.")
 
+(defvar proofread--ignored-diagnostics (make-hash-table :test #'equal)
+  "Session-local table of ignored proofread diagnostic keys.")
+
 (defvar-local proofread--diagnostics nil
   "Proofread diagnostics for the current buffer.")
 
@@ -731,10 +734,11 @@ When BACKEND is nil, use the currently selected `proofread-backend'."
 
 (defun proofread--apply-backend-diagnostics (diagnostics)
   "Record DIAGNOSTICS and create proofread-owned overlays for them."
-  (setq proofread--diagnostics
-        (append proofread--diagnostics diagnostics))
-  (dolist (diagnostic diagnostics)
-    (proofread--create-overlay diagnostic)))
+  (let ((diagnostics (proofread--filter-ignored-diagnostics diagnostics)))
+    (setq proofread--diagnostics
+          (append proofread--diagnostics diagnostics))
+    (dolist (diagnostic diagnostics)
+      (proofread--create-overlay diagnostic))))
 
 (defun proofread--handle-backend-result (result)
   "Handle backend RESULT and return an internal status symbol."
@@ -972,6 +976,75 @@ navigation order."
         (when (proofread--diagnostic-covers-position-p
                diagnostic point-position)
           (throw 'found diagnostic))))))
+
+(defun proofread--diagnostic-ignore-key (diagnostic)
+  "Return the session ignore key for DIAGNOSTIC."
+  (list :text (proofread--diagnostic-get diagnostic :text)
+        :kind (proofread--diagnostic-get diagnostic :kind)))
+
+(defun proofread--ensure-ignored-diagnostics ()
+  "Return the session ignore table for proofread diagnostics."
+  (unless (hash-table-p proofread--ignored-diagnostics)
+    (setq proofread--ignored-diagnostics
+          (make-hash-table :test #'equal)))
+  proofread--ignored-diagnostics)
+
+(defun proofread--ignore-key-p (key)
+  "Return non-nil when KEY is recorded as ignored this session."
+  (gethash key (proofread--ensure-ignored-diagnostics)))
+
+(defun proofread--diagnostic-ignored-p (diagnostic)
+  "Return non-nil when DIAGNOSTIC is ignored this session."
+  (proofread--ignore-key-p
+   (proofread--diagnostic-ignore-key diagnostic)))
+
+(defun proofread--record-ignored-diagnostic (diagnostic)
+  "Record DIAGNOSTIC as ignored for the current Emacs session."
+  (let ((key (proofread--diagnostic-ignore-key diagnostic)))
+    (puthash key t (proofread--ensure-ignored-diagnostics))
+    key))
+
+(defun proofread--filter-ignored-diagnostics (diagnostics)
+  "Return DIAGNOSTICS without session-ignored entries."
+  (delq nil
+        (mapcar (lambda (diagnostic)
+                  (unless (proofread--diagnostic-ignored-p diagnostic)
+                    diagnostic))
+                diagnostics)))
+
+(defun proofread--diagnostic-matches-ignore-key-p (diagnostic key)
+  "Return non-nil when DIAGNOSTIC matches ignore KEY."
+  (equal (proofread--diagnostic-ignore-key diagnostic) key))
+
+(defun proofread--diagnostics-matching-ignore-key (key)
+  "Return current buffer diagnostics matching ignore KEY."
+  (let (diagnostics)
+    (dolist (diagnostic proofread--diagnostics)
+      (when (proofread--diagnostic-matches-ignore-key-p diagnostic key)
+        (push diagnostic diagnostics)))
+    (nreverse diagnostics)))
+
+(defun proofread--delete-overlays-matching-ignore-key (key)
+  "Delete proofread-owned overlays matching ignore KEY."
+  (proofread--prune-overlays)
+  (dolist (overlay proofread--overlays)
+    (let ((diagnostic (overlay-get overlay 'proofread-diagnostic)))
+      (when (and diagnostic
+                 (proofread--diagnostic-matches-ignore-key-p
+                  diagnostic key))
+        (proofread--delete-overlay overlay))))
+  (proofread--prune-overlays))
+
+(defun proofread--remove-diagnostics-matching-ignore-key (key)
+  "Remove current buffer diagnostics and overlays matching ignore KEY."
+  (let ((diagnostics (proofread--diagnostics-matching-ignore-key key)))
+    (proofread--delete-overlays-matching-ignore-key key)
+    (proofread--remove-diagnostics diagnostics)
+    (when (and proofread--current-diagnostic
+               (proofread--diagnostic-matches-ignore-key-p
+                proofread--current-diagnostic key))
+      (setq proofread--current-diagnostic nil))
+    diagnostics))
 
 (defun proofread--next-diagnostic-after (position)
   "Return the nearest diagnostic strictly after POSITION."
@@ -1357,7 +1430,14 @@ configured backend."
 (defun proofread-ignore ()
   "Ignore the proofreading diagnostic at point."
   (interactive)
-  (proofread--command-placeholder 'proofread-ignore))
+  (let ((diagnostic (proofread--diagnostic-at-point))
+        key)
+    (unless diagnostic
+      (user-error "No proofread diagnostic at point"))
+    (setq key (proofread--record-ignored-diagnostic diagnostic))
+    (proofread--remove-diagnostics-matching-ignore-key key)
+    (message "proofread: ignored diagnostic")
+    'ignored))
 
 ;;;###autoload
 (defun proofread-clear ()
