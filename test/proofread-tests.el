@@ -1358,6 +1358,201 @@
       (should-not proofread--current-diagnostic)
       (should-not (overlay-buffer overlay)))))
 
+(ert-deftest proofread-test-diagnostic-at-point-finds-covering-diagnostic ()
+  "Diagnostic lookup returns the proofread diagnostic covering point."
+  (with-temp-buffer
+    (insert "abcdefghij")
+    (proofread-mode 1)
+    (let ((diagnostic (proofread-test--diagnostic-for-range 3 6 "cde")))
+      (setq proofread--diagnostics (list diagnostic))
+      (goto-char 3)
+      (should (eq (proofread--diagnostic-at-point) diagnostic))
+      (goto-char 5)
+      (should (eq (proofread--diagnostic-at-point) diagnostic))
+      (goto-char 6)
+      (should-not (proofread--diagnostic-at-point)))))
+
+(ert-deftest proofread-test-diagnostic-at-point-uses-overlap-order ()
+  "Overlapping diagnostic lookup uses navigation ordering."
+  (with-temp-buffer
+    (insert "abcdefghij")
+    (proofread-mode 1)
+    (let ((long (proofread-test--diagnostic-for-range 2 9 "bcdefgh"))
+          (short (proofread-test--diagnostic-for-range 2 6 "bcde"))
+          (later (proofread-test--diagnostic-for-range 4 5 "d")))
+      (setq proofread--diagnostics (list later long short))
+      (goto-char 4)
+      (should (eq (proofread--diagnostic-at-point) short)))))
+
+(ert-deftest proofread-test-diagnostic-at-point-ignores-foreign-overlays ()
+  "Diagnostic lookup ignores foreign overlays and invalid diagnostic ranges."
+  (with-temp-buffer
+    (insert "abcdefghij")
+    (proofread-mode 1)
+    (let ((foreign-overlay (make-overlay 3 6))
+          (invalid-backward
+           (proofread-test--diagnostic-for-range 7 6 ""))
+          (invalid-beg
+           (proofread-test--diagnostic-for-range 'not-a-position 5 "")))
+      (overlay-put foreign-overlay 'category 'foreign-overlay)
+      (setq proofread--diagnostics (list invalid-backward invalid-beg))
+      (goto-char 4)
+      (should-not (proofread--diagnostic-at-point)))))
+
+(ert-deftest proofread-test-format-diagnostic-description-details ()
+  "Diagnostic description includes stable package-level fields."
+  (let* ((diagnostic
+          (proofread--make-diagnostic
+           :beg 1
+           :end 5
+           :text "helo"
+           :kind 'spelling
+           :message "Possible misspelling"
+           :suggestions '("hello")
+           :confidence 0.92
+           :source 'mock))
+         (description
+          (proofread--format-diagnostic-description diagnostic)))
+    (should (string-match-p "Kind: spelling" description))
+    (should (string-match-p "Message: Possible misspelling" description))
+    (should (string-match-p "Original text:\nhelo" description))
+    (should (string-match-p "1\\. hello" description))
+    (should (string-match-p "Confidence: 0.92" description))
+    (should (string-match-p "Source: mock" description))))
+
+(ert-deftest proofread-test-describe-displays-diagnostic-details ()
+  "`proofread-describe' displays diagnostic details at point."
+  (save-window-excursion
+    (with-temp-buffer
+      (insert "helo world")
+      (proofread-mode 1)
+      (let ((diagnostic
+             (proofread--make-diagnostic
+              :beg 1
+              :end 5
+              :text "helo"
+              :kind 'spelling
+              :message "Possible misspelling"
+              :suggestions '("hello")
+              :confidence 0.91
+              :source 'mock)))
+        (proofread-test--install-diagnostics (list diagnostic))
+        (goto-char 2)
+        (proofread-describe)
+        (with-current-buffer proofread--description-buffer-name
+          (let ((description (buffer-string)))
+            (should (string-match-p "Kind: spelling" description))
+            (should (string-match-p "Message: Possible misspelling"
+                                    description))
+            (should (string-match-p "Original text:\nhelo" description))
+            (should (string-match-p "1\\. hello" description))
+            (should (string-match-p "Confidence: 0.91" description))
+            (should (string-match-p "Source: mock" description))))))))
+
+(ert-deftest proofread-test-describe-preserves-suggestion-order ()
+  "`proofread-describe' displays suggestions in stored order."
+  (save-window-excursion
+    (with-temp-buffer
+      (insert "helo")
+      (proofread-mode 1)
+      (let ((diagnostic
+             (proofread--make-diagnostic
+              :beg 1
+              :end 5
+              :text "helo"
+              :kind 'spelling
+              :message "Possible misspelling"
+              :suggestions '("hello" "help" "hero"))))
+        (proofread-test--install-diagnostics (list diagnostic))
+        (goto-char 2)
+        (proofread-describe)
+        (with-current-buffer proofread--description-buffer-name
+          (let* ((description (buffer-string))
+                 (first (string-match-p "1\\. hello" description))
+                 (second (string-match-p "2\\. help" description))
+                 (third (string-match-p "3\\. hero" description)))
+            (should first)
+            (should second)
+            (should third)
+            (should (< first second))
+            (should (< second third))))))))
+
+(ert-deftest proofread-test-describe-handles-missing-optional-fields ()
+  "`proofread-describe' displays available fields when optional data is absent."
+  (save-window-excursion
+    (with-temp-buffer
+      (insert "helo")
+      (proofread-mode 1)
+      (let ((diagnostic
+             (proofread--make-diagnostic
+              :beg 1
+              :end 5
+              :text "helo"
+              :message "Message only")))
+        (proofread-test--install-diagnostics (list diagnostic))
+        (goto-char 2)
+        (proofread-describe)
+        (with-current-buffer proofread--description-buffer-name
+          (let ((description (buffer-string)))
+            (should (string-match-p "Message: Message only" description))
+            (should (string-match-p "Original text:\nhelo" description))
+            (should-not (string-match-p "Suggestions:" description))
+            (should-not (string-match-p "Confidence:" description))
+            (should-not (string-match-p "Source:" description))))))))
+
+(ert-deftest proofread-test-describe-away-from-diagnostic-keeps-point ()
+  "`proofread-describe' reports absence away from proofread diagnostics."
+  (with-temp-buffer
+    (insert "abcdefghij")
+    (proofread-mode 1)
+    (let ((diagnostic (proofread-test--diagnostic-for-range 3 5 "cd"))
+          (text (buffer-string)))
+      (proofread-test--install-diagnostics (list diagnostic))
+      (goto-char 8)
+      (let ((position (point)))
+        (should-error (proofread-describe) :type 'user-error)
+        (should (= (point) position))
+        (should (equal (buffer-string) text))))))
+
+(ert-deftest proofread-test-describe-preserves-source-buffer-text ()
+  "`proofread-describe' does not modify source buffer text."
+  (save-window-excursion
+    (with-temp-buffer
+      (insert "helo world")
+      (proofread-mode 1)
+      (let ((diagnostic (proofread-test--diagnostic-for-range 1 5 "helo"))
+            (text (buffer-string)))
+        (proofread-test--install-diagnostics (list diagnostic))
+        (goto-char 2)
+        (proofread-describe)
+        (should (equal (buffer-string) text))))))
+
+(ert-deftest proofread-test-describe-preserves-diagnostics-and-overlays ()
+  "`proofread-describe' does not mutate source diagnostics or overlays."
+  (save-window-excursion
+    (with-temp-buffer
+      (insert "helo world")
+      (proofread-mode 1)
+      (let* ((diagnostic (proofread-test--diagnostic-for-range 1 5 "helo"))
+             (overlays (proofread-test--install-diagnostics
+                        (list diagnostic)))
+             (diagnostics-before (copy-sequence proofread--diagnostics))
+             (overlays-before (copy-sequence proofread--overlays))
+             (faces-before
+              (mapcar (lambda (overlay)
+                        (overlay-get overlay 'face))
+                      proofread--overlays)))
+        (goto-char 2)
+        (proofread-describe)
+        (should (equal proofread--diagnostics diagnostics-before))
+        (should (equal proofread--overlays overlays-before))
+        (should (equal (mapcar (lambda (overlay)
+                                 (overlay-get overlay 'face))
+                               proofread--overlays)
+                       faces-before))
+        (dolist (overlay overlays)
+          (should (overlay-buffer overlay)))))))
+
 (provide 'proofread-tests)
 
 ;;; proofread-tests.el ends here

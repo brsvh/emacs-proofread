@@ -119,6 +119,9 @@ property has a non-nil value is not included in request-ready chunks."
 (defconst proofread--overlay-category 'proofread-overlay
   "Overlay category used for proofread-owned overlays.")
 
+(defconst proofread--description-buffer-name "*Proofread Diagnostic*"
+  "Buffer name used to display proofread diagnostic descriptions.")
+
 (defvar-local proofread--diagnostics nil
   "Proofread diagnostics for the current buffer.")
 
@@ -950,6 +953,26 @@ AFTER is non-nil for the after-change notification."
   "Return valid proofread diagnostics sorted for navigation."
   (mapcar #'car (proofread--navigation-entries)))
 
+(defun proofread--diagnostic-covers-position-p (diagnostic position)
+  "Return non-nil when DIAGNOSTIC covers POSITION."
+  (let ((range (proofread--diagnostic-range diagnostic))
+        (point-position (proofread--position-integer position)))
+    (and range
+         point-position
+         (<= (car range) point-position)
+         (< point-position (cdr range)))))
+
+(defun proofread--diagnostic-at-point (&optional position)
+  "Return the proofread diagnostic covering POSITION or point.
+When multiple diagnostics cover the position, return the first one in
+navigation order."
+  (let ((point-position (or position (point))))
+    (catch 'found
+      (dolist (diagnostic (proofread--navigation-diagnostics))
+        (when (proofread--diagnostic-covers-position-p
+               diagnostic point-position)
+          (throw 'found diagnostic))))))
+
 (defun proofread--next-diagnostic-after (position)
   "Return the nearest diagnostic strictly after POSITION."
   (catch 'found
@@ -995,6 +1018,80 @@ AFTER is non-nil for the after-change notification."
     (when overlay
       (overlay-put overlay 'face 'proofread-current-face)))
   diagnostic)
+
+(defun proofread--format-diagnostic-field (value)
+  "Return VALUE formatted for a diagnostic description."
+  (cond
+   ((stringp value) value)
+   ((symbolp value) (symbol-name value))
+   (t (format "%S" value))))
+
+(defun proofread--diagnostic-suggestions (diagnostic)
+  "Return DIAGNOSTIC suggestions as a list."
+  (let ((suggestions (proofread--diagnostic-get diagnostic :suggestions)))
+    (cond
+     ((null suggestions) nil)
+     ((listp suggestions) suggestions)
+     (t (list suggestions)))))
+
+(defun proofread--format-diagnostic-description (diagnostic)
+  "Return a stable plain-text description for DIAGNOSTIC."
+  (let ((kind (proofread--diagnostic-get diagnostic :kind))
+        (message (proofread--diagnostic-get diagnostic :message))
+        (text (proofread--diagnostic-get diagnostic :text))
+        (suggestions (proofread--diagnostic-suggestions diagnostic))
+        (confidence (proofread--diagnostic-get diagnostic :confidence))
+        (source (proofread--diagnostic-get diagnostic :source))
+        (lines '("Proofread diagnostic")))
+    (when kind
+      (setq lines
+            (append lines
+                    (list ""
+                          (format "Kind: %s"
+                                  (proofread--format-diagnostic-field
+                                   kind))))))
+    (when message
+      (setq lines
+            (append lines
+                    (list (format "Message: %s"
+                                  (proofread--format-diagnostic-field
+                                   message))))))
+    (when text
+      (setq lines
+            (append lines
+                    (list ""
+                          "Original text:"
+                          (proofread--format-diagnostic-field text)))))
+    (when suggestions
+      (setq lines (append lines (list "" "Suggestions:")))
+      (let ((index 1))
+        (dolist (suggestion suggestions)
+          (setq lines
+                (append lines
+                        (list (format "%d. %s"
+                                      index
+                                      (proofread--format-diagnostic-field
+                                       suggestion)))))
+          (setq index (1+ index)))))
+    (when confidence
+      (setq lines
+            (append lines
+                    (list ""
+                          (format "Confidence: %s"
+                                  (proofread--format-diagnostic-field
+                                   confidence))))))
+    (when source
+      (setq lines
+            (append lines
+                    (list (format "Source: %s"
+                                  (proofread--format-diagnostic-field
+                                   source))))))
+    (mapconcat #'identity lines "\n")))
+
+(defun proofread--display-diagnostic-description (diagnostic)
+  "Display formatted details for DIAGNOSTIC in a help buffer."
+  (with-help-window proofread--description-buffer-name
+    (princ (proofread--format-diagnostic-description diagnostic))))
 
 (defun proofread--create-overlay (diagnostic)
   "Create and return a proofread overlay for DIAGNOSTIC."
@@ -1133,7 +1230,10 @@ configured backend."
 (defun proofread-describe ()
   "Describe the proofreading diagnostic at point."
   (interactive)
-  (proofread--command-placeholder 'proofread-describe))
+  (let ((diagnostic (proofread--diagnostic-at-point)))
+    (if diagnostic
+        (proofread--display-diagnostic-description diagnostic)
+      (user-error "No proofread diagnostic at point"))))
 
 ;;;###autoload
 (defun proofread-apply-suggestion ()
