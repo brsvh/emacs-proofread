@@ -20,6 +20,8 @@
   outputs =
     inputs@{
       flake-parts,
+      nixpkgs,
+      self,
       ...
     }:
     let
@@ -46,6 +48,57 @@
           flake-parts.flakeModules.partitions
         ];
 
+        flake = {
+          overlays = {
+            default =
+              final: prev:
+              let
+                inherit (prev)
+                  emacsPackagesFor
+                  ;
+
+                package =
+                  {
+                    lib,
+                    melpaBuild,
+                    projectRoot,
+                    ...
+                  }:
+                  let
+                    inherit (lib)
+                      licenses
+                      maintainers
+                      ;
+                  in
+                  melpaBuild {
+                    meta = {
+                      description = "Context-aware LLM proofreading for GNU Emacs";
+                      homepage = "https://codeberg.org/bingshan/emacs-proofread";
+                      license = licenses.gpl3Plus;
+                      maintainers = with maintainers; [ brsvh ];
+                    };
+
+                    pname = "proofread";
+                    src = projectRoot + /lisp;
+                    version = "0.1.0";
+                  };
+
+                scope = finalAttrs: prevAttrs: {
+                  proofread = finalAttrs.callPackage package {
+                    inherit
+                      projectRoot
+                      ;
+                  };
+                };
+              in
+              {
+                emacsPackagesFor =
+                  emacs:
+                  (emacsPackagesFor emacs).overrideScope scope;
+              };
+          };
+        };
+
         partitionedAttrs = {
           devShells = "tool";
           formatter = "tool";
@@ -66,6 +119,101 @@
               };
           };
         };
+
+        perSystem =
+          {
+            lib,
+            pkgs,
+            system,
+            ...
+          }:
+          let
+            inherit (lib)
+              foldl'
+              versions
+              ;
+          in
+          {
+            _module = {
+              args = {
+                pkgs = import nixpkgs {
+                  inherit
+                    system
+                    ;
+
+                  overlays = [
+                    self.overlays.default
+                  ];
+                };
+              };
+            };
+
+            packages =
+              foldl'
+                (
+                  acc: base:
+                  let
+                    inherit (pkgs)
+                      emacsPackagesFor
+                      writeShellApplication
+                      ;
+
+                    version = "${versions.major base.version}";
+
+                    emacs =
+                      (emacsPackagesFor base).emacsWithPackages
+                        (
+                          epkgs: with epkgs; [
+                            proofread
+                          ]
+                        );
+                  in
+                  acc
+                  // {
+                    "emacs${version}-with-proofread" =
+                      writeShellApplication
+                        {
+                          name = "emacs${version}-with-proofread";
+
+                          runtimeInputs = [
+                            emacs
+                          ];
+
+                          text = ''
+                            exec emacs --init-directory "$(mktemp -d)" "$@"
+                          '';
+                        };
+
+                    "emacs${version}-run-proofread-tests" =
+                      writeShellApplication
+                        {
+                          name = "emacs${version}-run-proofread-tests";
+
+                          runtimeInputs = [
+                            emacs
+                          ];
+
+                          text = ''
+                            initdir="$(mktemp --tmpdir -d emacs-proofread-test-XXXXXX)"
+                            trap 'rm -rf "$initdir"' EXIT
+
+                            emacs --batch \
+                              --init-directory "$initdir" \
+                              -l "${projectRoot + /test/proofread-tests.el}" \
+                              -f ert-run-tests-batch-and-exit
+                          '';
+                        };
+                  }
+                )
+                { }
+                (
+                  with pkgs;
+                  [
+                    emacs30
+                    emacs31
+                  ]
+                );
+          };
 
         systems = [
           "x86_64-linux"
