@@ -1015,6 +1015,40 @@
       (should (string-match-p "helo" prompt))
       (should-not (string-match-p "http://example.com" prompt)))))
 
+(ert-deftest proofread-test-ollama-http-request-data-is-unibyte ()
+  "Ollama HTTP request data is UTF-8 encoded before `url-retrieve'."
+  (let ((request-data
+         "{\"model\":\"qwen3:1.7b\",\"prompt\":\"青晨\",\"stream\":false}")
+        captured-data)
+    (should (multibyte-string-p request-data))
+    (cl-letf (((symbol-function 'url-retrieve)
+               (lambda (_url _callback _args &rest _rest)
+                 (setq captured-data url-request-data)
+                 nil)))
+      (proofread--ollama-url-retrieve
+       "http://localhost:11434/api/generate"
+       request-data
+       #'ignore))
+    (should (stringp captured-data))
+    (should-not (multibyte-string-p captured-data))
+    (should (equal (decode-coding-string captured-data 'utf-8)
+                   request-data))))
+
+(ert-deftest proofread-test-ollama-response-buffer-process-is-quietly-killed ()
+  "Ollama response buffers with live processes are killed without query."
+  (let* ((buffer (generate-new-buffer " *proofread-response-process*"))
+         (process
+          (make-pipe-process
+           :name "proofread-test-response-process"
+           :buffer buffer)))
+    (should (buffer-live-p buffer))
+    (should (process-live-p process))
+    (should (process-query-on-exit-flag process))
+    (proofread--kill-response-buffer buffer)
+    (should-not (buffer-live-p buffer))
+    (should-not (process-live-p process))
+    (should-not (process-query-on-exit-flag process))))
+
 (ert-deftest proofread-test-ollama-backend-callback-is-asynchronous ()
   "Ollama backend callbacks are not invoked inline."
   (with-temp-buffer

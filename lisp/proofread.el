@@ -680,6 +680,10 @@ When BACKEND is nil, check the selected `proofread-backend'."
   "Return JSON encoding for VALUE."
   (json-encode value))
 
+(defun proofread--encode-http-request-data (data)
+  "Return DATA encoded as UTF-8 unibyte data for `url-request-data'."
+  (encode-coding-string data 'utf-8))
+
 (defun proofread--json-read-string (string)
   "Read STRING as JSON and return plist/list data."
   (let ((json-object-type 'plist)
@@ -696,11 +700,21 @@ When BACKEND is nil, check the selected `proofread-backend'."
   "Submit DATA to URL and invoke CALLBACK asynchronously."
   (let ((url-request-method "POST")
         (url-request-extra-headers
-         '(("Content-Type" . "application/json")))
-        (url-request-data data))
+         '(("Content-Type" . "application/json; charset=utf-8")))
+        (url-request-data (proofread--encode-http-request-data data)))
     (url-retrieve
      url #'proofread--ollama-url-retrieve-callback
      (list callback) t t)))
+
+(defun proofread--kill-response-buffer (buffer)
+  "Kill response BUFFER without prompting about live processes."
+  (when (buffer-live-p buffer)
+    (let ((process (get-buffer-process buffer)))
+      (when (processp process)
+        (set-process-query-on-exit-flag process nil)
+        (delete-process process)))
+    (let ((kill-buffer-query-functions nil))
+      (kill-buffer buffer))))
 
 (defun proofread--ollama-http-status ()
   "Return HTTP status code from the current response buffer."
@@ -938,7 +952,7 @@ When BACKEND is nil, check the selected `proofread-backend'."
               (when (timerp timeout-timer)
                 (cancel-timer timeout-timer))
               (when (buffer-live-p buffer)
-                (kill-buffer buffer))
+                (proofread--kill-response-buffer buffer))
               (proofread--invoke-backend-callback callback result))))
     (when (and (numberp proofread-ollama-timeout)
                (> proofread-ollama-timeout 0))
