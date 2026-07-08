@@ -1301,7 +1301,7 @@ When BACKEND is nil, use `proofread-backend'.  Return dispatched requests."
 
 (defun proofread--window-configuration-change ()
   "Mark proofread buffers pending after window configuration changes."
-  (dolist (window (window-list nil nil t))
+  (dolist (window (window-list nil nil))
     (proofread--mark-window-buffer-pending window)))
 
 (defun proofread--install-window-hooks ()

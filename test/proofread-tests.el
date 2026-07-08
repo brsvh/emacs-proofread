@@ -381,6 +381,28 @@
         (kill-buffer proofread-buffer)
         (kill-buffer plain-buffer)))))
 
+(ert-deftest proofread-test-window-configuration-change-marks-buffer ()
+  "Window configuration changes mark proofread buffers pending."
+  (save-window-excursion
+    (let ((proofread-buffer
+           (generate-new-buffer " *proofread-window-config*")))
+      (unwind-protect
+          (let (timer-count)
+            (with-current-buffer proofread-buffer
+              (insert "Alpha")
+              (proofread-mode 1))
+            (cl-letf (((symbol-function 'run-with-idle-timer)
+                       (lambda (_seconds _repeat _function &rest _args)
+                         (setq timer-count (1+ (or timer-count 0)))
+                         (intern (format "proofread-test-window-timer-%d"
+                                         timer-count)))))
+              (switch-to-buffer proofread-buffer)
+              (proofread--window-configuration-change)
+              (with-current-buffer proofread-buffer
+                (should proofread--pending-work))
+              (should (= timer-count 1))))
+        (kill-buffer proofread-buffer)))))
+
 (ert-deftest proofread-test-disable-mode-clears-scheduled-work ()
   "Disabling `proofread-mode' clears pending work and timer state."
   (with-temp-buffer
