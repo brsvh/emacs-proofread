@@ -70,6 +70,52 @@ The backend protocol is defined in later implementation steps."
                  symbol)
   :group 'proofread)
 
+(defconst proofread--diagnostic-keys
+  '(:beg :end :text :kind :message :suggestions :confidence :source)
+  "Required keys for proofread diagnostic plists.")
+
+(defvar-local proofread--diagnostics nil
+  "Proofread diagnostics for the current buffer.")
+
+(defvar-local proofread--overlays nil
+  "Proofread-owned overlays for the current buffer.")
+
+(defvar-local proofread--pending-ranges nil
+  "Pending proofread ranges for the current buffer.")
+
+(defvar-local proofread--requests nil
+  "Active proofread requests for the current buffer.")
+
+(defvar-local proofread--cache nil
+  "Proofread cache for the current buffer.")
+
+(defun proofread--make-diagnostic (&rest properties)
+  "Return a proofread diagnostic plist from PROPERTIES.
+The returned plist contains the keys in `proofread--diagnostic-keys'."
+  (mapcan (lambda (key)
+            (list key (plist-get properties key)))
+          proofread--diagnostic-keys))
+
+(defun proofread--diagnostic-get (diagnostic property)
+  "Return PROPERTY from DIAGNOSTIC."
+  (plist-get diagnostic property))
+
+(defun proofread--initialize-buffer-state ()
+  "Initialize proofread-owned state for the current buffer."
+  (setq-local proofread--diagnostics nil)
+  (setq-local proofread--overlays nil)
+  (setq-local proofread--pending-ranges nil)
+  (setq-local proofread--requests nil)
+  (setq-local proofread--cache (make-hash-table :test #'equal)))
+
+(defun proofread--clear-buffer-state ()
+  "Clear proofread-owned state for the current buffer."
+  (setq proofread--diagnostics nil)
+  (setq proofread--overlays nil)
+  (setq proofread--pending-ranges nil)
+  (setq proofread--requests nil)
+  (setq proofread--cache nil))
+
 (defun proofread--command-placeholder (command)
   "Report that COMMAND has not been implemented yet."
   (message "proofread: `%s' is not implemented yet" command))
@@ -81,7 +127,10 @@ The backend protocol is defined in later implementation steps."
 This initial skeleton only installs the mode entry point.  It deliberately does
 not create overlays, timers, requests, or other background state."
   :lighter " Proofread"
-  :group 'proofread)
+  :group 'proofread
+  (if proofread-mode
+      (proofread--initialize-buffer-state)
+    (proofread--clear-buffer-state)))
 
 ;;;###autoload
 (defun proofread-check-visible ()
