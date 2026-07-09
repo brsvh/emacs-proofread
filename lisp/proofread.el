@@ -98,7 +98,8 @@ dispatch."
 (defcustom proofread-llm-provider nil
   "Provider object used when `proofread-backend' is `llm'.
 Users should configure this with a provider constructor from the GNU ELPA
-`llm' package, such as `make-llm-ollama'."
+`llm' package.  Providers that do not advertise the `json-response' capability
+are rejected before request dispatch."
   :type 'sexp
   :group 'proofread)
 
@@ -110,7 +111,7 @@ old diagnostic cache entries."
   :type 'sexp
   :group 'proofread)
 
-(defcustom proofread-prompt-version "2"
+(defcustom proofread-prompt-version "3"
   "Prompt contract version used to invalidate diagnostic cache entries."
   :type 'string
   :group 'proofread)
@@ -156,63 +157,69 @@ property has a non-nil value is not included in request-ready chunks."
   '(:beg :end :text :kind :message :suggestions :confidence :source)
   "Required keys for proofread diagnostic plists.")
 
+(defconst proofread--diagnostic-kinds
+  '(spelling grammar style other)
+  "Diagnostic kind symbols accepted from structured responses.")
+
+(defconst proofread--diagnostic-kind-names
+  (vconcat (mapcar #'symbol-name proofread--diagnostic-kinds))
+  "Diagnostic kind names accepted by the structured response schema.")
+
 (defconst proofread--backend-request-keys
   '( :id :buffer :beg :end :text :context-before :context-after
      :language :major-mode :modified-tick :backend :tokens :tokenization)
   "Required keys for proofread backend request plists.")
 
-(defconst proofread--json-diagnostic-prompt-contract
+(defconst proofread--structured-response-instructions
   (concat
-   "Return only one JSON object.  Do not include Markdown, comments, "
-   "prose, or reasoning outside the JSON object.\n"
-   "The JSON object must have this shape:\n"
-   "{\"diagnostics\":[{\"kind\":\"spelling|grammar|style|other\","
-   "\"message\":\"short explanation\","
-   "\"text\":\"exact original text\","
-   "\"range\":{\"beg\":0,\"end\":0},"
-   "\"token_index\":0,"
-   "\"token_range\":{\"beg\":0,\"end\":1},"
-   "\"suggestions\":[\"replacement\"],"
-   "\"confidence\":0.0,"
-   "\"source\":\"optional source\"}]}\n"
+   "Return proofreading diagnostics that match the requested response "
+   "schema.  Do not include Markdown, comments, prose, or reasoning outside "
+   "the structured response.\n"
+   "The top-level response has a diagnostics array.  Each diagnostic has "
+   "kind, message, text, range, token_index, token_range, suggestions, "
+   "confidence, and source fields.\n"
    "Use zero-based chunk-relative offsets; range end is exclusive.\n"
    "The text field must exactly equal the substring selected by range.\n"
-   "Token fields are optional locator hints only when a token list is "
-   "provided; range and text remain required.\n"
-   "Use {\"diagnostics\":[]} when there are no diagnostics.\n")
-  "Prompt contract for JSON diagnostics.")
+   "Use kind values spelling, grammar, style, or other.\n"
+   "Set token_index and token_range to null when token locators are not "
+   "useful or no token list is provided; range and text remain required.\n"
+   "Set confidence and source to null when unknown.\n"
+   "Use an empty diagnostics array when there are no diagnostics.\n")
+  "Provider-independent instructions for structured responses.")
 
-(defconst proofread--json-diagnostic-response-format
-  '(:type
-    "object"
-    :properties
-    (:diagnostics
-     (:type
-      "array"
-      :items
-      (:type
-       "object"
-       :properties
-       (:kind (:type "string")
-              :message (:type "string")
-              :text (:type "string")
-              :range
-              (:type
-               "object"
-               :properties (:beg (:type "integer") :end (:type "integer"))
-               :required ["beg" "end"])
-              :token_index (:type "integer")
-              :token_range
-              (:type
-               "object"
-               :properties (:beg (:type "integer") :end (:type "integer"))
-               :required ["beg" "end"])
-              :suggestions (:type "array" :items (:type "string"))
-              :confidence (:type "number")
-              :source (:type "string"))
-       :required ["kind" "message" "text" "range" "suggestions"])))
-    :required ["diagnostics"])
-  "JSON response format requested from generic LLM providers.")
+(defconst proofread--structured-response-schema
+  `(:type "object"
+          :properties
+          (:diagnostics
+           (:type "array"
+                  :items
+                  (:type "object"
+                         :properties
+                         (:kind
+                          (:type "string"
+                                 :enum ,proofread--diagnostic-kind-names)
+                          :message (:type "string")
+                          :text (:type "string")
+                          :range
+                          (:type "object"
+                                 :properties (:beg (:type "integer") :end (:type "integer"))
+                                 :required ["beg" "end"]
+                                 :additionalProperties :false)
+                          :token_index (:type ["integer" "null"])
+                          :token_range
+                          (:type ["object" "null"]
+                                 :properties (:beg (:type "integer") :end (:type "integer"))
+                                 :required ["beg" "end"]
+                                 :additionalProperties :false)
+                          :suggestions (:type "array" :items (:type "string"))
+                          :confidence (:type ["number" "null"])
+                          :source (:type ["string" "null"]))
+                         :required ["kind" "message" "text" "range" "token_index"
+                                    "token_range" "suggestions" "confidence" "source"]
+                         :additionalProperties :false)))
+          :required ["diagnostics"]
+          :additionalProperties :false)
+  "JSON schema requested from LLM providers for structured responses.")
 
 (defconst proofread--overlay-category 'proofread-overlay
   "Overlay category used for proofread-owned overlays.")
@@ -267,10 +274,6 @@ The returned plist contains the keys in `proofread--diagnostic-keys'."
   (mapcan (lambda (key)
             (list key (plist-get properties key)))
           proofread--diagnostic-keys))
-
-(defun proofread--diagnostic-get (diagnostic property)
-  "Return PROPERTY from DIAGNOSTIC."
-  (plist-get diagnostic property))
 
 (defun proofread--position-integer (position)
   "Return POSITION as an integer, or nil if it is not a buffer position."
@@ -653,10 +656,6 @@ chunks within `proofread-max-chunk-size'."
       (push (proofread--make-chunk (car span) (cdr span)) chunks))
     (nreverse chunks)))
 
-(defun proofread--visible-chunks ()
-  "Return paragraph chunks for `proofread--pending-ranges'."
-  (proofread--chunks-for-ranges proofread--pending-ranges))
-
 (defconst proofread--url-regexp
   "\\_<https?://[^[:space:]<>(){}\"']+"
   "Regular expression matching URL text ignored before backend requests.")
@@ -1020,10 +1019,6 @@ When BACKEND is non-nil, store its canonical identity in the request."
              (_ (plist-get chunk key)))))
    proofread--backend-request-keys))
 
-(defun proofread--backend-requests-from-chunks (chunks)
-  "Return backend request plists for request-ready CHUNKS."
-  (mapcar #'proofread--make-backend-request chunks))
-
 (defun proofread--backend-success-result (request diagnostics)
   "Return a successful backend result for REQUEST and DIAGNOSTICS."
   (list :status 'ok
@@ -1090,15 +1085,13 @@ When MESSAGE is non-nil, include it as caller-readable error text."
           (proofread--remove-active-request request))))
     (proofread--invoke-backend-callback callback result)))
 
-(defun proofread--llm-provider-available-p ()
-  "Return non-nil when `proofread-llm-provider' is configured."
-  (not (null proofread-llm-provider)))
-
 (defun proofread-backend-available-p (&optional backend)
   "Return non-nil if BACKEND can accept proofreading requests.
 When BACKEND is nil, check the selected `proofread-backend'."
   (pcase (or backend proofread-backend)
-    ('llm (proofread--llm-provider-available-p))
+    ('llm (and proofread-llm-provider
+               (proofread--llm-provider-structured-output-p
+                proofread-llm-provider)))
     (_ nil)))
 
 (defun proofread--diagnostic-token-contract (request)
@@ -1128,7 +1121,7 @@ When BACKEND is nil, check the selected `proofread-backend'."
          "\n")
       "")))
 
-(defun proofread--diagnostic-prompt (request)
+(defun proofread--structured-response-prompt (request)
   "Return the provider-independent proofreading prompt for REQUEST."
   (format
    (concat "Proofread the following text.\n\n"
@@ -1140,7 +1133,7 @@ When BACKEND is nil, check the selected `proofread-backend'."
            "Text:\n%s\n\n"
            "Context after:\n%s\n"
            "%s")
-   proofread--json-diagnostic-prompt-contract
+   proofread--structured-response-instructions
    (or (proofread--diagnostic-token-contract request) "")
    (plist-get request :language)
    (plist-get request :major-mode)
@@ -1149,74 +1142,42 @@ When BACKEND is nil, check the selected `proofread-backend'."
    (or (plist-get request :context-after) "")
    (proofread--diagnostic-token-list request)))
 
-(defun proofread--json-encode (value)
-  "Return JSON encoding for VALUE."
-  (json-encode value))
-
 (defun proofread--json-read-string (string)
   "Read STRING as JSON and return plist/list data."
-  (let ((json-object-type 'plist)
-        (json-array-type 'list)
-        (json-key-type 'keyword)
-        (json-false nil))
-    (json-read-from-string string)))
+  (with-temp-buffer
+    (insert string)
+    (goto-char (point-min))
+    (let ((json-object-type 'plist)
+          (json-array-type 'list)
+          (json-key-type 'keyword)
+          (json-false nil)
+          value)
+      (skip-chars-forward " \t\r\n")
+      (setq value (json-read))
+      (skip-chars-forward " \t\r\n")
+      (unless (eobp)
+        (error "Trailing content after JSON structured response"))
+      value)))
 
-(defun proofread--json-diagnostic-object-substrings (string)
-  "Return top-level JSON object substrings found in STRING."
-  (let ((index 0)
-        (length (length string))
-        (depth 0)
-        start
-        in-string
-        escape
-        objects)
-    (while (< index length)
-      (let ((char (aref string index)))
-        (cond
-         ((and (> depth 0) escape)
-          (setq escape nil))
-         ((and (> depth 0) in-string (eq char ?\\))
-          (setq escape t))
-         ((and (> depth 0) (eq char ?\"))
-          (setq in-string (not in-string)))
-         (in-string nil)
-         ((eq char ?{)
-          (when (= depth 0)
-            (setq start index))
-          (setq depth (1+ depth)))
-         ((and (> depth 0) (eq char ?}))
-          (setq depth (1- depth))
-          (when (= depth 0)
-            (push (substring string start (1+ index)) objects)
-            (setq start nil)))))
-      (setq index (1+ index)))
-    (nreverse objects)))
-
-(defun proofread--json-diagnostic-parse-json (content)
-  "Parse one JSON diagnostic object from CONTENT."
-  (let ((objects (proofread--json-diagnostic-object-substrings content)))
-    (unless (= (length objects) 1)
-      (error "Expected exactly one diagnostic JSON object"))
-    (proofread--json-read-string (car objects))))
-
-(defun proofread--json-diagnostic-payload (content)
-  "Return parsed diagnostic payload from CONTENT."
+(defun proofread--structured-response-payload (content)
+  "Return structured response payload from CONTENT."
   (cond
    ((stringp content)
-    (proofread--json-diagnostic-parse-json content))
+    (proofread--json-read-string content))
    ((listp content) content)
-   (t (error "Invalid diagnostic response content"))))
+   (t (error "Invalid structured response content"))))
 
-(defun proofread--json-diagnostic-candidates (payload)
-  "Return diagnostic candidates from parsed PAYLOAD."
+(defun proofread--diagnostic-candidates (payload)
+  "Return diagnostic candidates from structured PAYLOAD."
   (unless (plist-member payload :diagnostics)
     (error "Missing diagnostics payload"))
   (let ((diagnostics (plist-get payload :diagnostics)))
-    (unless (listp diagnostics)
+    (unless (or (listp diagnostics)
+                (vectorp diagnostics))
       (error "Invalid diagnostics payload"))
-    diagnostics))
+    (append diagnostics nil)))
 
-(defun proofread--json-diagnostic-range (candidate)
+(defun proofread--diagnostic-candidate-range (candidate)
   "Return CANDIDATE's chunk-relative range as a cons cell."
   (let ((range (plist-get candidate :range)))
     (when (and (listp range)
@@ -1225,7 +1186,7 @@ When BACKEND is nil, check the selected `proofread-backend'."
       (cons (plist-get range :beg)
             (plist-get range :end)))))
 
-(defun proofread--json-diagnostic-range-valid-p (request beg end)
+(defun proofread--diagnostic-candidate-range-valid-p (request beg end)
   "Return non-nil if relative BEG and END are valid for REQUEST."
   (let ((text (plist-get request :text)))
     (and (integerp beg)
@@ -1235,38 +1196,43 @@ When BACKEND is nil, check the selected `proofread-backend'."
          (<= beg end)
          (<= end (length text)))))
 
-(defun proofread--json-diagnostic-suggestions (value)
+(defun proofread--diagnostic-candidate-suggestions (value)
   "Return string suggestions from VALUE in original order."
-  (when (listp value)
+  (when (or (listp value)
+            (vectorp value))
     (let (strings)
-      (dolist (suggestion value)
+      (dolist (suggestion (append value nil))
         (when (stringp suggestion)
           (push suggestion strings)))
       (nreverse strings))))
 
-(defun proofread--json-diagnostic-kind (value)
+(defun proofread--diagnostic-candidate-kind (value)
   "Return normalized diagnostic kind for VALUE."
-  (cond
-   ((and (symbolp value)
-         (not (keywordp value)))
-    value)
-   ((and (stringp value)
-         (string-match-p "\\`[[:alnum:]_-]+\\'" value))
-    (intern value))))
+  (let ((kind
+         (cond
+          ((and (symbolp value)
+                (not (keywordp value)))
+           value)
+          ((and (stringp value)
+                (string-match-p "\\`[[:alnum:]_-]+\\'" value))
+           (intern value)))))
+    (when (memq kind proofread--diagnostic-kinds)
+      kind)))
 
-(defun proofread--json-diagnostic-confidence (value)
+(defun proofread--diagnostic-candidate-confidence (value)
   "Return normalized diagnostic confidence for VALUE, or nil."
   (when (and (numberp value)
              (<= 0 value)
              (<= value 1))
     value))
 
-(defun proofread--json-diagnostic-source (candidate &optional default-source)
+(defun proofread--diagnostic-candidate-source (candidate &optional default-source)
   "Return normalized diagnostic source from CANDIDATE.
 When CANDIDATE has no valid source, use DEFAULT-SOURCE or `llm'."
   (let ((value (plist-get candidate :source)))
     (cond
      ((and (plist-member candidate :source)
+           value
            (symbolp value)
            (not (keywordp value)))
       value)
@@ -1284,7 +1250,7 @@ When CANDIDATE has no valid source, use DEFAULT-SOURCE or `llm'."
         (throw 'found token)))
     nil))
 
-(defun proofread--json-diagnostic-token-index-range (request index)
+(defun proofread--text-range-for-token-index (request index)
   "Return chunk-relative text range for token INDEX in REQUEST."
   (when (integerp index)
     (let ((token (proofread--token-by-index
@@ -1294,7 +1260,7 @@ When CANDIDATE has no valid source, use DEFAULT-SOURCE or `llm'."
         (cons (plist-get token :beg)
               (plist-get token :end))))))
 
-(defun proofread--json-diagnostic-token-range-field (candidate)
+(defun proofread--diagnostic-candidate-token-range (candidate)
   "Return CANDIDATE's token index range as a cons cell, or nil."
   (let ((range (plist-get candidate :token_range)))
     (when (and (listp range)
@@ -1303,7 +1269,7 @@ When CANDIDATE has no valid source, use DEFAULT-SOURCE or `llm'."
       (cons (plist-get range :beg)
             (plist-get range :end)))))
 
-(defun proofread--json-diagnostic-token-indexes-range
+(defun proofread--text-range-for-token-range
     (request beg end)
   "Return chunk-relative text range for token indexes BEG through END.
 END is exclusive.  Return nil when the token indexes cannot be mapped."
@@ -1317,7 +1283,7 @@ END is exclusive.  Return nil when the token indexes cannot be mapped."
       (cons (plist-get first :beg)
             (plist-get last :end)))))
 
-(defun proofread--json-diagnostic-token-locator-ranges
+(defun proofread--diagnostic-candidate-token-ranges
     (request candidate)
   "Return interpretable token locator ranges for CANDIDATE.
 Malformed token locators are ignored."
@@ -1325,26 +1291,26 @@ Malformed token locators are ignored."
     (let ((index (plist-get candidate :token_index)))
       (when (integerp index)
         (let ((range
-               (proofread--json-diagnostic-token-index-range
+               (proofread--text-range-for-token-index
                 request index)))
           (when range
             (push range ranges)))))
     (let ((token-range
-           (proofread--json-diagnostic-token-range-field candidate)))
+           (proofread--diagnostic-candidate-token-range candidate)))
       (when token-range
         (let ((range
-               (proofread--json-diagnostic-token-indexes-range
+               (proofread--text-range-for-token-range
                 request (car token-range) (cdr token-range))))
           (when range
             (push range ranges)))))
     (nreverse ranges)))
 
-(defun proofread--json-diagnostic-token-locator-consistent-p
+(defun proofread--diagnostic-candidate-token-consistent-p
     (request candidate relative-beg relative-end text)
   "Return non-nil when CANDIDATE token locators do not contradict range.
 REQUEST, RELATIVE-BEG, RELATIVE-END, and TEXT describe the already-validated
 authoritative diagnostic location."
-  (let ((ranges (proofread--json-diagnostic-token-locator-ranges
+  (let ((ranges (proofread--diagnostic-candidate-token-ranges
                  request candidate))
         (expected (cons relative-beg relative-end))
         (request-text (plist-get request :text))
@@ -1357,19 +1323,19 @@ authoritative diagnostic location."
         (setq inconsistent t)))
     (not inconsistent)))
 
-(defun proofread--json-diagnostic-from-candidate
+(defun proofread--diagnostic-from-candidate
     (request candidate &optional default-source)
   "Return proofread diagnostic for REQUEST and CANDIDATE, or nil."
-  (let* ((range (proofread--json-diagnostic-range candidate))
+  (let* ((range (proofread--diagnostic-candidate-range candidate))
          (relative-beg (car-safe range))
          (relative-end (cdr-safe range))
          (request-beg (plist-get request :beg))
          (request-text (plist-get request :text))
          (text (plist-get candidate :text))
-         (kind (proofread--json-diagnostic-kind
+         (kind (proofread--diagnostic-candidate-kind
                 (plist-get candidate :kind)))
          (message (plist-get candidate :message)))
-    (when (and (proofread--json-diagnostic-range-valid-p
+    (when (and (proofread--diagnostic-candidate-range-valid-p
                 request relative-beg relative-end)
                (integerp request-beg)
                (stringp text)
@@ -1377,7 +1343,7 @@ authoritative diagnostic location."
                (stringp message)
                (equal text
                       (substring request-text relative-beg relative-end))
-               (proofread--json-diagnostic-token-locator-consistent-p
+               (proofread--diagnostic-candidate-token-consistent-p
                 request candidate relative-beg relative-end text))
       (proofread--make-diagnostic
        :beg (+ request-beg relative-beg)
@@ -1385,66 +1351,59 @@ authoritative diagnostic location."
        :text text
        :kind kind
        :message message
-       :suggestions (proofread--json-diagnostic-suggestions
+       :suggestions (proofread--diagnostic-candidate-suggestions
                      (plist-get candidate :suggestions))
-       :confidence (proofread--json-diagnostic-confidence
+       :confidence (proofread--diagnostic-candidate-confidence
                     (plist-get candidate :confidence))
-       :source (proofread--json-diagnostic-source
+       :source (proofread--diagnostic-candidate-source
                 candidate default-source)))))
 
-(defun proofread--json-diagnostics-from-payload
+(defun proofread--diagnostics-from-structured-payload
     (request payload &optional default-source)
   "Return proofread diagnostics for REQUEST from parsed PAYLOAD.
 DEFAULT-SOURCE is used for diagnostics without an explicit source."
   (let (diagnostics)
-    (dolist (candidate (proofread--json-diagnostic-candidates payload))
+    (dolist (candidate (proofread--diagnostic-candidates payload))
       (let ((diagnostic
              (and (listp candidate)
-                  (proofread--json-diagnostic-from-candidate
+                  (proofread--diagnostic-from-candidate
                    request candidate default-source))))
         (when diagnostic
           (push diagnostic diagnostics))))
     (nreverse diagnostics)))
 
-(defun proofread--diagnostic-payload (content)
-  "Return parsed diagnostic payload from generated CONTENT."
-  (proofread--json-diagnostic-payload content))
-
-(defun proofread--diagnostics-from-payload
-    (request payload &optional default-source)
-  "Return proofread diagnostics for REQUEST from parsed PAYLOAD."
-  (proofread--json-diagnostics-from-payload
-   request payload default-source))
-
-(defun proofread--diagnostics-from-content
+(defun proofread--diagnostics-from-structured-response
     (request content &optional default-source)
-  "Return proofread diagnostics for REQUEST from generated CONTENT."
-  (proofread--diagnostics-from-payload
-   request (proofread--diagnostic-payload content) default-source))
+  "Return proofread diagnostics for REQUEST from structured response CONTENT."
+  (proofread--diagnostics-from-structured-payload
+   request (proofread--structured-response-payload content) default-source))
 
 (defun proofread--llm-prompt (request)
   "Return an `llm-chat-prompt' for backend REQUEST."
   (llm-make-chat-prompt
-   (proofread--diagnostic-prompt request)
-   :response-format proofread--json-diagnostic-response-format))
+   (proofread--structured-response-prompt request)
+   :response-format proofread--structured-response-schema))
 
-(defun proofread--llm-response-text (response)
-  "Return generated text from an LLM RESPONSE."
+(defun proofread--llm-response-content (response)
+  "Return structured response content from LLM RESPONSE."
   (cond
    ((stringp response) response)
+   ((and (listp response)
+         (plist-member response :diagnostics))
+    response)
    ((and (listp response)
          (plist-member response :text)
          (stringp (plist-get response :text)))
     (plist-get response :text))
-   (t (error "Invalid llm response text"))))
+   (t (error "Invalid llm structured response"))))
 
 (defun proofread--llm-success-result (request response)
   "Return backend success or parse error result for LLM RESPONSE."
   (condition-case err
       (proofread--backend-success-result
        request
-       (proofread--diagnostics-from-content
-        request (proofread--llm-response-text response) 'llm))
+       (proofread--diagnostics-from-structured-response
+        request (proofread--llm-response-content response) 'llm))
     (error
      (proofread--backend-error-result
       request 'llm-invalid-response (error-message-string err)))))
@@ -1458,22 +1417,41 @@ DEFAULT-SOURCE is used for diagnostics without an explicit source."
        (format "%s" message)
      (format "%S" error))))
 
+(defun proofread--llm-provider-structured-output-p (provider)
+  "Return non-nil when PROVIDER advertises structured JSON output."
+  (condition-case nil
+      (memq 'json-response (llm-capabilities provider))
+    (error nil)))
+
 (defun proofread--llm-defer-callback (callback result)
   "Invoke CALLBACK with RESULT after the current call stack unwinds."
   (run-at-time 0 nil #'proofread--invoke-backend-callback callback result))
 
 (defun proofread--llm-backend-check (request callback)
   "Submit REQUEST to `proofread-llm-provider' asynchronously."
-  (if (not proofread-llm-provider)
-      (let ((timer
-             (proofread--llm-defer-callback
-              callback
-              (proofread--backend-error-result
-               request 'llm-provider-unavailable
-               "No proofread llm provider is configured"))))
-        (list :backend 'llm
-              :request nil
-              :timer timer))
+  (cond
+   ((not proofread-llm-provider)
+    (let ((timer
+           (proofread--llm-defer-callback
+            callback
+            (proofread--backend-error-result
+             request 'llm-provider-unavailable
+             "No proofread llm provider is configured"))))
+      (list :backend 'llm
+            :request nil
+            :timer timer)))
+   ((not (proofread--llm-provider-structured-output-p
+          proofread-llm-provider))
+    (let ((timer
+           (proofread--llm-defer-callback
+            callback
+            (proofread--backend-error-result
+             request 'llm-structured-output-unavailable
+             "The configured llm provider does not advertise json-response"))))
+      (list :backend 'llm
+            :request nil
+            :timer timer)))
+   (t
     (let* ((provider proofread-llm-provider)
            (prompt (proofread--llm-prompt request))
            (handle
@@ -1496,7 +1474,7 @@ DEFAULT-SOURCE is used for diagnostics without an explicit source."
                  request 'llm-submit-error (error-message-string err)))
                nil))))
       (list :backend 'llm
-            :request handle))))
+            :request handle)))))
 
 (defun proofread--unsupported-backend-check (backend request callback)
   "Report unsupported BACKEND for REQUEST through CALLBACK asynchronously."
@@ -1617,11 +1595,6 @@ When BACKEND is nil, use the selected `proofread-backend'."
      ((eq backend 'llm) (proofread--llm-provider-identity))
      (t nil))))
 
-(defun proofread--cache-backend-identity (&optional backend)
-  "Return BACKEND identity for cache keys.
-When BACKEND is nil, use the currently selected `proofread-backend'."
-  (proofread--backend-identity backend))
-
 (defun proofread--chunk-text-hash (text)
   "Return a deterministic cache hash for chunk TEXT."
   (secure-hash 'sha1 (or text "")))
@@ -1643,7 +1616,7 @@ When BACKEND is nil, use the currently selected `proofread-backend'."
                    (proofread--chunk-text-hash (plist-get chunk :text))
                    :language (plist-get chunk :language)
                    :major-mode (plist-get chunk :major-mode)
-                   :backend (proofread--cache-backend-identity
+                   :backend (proofread--backend-identity
                              (or (plist-get chunk :backend) backend))
                    :prompt-version proofread-prompt-version
                    :context (proofread--context-cache-identity chunk)
@@ -1676,8 +1649,8 @@ When BACKEND is nil, use the currently selected `proofread-backend'."
 (defun proofread--diagnostic-to-relative (diagnostic request)
   "Return DIAGNOSTIC with ranges relative to REQUEST start."
   (let* ((base (plist-get request :beg))
-         (beg (proofread--diagnostic-get diagnostic :beg))
-         (end (proofread--diagnostic-get diagnostic :end))
+         (beg (plist-get diagnostic :beg))
+         (end (plist-get diagnostic :end))
          (relative (copy-sequence diagnostic)))
     (setq relative (plist-put relative :beg (- beg base)))
     (setq relative (plist-put relative :end (- end base)))
@@ -1686,8 +1659,8 @@ When BACKEND is nil, use the currently selected `proofread-backend'."
 (defun proofread--diagnostic-to-absolute (diagnostic request)
   "Return cached DIAGNOSTIC with ranges absolute to REQUEST start."
   (let* ((base (plist-get request :beg))
-         (beg (proofread--diagnostic-get diagnostic :beg))
-         (end (proofread--diagnostic-get diagnostic :end))
+         (beg (plist-get diagnostic :beg))
+         (end (plist-get diagnostic :end))
          (absolute (copy-sequence diagnostic)))
     (setq absolute (plist-put absolute :beg (+ base beg)))
     (setq absolute (plist-put absolute :end (+ base end)))
@@ -1764,7 +1737,7 @@ When BACKEND is nil, use the currently selected `proofread-backend'."
   "Dispatch request-ready CHUNKS through BACKEND.
 When BACKEND is nil, use `proofread-backend'.  Return dispatched requests."
   (when (proofread-backend-available-p backend)
-    (let ((backend-identity (proofread--cache-backend-identity backend))
+    (let ((backend-identity (proofread--backend-identity backend))
           requests)
       (dolist (chunk chunks)
         (let ((request (proofread--make-backend-request chunk backend)))
@@ -1939,9 +1912,9 @@ AFTER is non-nil for the after-change notification."
 (defun proofread--diagnostic-range (diagnostic)
   "Return DIAGNOSTIC's valid range as a cons cell, or nil."
   (let ((beg (proofread--position-integer
-              (proofread--diagnostic-get diagnostic :beg)))
+              (plist-get diagnostic :beg)))
         (end (proofread--position-integer
-              (proofread--diagnostic-get diagnostic :end))))
+              (plist-get diagnostic :end))))
     (when (and beg end (<= beg end))
       (cons beg end))))
 
@@ -1999,8 +1972,8 @@ navigation order."
 
 (defun proofread--diagnostic-ignore-key (diagnostic)
   "Return the session ignore key for DIAGNOSTIC."
-  (list :text (proofread--diagnostic-get diagnostic :text)
-        :kind (proofread--diagnostic-get diagnostic :kind)))
+  (list :text (plist-get diagnostic :text)
+        :kind (plist-get diagnostic :kind)))
 
 (defun proofread--ensure-ignored-diagnostics ()
   "Return the session ignore table for proofread diagnostics."
@@ -2121,7 +2094,7 @@ navigation order."
 
 (defun proofread--diagnostic-suggestions (diagnostic)
   "Return DIAGNOSTIC suggestions as strings in stored order."
-  (let ((suggestions (proofread--diagnostic-get diagnostic :suggestions)))
+  (let ((suggestions (plist-get diagnostic :suggestions)))
     (cond
      ((null suggestions) nil)
      ((listp suggestions)
@@ -2154,7 +2127,7 @@ navigation order."
   (let* ((range (proofread--application-range diagnostic))
          (beg (car range))
          (end (cdr range))
-         (text (proofread--diagnostic-get diagnostic :text)))
+         (text (plist-get diagnostic :text)))
     (unless (proofread--overlay-for-diagnostic diagnostic)
       (user-error "Proofread diagnostic is stale"))
     (unless (stringp text)
@@ -2236,12 +2209,12 @@ navigation order."
 
 (defun proofread--format-diagnostic-description (diagnostic)
   "Return a stable plain-text description for DIAGNOSTIC."
-  (let ((kind (proofread--diagnostic-get diagnostic :kind))
-        (message (proofread--diagnostic-get diagnostic :message))
-        (text (proofread--diagnostic-get diagnostic :text))
+  (let ((kind (plist-get diagnostic :kind))
+        (message (plist-get diagnostic :message))
+        (text (plist-get diagnostic :text))
         (suggestions (proofread--diagnostic-suggestions diagnostic))
-        (confidence (proofread--diagnostic-get diagnostic :confidence))
-        (source (proofread--diagnostic-get diagnostic :source))
+        (confidence (plist-get diagnostic :confidence))
+        (source (plist-get diagnostic :source))
         (lines '("Proofread diagnostic")))
     (when kind
       (setq lines
@@ -2295,8 +2268,8 @@ navigation order."
 
 (defun proofread--create-overlay (diagnostic)
   "Create and return a proofread overlay for DIAGNOSTIC."
-  (let ((beg (proofread--diagnostic-get diagnostic :beg))
-        (end (proofread--diagnostic-get diagnostic :end)))
+  (let ((beg (plist-get diagnostic :beg))
+        (end (plist-get diagnostic :end)))
     (unless (and (integer-or-marker-p beg)
                  (integer-or-marker-p end)
                  (<= beg end))

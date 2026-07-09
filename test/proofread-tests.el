@@ -114,8 +114,19 @@
 (defconst proofread-test--llm-provider-identity "proofread-test-provider"
   "Stable provider identity used for local LLM backend tests.")
 
+(defun proofread-test--llm-capabilities (_provider)
+  "Return LLM capabilities used by local backend tests."
+  '(json-response))
+
+(defmacro proofread-test--with-llm-capabilities (&rest body)
+  "Run BODY with the local test provider advertising structured output."
+  (declare (indent 0) (debug (body)))
+  `(cl-letf (((symbol-function 'llm-capabilities)
+              #'proofread-test--llm-capabilities))
+     ,@body))
+
 (defmacro proofread-test--with-llm-success (content &rest body)
-  "Run BODY with `llm-chat-async' stubbed to return CONTENT."
+  "Run BODY with `llm-chat-async' configured to return CONTENT."
   (declare (indent 1) (debug (form body)))
   `(let ((proofread-llm-provider proofread-test--llm-provider)
          (proofread-llm-provider-identity
@@ -123,11 +134,13 @@
      (cl-letf (((symbol-function 'llm-chat-async)
                 (lambda (_provider _prompt success _error &optional _multi-output)
                   (funcall success ,content)
-                  'proofread-test-llm-handle)))
+                  'proofread-test-llm-handle))
+               ((symbol-function 'llm-capabilities)
+                #'proofread-test--llm-capabilities))
        ,@body)))
 
 (defmacro proofread-test--with-llm-error (error message &rest body)
-  "Run BODY with `llm-chat-async' stubbed to signal ERROR and MESSAGE."
+  "Run BODY with `llm-chat-async' configured to signal ERROR and MESSAGE."
   (declare (indent 2) (debug (form form body)))
   `(let ((proofread-llm-provider proofread-test--llm-provider)
          (proofread-llm-provider-identity
@@ -136,15 +149,16 @@
                 (lambda (_provider _prompt _success error-callback
                                    &optional _multi-output)
                   (funcall error-callback ,error ,message)
-                  'proofread-test-llm-handle)))
+                  'proofread-test-llm-handle))
+               ((symbol-function 'llm-capabilities)
+                #'proofread-test--llm-capabilities))
        ,@body)))
 
-(defun proofread-test--json-diagnostics-content (diagnostics)
-  "Return a generated JSON content string containing DIAGNOSTICS."
-  (proofread--json-encode
-   `(("diagnostics" . ,(vconcat diagnostics)))))
+(defun proofread-test--response-content (diagnostics)
+  "Return structured response text containing DIAGNOSTICS."
+  (json-encode `(("diagnostics" . ,(vconcat diagnostics)))))
 
-(defun proofread-test--json-diagnostic
+(defun proofread-test--response-diagnostic
     (beg end text &optional suggestions)
   "Return a diagnostic alist for BEG, END, TEXT, and SUGGESTIONS."
   `(("kind" . "spelling")
@@ -152,13 +166,18 @@
     ("text" . ,text)
     ("range" . (("beg" . ,beg)
                 ("end" . ,end)))
+    ("token_index" . nil)
+    ("token_range" . nil)
     ("suggestions" . ,(vconcat (or suggestions '("hello"))))
-    ("confidence" . 0.9)))
+    ("confidence" . 0.9)
+    ("source" . nil)))
 
-(defun proofread-test--json-diagnostic-with-fields
+(defun proofread-test--response-diagnostic-with-fields
     (beg end text fields)
-  "Return a JSON diagnostic for BEG, END, and TEXT plus FIELDS."
-  (append (proofread-test--json-diagnostic beg end text)
+  "Return a structured response diagnostic for BEG, END, and TEXT plus FIELDS."
+  (append (cl-remove-if (lambda (field)
+                          (assoc (car field) fields))
+                        (proofread-test--response-diagnostic beg end text))
           fields))
 
 (ert-deftest proofread-test-normalize-ranges-merges-adjacent-ranges ()
@@ -1329,35 +1348,36 @@
                   request
                   callback
                   backend-calls)
-              (cl-letf (((symbol-function 'window-start)
-                         (lambda (&optional _window) (point-min)))
-                        ((symbol-function 'window-end)
-                         (lambda (&optional _window _update) 5))
-                        ((symbol-function 'proofread-backend-check)
-                         (lambda (backend-request backend-callback
-                                                  &optional _backend)
-                           (setq backend-calls
-                                 (1+ (or backend-calls 0)))
-                           (setq request backend-request)
-                           (setq callback backend-callback)
-                           'proofread-test-handle)))
-                (proofread-check-visible)
-                (should (= backend-calls 1))
-                (let ((diagnostic
-                       (proofread-test--diagnostic-for-range 1 5 "helo")))
-                  (should (eq (funcall
-                               callback
-                               (proofread--backend-success-result
-                                request (list diagnostic)))
-                              'applied))
-                  (should (= (hash-table-count proofread--cache) 1))
-                  (proofread-clear)
-                  (setq proofread--diagnostics nil)
-                  (proofread-check-visible)
-                  (should (= backend-calls 1))
-                  (should (equal proofread--diagnostics
-                                 (list diagnostic)))
-                  (should (= (length proofread--overlays) 1))))))
+              (proofread-test--with-llm-capabilities
+               (cl-letf (((symbol-function 'window-start)
+                          (lambda (&optional _window) (point-min)))
+                         ((symbol-function 'window-end)
+                          (lambda (&optional _window _update) 5))
+                         ((symbol-function 'proofread-backend-check)
+                          (lambda (backend-request backend-callback
+                                                   &optional _backend)
+                            (setq backend-calls
+                                  (1+ (or backend-calls 0)))
+                            (setq request backend-request)
+                            (setq callback backend-callback)
+                            'proofread-test-handle)))
+                 (proofread-check-visible)
+                 (should (= backend-calls 1))
+                 (let ((diagnostic
+                        (proofread-test--diagnostic-for-range 1 5 "helo")))
+                   (should (eq (funcall
+                                callback
+                                (proofread--backend-success-result
+                                 request (list diagnostic)))
+                               'applied))
+                   (should (= (hash-table-count proofread--cache) 1))
+                   (proofread-clear)
+                   (setq proofread--diagnostics nil)
+                   (proofread-check-visible)
+                   (should (= backend-calls 1))
+                   (should (equal proofread--diagnostics
+                                  (list diagnostic)))
+                   (should (= (length proofread--overlays) 1)))))))
         (kill-buffer buffer)))))
 
 (ert-deftest proofread-test-cache-miss-calls-backend ()
@@ -1374,21 +1394,22 @@
                    (proofread-llm-provider-identity
                     proofread-test--llm-provider-identity)
                    (recorder (proofread-test--make-backend-recorder)))
-              (cl-letf (((symbol-function 'window-start)
-                         (lambda (&optional _window) (point-min)))
-                        ((symbol-function 'window-end)
-                         (lambda (&optional _window _update) (point-max)))
-                        ((symbol-function 'proofread-backend-check)
-                         (plist-get recorder :function)))
-                (proofread-check-visible)
-                (should (= (length (funcall
-                                    (plist-get recorder :requests)))
-                           1))
-                (should (equal (plist-get
-                                (car (funcall
-                                      (plist-get recorder :requests)))
-                                :text)
-                               "helo")))))
+              (proofread-test--with-llm-capabilities
+               (cl-letf (((symbol-function 'window-start)
+                          (lambda (&optional _window) (point-min)))
+                         ((symbol-function 'window-end)
+                          (lambda (&optional _window _update) (point-max)))
+                         ((symbol-function 'proofread-backend-check)
+                          (plist-get recorder :function)))
+                 (proofread-check-visible)
+                 (should (= (length (funcall
+                                     (plist-get recorder :requests)))
+                            1))
+                 (should (equal (plist-get
+                                 (car (funcall
+                                       (plist-get recorder :requests)))
+                                 :text)
+                                "helo"))))))
         (kill-buffer buffer)))))
 
 (ert-deftest proofread-test-filtering-precedes-cache-and-backend-dispatch ()
@@ -1417,21 +1438,22 @@
                     (plist-put cached-request :backend 'llm))
               (proofread--cache-write-request
                cached-request (list cached-diagnostic))
-              (cl-letf (((symbol-function 'window-start)
-                         (lambda (&optional _window) (point-min)))
-                        ((symbol-function 'window-end)
-                         (lambda (&optional _window _update) (point-max)))
-                        ((symbol-function 'proofread-backend-check)
-                         (plist-get recorder :function)))
-                (proofread-check-visible)
-                (should (equal (mapcar
-                                (lambda (request)
-                                  (plist-get request :text))
-                                (funcall (plist-get recorder :requests)))
-                               '(" Beta")))
-                (should (equal proofread--diagnostics
-                               (list cached-diagnostic)))
-                (should (= (length proofread--overlays) 1)))))
+              (proofread-test--with-llm-capabilities
+               (cl-letf (((symbol-function 'window-start)
+                          (lambda (&optional _window) (point-min)))
+                         ((symbol-function 'window-end)
+                          (lambda (&optional _window _update) (point-max)))
+                         ((symbol-function 'proofread-backend-check)
+                          (plist-get recorder :function)))
+                 (proofread-check-visible)
+                 (should (equal (mapcar
+                                 (lambda (request)
+                                   (plist-get request :text))
+                                 (funcall (plist-get recorder :requests)))
+                                '(" Beta")))
+                 (should (equal proofread--diagnostics
+                                (list cached-diagnostic)))
+                 (should (= (length proofread--overlays) 1))))))
         (kill-buffer buffer)))))
 
 (ert-deftest proofread-test-cache-invalidation-misses ()
@@ -1514,28 +1536,29 @@
 
 (ert-deftest proofread-test-backend-availability ()
   "Backend availability is limited to a configured LLM backend."
-  (let ((proofread-backend 'llm)
-        (proofread-llm-provider proofread-test--llm-provider))
-    (should (proofread-backend-available-p))
-    (should (proofread-backend-available-p 'llm))
-    (should-not (proofread-backend-available-p 'unknown-backend))))
+  (proofread-test--with-llm-capabilities
+   (let ((proofread-backend 'llm)
+         (proofread-llm-provider proofread-test--llm-provider))
+     (should (proofread-backend-available-p))
+     (should (proofread-backend-available-p 'llm))
+     (should-not (proofread-backend-available-p 'unknown-backend)))))
 
-(ert-deftest proofread-test-ollama-backend-is-unavailable-and-unsupported ()
-  "Direct Ollama backend is unavailable and uses unsupported dispatch."
+(ert-deftest proofread-test-unknown-backend-is-unavailable-and-unsupported ()
+  "Unknown backend symbols are unavailable and use unsupported dispatch."
   (with-temp-buffer
     (insert "helo")
-    (let* ((proofread-backend 'ollama)
+    (let* ((proofread-backend 'unknown-backend)
            (chunk (car (proofread--request-ready-chunks-for-ranges
                         (list (cons (point-min) (point-max))))))
-           (request (proofread--make-backend-request chunk 'ollama))
+           (request (proofread--make-backend-request chunk 'unknown-backend))
            result)
       (should-not (proofread-backend-available-p))
-      (should-not (proofread-backend-available-p 'ollama))
+      (should-not (proofread-backend-available-p 'unknown-backend))
       (should (proofread-backend-check
                request
                (lambda (backend-result)
                  (setq result backend-result))
-               'ollama))
+               'unknown-backend))
       (should-not result)
       (should (proofread-test--wait-for (lambda () result)))
       (should (eq (plist-get result :status) 'error))
@@ -1543,15 +1566,20 @@
       (should (eq (plist-get result :error) 'unsupported-backend)))))
 
 (ert-deftest proofread-test-llm-backend-availability ()
-  "LLM availability depends on `proofread-llm-provider'."
+  "LLM availability depends on provider and structured output support."
   (let ((proofread-backend 'llm)
         (proofread-llm-provider nil))
     (should-not (proofread-backend-available-p))
     (should-not (proofread-backend-available-p 'llm)))
   (let ((proofread-backend 'llm)
         (proofread-llm-provider 'proofread-test-provider))
-    (should (proofread-backend-available-p))
-    (should (proofread-backend-available-p 'llm))))
+    (should-not (proofread-backend-available-p))
+    (should-not (proofread-backend-available-p 'llm)))
+  (proofread-test--with-llm-capabilities
+   (let ((proofread-backend 'llm)
+         (proofread-llm-provider proofread-test--llm-provider))
+     (should (proofread-backend-available-p))
+     (should (proofread-backend-available-p 'llm)))))
 
 (ert-deftest proofread-test-llm-provider-unavailable-is-asynchronous-error ()
   "Missing LLM provider reports an asynchronous backend error."
@@ -1572,6 +1600,57 @@
       (should (eq (plist-get result :status) 'error))
       (should (eq (plist-get result :error)
                   'llm-provider-unavailable)))))
+
+(ert-deftest proofread-test-llm-structured-output-unavailable-is-asynchronous-error ()
+  "LLM providers without schema output report an asynchronous backend error."
+  (with-temp-buffer
+    (insert "helo")
+    (let* ((proofread-llm-provider proofread-test--llm-provider)
+           (chunk (car (proofread--request-ready-chunks-for-ranges
+                        (list (cons (point-min) (point-max))))))
+           (request (proofread--make-backend-request chunk 'llm))
+           result)
+      (cl-letf (((symbol-function 'llm-capabilities)
+                 (lambda (_provider)
+                   '(generation)))
+                ((symbol-function 'llm-chat-async)
+                 (lambda (&rest _)
+                   (error "Unexpected llm-chat-async call"))))
+        (should (proofread-backend-check
+                 request
+                 (lambda (backend-result)
+                   (setq result backend-result))
+                 'llm))
+        (should-not result)
+        (should (proofread-test--wait-for (lambda () result)))
+        (should (eq (plist-get result :status) 'error))
+        (should (eq (plist-get result :error)
+                    'llm-structured-output-unavailable))))))
+
+(ert-deftest proofread-test-deepseek-v4-flash-structured-output-unavailable ()
+  "DeepSeek v4 flash is rejected before dispatch when schema output is absent."
+  (require 'llm-deepseek)
+  (with-temp-buffer
+    (insert "helo")
+    (let* ((proofread-llm-provider
+            (make-llm-deepseek :chat-model "deepseek-v4-flash"))
+           (chunk (car (proofread--request-ready-chunks-for-ranges
+                        (list (cons (point-min) (point-max))))))
+           (request (proofread--make-backend-request chunk 'llm))
+           result)
+      (cl-letf (((symbol-function 'llm-chat-async)
+                 (lambda (&rest _)
+                   (error "Unexpected llm-chat-async call"))))
+        (should (proofread-backend-check
+                 request
+                 (lambda (backend-result)
+                   (setq result backend-result))
+                 'llm))
+        (should-not result)
+        (should (proofread-test--wait-for (lambda () result)))
+        (should (eq (plist-get result :status) 'error))
+        (should (eq (plist-get result :error)
+                    'llm-structured-output-unavailable))))))
 
 (ert-deftest proofread-test-llm-provider-identity-is-stable ()
   "LLM identity uses stable provider metadata, not provider objects."
@@ -1642,8 +1721,8 @@
         (should-not (proofread--cache-read-request
                      (proofread--make-backend-request chunk)))))))
 
-(ert-deftest proofread-test-llm-dispatch-builds-json-prompt-asynchronously ()
-  "LLM backend dispatches an async chat prompt built from request fields."
+(ert-deftest proofread-test-llm-dispatch-builds-schema-prompt-asynchronously ()
+  "LLM backend dispatches an async schema prompt built from request fields."
   (with-temp-buffer
     (text-mode)
     (insert "helo")
@@ -1653,8 +1732,8 @@
                         (list (cons (point-min) (point-max))))))
            (request (proofread--make-backend-request chunk 'llm))
            (content
-            (proofread-test--json-diagnostics-content
-             (list (proofread-test--json-diagnostic 0 4 "helo"))))
+            (proofread-test--response-content
+             (list (proofread-test--response-diagnostic 0 4 "helo"))))
            captured-provider
            captured-prompt
            captured-multi-output
@@ -1666,7 +1745,9 @@
                    (setq captured-prompt prompt)
                    (setq captured-multi-output multi-output)
                    (funcall success content)
-                   'proofread-test-llm-handle)))
+                   'proofread-test-llm-handle))
+                ((symbol-function 'llm-capabilities)
+                 #'proofread-test--llm-capabilities))
         (let ((handle
                (proofread-backend-check
                 request
@@ -1678,12 +1759,12 @@
           (should (eq captured-provider proofread-llm-provider))
           (should-not captured-multi-output)
           (should (equal (llm-chat-prompt-response-format captured-prompt)
-                         proofread--json-diagnostic-response-format))
+                         proofread--structured-response-schema))
           (let* ((interaction
                   (car (llm-chat-prompt-interactions captured-prompt)))
                  (prompt-text
                   (llm-chat-prompt-interaction-content interaction)))
-            (should (string-match-p "Return only one JSON object"
+            (should (string-match-p "requested response schema"
                                     prompt-text))
             (should (string-match-p "Language: \"en\"" prompt-text))
             (should (string-match-p "Major mode: text-mode" prompt-text))
@@ -1712,7 +1793,9 @@
                  (lambda (_provider prompt _success _error
                                     &optional _multi-output)
                    (setq captured-prompt prompt)
-                   'proofread-test-llm-handle)))
+                   'proofread-test-llm-handle))
+                ((symbol-function 'llm-capabilities)
+                 #'proofread-test--llm-capabilities))
         (let* ((chunk (car (proofread--request-ready-chunks-for-ranges
                             (list (cons (point-min) (point-max))))))
                (request (proofread--make-backend-request chunk 'llm)))
@@ -1742,14 +1825,16 @@
                         (list (cons (point-min) (point-max))))))
            (request (proofread--make-backend-request chunk 'llm))
            (content
-            (proofread-test--json-diagnostics-content
-             (list (proofread-test--json-diagnostic 0 4 "helo"))))
+            (proofread-test--response-content
+             (list (proofread-test--response-diagnostic 0 4 "helo"))))
            result)
       (cl-letf (((symbol-function 'llm-chat-async)
                  (lambda (_provider _prompt success _error
                                     &optional _multi-output)
                    (run-at-time 0 nil (lambda () (funcall success content)))
-                   'proofread-test-llm-handle)))
+                   'proofread-test-llm-handle))
+                ((symbol-function 'llm-capabilities)
+                 #'proofread-test--llm-capabilities))
         (should (proofread--dispatch-backend-request
                  request
                  (lambda (backend-result)
@@ -1780,7 +1865,9 @@
                  (lambda (_provider _prompt _success error
                                     &optional _multi-output)
                    (funcall error 'llm-error "boom")
-                   'proofread-test-llm-handle)))
+                   'proofread-test-llm-handle))
+                ((symbol-function 'llm-capabilities)
+                 #'proofread-test--llm-capabilities))
         (should (proofread--dispatch-backend-request
                  request
                  (lambda (backend-result)
@@ -1807,7 +1894,9 @@
                  (lambda (_provider _prompt success _error
                                     &optional _multi-output)
                    (funcall success "not json")
-                   'proofread-test-llm-handle)))
+                   'proofread-test-llm-handle))
+                ((symbol-function 'llm-capabilities)
+                 #'proofread-test--llm-capabilities))
         (should (proofread--dispatch-backend-request
                  request
                  (lambda (backend-result)
@@ -1844,6 +1933,8 @@
                                               &optional _multi-output)
                              (setq success callback)
                              'proofread-test-llm-handle))
+                          ((symbol-function 'llm-capabilities)
+                           #'proofread-test--llm-capabilities)
                           ((symbol-function 'llm-cancel-request)
                            (lambda (_handle)
                              nil)))
@@ -1873,8 +1964,8 @@
                             (buffer-chars-modified-tick)))))
             (funcall
              success
-             (proofread-test--json-diagnostics-content
-              (list (proofread-test--json-diagnostic 0 4 "helo"))))
+             (proofread-test--response-content
+              (list (proofread-test--response-diagnostic 0 4 "helo"))))
             (should (proofread-test--wait-for (lambda () result)))
             (should (eq result 'stale))
             (when (buffer-live-p buffer)
@@ -1884,8 +1975,8 @@
         (when (buffer-live-p buffer)
           (kill-buffer buffer))))))
 
-(ert-deftest proofread-test-json-diagnostic-prompt-requests-contract ()
-  "Diagnostic prompts request JSON diagnostics with chunk-relative ranges."
+(ert-deftest proofread-test-structured-response-prompt-requests-contract ()
+  "Diagnostic prompts describe schema output with chunk-relative ranges."
   (with-temp-buffer
     (text-mode)
     (insert "helo")
@@ -1893,20 +1984,21 @@
            (chunk (car (proofread--request-ready-chunks-for-ranges
                         (list (cons (point-min) (point-max))))))
            (request (proofread--make-backend-request chunk 'llm))
-           (prompt (proofread--diagnostic-prompt request)))
-      (should (string-match-p "Return only one JSON object" prompt))
-      (should (string-match-p (regexp-quote "\"diagnostics\"") prompt))
+           (prompt (proofread--structured-response-prompt request)))
+      (should (string-match-p "requested response schema" prompt))
+      (should (string-match-p "diagnostics array" prompt))
       (should (string-match-p "zero-based chunk-relative offsets" prompt))
       (should (string-match-p "range end is exclusive" prompt))
-      (dolist (field '("\"kind\"" "\"message\"" "\"text\"" "\"range\""
-                       "\"suggestions\"" "\"confidence\""))
-        (should (string-match-p (regexp-quote field) prompt)))
+      (dolist (field '("kind" "message" "text" "range"
+                       "token_index" "token_range" "suggestions"
+                       "confidence" "source"))
+        (should (string-match-p field prompt)))
       (should (string-match-p "Language: \"en\"" prompt))
       (should (string-match-p "Major mode: text-mode" prompt))
       (should (string-match-p "Text:\nhelo" prompt))
       (should-not (string-match-p "absolute buffer" prompt)))))
 
-(ert-deftest proofread-test-json-diagnostic-prompt-without-tokens-falls-back ()
+(ert-deftest proofread-test-structured-response-prompt-without-tokens-falls-back ()
   "Token locator details are not required when requests have no tokens."
   (with-temp-buffer
     (text-mode)
@@ -1914,14 +2006,14 @@
     (let* ((chunk (car (proofread--request-ready-chunks-for-ranges
                         (list (cons (point-min) (point-max))))))
            (request (proofread--make-backend-request chunk 'llm))
-           (prompt (proofread--diagnostic-prompt request)))
+           (prompt (proofread--structured-response-prompt request)))
       (should-not (string-match-p "Tokens:" prompt))
       (should-not (string-match-p "When you can localize" prompt))
-      (should (string-match-p "Token fields are optional locator hints"
+      (should (string-match-p "Set token_index and token_range to null"
                               prompt)))))
 
-(ert-deftest proofread-test-json-diagnostic-extra-text-around-payload ()
-  "JSON diagnostic parser accepts extra text around one payload."
+(ert-deftest proofread-test-structured-response-extra-text-around-payload-is-error ()
+  "Structured response parser rejects extra text around a payload."
   (with-temp-buffer
     (insert "helo")
     (let* ((chunk (car (proofread--request-ready-chunks-for-ranges
@@ -1929,98 +2021,125 @@
            (request (proofread--make-backend-request chunk 'llm))
            (content
             (concat "Result follows:\n"
-                    (proofread-test--json-diagnostics-content
-                     (list (proofread-test--json-diagnostic 0 4 "helo")))
-                    "\nDone."))
-           (diagnostics
-            (proofread--diagnostics-from-content request content 'llm)))
-      (should (= (length diagnostics) 1))
-      (should (equal (plist-get (car diagnostics) :text) "helo"))
-      (should (eq (plist-get (car diagnostics) :source) 'llm)))))
+                    (proofread-test--response-content
+                     (list (proofread-test--response-diagnostic 0 4 "helo")))
+                    "\nDone.")))
+      (should-error
+       (proofread--diagnostics-from-structured-response
+        request content 'llm)))))
 
-(ert-deftest proofread-test-json-diagnostic-ambiguous-extra-json-is-error ()
-  "JSON diagnostic parser rejects text with more than one payload."
+(ert-deftest proofread-test-structured-response-ambiguous-extra-json-is-error ()
+  "Structured response parser rejects multiple payloads."
   (with-temp-buffer
     (insert "helo")
     (let* ((chunk (car (proofread--request-ready-chunks-for-ranges
                         (list (cons (point-min) (point-max))))))
            (request (proofread--make-backend-request chunk 'llm))
            (payload
-            (proofread-test--json-diagnostics-content
-             (list (proofread-test--json-diagnostic 0 4 "helo")))))
+            (proofread-test--response-content
+             (list (proofread-test--response-diagnostic 0 4 "helo")))))
       (should-error
-       (proofread--diagnostics-from-content
+       (proofread--diagnostics-from-structured-response
         request (concat payload "\n" payload) 'llm)))))
 
-(ert-deftest proofread-test-json-diagnostic-non-json-content-is-error ()
-  "Non-JSON generated content is a diagnostic parse error."
+(ert-deftest proofread-test-structured-response-non-json-content-is-error ()
+  "Non-schema structured response text is a parse error."
   (with-temp-buffer
     (insert "helo")
     (let* ((chunk (car (proofread--request-ready-chunks-for-ranges
                         (list (cons (point-min) (point-max))))))
            (request (proofread--make-backend-request chunk 'llm)))
       (should-error
-       (proofread--diagnostics-from-content
+       (proofread--diagnostics-from-structured-response
         request "I found a spelling issue." 'llm)))))
 
-(ert-deftest proofread-test-json-diagnostic-malformed-json-is-error ()
-  "Malformed generated JSON content is a diagnostic parse error."
+(ert-deftest proofread-test-structured-response-malformed-json-is-error ()
+  "Malformed structured response JSON is a parse error."
   (with-temp-buffer
     (insert "helo")
     (let* ((chunk (car (proofread--request-ready-chunks-for-ranges
                         (list (cons (point-min) (point-max))))))
            (request (proofread--make-backend-request chunk 'llm)))
       (should-error
-       (proofread--diagnostics-from-content
+       (proofread--diagnostics-from-structured-response
         request "Before {\"diagnostics\":[} after" 'llm)))))
 
-(ert-deftest proofread-test-json-diagnostic-out-of-range-is-dropped ()
-  "JSON diagnostics outside the request chunk are dropped."
+(ert-deftest proofread-test-structured-response-direct-payload ()
+  "Structured response payloads can be consumed directly."
+  (with-temp-buffer
+    (insert "helo")
+    (let* ((chunk (car (proofread--request-ready-chunks-for-ranges
+                        (list (cons (point-min) (point-max))))))
+           (request (proofread--make-backend-request chunk 'llm))
+           (payload
+            '(:diagnostics
+              ((:kind "spelling"
+                      :message "Possible misspelling"
+                      :text "helo"
+                      :range (:beg 0 :end 4)
+                      :token_index nil
+                      :token_range nil
+                      :suggestions ["hello"]
+                      :confidence nil
+                      :source nil))))
+           (diagnostics
+            (proofread--diagnostics-from-structured-response
+             request payload 'llm)))
+      (should (= (length diagnostics) 1))
+      (should (equal (plist-get (car diagnostics) :text) "helo"))
+      (should (equal (plist-get (car diagnostics) :suggestions)
+                     '("hello")))
+      (should (eq (plist-get (car diagnostics) :source) 'llm)))))
+
+(ert-deftest proofread-test-structured-response-out-of-range-is-dropped ()
+  "Structured response diagnostics outside the request chunk are dropped."
   (with-temp-buffer
     (insert "helo")
     (let* ((chunk (car (proofread--request-ready-chunks-for-ranges
                         (list (cons (point-min) (point-max))))))
            (request (proofread--make-backend-request chunk 'llm))
            (content
-            (proofread-test--json-diagnostics-content
-             (list (proofread-test--json-diagnostic 0 99 "helo"))))
+            (proofread-test--response-content
+             (list (proofread-test--response-diagnostic 0 99 "helo"))))
            (diagnostics
-            (proofread--diagnostics-from-content request content 'llm)))
+            (proofread--diagnostics-from-structured-response request content 'llm)))
       (should-not diagnostics))))
 
-(ert-deftest proofread-test-json-diagnostic-text-mismatch-is-dropped ()
-  "JSON diagnostics whose text does not match the range are dropped."
+(ert-deftest proofread-test-structured-response-text-mismatch-is-dropped ()
+  "Structured response diagnostics whose text does not match the range are dropped."
   (with-temp-buffer
     (insert "helo")
     (let* ((chunk (car (proofread--request-ready-chunks-for-ranges
                         (list (cons (point-min) (point-max))))))
            (request (proofread--make-backend-request chunk 'llm))
            (content
-            (proofread-test--json-diagnostics-content
-             (list (proofread-test--json-diagnostic 0 4 "hola"))))
+            (proofread-test--response-content
+             (list (proofread-test--response-diagnostic 0 4 "hola"))))
            (diagnostics
-            (proofread--diagnostics-from-content request content 'llm)))
+            (proofread--diagnostics-from-structured-response request content 'llm)))
       (should-not diagnostics))))
 
-(ert-deftest proofread-test-json-diagnostic-invalid-candidate-preserves-valid ()
-  "One invalid JSON diagnostic does not discard valid diagnostics."
+(ert-deftest proofread-test-structured-response-invalid-candidate-preserves-valid ()
+  "One invalid structured response diagnostic does not discard valid diagnostics."
   (with-temp-buffer
     (insert "helo wrld")
     (let* ((chunk (car (proofread--request-ready-chunks-for-ranges
                         (list (cons (point-min) (point-max))))))
            (request (proofread--make-backend-request chunk 'llm))
            (content
-            (proofread-test--json-diagnostics-content
+            (proofread-test--response-content
              (list
-              (proofread-test--json-diagnostic 0 99 "helo")
-              (proofread-test--json-diagnostic 5 9 "wrld" '("world")))))
+              (proofread-test--response-diagnostic 0 99 "helo")
+              (proofread-test--response-diagnostic-with-fields
+               0 4 "helo" '(("kind" . "typo")))
+              (proofread-test--response-diagnostic 5 9 "wrld" '("world")))))
            (diagnostics
-            (proofread--diagnostics-from-content request content 'llm)))
+            (proofread--diagnostics-from-structured-response request content 'llm)))
       (should (= (length diagnostics) 1))
       (should (equal (plist-get (car diagnostics) :text) "wrld")))))
 
-(ert-deftest proofread-test-json-diagnostic-suggestions-preserve-order ()
-  "JSON diagnostic suggestions keep string order and ignore non-strings."
+(ert-deftest proofread-test-structured-response-suggestions-preserve-order ()
+  "Structured response suggestions keep string order and ignore non-strings."
   (with-temp-buffer
     (insert "helo")
     (let* ((chunk (car (proofread--request-ready-chunks-for-ranges
@@ -2034,16 +2153,16 @@
                           ("end" . 4)))
               ("suggestions" . ["hello" 42 "hullo" nil "help"])
               ("confidence" . 0.9)))
-           (content (proofread-test--json-diagnostics-content
+           (content (proofread-test--response-content
                      (list candidate)))
            (diagnostic
-            (car (proofread--diagnostics-from-content
+            (car (proofread--diagnostics-from-structured-response
                   request content 'llm))))
       (should (equal (plist-get diagnostic :suggestions)
                      '("hello" "hullo" "help"))))))
 
-(ert-deftest proofread-test-json-diagnostic-optional-fields-conservative ()
-  "JSON diagnostic optional confidence and source fields are validated."
+(ert-deftest proofread-test-structured-response-optional-fields-conservative ()
+  "Structured response optional confidence and source fields are validated."
   (with-temp-buffer
     (insert "helo wrld")
     (let* ((chunk (car (proofread--request-ready-chunks-for-ranges
@@ -2068,17 +2187,17 @@
               ("confidence" . 3)
               ("source" . 42)))
            (content
-            (proofread-test--json-diagnostics-content
+            (proofread-test--response-content
              (list valid-optional invalid-optional)))
            (diagnostics
-            (proofread--diagnostics-from-content request content 'llm)))
+            (proofread--diagnostics-from-structured-response request content 'llm)))
       (should (= (length diagnostics) 2))
       (should (= (plist-get (car diagnostics) :confidence) 0.75))
       (should (equal (plist-get (car diagnostics) :source) "provider"))
       (should-not (plist-get (cadr diagnostics) :confidence))
       (should (eq (plist-get (cadr diagnostics) :source) 'llm)))))
 
-(ert-deftest proofread-test-json-diagnostic-token-locators ()
+(ert-deftest proofread-test-structured-response-token-locators ()
   "Token locators are consistency hints for otherwise valid diagnostics."
   (let* ((request '(:beg 10
                          :end 18
@@ -2086,16 +2205,16 @@
                          :tokens ((:index 0 :beg 0 :end 2 :text "青晨")
                                   (:index 1 :beg 2 :end 4 :text "六点"))))
          (content
-          (proofread-test--json-diagnostics-content
+          (proofread-test--response-content
            (list
-            (proofread-test--json-diagnostic-with-fields
+            (proofread-test--response-diagnostic-with-fields
              0 2 "青晨" '(("token_index" . 0)))
-            (proofread-test--json-diagnostic
+            (proofread-test--response-diagnostic
              2 4 "六点" '("六点钟"))
-            (proofread-test--json-diagnostic-with-fields
+            (proofread-test--response-diagnostic-with-fields
              0 2 "青晨" '(("token_index" . "0"))))))
          (diagnostics
-          (proofread--diagnostics-from-content request content 'llm)))
+          (proofread--diagnostics-from-structured-response request content 'llm)))
     (should (= (length diagnostics) 3))
     (should (equal (mapcar (lambda (diagnostic)
                              (plist-get diagnostic :text))
@@ -2107,7 +2226,7 @@
                            diagnostics)
                    '((10 . 12) (12 . 14) (10 . 12))))))
 
-(ert-deftest proofread-test-json-diagnostic-token-range-locator ()
+(ert-deftest proofread-test-structured-response-token-range-locator ()
   "Token ranges validate against required diagnostic ranges."
   (let* ((request '(:beg 1
                          :end 5
@@ -2115,20 +2234,20 @@
                          :tokens ((:index 0 :beg 0 :end 2 :text "青晨")
                                   (:index 1 :beg 2 :end 4 :text "六点"))))
          (content
-          (proofread-test--json-diagnostics-content
+          (proofread-test--response-content
            (list
-            (proofread-test--json-diagnostic-with-fields
+            (proofread-test--response-diagnostic-with-fields
              0 4 "青晨六点"
              '(("token_range" . (("beg" . 0)
                                  ("end" . 2))))))))
          (diagnostic
-          (car (proofread--diagnostics-from-content
+          (car (proofread--diagnostics-from-structured-response
                 request content 'llm))))
     (should diagnostic)
     (should (= (plist-get diagnostic :beg) 1))
     (should (= (plist-get diagnostic :end) 5))))
 
-(ert-deftest proofread-test-json-diagnostic-contradictory-token-is-dropped ()
+(ert-deftest proofread-test-structured-response-contradictory-token-is-dropped ()
   "Token locators that contradict range and text reject only that candidate."
   (let* ((request '(:beg 1
                          :end 9
@@ -2137,33 +2256,33 @@
                                   (:index 1 :beg 2 :end 4 :text "六点")
                                   (:index 2 :beg 4 :end 6 :text "小城"))))
          (content
-          (proofread-test--json-diagnostics-content
+          (proofread-test--response-content
            (list
-            (proofread-test--json-diagnostic-with-fields
+            (proofread-test--response-diagnostic-with-fields
              0 2 "青晨" '(("token_index" . 1)))
-            (proofread-test--json-diagnostic-with-fields
+            (proofread-test--response-diagnostic-with-fields
              4 6 "小城" '(("token_index" . 2)))))))
     (let ((diagnostics
-           (proofread--diagnostics-from-content request content 'llm)))
+           (proofread--diagnostics-from-structured-response request content 'llm)))
       (should (= (length diagnostics) 1))
       (should (equal (plist-get (car diagnostics) :text) "小城")))))
 
-(ert-deftest proofread-test-json-diagnostic-token-only-is-rejected ()
+(ert-deftest proofread-test-structured-response-token-only-is-rejected ()
   "Token-only diagnostics without range and text are rejected."
   (let* ((request '(:beg 1
                          :end 5
                          :text "青晨六点"
                          :tokens ((:index 0 :beg 0 :end 2 :text "青晨"))))
          (content
-          (proofread-test--json-diagnostics-content
+          (proofread-test--response-content
            (list '(("kind" . "spelling")
                    ("message" . "Possible misspelling")
                    ("token_index" . 0)
                    ("suggestions" . ["清晨"]))))))
-    (should-not (proofread--diagnostics-from-content request content 'llm))))
+    (should-not (proofread--diagnostics-from-structured-response request content 'llm))))
 
-(ert-deftest proofread-test-json-diagnostic-parsed-results-still-stale-check ()
-  "Parsed JSON diagnostics still require stale validation."
+(ert-deftest proofread-test-structured-response-parsed-results-still-stale-check ()
+  "Parsed structured response diagnostics still require stale validation."
   (with-temp-buffer
     (insert "helo")
     (proofread-mode 1)
@@ -2171,10 +2290,10 @@
                         (list (cons (point-min) (point-max))))))
            (request (proofread--make-backend-request chunk 'llm))
            (content
-            (proofread-test--json-diagnostics-content
-             (list (proofread-test--json-diagnostic 0 4 "helo"))))
+            (proofread-test--response-content
+             (list (proofread-test--response-diagnostic 0 4 "helo"))))
            (diagnostics
-            (proofread--diagnostics-from-content request content 'llm)))
+            (proofread--diagnostics-from-structured-response request content 'llm)))
       (goto-char (point-max))
       (insert "!")
       (should (eq (proofread--handle-backend-result
@@ -2185,15 +2304,15 @@
       (should-not proofread--overlays)
       (should (equal (buffer-string) "helo!")))))
 
-(ert-deftest proofread-test-json-diagnostic-prompt-version-cache-miss ()
-  "JSON diagnostic cache entries miss when prompt version changes."
+(ert-deftest proofread-test-structured-response-prompt-version-cache-miss ()
+  "Structured response cache entries miss when prompt version changes."
   (with-temp-buffer
     (insert "helo")
     (proofread-mode 1)
     (let* ((proofread-backend 'llm)
            (proofread-llm-provider 'proofread-test-provider)
            (proofread-llm-provider-identity "provider")
-           (proofread-prompt-version "json-v1")
+           (proofread-prompt-version "schema-v1")
            (chunk (car (proofread--request-ready-chunks-for-ranges
                         (list (cons (point-min) (point-max))))))
            (request (proofread--make-backend-request chunk))
@@ -2202,7 +2321,7 @@
       (proofread--cache-write-request request (list diagnostic))
       (should (proofread--cache-read-request
                (proofread--make-backend-request chunk)))
-      (let ((proofread-prompt-version "json-v2"))
+      (let ((proofread-prompt-version "schema-v2"))
         (should-not (proofread--cache-read-request
                      (proofread--make-backend-request chunk)))))))
 
@@ -2277,11 +2396,11 @@
                             (list (cons (point-min) (point-max))))))
                (request (proofread--make-backend-request chunk 'llm))
                (content
-                (proofread-test--json-diagnostics-content
-                 (list (proofread-test--json-diagnostic-with-fields
+                (proofread-test--response-content
+                 (list (proofread-test--response-diagnostic-with-fields
                         0 2 "青晨" '(("token_index" . 0))))))
                (diagnostics
-                (proofread--diagnostics-from-content request content 'llm)))
+                (proofread--diagnostics-from-structured-response request content 'llm)))
           (goto-char (point-max))
           (insert "!")
           (should (eq (proofread--handle-backend-result
@@ -2320,7 +2439,7 @@
   (with-temp-buffer
     (insert "Alpha")
     (proofread-test--with-llm-success
-     (proofread-test--json-diagnostics-content nil)
+     (proofread-test--response-content nil)
      (let* ((chunk (car (proofread--request-ready-chunks-for-ranges
                          (list (cons (point-min) (point-max))))))
             (request (proofread--make-backend-request chunk))
@@ -2382,7 +2501,7 @@
     (insert "Alpha")
     (proofread-mode 1)
     (proofread-test--with-llm-success
-     (proofread-test--json-diagnostics-content nil)
+     (proofread-test--response-content nil)
      (let* ((buffer (current-buffer))
             (chunk (car (proofread--request-ready-chunks-for-ranges
                          (list (cons (point-min) (point-max))))))
@@ -2445,27 +2564,28 @@
                   (proofread-context-size 0)
                   requests
                   callbacks)
-              (cl-letf (((symbol-function 'window-start)
-                         (lambda (&optional _window) (point-min)))
-                        ((symbol-function 'window-end)
-                         (lambda (&optional _window _update) (point-max)))
-                        ((symbol-function 'proofread-backend-check)
-                         (lambda (request callback &optional _backend)
-                           (push request requests)
-                           (push callback callbacks)
-                           'proofread-test-handle)))
-                (proofread-check-visible)
-                (setq requests (nreverse requests))
-                (should (equal proofread--pending-ranges
-                               (list (cons (point-min) (point-max)))))
-                (should (equal (mapcar (lambda (request)
-                                         (plist-get request :text))
-                                       requests)
-                               '("Alpha " " Beta")))
-                (should (= (length callbacks) 2))
-                (should (= (length proofread--requests) 2))
-                (should-not proofread--diagnostics)
-                (should-not proofread--overlays))))
+              (proofread-test--with-llm-capabilities
+               (cl-letf (((symbol-function 'window-start)
+                          (lambda (&optional _window) (point-min)))
+                         ((symbol-function 'window-end)
+                          (lambda (&optional _window _update) (point-max)))
+                         ((symbol-function 'proofread-backend-check)
+                          (lambda (request callback &optional _backend)
+                            (push request requests)
+                            (push callback callbacks)
+                            'proofread-test-handle)))
+                 (proofread-check-visible)
+                 (setq requests (nreverse requests))
+                 (should (equal proofread--pending-ranges
+                                (list (cons (point-min) (point-max)))))
+                 (should (equal (mapcar (lambda (request)
+                                          (plist-get request :text))
+                                        requests)
+                                '("Alpha " " Beta")))
+                 (should (= (length callbacks) 2))
+                 (should (= (length proofread--requests) 2))
+                 (should-not proofread--diagnostics)
+                 (should-not proofread--overlays)))))
         (kill-buffer buffer)))))
 
 (ert-deftest proofread-test-check-visible-dispatches-sentence-chunks ()
@@ -2487,32 +2607,33 @@
                   (proofread-max-concurrent-requests 10)
                   requests
                   callbacks)
-              (cl-letf (((symbol-function 'window-start)
-                         (lambda (&optional _window) (point-min)))
-                        ((symbol-function 'window-end)
-                         (lambda (&optional _window _update) (point-max)))
-                        ((symbol-function 'proofread-backend-check)
-                         (lambda (request callback &optional _backend)
-                           (push request requests)
-                           (push callback callbacks)
-                           'proofread-test-handle)))
-                (proofread-check-visible)
-                (setq requests (nreverse requests))
-                (should (equal
-                         (mapcar (lambda (request)
-                                   (plist-get request :text))
-                                 requests)
-                         '("青晨六点半，小城的街到刚刚醒来。"
-                           "卖豆浆的滩主把炉子推到巷口。"
-                           "几个上班的人撑着伞从桥边经过。")))
-                (dolist (request requests)
-                  (should (equal
-                           (plist-get request :text)
-                           (buffer-substring-no-properties
-                            (plist-get request :beg)
-                            (plist-get request :end)))))
-                (should (= (length callbacks) 3))
-                (should (= (length proofread--requests) 3)))))
+              (proofread-test--with-llm-capabilities
+               (cl-letf (((symbol-function 'window-start)
+                          (lambda (&optional _window) (point-min)))
+                         ((symbol-function 'window-end)
+                          (lambda (&optional _window _update) (point-max)))
+                         ((symbol-function 'proofread-backend-check)
+                          (lambda (request callback &optional _backend)
+                            (push request requests)
+                            (push callback callbacks)
+                            'proofread-test-handle)))
+                 (proofread-check-visible)
+                 (setq requests (nreverse requests))
+                 (should (equal
+                          (mapcar (lambda (request)
+                                    (plist-get request :text))
+                                  requests)
+                          '("青晨六点半，小城的街到刚刚醒来。"
+                            "卖豆浆的滩主把炉子推到巷口。"
+                            "几个上班的人撑着伞从桥边经过。")))
+                 (dolist (request requests)
+                   (should (equal
+                            (plist-get request :text)
+                            (buffer-substring-no-properties
+                             (plist-get request :beg)
+                             (plist-get request :end)))))
+                 (should (= (length callbacks) 3))
+                 (should (= (length proofread--requests) 3))))))
         (kill-buffer buffer)))))
 
 (ert-deftest proofread-test-active-requests-remain-buffer-local ()
@@ -2524,29 +2645,30 @@
               (proofread-llm-provider proofread-test--llm-provider)
               (proofread-llm-provider-identity
                proofread-test--llm-provider-identity))
-          (cl-letf (((symbol-function 'proofread-backend-check)
-                     (lambda (_request _callback &optional _backend)
-                       'proofread-test-handle)))
-            (with-current-buffer first-buffer
-              (insert "Alpha")
-              (proofread-mode 1)
-              (proofread--dispatch-request-ready-chunks
-               (proofread--request-ready-chunks-for-ranges
-                (list (cons (point-min) (point-max))))))
-            (with-current-buffer second-buffer
-              (insert "Beta")
-              (proofread-mode 1)
-              (proofread--dispatch-request-ready-chunks
-               (proofread--request-ready-chunks-for-ranges
-                (list (cons (point-min) (point-max))))))
-            (with-current-buffer first-buffer
-              (should (= (length proofread--requests) 1))
-              (should (eq (plist-get (car proofread--requests) :buffer)
-                          first-buffer)))
-            (with-current-buffer second-buffer
-              (should (= (length proofread--requests) 1))
-              (should (eq (plist-get (car proofread--requests) :buffer)
-                          second-buffer)))))
+          (proofread-test--with-llm-capabilities
+           (cl-letf (((symbol-function 'proofread-backend-check)
+                      (lambda (_request _callback &optional _backend)
+                        'proofread-test-handle)))
+             (with-current-buffer first-buffer
+               (insert "Alpha")
+               (proofread-mode 1)
+               (proofread--dispatch-request-ready-chunks
+                (proofread--request-ready-chunks-for-ranges
+                 (list (cons (point-min) (point-max))))))
+             (with-current-buffer second-buffer
+               (insert "Beta")
+               (proofread-mode 1)
+               (proofread--dispatch-request-ready-chunks
+                (proofread--request-ready-chunks-for-ranges
+                 (list (cons (point-min) (point-max))))))
+             (with-current-buffer first-buffer
+               (should (= (length proofread--requests) 1))
+               (should (eq (plist-get (car proofread--requests) :buffer)
+                           first-buffer)))
+             (with-current-buffer second-buffer
+               (should (= (length proofread--requests) 1))
+               (should (eq (plist-get (car proofread--requests) :buffer)
+                           second-buffer))))))
       (kill-buffer first-buffer)
       (kill-buffer second-buffer))))
 
@@ -2565,29 +2687,30 @@
                    proofread-test--llm-provider-identity)
                   request
                   callback)
-              (cl-letf (((symbol-function 'window-start)
-                         (lambda (&optional _window) (point-min)))
-                        ((symbol-function 'window-end)
-                         (lambda (&optional _window _update) (point-max)))
-                        ((symbol-function 'proofread-backend-check)
-                         (lambda (backend-request backend-callback
-                                                  &optional _backend)
-                           (setq request backend-request)
-                           (setq callback backend-callback)
-                           'proofread-test-handle)))
-                (proofread-check-visible)
-                (should (proofread--active-request-p request))
-                (let ((diagnostic
-                       (proofread-test--diagnostic-for-range 1 5 "helo")))
-                  (should (eq (funcall
-                               callback
-                               (proofread--backend-success-result
-                                request (list diagnostic)))
-                              'applied))
-                  (should (equal proofread--diagnostics (list diagnostic)))
-                  (should (= (length proofread--overlays) 1))
-                  (should (overlay-buffer (car proofread--overlays)))
-                  (should-not (proofread--active-request-p request))))))
+              (proofread-test--with-llm-capabilities
+               (cl-letf (((symbol-function 'window-start)
+                          (lambda (&optional _window) (point-min)))
+                         ((symbol-function 'window-end)
+                          (lambda (&optional _window _update) (point-max)))
+                         ((symbol-function 'proofread-backend-check)
+                          (lambda (backend-request backend-callback
+                                                   &optional _backend)
+                            (setq request backend-request)
+                            (setq callback backend-callback)
+                            'proofread-test-handle)))
+                 (proofread-check-visible)
+                 (should (proofread--active-request-p request))
+                 (let ((diagnostic
+                        (proofread-test--diagnostic-for-range 1 5 "helo")))
+                   (should (eq (funcall
+                                callback
+                                (proofread--backend-success-result
+                                 request (list diagnostic)))
+                               'applied))
+                   (should (equal proofread--diagnostics (list diagnostic)))
+                   (should (= (length proofread--overlays) 1))
+                   (should (overlay-buffer (car proofread--overlays)))
+                   (should-not (proofread--active-request-p request)))))))
         (kill-buffer buffer)))))
 
 (ert-deftest proofread-test-context-does-not-shift-diagnostic-overlays ()
@@ -2632,17 +2755,18 @@
             (proofread-llm-provider proofread-test--llm-provider)
             (proofread-llm-provider-identity
              proofread-test--llm-provider-identity))
-        (cl-letf (((symbol-function 'window-start)
-                   (lambda (&optional _window) (point-min)))
-                  ((symbol-function 'window-end)
-                   (lambda (&optional _window _update) (point-max)))
-                  ((symbol-function 'proofread-backend-check)
-                   (lambda (backend-request backend-callback
-                                            &optional _backend)
-                     (setq request backend-request)
-                     (setq callback backend-callback)
-                     'proofread-test-handle)))
-          (proofread-check-visible)))
+        (proofread-test--with-llm-capabilities
+         (cl-letf (((symbol-function 'window-start)
+                    (lambda (&optional _window) (point-min)))
+                   ((symbol-function 'window-end)
+                    (lambda (&optional _window _update) (point-max)))
+                   ((symbol-function 'proofread-backend-check)
+                    (lambda (backend-request backend-callback
+                                             &optional _backend)
+                      (setq request backend-request)
+                      (setq callback backend-callback)
+                      'proofread-test-handle)))
+           (proofread-check-visible))))
       (kill-buffer buffer)
       (should-not (buffer-live-p buffer))
       (should (eq (funcall
@@ -2667,28 +2791,29 @@
                    proofread-test--llm-provider-identity)
                   request
                   callback)
-              (cl-letf (((symbol-function 'window-start)
-                         (lambda (&optional _window) (point-min)))
-                        ((symbol-function 'window-end)
-                         (lambda (&optional _window _update) (point-max)))
-                        ((symbol-function 'proofread-backend-check)
-                         (lambda (backend-request backend-callback
-                                                  &optional _backend)
-                           (setq request backend-request)
-                           (setq callback backend-callback)
-                           'proofread-test-handle)))
-                (proofread-check-visible)
-                (proofread-mode -1)
-                (should (eq (funcall
-                             callback
-                             (proofread--backend-success-result
-                              request
-                              (list (proofread-test--diagnostic-for-range
-                                     1 5 "helo"))))
-                            'stale))
-                (should-not proofread--diagnostics)
-                (should-not proofread--overlays)
-                (should-not proofread--requests))))
+              (proofread-test--with-llm-capabilities
+               (cl-letf (((symbol-function 'window-start)
+                          (lambda (&optional _window) (point-min)))
+                         ((symbol-function 'window-end)
+                          (lambda (&optional _window _update) (point-max)))
+                         ((symbol-function 'proofread-backend-check)
+                          (lambda (backend-request backend-callback
+                                                   &optional _backend)
+                            (setq request backend-request)
+                            (setq callback backend-callback)
+                            'proofread-test-handle)))
+                 (proofread-check-visible)
+                 (proofread-mode -1)
+                 (should (eq (funcall
+                              callback
+                              (proofread--backend-success-result
+                               request
+                               (list (proofread-test--diagnostic-for-range
+                                      1 5 "helo"))))
+                             'stale))
+                 (should-not proofread--diagnostics)
+                 (should-not proofread--overlays)
+                 (should-not proofread--requests)))))
         (kill-buffer buffer)))))
 
 (ert-deftest proofread-test-modified-tick-result-is-dropped ()
@@ -2706,29 +2831,30 @@
                    proofread-test--llm-provider-identity)
                   request
                   callback)
-              (cl-letf (((symbol-function 'window-start)
-                         (lambda (&optional _window) (point-min)))
-                        ((symbol-function 'window-end)
-                         (lambda (&optional _window _update) 5))
-                        ((symbol-function 'proofread-backend-check)
-                         (lambda (backend-request backend-callback
-                                                  &optional _backend)
-                           (setq request backend-request)
-                           (setq callback backend-callback)
-                           'proofread-test-handle)))
-                (proofread-check-visible)
-                (goto-char (point-max))
-                (insert "!")
-                (should (eq (funcall
-                             callback
-                             (proofread--backend-success-result
-                              request
-                              (list (proofread-test--diagnostic-for-range
-                                     1 5 "helo"))))
-                            'stale))
-                (should-not proofread--diagnostics)
-                (should-not proofread--overlays)
-                (should-not (proofread--active-request-p request)))))
+              (proofread-test--with-llm-capabilities
+               (cl-letf (((symbol-function 'window-start)
+                          (lambda (&optional _window) (point-min)))
+                         ((symbol-function 'window-end)
+                          (lambda (&optional _window _update) 5))
+                         ((symbol-function 'proofread-backend-check)
+                          (lambda (backend-request backend-callback
+                                                   &optional _backend)
+                            (setq request backend-request)
+                            (setq callback backend-callback)
+                            'proofread-test-handle)))
+                 (proofread-check-visible)
+                 (goto-char (point-max))
+                 (insert "!")
+                 (should (eq (funcall
+                              callback
+                              (proofread--backend-success-result
+                               request
+                               (list (proofread-test--diagnostic-for-range
+                                      1 5 "helo"))))
+                             'stale))
+                 (should-not proofread--diagnostics)
+                 (should-not proofread--overlays)
+                 (should-not (proofread--active-request-p request))))))
         (kill-buffer buffer)))))
 
 (ert-deftest proofread-test-text-mismatch-result-is-dropped ()
@@ -2746,33 +2872,34 @@
                    proofread-test--llm-provider-identity)
                   request
                   callback)
-              (cl-letf (((symbol-function 'window-start)
-                         (lambda (&optional _window) (point-min)))
-                        ((symbol-function 'window-end)
-                         (lambda (&optional _window _update) 5))
-                        ((symbol-function 'proofread-backend-check)
-                         (lambda (backend-request backend-callback
-                                                  &optional _backend)
-                           (setq request backend-request)
-                           (setq callback backend-callback)
-                           'proofread-test-handle)))
-                (proofread-check-visible)
-                (delete-region 1 5)
-                (insert "hello")
-                (let ((mismatched-request
-                       (plist-put (copy-sequence request)
-                                  :modified-tick
-                                  (buffer-chars-modified-tick))))
-                  (should (eq (funcall
-                               callback
-                               (proofread--backend-success-result
-                                mismatched-request
-                                (list (proofread-test--diagnostic-for-range
-                                       1 6 "hello"))))
-                              'stale)))
-                (should-not proofread--diagnostics)
-                (should-not proofread--overlays)
-                (should-not (proofread--active-request-p request)))))
+              (proofread-test--with-llm-capabilities
+               (cl-letf (((symbol-function 'window-start)
+                          (lambda (&optional _window) (point-min)))
+                         ((symbol-function 'window-end)
+                          (lambda (&optional _window _update) 5))
+                         ((symbol-function 'proofread-backend-check)
+                          (lambda (backend-request backend-callback
+                                                   &optional _backend)
+                            (setq request backend-request)
+                            (setq callback backend-callback)
+                            'proofread-test-handle)))
+                 (proofread-check-visible)
+                 (delete-region 1 5)
+                 (insert "hello")
+                 (let ((mismatched-request
+                        (plist-put (copy-sequence request)
+                                   :modified-tick
+                                   (buffer-chars-modified-tick))))
+                   (should (eq (funcall
+                                callback
+                                (proofread--backend-success-result
+                                 mismatched-request
+                                 (list (proofread-test--diagnostic-for-range
+                                        1 6 "hello"))))
+                               'stale)))
+                 (should-not proofread--diagnostics)
+                 (should-not proofread--overlays)
+                 (should-not (proofread--active-request-p request))))))
         (kill-buffer buffer)))))
 
 (ert-deftest proofread-test-backend-error-result-creates-no-overlays ()
@@ -2791,26 +2918,27 @@
                   (before-text (buffer-string))
                   request
                   callback)
-              (cl-letf (((symbol-function 'window-start)
-                         (lambda (&optional _window) (point-min)))
-                        ((symbol-function 'window-end)
-                         (lambda (&optional _window _update) (point-max)))
-                        ((symbol-function 'proofread-backend-check)
-                         (lambda (backend-request backend-callback
-                                                  &optional _backend)
-                           (setq request backend-request)
-                           (setq callback backend-callback)
-                           'proofread-test-handle)))
-                (proofread-check-visible)
-                (should (eq (funcall
-                             callback
-                             (proofread--backend-error-result
-                              request 'llm-failure "LLM failure"))
-                            'error))
-                (should (equal (buffer-string) before-text))
-                (should-not proofread--diagnostics)
-                (should-not proofread--overlays)
-                (should-not (proofread--active-request-p request)))))
+              (proofread-test--with-llm-capabilities
+               (cl-letf (((symbol-function 'window-start)
+                          (lambda (&optional _window) (point-min)))
+                         ((symbol-function 'window-end)
+                          (lambda (&optional _window _update) (point-max)))
+                         ((symbol-function 'proofread-backend-check)
+                          (lambda (backend-request backend-callback
+                                                   &optional _backend)
+                            (setq request backend-request)
+                            (setq callback backend-callback)
+                            'proofread-test-handle)))
+                 (proofread-check-visible)
+                 (should (eq (funcall
+                              callback
+                              (proofread--backend-error-result
+                               request 'llm-failure "LLM failure"))
+                             'error))
+                 (should (equal (buffer-string) before-text))
+                 (should-not proofread--diagnostics)
+                 (should-not proofread--overlays)
+                 (should-not (proofread--active-request-p request))))))
         (kill-buffer buffer)))))
 
 (ert-deftest proofread-test-navigation-sorts-and-filters-diagnostics ()
