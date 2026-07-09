@@ -263,6 +263,26 @@
       (should-not proofread--diagnostics)
       (should-not proofread--overlays))))
 
+(ert-deftest proofread-test-disable-mode-clears-untracked-overlays ()
+  "Disabling `proofread-mode' deletes untracked proofread overlays."
+  (with-temp-buffer
+    (insert "hello world again")
+    (proofread-mode 1)
+    (let* ((diagnostic (proofread-test--diagnostic))
+           (tracked-overlay (proofread--create-overlay diagnostic))
+           (orphan-overlay (make-overlay 8 13))
+           (foreign-overlay (make-overlay 8 13)))
+      (overlay-put orphan-overlay 'category proofread--overlay-category)
+      (overlay-put orphan-overlay 'face 'proofread-face)
+      (overlay-put foreign-overlay 'category 'foreign-overlay)
+      (setq proofread--overlays (list tracked-overlay))
+      (narrow-to-region 1 6)
+      (proofread-mode -1)
+      (should-not (overlay-buffer tracked-overlay))
+      (should-not (overlay-buffer orphan-overlay))
+      (should (overlay-buffer foreign-overlay))
+      (should-not proofread--overlays))))
+
 (ert-deftest proofread-test-check-visible-collects-single-window-range ()
   "`proofread-check-visible' records the selected visible window range."
   (save-window-excursion

@@ -2075,13 +2075,21 @@ When BACKEND is nil, use `proofread-backend'.  Return dispatched requests."
   (and (proofread--overlay-p overlay)
        (eq (overlay-buffer overlay) (current-buffer))))
 
-(defun proofread--prune-overlays ()
-  "Remove stale or foreign overlay references from `proofread--overlays'."
+(defun proofread--current-buffer-overlays ()
+  "Return all live proofread-owned overlays in the current buffer."
   (let (overlays)
-    (dolist (overlay proofread--overlays)
-      (when (proofread--current-buffer-overlay-p overlay)
-        (push overlay overlays)))
-    (setq proofread--overlays (nreverse overlays))))
+    (save-restriction
+      (widen)
+      (dolist (overlay (append proofread--overlays
+                               (overlays-in (point-min) (point-max))))
+        (when (and (proofread--current-buffer-overlay-p overlay)
+                   (not (memq overlay overlays)))
+          (push overlay overlays))))
+    (nreverse overlays)))
+
+(defun proofread--prune-overlays ()
+  "Synchronize `proofread--overlays' with live current-buffer overlays."
+  (setq proofread--overlays (proofread--current-buffer-overlays)))
 
 (defun proofread--delete-overlay (overlay)
   "Delete proofread-owned OVERLAY when it is live."
@@ -2471,11 +2479,11 @@ navigation order."
 
 (defun proofread--clear-overlays ()
   "Delete proofread-owned overlays in the current buffer."
-  (dolist (overlay proofread--overlays)
-    (when (proofread--current-buffer-overlay-p overlay)
-      (delete-overlay overlay)))
+  (dolist (overlay (proofread--current-buffer-overlays))
+    (delete-overlay overlay))
   (setq proofread--overlays nil)
-  (setq proofread--current-diagnostic nil))
+  (setq proofread--current-diagnostic nil)
+  (force-window-update (current-buffer)))
 
 (defun proofread--initialize-buffer-state ()
   "Initialize proofread-owned state for the current buffer."
