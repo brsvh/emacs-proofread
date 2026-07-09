@@ -1296,6 +1296,7 @@
       (should (equal (proofread--backend-identity)
                      `(:backend llm
                                 :provider ,proofread-test--llm-provider-identity
+                                :response-strategy prompt-json
                                 :prompt-version ,proofread-prompt-version)))
       (should (proofread--backend-identity-p (plist-get request :backend)))
       (proofread--cache-write-request request (list diagnostic))
@@ -1425,6 +1426,7 @@
                    (proofread-llm-provider proofread-test--llm-provider)
                    (proofread-llm-provider-identity
                     proofread-test--llm-provider-identity)
+                   (proofread-llm-response-strategy 'prompt-json)
                    (proofread-context-size 0)
                    (chunks (proofread--request-ready-chunks-for-ranges
                             (list (cons (point-min) (point-max)))))
@@ -1566,13 +1568,18 @@
       (should (eq (plist-get result :error) 'unsupported-backend)))))
 
 (ert-deftest proofread-test-llm-backend-availability ()
-  "LLM availability depends on provider and structured output support."
+  "LLM availability depends on provider and selected response strategy."
   (let ((proofread-backend 'llm)
         (proofread-llm-provider nil))
     (should-not (proofread-backend-available-p))
     (should-not (proofread-backend-available-p 'llm)))
   (let ((proofread-backend 'llm)
         (proofread-llm-provider 'proofread-test-provider))
+    (should (proofread-backend-available-p))
+    (should (proofread-backend-available-p 'llm)))
+  (let ((proofread-backend 'llm)
+        (proofread-llm-provider 'proofread-test-provider)
+        (proofread-llm-response-strategy 'provider-json))
     (should-not (proofread-backend-available-p))
     (should-not (proofread-backend-available-p 'llm)))
   (proofread-test--with-llm-capabilities
@@ -1602,10 +1609,11 @@
                   'llm-provider-unavailable)))))
 
 (ert-deftest proofread-test-llm-structured-output-unavailable-is-asynchronous-error ()
-  "LLM providers without schema output report an asynchronous backend error."
+  "Forced provider JSON reports an error when schema output is unavailable."
   (with-temp-buffer
     (insert "helo")
     (let* ((proofread-llm-provider proofread-test--llm-provider)
+           (proofread-llm-response-strategy 'provider-json)
            (chunk (car (proofread--request-ready-chunks-for-ranges
                         (list (cons (point-min) (point-max))))))
            (request (proofread--make-backend-request chunk 'llm))
@@ -1627,8 +1635,8 @@
         (should (eq (plist-get result :error)
                     'llm-structured-output-unavailable))))))
 
-(ert-deftest proofread-test-deepseek-v4-flash-structured-output-unavailable ()
-  "DeepSeek v4 flash is rejected before dispatch when schema output is absent."
+(ert-deftest proofread-test-deepseek-v4-flash-uses-prompt-json-fallback ()
+  "DeepSeek v4 flash uses prompt-only JSON when schema output is absent."
   (require 'llm-deepseek)
   (with-temp-buffer
     (insert "helo")
@@ -1637,10 +1645,17 @@
            (chunk (car (proofread--request-ready-chunks-for-ranges
                         (list (cons (point-min) (point-max))))))
            (request (proofread--make-backend-request chunk 'llm))
+           (content (proofread-test--response-content nil))
+           captured-prompt
            result)
+      (should-not (memq 'json-response
+                        (llm-capabilities proofread-llm-provider)))
       (cl-letf (((symbol-function 'llm-chat-async)
-                 (lambda (&rest _)
-                   (error "Unexpected llm-chat-async call"))))
+                 (lambda (_provider prompt success _error
+                                    &optional _multi-output)
+                   (setq captured-prompt prompt)
+                   (funcall success content)
+                   'proofread-test-llm-handle)))
         (should (proofread-backend-check
                  request
                  (lambda (backend-result)
@@ -1648,9 +1663,16 @@
                  'llm))
         (should-not result)
         (should (proofread-test--wait-for (lambda () result)))
-        (should (eq (plist-get result :status) 'error))
-        (should (eq (plist-get result :error)
-                    'llm-structured-output-unavailable))))))
+        (should (eq (plist-get result :status) 'ok))
+        (should-not (plist-get result :diagnostics))
+        (should-not (llm-chat-prompt-response-format captured-prompt))
+        (let* ((interaction
+                (car (llm-chat-prompt-interactions captured-prompt)))
+               (prompt-text
+                (llm-chat-prompt-interaction-content interaction)))
+          (should (string-match-p "JSON schema:" prompt-text))
+          (should (string-match-p "no Markdown code fence" prompt-text))
+          (should (string-match-p "Text:\nhelo" prompt-text)))))))
 
 (ert-deftest proofread-test-llm-provider-identity-is-stable ()
   "LLM identity uses stable provider metadata, not provider objects."
@@ -1667,6 +1689,8 @@
         (let ((provider (plist-get identity :provider)))
           (should (equal (plist-get provider :name) "qwen3:1.7b"))
           (should (integerp (plist-get provider :session))))
+        (should (eq (plist-get identity :response-strategy)
+                    'prompt-json))
         (should (equal (plist-get identity :prompt-version) "prompt-a"))
         (should-not (string-match-p
                      "secret-token"
@@ -1987,6 +2011,7 @@
            (prompt (proofread--structured-response-prompt request)))
       (should (string-match-p "requested response schema" prompt))
       (should (string-match-p "diagnostics array" prompt))
+      (should (string-match-p "only for the Text section" prompt))
       (should (string-match-p "zero-based chunk-relative offsets" prompt))
       (should (string-match-p "range end is exclusive" prompt))
       (dolist (field '("kind" "message" "text" "range"
@@ -2011,6 +2036,13 @@
       (should-not (string-match-p "When you can localize" prompt))
       (should (string-match-p "Set token_index and token_range to null"
                               prompt)))))
+
+(ert-deftest proofread-test-structured-response-schema-encodes-json-false ()
+  "Structured response schema encodes false as a JSON boolean."
+  (let ((schema (proofread--structured-response-schema-text)))
+    (should (string-match-p "\"additionalProperties\":false" schema))
+    (should-not
+     (string-match-p "\"additionalProperties\":\"false\"" schema))))
 
 (ert-deftest proofread-test-structured-response-extra-text-around-payload-is-error ()
   "Structured response parser rejects extra text around a payload."
@@ -2324,6 +2356,28 @@
       (let ((proofread-prompt-version "schema-v2"))
         (should-not (proofread--cache-read-request
                      (proofread--make-backend-request chunk)))))))
+
+(ert-deftest proofread-test-structured-response-strategy-cache-miss ()
+  "Structured response cache entries miss when LLM response strategy changes."
+  (with-temp-buffer
+    (insert "helo")
+    (proofread-mode 1)
+    (let* ((proofread-backend 'llm)
+           (proofread-llm-provider proofread-test--llm-provider)
+           (proofread-llm-provider-identity "provider")
+           (proofread-llm-response-strategy 'provider-json)
+           (chunk (car (proofread--request-ready-chunks-for-ranges
+                        (list (cons (point-min) (point-max))))))
+           (diagnostic
+            (proofread-test--diagnostic-for-range 1 5 "helo")))
+      (proofread-test--with-llm-capabilities
+       (let ((request (proofread--make-backend-request chunk)))
+         (proofread--cache-write-request request (list diagnostic))
+         (should (proofread--cache-read-request
+                  (proofread--make-backend-request chunk)))
+         (let ((proofread-llm-response-strategy 'prompt-json))
+           (should-not (proofread--cache-read-request
+                        (proofread--make-backend-request chunk)))))))))
 
 (ert-deftest proofread-test-tokenization-identity-cache-miss ()
   "Tokenization identity changes miss old cache entries."

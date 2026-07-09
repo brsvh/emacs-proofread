@@ -98,9 +98,19 @@ dispatch."
 (defcustom proofread-llm-provider nil
   "Provider object used when `proofread-backend' is `llm'.
 Users should configure this with a provider constructor from the GNU ELPA
-`llm' package.  Providers that do not advertise the `json-response' capability
-are rejected before request dispatch."
+`llm' package."
   :type 'sexp
+  :group 'proofread)
+
+(defcustom proofread-llm-response-strategy 'auto
+  "How the LLM backend requests structured diagnostics.
+The value `auto' uses provider-enforced JSON schema output when the provider
+advertises `json-response', and otherwise falls back to prompt-only JSON.  The
+value `provider-json' requires `json-response'.  The value `prompt-json' always
+uses ordinary chat output and asks the model to return only JSON."
+  :type '(choice (const :tag "Auto" auto)
+                 (const :tag "Provider JSON schema" provider-json)
+                 (const :tag "Prompt-only JSON" prompt-json))
   :group 'proofread)
 
 (defcustom proofread-llm-provider-identity nil
@@ -178,6 +188,9 @@ property has a non-nil value is not included in request-ready chunks."
    "The top-level response has a diagnostics array.  Each diagnostic has "
    "kind, message, text, range, token_index, token_range, suggestions, "
    "confidence, and source fields.\n"
+   "Report diagnostics only for the Text section.  Use context before and "
+   "context after only to understand the Text; never return ranges or text "
+   "from context.\n"
    "Use zero-based chunk-relative offsets; range end is exclusive.\n"
    "The text field must exactly equal the substring selected by range.\n"
    "Use kind values spelling, grammar, style, or other.\n"
@@ -204,21 +217,21 @@ property has a non-nil value is not included in request-ready chunks."
                           (:type "object"
                                  :properties (:beg (:type "integer") :end (:type "integer"))
                                  :required ["beg" "end"]
-                                 :additionalProperties :false)
+                                 :additionalProperties ,json-false)
                           :token_index (:type ["integer" "null"])
                           :token_range
                           (:type ["object" "null"]
                                  :properties (:beg (:type "integer") :end (:type "integer"))
                                  :required ["beg" "end"]
-                                 :additionalProperties :false)
+                                 :additionalProperties ,json-false)
                           :suggestions (:type "array" :items (:type "string"))
                           :confidence (:type ["number" "null"])
                           :source (:type ["string" "null"]))
                          :required ["kind" "message" "text" "range" "token_index"
                                     "token_range" "suggestions" "confidence" "source"]
-                         :additionalProperties :false)))
+                         :additionalProperties ,json-false)))
           :required ["diagnostics"]
-          :additionalProperties :false)
+          :additionalProperties ,json-false)
   "JSON schema requested from LLM providers for structured responses.")
 
 (defconst proofread--overlay-category 'proofread-overlay
@@ -1090,8 +1103,8 @@ When MESSAGE is non-nil, include it as caller-readable error text."
 When BACKEND is nil, check the selected `proofread-backend'."
   (pcase (or backend proofread-backend)
     ('llm (and proofread-llm-provider
-               (proofread--llm-provider-structured-output-p
-                proofread-llm-provider)))
+               (not (null (proofread--llm-response-strategy
+                           proofread-llm-provider)))))
     (_ nil)))
 
 (defun proofread--diagnostic-token-contract (request)
@@ -1121,11 +1134,26 @@ When BACKEND is nil, check the selected `proofread-backend'."
          "\n")
       "")))
 
-(defun proofread--structured-response-prompt (request)
+(defun proofread--structured-response-schema-text ()
+  "Return the diagnostic response schema as JSON text."
+  (json-encode proofread--structured-response-schema))
+
+(defun proofread--prompt-json-response-contract ()
+  "Return extra instructions for prompt-only JSON responses."
+  (concat
+   "The provider is not enforcing the schema.  Return exactly one JSON "
+   "object that matches this schema, with no Markdown code fence and no "
+   "other text.\n"
+   "JSON schema:\n"
+   (proofread--structured-response-schema-text)
+   "\n"))
+
+(defun proofread--structured-response-prompt (request &optional prompt-json)
   "Return the provider-independent proofreading prompt for REQUEST."
   (format
    (concat "Proofread the following text.\n\n"
            "%s\n"
+           "%s"
            "%s"
            "Language: %S\n"
            "Major mode: %S\n\n"
@@ -1134,6 +1162,9 @@ When BACKEND is nil, check the selected `proofread-backend'."
            "Context after:\n%s\n"
            "%s")
    proofread--structured-response-instructions
+   (if prompt-json
+       (proofread--prompt-json-response-contract)
+     "")
    (or (proofread--diagnostic-token-contract request) "")
    (plist-get request :language)
    (plist-get request :major-mode)
@@ -1378,11 +1409,17 @@ DEFAULT-SOURCE is used for diagnostics without an explicit source."
   (proofread--diagnostics-from-structured-payload
    request (proofread--structured-response-payload content) default-source))
 
-(defun proofread--llm-prompt (request)
-  "Return an `llm-chat-prompt' for backend REQUEST."
-  (llm-make-chat-prompt
-   (proofread--structured-response-prompt request)
-   :response-format proofread--structured-response-schema))
+(defun proofread--llm-prompt (request strategy)
+  "Return an `llm-chat-prompt' for backend REQUEST and STRATEGY."
+  (pcase strategy
+    ('provider-json
+     (llm-make-chat-prompt
+      (proofread--structured-response-prompt request)
+      :response-format proofread--structured-response-schema))
+    ('prompt-json
+     (llm-make-chat-prompt
+      (proofread--structured-response-prompt request t)))
+    (_ (error "Unsupported llm response strategy: %S" strategy))))
 
 (defun proofread--llm-response-content (response)
   "Return structured response content from LLM RESPONSE."
@@ -1417,11 +1454,27 @@ DEFAULT-SOURCE is used for diagnostics without an explicit source."
        (format "%s" message)
      (format "%S" error))))
 
-(defun proofread--llm-provider-structured-output-p (provider)
-  "Return non-nil when PROVIDER advertises structured JSON output."
+(defun proofread--llm-provider-json-response-p (provider)
+  "Return non-nil when PROVIDER advertises JSON response support."
   (condition-case nil
       (memq 'json-response (llm-capabilities provider))
     (error nil)))
+
+(defun proofread--llm-response-strategy (&optional provider)
+  "Return the actual LLM response strategy for PROVIDER, or nil.
+When PROVIDER is nil, use `proofread-llm-provider'."
+  (let ((provider (or provider proofread-llm-provider)))
+    (when provider
+      (pcase proofread-llm-response-strategy
+        ('auto
+         (if (proofread--llm-provider-json-response-p provider)
+             'provider-json
+           'prompt-json))
+        ('provider-json
+         (and (proofread--llm-provider-json-response-p provider)
+              'provider-json))
+        ('prompt-json 'prompt-json)
+        (_ nil)))))
 
 (defun proofread--llm-defer-callback (callback result)
   "Invoke CALLBACK with RESULT after the current call stack unwinds."
@@ -1440,20 +1493,20 @@ DEFAULT-SOURCE is used for diagnostics without an explicit source."
       (list :backend 'llm
             :request nil
             :timer timer)))
-   ((not (proofread--llm-provider-structured-output-p
-          proofread-llm-provider))
+   ((not (proofread--llm-response-strategy proofread-llm-provider))
     (let ((timer
            (proofread--llm-defer-callback
             callback
             (proofread--backend-error-result
              request 'llm-structured-output-unavailable
-             "The configured llm provider does not advertise json-response"))))
+             "The configured llm response strategy is unavailable"))))
       (list :backend 'llm
             :request nil
             :timer timer)))
    (t
     (let* ((provider proofread-llm-provider)
-           (prompt (proofread--llm-prompt request))
+           (strategy (proofread--llm-response-strategy provider))
+           (prompt (proofread--llm-prompt request strategy))
            (handle
             (condition-case err
                 (llm-chat-async
@@ -1583,6 +1636,8 @@ handle."
                                 (proofread--llm-provider-session-identity
                                  proofread-llm-provider)))
                     'unconfigured)
+        :response-strategy
+        (proofread--llm-response-strategy proofread-llm-provider)
         :prompt-version proofread-prompt-version))
 
 (defun proofread--backend-identity (&optional backend)
