@@ -1,0 +1,47 @@
+repository:
+  name: emacs-proofread
+  description: Context-aware LLM proofreading for GNU Emacs
+  private: false
+
+  has_issues: true
+  has_discussions: false
+  has_projects: false
+  has_wiki: false
+  has_downloads: false
+
+  default_branch: main
+
+  allow_squash_merge: true
+  allow_merge_commit: false
+  allow_rebase_merge: true
+  allow_auto_merge: false
+  allow_update_branch: true
+  delete_branch_on_merge: true
+
+  enable_vulnerability_alerts: false
+  enable_automated_security_fixes: false
+
+  security_and_analysis:
+    advanced_security:
+      status: disabled
+
+    code_security:
+      status: disabled
+
+    secret_scanning:
+      status: disabled
+
+    secret_scanning_push_protection:
+      status: disabled
+
+    secret_scanning_ai_detection:
+      status: disabled
+
+    secret_scanning_non_provider_patterns:
+      status: disabled
+
+    secret_scanning_delegated_alert_dismissal:
+      status: disabled
+
+    secret_scanning_delegated_bypass:
+      status: disabled
