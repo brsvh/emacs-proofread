@@ -2,6 +2,20 @@
   description = "Context-aware LLM proofreading for GNU Emacs";
 
   inputs = {
+    emacs-jieba-rs = {
+      inputs = {
+        flake-parts = {
+          follows = "flake-parts";
+        };
+
+        nixpkgs = {
+          follows = "nixpkgs";
+        };
+      };
+
+      url = "git+https://github.com/brsvh/emacs-jieba-rs.git?ref=main";
+    };
+
     flake-parts = {
       inputs = {
         nixpkgs-lib = {
@@ -19,6 +33,7 @@
 
   outputs =
     inputs@{
+      emacs-jieba-rs,
       flake-parts,
       nixpkgs,
       self,
@@ -147,6 +162,7 @@
                     ;
 
                   overlays = [
+                    emacs-jieba-rs.overlays.default
                     self.overlays.default
                   ];
                 };
@@ -169,6 +185,7 @@
                       (emacsPackagesFor base).emacsWithPackages
                         (
                           epkgs: with epkgs; [
+                            jieba-rs
                             llm
                             proofread
                           ]
