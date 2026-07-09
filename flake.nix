@@ -78,6 +78,7 @@
                     lib,
                     llm,
                     melpaBuild,
+                    posframe,
                     projectRoot,
                     ...
                   }:
@@ -91,6 +92,7 @@
                     packageRequires = [
                       jieba-rs
                       llm
+                      posframe
                     ];
 
                     meta = {
@@ -189,6 +191,7 @@
                           epkgs: with epkgs; [
                             jieba-rs
                             llm
+                            posframe
                             proofread
                           ]
                         );
