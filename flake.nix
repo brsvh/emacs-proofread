@@ -74,6 +74,7 @@
 
                 package =
                   {
+                    jieba-rs,
                     lib,
                     llm,
                     melpaBuild,
@@ -88,6 +89,7 @@
                   in
                   melpaBuild {
                     packageRequires = [
+                      jieba-rs
                       llm
                     ];
 

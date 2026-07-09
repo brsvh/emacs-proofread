@@ -71,6 +71,13 @@
             (plist-get chunk :text))
           chunks))
 
+(defun proofread-test--chunk-ranges (chunks)
+  "Return the buffer ranges from CHUNKS."
+  (mapcar (lambda (chunk)
+            (cons (plist-get chunk :beg)
+                  (plist-get chunk :end)))
+          chunks))
+
 (defun proofread-test--wait-for (predicate &optional timeout)
   "Wait until PREDICATE returns non-nil or TIMEOUT seconds pass."
   (let ((deadline (+ (float-time) (or timeout 1.0)))
@@ -450,7 +457,7 @@
 (ert-deftest proofread-test-chunks-for-ranges-ordinary-paragraph ()
   "Paragraph chunking records exact boundaries and text."
   (with-temp-buffer
-    (insert "First paragraph.\nSecond line.\n\nIgnored")
+    (insert "First paragraph. Second line.\n\nIgnored")
     (let* ((paragraph-end (save-excursion
                             (goto-char (point-min))
                             (search-forward "\n\n")
@@ -534,6 +541,177 @@
         (should (eq (get-text-property (point-min) 'face) 'bold))
         (should (get-text-property (point-min) 'proofread-test))
         (should-not (text-properties-at 0 (plist-get (car chunks) :text)))
+        (should-not proofread--diagnostics)
+        (should-not proofread--overlays)
+        (should-not proofread--requests)
+        (should (= (hash-table-count proofread--cache) 0))))))
+
+(ert-deftest proofread-test-sentence-chunking-splits-chinese-paragraph ()
+  "Chinese sentence punctuation splits a paragraph into sentence chunks."
+  (with-temp-buffer
+    (insert "第一句。第二句！第三句？")
+    (let* ((proofread-context-size 0)
+           (chunks (proofread--chunks-for-ranges
+                    (list (cons (point-min) (point-max))))))
+      (should (equal (proofread-test--chunk-texts chunks)
+                     '("第一句。" "第二句！" "第三句？")))
+      (dolist (chunk chunks)
+        (should (equal (plist-get chunk :text)
+                       (buffer-substring-no-properties
+                        (plist-get chunk :beg)
+                        (plist-get chunk :end))))))))
+
+(ert-deftest proofread-test-sentence-chunking-splits-newline ()
+  "Newline sentence boundaries can split visible text."
+  (with-temp-buffer
+    (insert "第一句\n第二句")
+    (let* ((proofread-context-size 0)
+           (chunks (proofread--chunks-for-ranges
+                    (list (cons (point-min) (point-max))))))
+      (should (equal (proofread-test--chunk-texts chunks)
+                     '("第一句\n" "第二句")))
+      (should (equal (proofread-test--chunk-ranges chunks)
+                     (list (cons (point-min) 5)
+                           (cons 5 (point-max))))))))
+
+(ert-deftest proofread-test-sentence-chunking-preserves-metadata-and-context ()
+  "Sentence chunks preserve exact text, metadata, and context."
+  (with-temp-buffer
+    (org-mode)
+    (let ((proofread-language "zh")
+          (proofread-context-size 3))
+      (insert "前文。目标句。后文。")
+      (let* ((tick (buffer-chars-modified-tick))
+             (chunks (proofread--chunks-for-ranges
+                      (list (cons (point-min) (point-max)))))
+             (chunk (cadr chunks)))
+        (should (equal (plist-get chunk :text) "目标句。"))
+        (should (equal (plist-get chunk :text)
+                       (buffer-substring-no-properties
+                        (plist-get chunk :beg)
+                        (plist-get chunk :end))))
+        (should (eq (plist-get chunk :major-mode) 'org-mode))
+        (should (equal (plist-get chunk :language) "zh"))
+        (should (= (plist-get chunk :modified-tick) tick))
+        (should (equal (plist-get chunk :context-before) "前文。"))
+        (should (equal (plist-get chunk :context-after) "后文。"))))))
+
+(ert-deftest proofread-test-sentence-chunking-bounds-oversized-sentence ()
+  "A single oversized sentence still splits into bounded chunks."
+  (with-temp-buffer
+    (insert "一二三四五六。")
+    (let* ((proofread-max-chunk-size 3)
+           (proofread-context-size 0)
+           (chunks (proofread--chunks-for-ranges
+                    (list (cons (point-min) (point-max))))))
+      (should (equal (proofread-test--chunk-texts chunks)
+                     '("一二三" "四五六" "。")))
+      (should (equal (proofread-test--chunk-ranges chunks)
+                     '((1 . 4) (4 . 7) (7 . 8))))
+      (should (cl-every (lambda (chunk)
+                          (<= (length (plist-get chunk :text))
+                              proofread-max-chunk-size))
+                        chunks)))))
+
+(ert-deftest proofread-test-sentence-chunking-falls-back-on-error ()
+  "Sentence boundary failures fall back to paragraph chunking."
+  (with-temp-buffer
+    (insert "第一句。第二句。")
+    (let ((proofread-context-size 0))
+      (cl-letf (((symbol-function 'proofread--sentence-boundary-available-p)
+                 (lambda () t))
+                ((symbol-function 'jieba-rs-forward-sentence)
+                 (lambda (&optional _arg)
+                   (error "synthetic sentence failure"))))
+        (let ((chunks (proofread--chunks-for-ranges
+                       (list (cons (point-min) (point-max))))))
+          (should (equal (proofread-test--chunk-texts chunks)
+                         '("第一句。第二句。")))
+          (should (= (length chunks) 1)))))))
+
+(ert-deftest proofread-test-sentence-chunking-falls-back-unavailable ()
+  "Unavailable sentence boundaries fall back without signaling."
+  (with-temp-buffer
+    (insert "第一句。第二句。")
+    (let ((proofread-context-size 0))
+      (cl-letf (((symbol-function 'proofread--sentence-boundary-available-p)
+                 (lambda () nil)))
+        (let ((chunks (proofread--chunks-for-ranges
+                       (list (cons (point-min) (point-max))))))
+          (should (equal (proofread-test--chunk-texts chunks)
+                         '("第一句。第二句。")))
+          (should (= (length chunks) 1)))))))
+
+(ert-deftest proofread-test-sentence-chunking-filtering-still-applies ()
+  "Request-ready filtering still excludes ignored text after sentence splitting."
+  (with-temp-buffer
+    (insert (concat "甲 http://example.com 乙。"
+                    "丙 user@example.com 丁。"
+                    "戊 HIDDEN 己。"
+                    "庚 SKIP 辛。"
+                    "壬 DROP 癸。"))
+    (let ((hidden-beg (progn
+                        (goto-char (point-min))
+                        (search-forward "HIDDEN")
+                        (match-beginning 0)))
+          (hidden-end (match-end 0))
+          (skip-beg (progn
+                      (goto-char (point-min))
+                      (search-forward "SKIP")
+                      (match-beginning 0)))
+          (skip-end (match-end 0))
+          (drop-beg (progn
+                      (goto-char (point-min))
+                      (search-forward "DROP")
+                      (match-beginning 0)))
+          (drop-end (match-end 0))
+          (proofread-ignored-faces '(proofread-test-ignore))
+          (proofread-ignored-properties '(proofread-test-ignore))
+          (proofread-context-size 0))
+      (add-text-properties hidden-beg hidden-end '(invisible t))
+      (add-text-properties skip-beg skip-end
+                           '(face proofread-test-ignore))
+      (add-text-properties drop-beg drop-end
+                           '(proofread-test-ignore t))
+      (let* ((chunks (proofread--request-ready-chunks-for-ranges
+                      (list (cons (point-min) (point-max)))))
+             (text (mapconcat #'identity
+                              (proofread-test--chunk-texts chunks)
+                              "")))
+        (dolist (chunk chunks)
+          (should (equal (plist-get chunk :text)
+                         (buffer-substring-no-properties
+                          (plist-get chunk :beg)
+                          (plist-get chunk :end)))))
+        (should-not (string-match-p "http://example.com" text))
+        (should-not (string-match-p "user@example.com" text))
+        (should-not (string-match-p "HIDDEN" text))
+        (should-not (string-match-p "SKIP" text))
+        (should-not (string-match-p "DROP" text))
+        (should (string-match-p "甲 " text))
+        (should (string-match-p " 癸。" text))))))
+
+(ert-deftest proofread-test-sentence-chunking-preserves-buffer-and-state ()
+  "Sentence-aware chunking preserves buffer and proofread state."
+  (with-temp-buffer
+    (insert (propertize "第一句。第二句。" 'face 'bold 'proofread-test t))
+    (proofread-mode 1)
+    (goto-char 3)
+    (push-mark 5 t t)
+    (let ((before-text (buffer-string))
+          (before-tick (buffer-chars-modified-tick))
+          (before-point (point))
+          (before-mark (mark t)))
+      (let ((chunks (proofread--chunks-for-ranges
+                     (list (cons (point-min) (point-max))))))
+        (should (equal (proofread-test--chunk-texts chunks)
+                       '("第一句。" "第二句。")))
+        (should (equal (buffer-string) before-text))
+        (should (= (buffer-chars-modified-tick) before-tick))
+        (should (= (point) before-point))
+        (should (= (mark t) before-mark))
+        (should (eq (get-text-property (point-min) 'face) 'bold))
+        (should (get-text-property (point-min) 'proofread-test))
         (should-not proofread--diagnostics)
         (should-not proofread--overlays)
         (should-not proofread--requests)
@@ -1992,6 +2170,50 @@
                 (should (= (length proofread--requests) 2))
                 (should-not proofread--diagnostics)
                 (should-not proofread--overlays))))
+        (kill-buffer buffer)))))
+
+(ert-deftest proofread-test-check-visible-dispatches-sentence-chunks ()
+  "`proofread-check-visible' dispatches sentence-level visible chunks."
+  (save-window-excursion
+    (let ((buffer (generate-new-buffer " *proofread-visible-sentences*")))
+      (unwind-protect
+          (progn
+            (switch-to-buffer buffer)
+            (insert (concat "青晨六点半，小城的街到刚刚醒来。"
+                            "卖豆浆的滩主把炉子推到巷口。"
+                            "几个上班的人撑着伞从桥边经过。"))
+            (proofread-mode 1)
+            (let ((proofread-backend 'mock)
+                  (proofread-context-size 0)
+                  (proofread-max-concurrent-requests 10)
+                  requests
+                  callbacks)
+              (cl-letf (((symbol-function 'window-start)
+                         (lambda (&optional _window) (point-min)))
+                        ((symbol-function 'window-end)
+                         (lambda (&optional _window _update) (point-max)))
+                        ((symbol-function 'proofread-backend-check)
+                         (lambda (request callback &optional _backend)
+                           (push request requests)
+                           (push callback callbacks)
+                           'proofread-test-handle)))
+                (proofread-check-visible)
+                (setq requests (nreverse requests))
+                (should (equal
+                         (mapcar (lambda (request)
+                                   (plist-get request :text))
+                                 requests)
+                         '("青晨六点半，小城的街到刚刚醒来。"
+                           "卖豆浆的滩主把炉子推到巷口。"
+                           "几个上班的人撑着伞从桥边经过。")))
+                (dolist (request requests)
+                  (should (equal
+                           (plist-get request :text)
+                           (buffer-substring-no-properties
+                            (plist-get request :beg)
+                            (plist-get request :end)))))
+                (should (= (length callbacks) 3))
+                (should (= (length proofread--requests) 3)))))
         (kill-buffer buffer)))))
 
 (ert-deftest proofread-test-active-requests-remain-buffer-local ()

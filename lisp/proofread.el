@@ -4,7 +4,7 @@
 
 ;; Author: Bingshan Chang <chang@bingshan.org>
 ;; Keywords: convenience, wp
-;; Package-Requires: ((emacs "30.1") (llm "0.31.1"))
+;; Package-Requires: ((emacs "30.1") (jieba-rs "0.1.0") (llm "0.31.1"))
 ;; Version: 0.1.0
 
 ;; This file is not part of GNU Emacs.
@@ -33,6 +33,8 @@
 (require 'json)
 (require 'llm)
 (require 'url)
+
+(declare-function jieba-rs-forward-sentence "jieba-rs" (&optional arg))
 
 (defgroup proofread nil
   "Context-aware proofreading for Emacs buffers."
@@ -405,6 +407,68 @@ Paragraphs are nonblank runs of lines separated by one or more blank lines."
         (push span spans)))
     (nreverse spans)))
 
+(defun proofread--sentence-boundary-available-p ()
+  "Return non-nil when Chinese sentence boundary movement is available."
+  (or (fboundp 'jieba-rs-forward-sentence)
+      (and (require 'jieba-rs nil t)
+           (fboundp 'jieba-rs-forward-sentence))))
+
+(defun proofread--forward-sentence-boundary (limit)
+  "Move to the next sentence boundary before LIMIT and return point.
+Return nil when sentence boundary movement is unavailable, fails, does not move
+point, or moves outside LIMIT."
+  (when (proofread--sentence-boundary-available-p)
+    (let ((origin (point)))
+      (condition-case nil
+          (progn
+            (jieba-rs-forward-sentence 1)
+            (if (and (> (point) origin)
+                     (<= (point) limit))
+                (point)
+              (goto-char origin)
+              nil))
+        (error
+         (goto-char origin)
+         nil)))))
+
+(defun proofread--sentence-spans-in-paragraph (span)
+  "Return sentence spans inside paragraph SPAN, or nil if unavailable."
+  (let ((beg (car span))
+        (end (cdr span))
+        spans
+        moved)
+    (save-mark-and-excursion
+      (save-restriction
+        (narrow-to-region beg end)
+        (goto-char beg)
+        (while (< (point) end)
+          (let ((span-beg (point))
+                (span-end (proofread--forward-sentence-boundary end)))
+            (if span-end
+                (progn
+                  (when (proofread--range-nonblank-p span-beg span-end)
+                    (push (cons span-beg span-end) spans))
+                  (setq moved t)
+                  (goto-char span-end))
+              (goto-char end)
+              (when (proofread--range-nonblank-p span-beg end)
+                (push (cons span-beg end) spans)))))))
+    (when (and moved spans)
+      (nreverse spans))))
+
+(defun proofread--sentence-or-paragraph-spans (span)
+  "Return sentence spans for SPAN, falling back to paragraph SPAN."
+  (or (proofread--sentence-spans-in-paragraph span)
+      (list span)))
+
+(defun proofread--sentence-spans-for-ranges (ranges)
+  "Return sentence-aware spans for visible RANGES."
+  (let (spans)
+    (dolist (span (proofread--paragraph-spans-for-ranges ranges))
+      (dolist (sentence-span (proofread--sentence-or-paragraph-spans span))
+        (push sentence-span spans)))
+    (nreverse spans)))
+
 (defun proofread--split-span-by-chunk-size (span)
   "Split SPAN into ranges no larger than `proofread-max-chunk-size'."
   (let ((beg (car span))
@@ -418,15 +482,15 @@ Paragraphs are nonblank runs of lines separated by one or more blank lines."
     (nreverse ranges)))
 
 (defun proofread--chunk-spans-for-ranges (ranges)
-  "Return bounded chunk spans for visible RANGES."
+  "Return sentence-aware bounded chunk spans for visible RANGES."
   (let (spans)
-    (dolist (span (proofread--paragraph-spans-for-ranges ranges))
+    (dolist (span (proofread--sentence-spans-for-ranges ranges))
       (dolist (chunk-span (proofread--split-span-by-chunk-size span))
         (push chunk-span spans)))
     (nreverse spans)))
 
 (defun proofread--chunks-for-ranges (ranges)
-  "Return paragraph chunks for visible RANGES in the current buffer."
+  "Return proofread chunks for visible RANGES in the current buffer."
   (let (chunks)
     (dolist (span (proofread--chunk-spans-for-ranges ranges))
       (push (proofread--make-chunk (car span) (cdr span)) chunks))
