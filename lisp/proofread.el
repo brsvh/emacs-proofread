@@ -120,7 +120,14 @@ old diagnostic cache entries."
   :type 'sexp
   :group 'proofread)
 
-(defcustom proofread-prompt-version "3"
+(defcustom proofread-llm-max-diagnostic-passes 3
+  "Maximum number of LLM passes used to find diagnostics for one request.
+Additional passes ask only for problems not already reported.  A value of 1
+uses a single LLM call."
+  :type 'natnum
+  :group 'proofread)
+
+(defcustom proofread-prompt-version "6"
   "Prompt contract version used to invalidate diagnostic cache entries."
   :type 'string
   :group 'proofread)
@@ -187,6 +194,15 @@ property has a non-nil value is not included in request-ready chunks."
    "The top-level response has a diagnostics array.  Each diagnostic has "
    "kind, message, text, range, token_index, token_range, suggestions, "
    "confidence, and source fields.\n"
+   "Report every independent problem in Text.  Do not stop after the first "
+   "problem in a sentence; when one sentence has multiple misspellings, grammar "
+   "issues, or style issues, return one diagnostic per issue.\n"
+   "Prefer the smallest exact text range that identifies each issue, and keep "
+   "diagnostics separate unless one correction requires a single combined "
+   "range.\n"
+   "For Chinese text, also check adjacent characters and tokens that may form "
+   "one misspelled word; do not assume individually valid neighboring tokens "
+   "are correct in context.\n"
    "Report diagnostics only for the Text section.  Use context before and "
    "context after only to understand the Text; never return ranges or text "
    "from context.\n"
@@ -1160,11 +1176,39 @@ When BACKEND is nil, check the selected `proofread-backend'."
    (proofread--structured-response-schema-text)
    "\n"))
 
-(defun proofread--structured-response-prompt (request &optional prompt-json)
+(defun proofread--reported-diagnostic-line (request diagnostic)
+  "Return a prompt line for previously reported DIAGNOSTIC in REQUEST."
+  (let ((request-beg (plist-get request :beg)))
+    (format "- range [%d,%d], text %S, kind %S, message %S\n"
+            (- (plist-get diagnostic :beg) request-beg)
+            (- (plist-get diagnostic :end) request-beg)
+            (plist-get diagnostic :text)
+            (plist-get diagnostic :kind)
+            (plist-get diagnostic :message))))
+
+(defun proofread--reported-diagnostics-prompt (request diagnostics)
+  "Return prompt text describing already reported DIAGNOSTICS for REQUEST."
+  (when diagnostics
+    (concat
+     "Already reported diagnostics for this same Text:\n"
+     (mapconcat
+      (lambda (diagnostic)
+        (proofread--reported-diagnostic-line request diagnostic))
+      diagnostics
+      "")
+     "Return only additional diagnostics not already reported above.  Do not "
+     "repeat diagnostics with the same range and text.  Scan the full Text "
+     "again, especially unreported words and token spans before, after, and "
+     "between the listed ranges.  Use an empty diagnostics array when no "
+     "additional problems remain.\n\n")))
+
+(defun proofread--structured-response-prompt
+    (request &optional prompt-json reported-diagnostics)
   "Return the provider-independent proofreading prompt for REQUEST."
   (format
    (concat "Proofread the following text.\n\n"
            "%s\n"
+           "%s"
            "%s"
            "%s"
            "Language: %S\n"
@@ -1174,6 +1218,9 @@ When BACKEND is nil, check the selected `proofread-backend'."
            "Context after:\n%s\n"
            "%s")
    proofread--structured-response-instructions
+   (or (proofread--reported-diagnostics-prompt
+        request reported-diagnostics)
+       "")
    (if prompt-json
        (proofread--prompt-json-response-contract)
      "")
@@ -1421,16 +1468,18 @@ DEFAULT-SOURCE is used for diagnostics without an explicit source."
   (proofread--diagnostics-from-structured-payload
    request (proofread--structured-response-payload content) default-source))
 
-(defun proofread--llm-prompt (request strategy)
-  "Return an `llm-chat-prompt' for backend REQUEST and STRATEGY."
+(defun proofread--llm-prompt (request strategy &optional reported-diagnostics)
+  "Return an `llm-chat-prompt' for REQUEST, STRATEGY, and diagnostics."
   (pcase strategy
     ('provider-json
      (llm-make-chat-prompt
-      (proofread--structured-response-prompt request)
+      (proofread--structured-response-prompt
+       request nil reported-diagnostics)
       :response-format proofread--structured-response-schema))
     ('prompt-json
      (llm-make-chat-prompt
-      (proofread--structured-response-prompt request t)))
+      (proofread--structured-response-prompt
+       request t reported-diagnostics)))
     (_ (error "Unsupported llm response strategy: %S" strategy))))
 
 (defun proofread--llm-response-content (response)
@@ -1492,6 +1541,89 @@ When PROVIDER is nil, use `proofread-llm-provider'."
   "Invoke CALLBACK with RESULT after the current call stack unwinds."
   (run-at-time 0 nil #'proofread--invoke-backend-callback callback result))
 
+(defun proofread--llm-diagnostic-passes ()
+  "Return the configured number of diagnostic LLM passes."
+  (max 1 proofread-llm-max-diagnostic-passes))
+
+(defun proofread--same-diagnostic-p (left right)
+  "Return non-nil when LEFT and RIGHT describe the same diagnostic."
+  (and (equal (plist-get left :beg) (plist-get right :beg))
+       (equal (plist-get left :end) (plist-get right :end))
+       (equal (plist-get left :text) (plist-get right :text))))
+
+(defun proofread--diagnostic-member-p (diagnostic diagnostics)
+  "Return non-nil when DIAGNOSTIC is already in DIAGNOSTICS."
+  (catch 'found
+    (dolist (candidate diagnostics)
+      (when (proofread--same-diagnostic-p diagnostic candidate)
+        (throw 'found t)))
+    nil))
+
+(defun proofread--append-new-diagnostics (diagnostics new-diagnostics)
+  "Return DIAGNOSTICS followed by non-duplicate NEW-DIAGNOSTICS."
+  (let ((merged (copy-sequence diagnostics)))
+    (dolist (diagnostic new-diagnostics)
+      (unless (proofread--diagnostic-member-p diagnostic merged)
+        (setq merged (append merged (list diagnostic)))))
+    merged))
+
+(defun proofread--llm-finish-or-continue
+    (request callback submit max-passes pass diagnostics result)
+  "Handle one LLM RESULT for REQUEST and maybe call SUBMIT again.
+MAX-PASSES is the request-local diagnostic pass limit."
+  (pcase (plist-get result :status)
+    ('ok
+     (let* ((new-diagnostics (plist-get result :diagnostics))
+            (merged (proofread--append-new-diagnostics
+                     diagnostics new-diagnostics)))
+       (if (and new-diagnostics
+                (> (length merged) (length diagnostics))
+                (< pass max-passes))
+           (funcall submit (1+ pass) merged)
+         (proofread--llm-defer-callback
+          callback
+          (proofread--backend-success-result request merged)))))
+    (_
+     (proofread--llm-defer-callback
+      callback
+      (if diagnostics
+          (proofread--backend-success-result request diagnostics)
+        result)))))
+
+(defun proofread--llm-submit-passes (provider strategy request callback handle)
+  "Submit REQUEST to PROVIDER using STRATEGY and record requests in HANDLE."
+  (let ((max-passes (proofread--llm-diagnostic-passes)))
+    (cl-labels
+        ((submit
+           (pass diagnostics)
+           (let ((prompt (proofread--llm-prompt request strategy diagnostics)))
+             (condition-case err
+                 (let ((request-handle
+                        (llm-chat-async
+                         provider prompt
+                         (lambda (response)
+                           (proofread--llm-finish-or-continue
+                            request callback #'submit max-passes pass diagnostics
+                            (proofread--llm-success-result request response)))
+                         (lambda (error &optional message &rest _)
+                           (proofread--llm-finish-or-continue
+                            request callback #'submit max-passes pass diagnostics
+                            (proofread--llm-error-result
+                             request error message))))))
+                   (plist-put handle
+                              :requests
+                              (cons request-handle
+                                    (plist-get handle :requests))))
+               (error
+                (proofread--llm-defer-callback
+                 callback
+                 (if diagnostics
+                     (proofread--backend-success-result request diagnostics)
+                   (proofread--backend-error-result
+                    request 'llm-submit-error (error-message-string err)))))))))
+      (submit 1 nil)))
+  handle)
+
 (defun proofread--llm-backend-check (request callback)
   "Submit REQUEST to `proofread-llm-provider' asynchronously."
   (cond
@@ -1518,28 +1650,10 @@ When PROVIDER is nil, use `proofread-llm-provider'."
    (t
     (let* ((provider proofread-llm-provider)
            (strategy (proofread--llm-response-strategy provider))
-           (prompt (proofread--llm-prompt request strategy))
-           (handle
-            (condition-case err
-                (llm-chat-async
-                 provider prompt
-                 (lambda (response)
-                   (proofread--llm-defer-callback
-                    callback
-                    (proofread--llm-success-result request response)))
-                 (lambda (error &optional message &rest _)
-                   (proofread--llm-defer-callback
-                    callback
-                    (proofread--llm-error-result
-                     request error message))))
-              (error
-               (proofread--llm-defer-callback
-                callback
-                (proofread--backend-error-result
-                 request 'llm-submit-error (error-message-string err)))
-               nil))))
-      (list :backend 'llm
-            :request handle)))))
+           (handle (list :backend 'llm
+                         :requests nil)))
+      (proofread--llm-submit-passes
+       provider strategy request callback handle)))))
 
 (defun proofread--unsupported-backend-check (backend request callback)
   "Report unsupported BACKEND for REQUEST through CALLBACK asynchronously."
@@ -1650,6 +1764,7 @@ handle."
                     'unconfigured)
         :response-strategy
         (proofread--llm-response-strategy proofread-llm-provider)
+        :diagnostic-passes (proofread--llm-diagnostic-passes)
         :prompt-version proofread-prompt-version))
 
 (defun proofread--backend-identity (&optional backend)
@@ -1820,12 +1935,15 @@ When BACKEND is nil, use `proofread-backend'.  Return dispatched requests."
 (defun proofread--cancel-request-handle (handle)
   "Cancel backend HANDLE when the backend supports cancellation."
   (when (and (listp handle)
-             (eq (plist-get handle :backend) 'llm)
-             (plist-get handle :request))
+             (eq (plist-get handle :backend) 'llm))
     (let ((warning-minimum-level :error)
           (warning-minimum-log-level :error))
-      (ignore-errors
-        (llm-cancel-request (plist-get handle :request))))))
+      (dolist (request-handle
+               (or (plist-get handle :requests)
+                   (and (plist-get handle :request)
+                        (list (plist-get handle :request)))))
+        (ignore-errors
+          (llm-cancel-request request-handle))))))
 
 (defun proofread--cancel-active-requests ()
   "Cancel cancellable active backend requests for the current buffer."

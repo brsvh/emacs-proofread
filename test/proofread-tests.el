@@ -1301,6 +1301,7 @@
                      `(:backend llm
                                 :provider ,proofread-test--llm-provider-identity
                                 :response-strategy prompt-json
+                                :diagnostic-passes 3
                                 :prompt-version ,proofread-prompt-version)))
       (should (proofread--backend-identity-p (plist-get request :backend)))
       (proofread--cache-write-request request (list diagnostic))
@@ -1756,6 +1757,7 @@
     (insert "helo")
     (let* ((proofread-language "en")
            (proofread-llm-provider 'proofread-test-provider)
+           (proofread-llm-max-diagnostic-passes 1)
            (chunk (car (proofread--request-ready-chunks-for-ranges
                         (list (cons (point-min) (point-max))))))
            (request (proofread--make-backend-request chunk 'llm))
@@ -1782,8 +1784,8 @@
                 (lambda (backend-result)
                   (setq result backend-result))
                 'llm)))
-          (should (equal (plist-get handle :request)
-                         'proofread-test-llm-handle))
+          (should (equal (plist-get handle :requests)
+                         '(proofread-test-llm-handle)))
           (should (eq captured-provider proofread-llm-provider))
           (should-not captured-multi-output)
           (should (equal (llm-chat-prompt-response-format captured-prompt)
@@ -1878,6 +1880,59 @@
         (should (= (length proofread--overlays) 1))
         (should (= (hash-table-count proofread--cache) 1))))))
 
+(ert-deftest proofread-test-llm-collects-additional-diagnostic-passes ()
+  "LLM backend can collect additional diagnostics in later passes."
+  (with-temp-buffer
+    (insert "helo wrld")
+    (let* ((proofread-llm-provider 'proofread-test-provider)
+           (proofread-llm-max-diagnostic-passes 2)
+           (chunk (car (proofread--request-ready-chunks-for-ranges
+                        (list (cons (point-min) (point-max))))))
+           (request (proofread--make-backend-request chunk 'llm))
+           (first
+            (proofread-test--response-content
+             (list (proofread-test--response-diagnostic 0 4 "helo"))))
+           (second
+            (proofread-test--response-content
+             (list (proofread-test--response-diagnostic 5 9 "wrld"))))
+           calls
+           prompts
+           result)
+      (cl-letf (((symbol-function 'llm-chat-async)
+                 (lambda (_provider prompt success _error
+                                    &optional _multi-output)
+                   (push prompt prompts)
+                   (setq calls (1+ (or calls 0)))
+                   (funcall success
+                            (if (= calls 1)
+                                first
+                              second))
+                   (intern (format "proofread-test-handle-%d" calls))))
+                ((symbol-function 'llm-capabilities)
+                 #'proofread-test--llm-capabilities))
+        (let ((handle (proofread-backend-check
+                       request
+                       (lambda (backend-result)
+                         (setq result backend-result))
+                       'llm)))
+          (should (= calls 2))
+          (should (= (length (plist-get handle :requests)) 2))
+          (let* ((second-prompt (car prompts))
+                 (interaction
+                  (car (llm-chat-prompt-interactions second-prompt)))
+                 (prompt-text
+                  (llm-chat-prompt-interaction-content interaction)))
+            (should (string-match-p "Already reported diagnostics"
+                                    prompt-text))
+            (should (string-match-p "Return only additional diagnostics"
+                                    prompt-text)))
+          (should (proofread-test--wait-for (lambda () result)))
+          (should (eq (plist-get result :status) 'ok))
+          (should (equal (mapcar (lambda (diagnostic)
+                                   (plist-get diagnostic :text))
+                                 (plist-get result :diagnostics))
+                         '("helo" "wrld"))))))))
+
 (ert-deftest proofread-test-llm-error-preserves-buffer-and-clears-request ()
   "LLM error callbacks preserve text and clear active request state."
   (with-temp-buffer
@@ -1952,6 +2007,7 @@
               (insert "helo")
               (proofread-mode 1)
               (let* ((proofread-llm-provider 'proofread-test-provider)
+                     (proofread-llm-max-diagnostic-passes 1)
                      (chunk (car (proofread--request-ready-chunks-for-ranges
                                   (list (cons (point-min)
                                               (point-max)))))))
@@ -2015,6 +2071,10 @@
            (prompt (proofread--structured-response-prompt request)))
       (should (string-match-p "requested response schema" prompt))
       (should (string-match-p "diagnostics array" prompt))
+      (should (string-match-p "every independent problem" prompt))
+      (should (string-match-p "Do not stop after the first" prompt))
+      (should (string-match-p "one diagnostic per issue" prompt))
+      (should (string-match-p "adjacent characters and tokens" prompt))
       (should (string-match-p "only for the Text section" prompt))
       (should (string-match-p "zero-based chunk-relative offsets" prompt))
       (should (string-match-p "range end is exclusive" prompt))
@@ -2126,6 +2186,32 @@
       (should (equal (plist-get (car diagnostics) :suggestions)
                      '("hello")))
       (should (eq (plist-get (car diagnostics) :source) 'llm)))))
+
+(ert-deftest proofread-test-structured-response-preserves-multiple-diagnostics ()
+  "Structured response keeps multiple diagnostics from one request."
+  (with-temp-buffer
+    (insert "helo wrld")
+    (let* ((chunk (car (proofread--request-ready-chunks-for-ranges
+                        (list (cons (point-min) (point-max))))))
+           (request (proofread--make-backend-request chunk 'llm))
+           (content
+            (proofread-test--response-content
+             (list
+              (proofread-test--response-diagnostic 0 4 "helo" '("hello"))
+              (proofread-test--response-diagnostic 5 9 "wrld" '("world")))))
+           (diagnostics
+            (proofread--diagnostics-from-structured-response
+             request content 'llm)))
+      (should (= (length diagnostics) 2))
+      (should (equal (mapcar (lambda (diagnostic)
+                               (plist-get diagnostic :text))
+                             diagnostics)
+                     '("helo" "wrld")))
+      (should (equal (mapcar (lambda (diagnostic)
+                               (cons (plist-get diagnostic :beg)
+                                     (plist-get diagnostic :end)))
+                             diagnostics)
+                     '((1 . 5) (6 . 10)))))))
 
 (ert-deftest proofread-test-structured-response-out-of-range-is-dropped ()
   "Structured response diagnostics outside the request chunk are dropped."
@@ -2382,6 +2468,27 @@
          (let ((proofread-llm-response-strategy 'prompt-json))
            (should-not (proofread--cache-read-request
                         (proofread--make-backend-request chunk)))))))))
+
+(ert-deftest proofread-test-llm-diagnostic-passes-cache-miss ()
+  "Cache entries miss when LLM diagnostic pass count changes."
+  (with-temp-buffer
+    (insert "helo")
+    (proofread-mode 1)
+    (let* ((proofread-backend 'llm)
+           (proofread-llm-provider proofread-test--llm-provider)
+           (proofread-llm-provider-identity "provider")
+           (proofread-llm-max-diagnostic-passes 1)
+           (chunk (car (proofread--request-ready-chunks-for-ranges
+                        (list (cons (point-min) (point-max))))))
+           (request (proofread--make-backend-request chunk))
+           (diagnostic
+            (proofread-test--diagnostic-for-range 1 5 "helo")))
+      (proofread--cache-write-request request (list diagnostic))
+      (should (proofread--cache-read-request
+               (proofread--make-backend-request chunk)))
+      (let ((proofread-llm-max-diagnostic-passes 2))
+        (should-not (proofread--cache-read-request
+                     (proofread--make-backend-request chunk)))))))
 
 (ert-deftest proofread-test-tokenization-identity-cache-miss ()
   "Tokenization identity changes miss old cache entries."
