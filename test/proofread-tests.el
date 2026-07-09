@@ -78,6 +78,12 @@
                   (plist-get chunk :end)))
           chunks))
 
+(defun proofread-test--chunk-with-text (chunks text)
+  "Return the first chunk from CHUNKS whose text is TEXT."
+  (cl-find-if (lambda (chunk)
+                (equal (plist-get chunk :text) text))
+              chunks))
+
 (defun proofread-test--wait-for (predicate &optional timeout)
   "Wait until PREDICATE returns non-nil or TIMEOUT seconds pass."
   (let ((deadline (+ (float-time) (or timeout 1.0)))
@@ -923,6 +929,192 @@
           (should-not (string-match-p "http://example.com"
                                       (plist-get chunk :context-after))))))))
 
+(ert-deftest proofread-test-request-ready-context-default-sentences ()
+  "Request-ready chunks use one complete sentence of context by default."
+  (with-temp-buffer
+    (insert "前文。目标句。后文。")
+    (let* ((proofread-language "zh")
+           (proofread-context-size 300)
+           (chunks (proofread--request-ready-chunks-for-ranges
+                    (list (cons (point-min) (point-max)))))
+           (chunk (proofread-test--chunk-with-text chunks "目标句。")))
+      (should chunk)
+      (should (equal (plist-get chunk :context-before) "前文。"))
+      (should (equal (plist-get chunk :context-after) "后文。")))))
+
+(ert-deftest proofread-test-request-ready-context-configured-counts ()
+  "Configured sentence counts change request-ready context windows."
+  (with-temp-buffer
+    (insert "一。二。三。目标。四。五。六。")
+    (let* ((proofread-language "zh")
+           (proofread-context-size 300)
+           (proofread-context-sentences-before 2)
+           (proofread-context-sentences-after 2)
+           (chunks (proofread--request-ready-chunks-for-ranges
+                    (list (cons (point-min) (point-max)))))
+           (chunk (proofread-test--chunk-with-text chunks "目标。")))
+      (should chunk)
+      (should (equal (plist-get chunk :context-before) "二。三。"))
+      (should (equal (plist-get chunk :context-after) "四。五。")))))
+
+(ert-deftest proofread-test-request-ready-context-zero-counts ()
+  "Zero sentence counts disable the corresponding context direction."
+  (with-temp-buffer
+    (insert "前文。目标句。后文。")
+    (let* ((proofread-language "zh")
+           (proofread-context-size 300)
+           (proofread-context-sentences-before 0)
+           (proofread-context-sentences-after 0)
+           (chunks (proofread--request-ready-chunks-for-ranges
+                    (list (cons (point-min) (point-max)))))
+           (chunk (proofread-test--chunk-with-text chunks "目标句。")))
+      (should chunk)
+      (should (equal (plist-get chunk :context-before) ""))
+      (should (equal (plist-get chunk :context-after) "")))))
+
+(ert-deftest proofread-test-request-ready-context-keeps-hard-wrap-sentence ()
+  "Hard-wrapped prose newlines do not split logical context sentences."
+  (with-temp-buffer
+    (insert "前半句\n后半句。目标句。")
+    (let* ((proofread-language "zh")
+           (proofread-context-size 300)
+           (chunks (proofread--request-ready-chunks-for-ranges
+                    (list (cons (point-min) (point-max)))))
+           (chunk (proofread-test--chunk-with-text chunks "目标句。")))
+      (should chunk)
+      (should (equal (plist-get chunk :context-before)
+                     "前半句\n后半句。"))
+      (should (equal (plist-get chunk :text)
+                     (buffer-substring-no-properties
+                      (plist-get chunk :beg)
+                      (plist-get chunk :end)))))))
+
+(ert-deftest proofread-test-request-ready-context-ignores-visual-wrapping ()
+  "Visual wrapping does not affect request-ready sentence context."
+  (with-temp-buffer
+    (insert "前文。目标句。后文。")
+    (let* ((proofread-language "zh")
+           (proofread-context-size 300)
+           (range (list (cons (point-min) (point-max))))
+           (plain (proofread--request-ready-chunks-for-ranges range)))
+      (visual-line-mode 1)
+      (let ((wrapped (proofread--request-ready-chunks-for-ranges range)))
+        (should (equal (proofread-test--chunk-texts wrapped)
+                       (proofread-test--chunk-texts plain)))
+        (cl-mapc
+         (lambda (left right)
+           (should (equal (plist-get left :context-before)
+                          (plist-get right :context-before)))
+           (should (equal (plist-get left :context-after)
+                          (plist-get right :context-after))))
+         plain wrapped)))))
+
+(ert-deftest proofread-test-request-ready-context-stops-at-blank-lines ()
+  "Blank lines stop request-ready sentence context search."
+  (with-temp-buffer
+    (insert "前文。\n\n目标句。\n\n后文。")
+    (let* ((proofread-language "zh")
+           (proofread-context-size 300)
+           (chunks (proofread--request-ready-chunks-for-ranges
+                    (list (cons (point-min) (point-max)))))
+           (chunk (proofread-test--chunk-with-text chunks "目标句。")))
+      (should chunk)
+      (should (equal (plist-get chunk :context-before) ""))
+      (should (equal (plist-get chunk :context-after) "")))))
+
+(ert-deftest proofread-test-request-ready-context-stops-at-org-structure ()
+  "Org structural lines stop request-ready sentence context search."
+  (dolist (text '("前文。\n* 标题\n目标句。"
+                  "前文。\n#+TITLE: 标题\n目标句。"
+                  "前文。\n:PROPERTIES:\n:CUSTOM_ID: x\n:END:\n目标句。"
+                  "前文。\n- 项目\n目标句。"
+                  "前文。\n| 表格 |\n目标句。"
+                  "前文。\n#+begin_quote\n引用。\n#+end_quote\n目标句。"))
+    (with-temp-buffer
+      (org-mode)
+      (insert text)
+      (let* ((proofread-language "zh")
+             (proofread-context-size 300)
+             (chunks (proofread--request-ready-chunks-for-ranges
+                      (list (cons (point-min) (point-max)))))
+             (chunk (proofread-test--chunk-with-text chunks "目标句。")))
+        (should chunk)
+        (should (equal (plist-get chunk :context-before) ""))))))
+
+(ert-deftest proofread-test-request-ready-context-filters-ignored-text ()
+  "Sentence context excludes ignored URL, email, invisible, face, and property."
+  (with-temp-buffer
+    (insert "访问 http://example.com，联系 user@example.com，保留 HIDDEN SKIP DROP。目标句。")
+    (let ((hidden-beg (progn
+                        (goto-char (point-min))
+                        (search-forward "HIDDEN")
+                        (match-beginning 0)))
+          (hidden-end (match-end 0))
+          (skip-beg (progn
+                      (goto-char (point-min))
+                      (search-forward "SKIP")
+                      (match-beginning 0)))
+          (skip-end (match-end 0))
+          (drop-beg (progn
+                      (goto-char (point-min))
+                      (search-forward "DROP")
+                      (match-beginning 0)))
+          (drop-end (match-end 0))
+          (proofread-language "zh")
+          (proofread-context-size 300)
+          (proofread-ignored-faces '(proofread-test-ignore))
+          (proofread-ignored-properties '(proofread-test-ignore)))
+      (add-text-properties hidden-beg hidden-end '(invisible t))
+      (add-text-properties skip-beg skip-end
+                           '(face proofread-test-ignore))
+      (add-text-properties drop-beg drop-end
+                           '(proofread-test-ignore t))
+      (let* ((chunks (proofread--request-ready-chunks-for-ranges
+                      (list (cons (point-min) (point-max)))))
+             (chunk (proofread-test--chunk-with-text chunks "目标句。"))
+             (context (plist-get chunk :context-before)))
+        (should chunk)
+        (should-not (string-match-p "http://example.com" context))
+        (should-not (string-match-p "user@example.com" context))
+        (should-not (string-match-p "HIDDEN" context))
+        (should-not (string-match-p "SKIP" context))
+        (should-not (string-match-p "DROP" context))
+        (should (string-match-p "访问" context))))))
+
+(ert-deftest proofread-test-request-ready-context-oversized-fallback ()
+  "Oversized single-sentence context uses bounded character fallback."
+  (with-temp-buffer
+    (insert "很长很长的前置句子。目标句。")
+    (let* ((proofread-language "zh")
+           (proofread-context-size 4)
+           (chunks (proofread--request-ready-chunks-for-ranges
+                    (list (cons (point-min) (point-max)))))
+           (chunk (proofread-test--chunk-with-text chunks "目标句。"))
+           (beg (plist-get chunk :beg))
+           (expected (buffer-substring-no-properties (- beg 4) beg)))
+      (should chunk)
+      (should (equal (plist-get chunk :context-before) expected))
+      (should (<= (length (plist-get chunk :context-before))
+                  proofread-context-size))
+      (should (equal (plist-get chunk :text)
+                     (buffer-substring-no-properties
+                      (plist-get chunk :beg)
+                      (plist-get chunk :end)))))))
+
+(ert-deftest proofread-test-request-ready-context-boundary-fallback ()
+  "Unavailable sentence boundaries fall back to character context."
+  (with-temp-buffer
+    (insert "abcTARGETxyz")
+    (let ((proofread-context-size 3)
+          (proofread-context-sentences-before 1)
+          (proofread-context-sentences-after 1))
+      (cl-letf (((symbol-function 'proofread--sentence-boundary-available-p)
+                 (lambda () nil)))
+        (let ((chunk (proofread--make-request-ready-chunk 4 10)))
+          (should (equal (plist-get chunk :text) "TARGET"))
+          (should (equal (plist-get chunk :context-before) "abc"))
+          (should (equal (plist-get chunk :context-after) "xyz")))))))
+
 (ert-deftest proofread-test-cache-key-varies-by-identity ()
   "Cache keys change when text or environment identity changes."
   (with-temp-buffer
@@ -957,6 +1149,83 @@
                 (plist-put changed-text :text "Beta"))
           (should-not (equal base-key
                              (proofread--cache-key changed-text 'mock))))))))
+
+(ert-deftest proofread-test-cache-key-varies-by-context ()
+  "Cache keys distinguish context strategy, configuration, and content."
+  (let* ((proofread-context-size 300)
+         (proofread-context-sentences-before 1)
+         (proofread-context-sentences-after 1)
+         (chunk '(:text "目标句。"
+                        :context-before "前文。"
+                        :context-after "后文。"
+                        :language "zh"
+                        :major-mode org-mode))
+         (base-key (proofread--cache-key chunk 'mock))
+         (context (plist-get base-key :context)))
+    (should (eq (plist-get context :strategy) 'sentence-window))
+    (let ((proofread-context-sentences-before 2))
+      (should-not (equal base-key (proofread--cache-key chunk 'mock))))
+    (let ((proofread-context-size 40))
+      (should-not (equal base-key (proofread--cache-key chunk 'mock))))
+    (let ((changed (plist-put (copy-sequence chunk)
+                              :context-before "别的前文。")))
+      (should-not (equal base-key (proofread--cache-key changed 'mock))))))
+
+(ert-deftest proofread-test-cache-key-context-excludes-volatile-values ()
+  "Context-aware cache keys exclude volatile objects and raw secrets."
+  (with-temp-buffer
+    (let* ((proofread-backend 'llm)
+           (proofread-llm-provider [:api-key "secret-token"])
+           (proofread-llm-provider-identity
+            '(:provider "stable-provider"))
+           (chunk (list :text "目标句。"
+                        :context-before "secret-token 前文。"
+                        :context-after "后文。"
+                        :language "zh"
+                        :major-mode 'org-mode
+                        :buffer (current-buffer)
+                        :callback #'ignore
+                        :tokens '((:index 0 :beg 0 :end 3 :text "目标"))))
+           (key (proofread--cache-key chunk)))
+      (should-not (plist-member key :buffer))
+      (should-not (plist-member key :callback))
+      (should-not (plist-member key :tokens))
+      (should-not (proofread-test--tree-member-p (current-buffer) key))
+      (should-not (proofread-test--tree-member-p proofread-llm-provider key))
+      (should-not (proofread-test--tree-member-p "secret-token" key)))))
+
+(ert-deftest proofread-test-cache-read-misses-old-context-strategy-key ()
+  "Cache entries without context identity miss current request keys."
+  (with-temp-buffer
+    (insert "前文。目标句。后文。")
+    (proofread-mode 1)
+    (let* ((proofread-language "zh")
+           (proofread-backend 'mock)
+           (proofread-context-size 300)
+           (chunk (proofread-test--chunk-with-text
+                   (proofread--request-ready-chunks-for-ranges
+                    (list (cons (point-min) (point-max))))
+                   "目标句。"))
+           (request (proofread--make-backend-request chunk))
+           (diagnostic
+            (proofread-test--diagnostic-for-range
+             (plist-get request :beg)
+             (+ (plist-get request :beg) 2)
+             "目标"))
+           (old-key (list :text-hash
+                          (proofread--chunk-text-hash
+                           (plist-get request :text))
+                          :language (plist-get request :language)
+                          :major-mode (plist-get request :major-mode)
+                          :backend (plist-get request :backend)
+                          :prompt-version proofread-prompt-version
+                          :configuration-version
+                          proofread-cache-configuration-version)))
+      (proofread--cache-write old-key
+                              (proofread--make-cache-entry
+                               request (list diagnostic)))
+      (should-not (proofread--cache-read-request request)))))
+
 
 (ert-deftest proofread-test-model-backend-identity-fields ()
   "Model backend identity records stable configuration fields only."
@@ -2275,6 +2544,35 @@
                   (should (overlay-buffer (car proofread--overlays)))
                   (should-not (proofread--active-request-p request))))))
         (kill-buffer buffer)))))
+
+(ert-deftest proofread-test-context-does-not-shift-diagnostic-overlays ()
+  "Sentence-window context does not shift accepted diagnostic overlays."
+  (with-temp-buffer
+    (insert "前文。目标句。后文。")
+    (proofread-mode 1)
+    (let* ((proofread-language "zh")
+           (proofread-backend 'mock)
+           (proofread-context-size 300)
+           (chunk (proofread-test--chunk-with-text
+                   (proofread--request-ready-chunks-for-ranges
+                    (list (cons (point-min) (point-max))))
+                   "目标句。"))
+           (request (proofread--make-backend-request chunk))
+           (diagnostic
+            (proofread-test--diagnostic-for-range
+             (plist-get request :beg)
+             (+ (plist-get request :beg) 2)
+             "目标")))
+      (should (equal (plist-get request :context-before) "前文。"))
+      (should (equal (plist-get request :context-after) "后文。"))
+      (should (eq (proofread--handle-backend-result
+                   (proofread--backend-success-result
+                    request (list diagnostic)))
+                  'applied))
+      (should (= (length proofread--overlays) 1))
+      (let ((overlay (car proofread--overlays)))
+        (should (= (overlay-start overlay) (plist-get diagnostic :beg)))
+        (should (= (overlay-end overlay) (plist-get diagnostic :end)))))))
 
 (ert-deftest proofread-test-killed-buffer-result-is-dropped ()
   "Results for killed buffers are dropped without recreating state."
