@@ -996,6 +996,298 @@
   (let ((proofread-ollama-model ""))
     (should-not (proofread-backend-available-p 'ollama))))
 
+(ert-deftest proofread-test-llm-backend-availability ()
+  "LLM availability depends on `proofread-llm-provider'."
+  (let ((proofread-backend 'llm)
+        (proofread-llm-provider nil))
+    (should-not (proofread-backend-available-p))
+    (should-not (proofread-backend-available-p 'llm)))
+  (let ((proofread-backend 'llm)
+        (proofread-llm-provider 'proofread-test-provider))
+    (should (proofread-backend-available-p))
+    (should (proofread-backend-available-p 'llm))))
+
+(ert-deftest proofread-test-llm-provider-unavailable-is-asynchronous-error ()
+  "Missing LLM provider reports an asynchronous backend error."
+  (with-temp-buffer
+    (insert "helo")
+    (let* ((proofread-llm-provider nil)
+           (chunk (car (proofread--request-ready-chunks-for-ranges
+                        (list (cons (point-min) (point-max))))))
+           (request (proofread--make-backend-request chunk 'llm))
+           result)
+      (should (proofread-backend-check
+               request
+               (lambda (backend-result)
+                 (setq result backend-result))
+               'llm))
+      (should-not result)
+      (should (proofread-test--wait-for (lambda () result)))
+      (should (eq (plist-get result :status) 'error))
+      (should (eq (plist-get result :error)
+                  'llm-provider-unavailable)))))
+
+(ert-deftest proofread-test-llm-provider-identity-is-stable ()
+  "LLM identity uses stable provider metadata, not provider objects."
+  (let ((proofread-backend 'llm)
+        (proofread-llm-provider
+         [:proofread-test-provider :api-key "secret-token"])
+        (proofread-llm-provider-identity nil)
+        (proofread-prompt-version "prompt-a"))
+    (cl-letf (((symbol-function 'llm-name)
+               (lambda (_provider)
+                 "qwen3:1.7b")))
+      (let ((identity (proofread--backend-identity)))
+        (should (eq (plist-get identity :backend) 'llm))
+        (should (equal (plist-get identity :provider) "qwen3:1.7b"))
+        (should (equal (plist-get identity :prompt-version) "prompt-a"))
+        (should-not (string-match-p
+                     "secret-token"
+                     (prin1-to-string identity)))
+        (dolist (volatile-key
+                 '(:id :buffer :callback :timer :process :request))
+          (should-not (plist-member identity volatile-key)))))))
+
+(ert-deftest proofread-test-llm-provider-identity-cache-miss ()
+  "Changing stable LLM provider identity misses old cache entries."
+  (with-temp-buffer
+    (insert "Alpha")
+    (proofread-mode 1)
+    (let* ((proofread-backend 'llm)
+           (proofread-llm-provider 'proofread-test-provider)
+           (proofread-llm-provider-identity "provider-a")
+           (chunk (car (proofread--request-ready-chunks-for-ranges
+                        (list (cons (point-min) (point-max))))))
+           (request (proofread--make-backend-request chunk))
+           (diagnostic
+            (proofread-test--diagnostic-for-range 1 6 "Alpha")))
+      (proofread--cache-write-request request (list diagnostic))
+      (should (proofread--cache-read-request
+               (proofread--make-backend-request chunk)))
+      (let ((proofread-llm-provider-identity "provider-b"))
+        (should-not (proofread--cache-read-request
+                     (proofread--make-backend-request chunk)))))))
+
+(ert-deftest proofread-test-llm-dispatch-builds-json-prompt-asynchronously ()
+  "LLM backend dispatches an async chat prompt built from request fields."
+  (with-temp-buffer
+    (text-mode)
+    (insert "helo")
+    (let* ((proofread-language "en")
+           (proofread-llm-provider 'proofread-test-provider)
+           (chunk (car (proofread--request-ready-chunks-for-ranges
+                        (list (cons (point-min) (point-max))))))
+           (request (proofread--make-backend-request chunk 'llm))
+           (content
+            (proofread-test--ollama-diagnostics-content
+             (list (proofread-test--ollama-diagnostic-json 0 4 "helo"))))
+           captured-provider
+           captured-prompt
+           captured-multi-output
+           result)
+      (cl-letf (((symbol-function 'llm-chat-async)
+                 (lambda (provider prompt success _error
+                                   &optional multi-output)
+                   (setq captured-provider provider)
+                   (setq captured-prompt prompt)
+                   (setq captured-multi-output multi-output)
+                   (funcall success content)
+                   'proofread-test-llm-handle)))
+        (let ((handle
+               (proofread-backend-check
+                request
+                (lambda (backend-result)
+                  (setq result backend-result))
+                'llm)))
+          (should (equal (plist-get handle :request)
+                         'proofread-test-llm-handle))
+          (should (eq captured-provider proofread-llm-provider))
+          (should-not captured-multi-output)
+          (should (equal (llm-chat-prompt-response-format captured-prompt)
+                         proofread--json-diagnostic-response-format))
+          (let* ((interaction
+                  (car (llm-chat-prompt-interactions captured-prompt)))
+                 (prompt-text
+                  (llm-chat-prompt-interaction-content interaction)))
+            (should (string-match-p "Return only one JSON object"
+                                    prompt-text))
+            (should (string-match-p "Language: \"en\"" prompt-text))
+            (should (string-match-p "Major mode: text-mode" prompt-text))
+            (should (string-match-p "Text:\nhelo" prompt-text)))
+          (should-not result)
+          (should (proofread-test--wait-for (lambda () result)))
+          (should (eq (plist-get result :status) 'ok))
+          (should (eq (plist-get
+                       (car (plist-get result :diagnostics))
+                       :source)
+                      'llm)))))))
+
+(ert-deftest proofread-test-llm-success-enters-overlay-pipeline ()
+  "Fresh LLM diagnostics use the existing result, cache, and overlay path."
+  (with-temp-buffer
+    (insert "helo")
+    (proofread-mode 1)
+    (let* ((proofread-llm-provider 'proofread-test-provider)
+           (chunk (car (proofread--request-ready-chunks-for-ranges
+                        (list (cons (point-min) (point-max))))))
+           (request (proofread--make-backend-request chunk 'llm))
+           (content
+            (proofread-test--ollama-diagnostics-content
+             (list (proofread-test--ollama-diagnostic-json 0 4 "helo"))))
+           result)
+      (cl-letf (((symbol-function 'llm-chat-async)
+                 (lambda (_provider _prompt success _error
+                                    &optional _multi-output)
+                   (run-at-time 0 nil (lambda () (funcall success content)))
+                   'proofread-test-llm-handle)))
+        (should (proofread--dispatch-backend-request
+                 request
+                 (lambda (backend-result)
+                   (setq result backend-result)
+                   (proofread--handle-backend-result backend-result))
+                 'llm))
+        (should (proofread-test--wait-for
+                 (lambda ()
+                   proofread--diagnostics)))
+        (should (eq (plist-get result :status) 'ok))
+        (should-not proofread--requests)
+        (should (= (length proofread--diagnostics) 1))
+        (should (= (length proofread--overlays) 1))
+        (should (= (hash-table-count proofread--cache) 1))))))
+
+(ert-deftest proofread-test-llm-error-preserves-buffer-and-clears-request ()
+  "LLM error callbacks preserve text and clear active request state."
+  (with-temp-buffer
+    (insert "helo")
+    (proofread-mode 1)
+    (let* ((proofread-llm-provider 'proofread-test-provider)
+           (before-text (buffer-string))
+           (chunk (car (proofread--request-ready-chunks-for-ranges
+                        (list (cons (point-min) (point-max))))))
+           (request (proofread--make-backend-request chunk 'llm))
+           result)
+      (cl-letf (((symbol-function 'llm-chat-async)
+                 (lambda (_provider _prompt _success error
+                                    &optional _multi-output)
+                   (funcall error 'llm-error "boom")
+                   'proofread-test-llm-handle)))
+        (should (proofread--dispatch-backend-request
+                 request
+                 (lambda (backend-result)
+                   (setq result backend-result))
+                 'llm))
+        (should (proofread-test--wait-for (lambda () result)))
+        (should (eq (plist-get result :status) 'error))
+        (should (eq (plist-get result :error) 'llm-error))
+        (should (equal (buffer-string) before-text))
+        (should-not proofread--requests)
+        (should-not proofread--overlays)))))
+
+(ert-deftest proofread-test-llm-invalid-success-response-is-error ()
+  "Unparsable LLM success responses create no overlays and become errors."
+  (with-temp-buffer
+    (insert "helo")
+    (proofread-mode 1)
+    (let* ((proofread-llm-provider 'proofread-test-provider)
+           (chunk (car (proofread--request-ready-chunks-for-ranges
+                        (list (cons (point-min) (point-max))))))
+           (request (proofread--make-backend-request chunk 'llm))
+           result)
+      (cl-letf (((symbol-function 'llm-chat-async)
+                 (lambda (_provider _prompt success _error
+                                    &optional _multi-output)
+                   (funcall success "not json")
+                   'proofread-test-llm-handle)))
+        (should (proofread--dispatch-backend-request
+                 request
+                 (lambda (backend-result)
+                   (setq result backend-result)
+                   (proofread--handle-backend-result backend-result))
+                 'llm))
+        (should (proofread-test--wait-for (lambda () result)))
+        (should (eq (plist-get result :status) 'error))
+        (should (eq (plist-get result :error) 'llm-invalid-response))
+        (should-not proofread--requests)
+        (should-not proofread--overlays)
+        (should (= (hash-table-count proofread--cache) 0))))))
+
+(ert-deftest proofread-test-llm-stale-results-are-dropped ()
+  "LLM results are stale after buffer, mode, tick, or text changes."
+  (dolist (scenario '(killed disabled modified text-mismatch))
+    (let ((buffer (generate-new-buffer
+                   (format " *proofread-llm-stale-%s*" scenario)))
+          success
+          request
+          result)
+      (unwind-protect
+          (progn
+            (with-current-buffer buffer
+              (insert "helo")
+              (proofread-mode 1)
+              (let* ((proofread-llm-provider 'proofread-test-provider)
+                     (chunk (car (proofread--request-ready-chunks-for-ranges
+                                  (list (cons (point-min)
+                                              (point-max)))))))
+                (setq request (proofread--make-backend-request chunk 'llm))
+                (cl-letf (((symbol-function 'llm-chat-async)
+                           (lambda (_provider _prompt callback _error
+                                              &optional _multi-output)
+                             (setq success callback)
+                             'proofread-test-llm-handle))
+                          ((symbol-function 'llm-cancel-request)
+                           (lambda (_handle)
+                             nil)))
+                  (should (proofread--dispatch-backend-request
+                           request
+                           (lambda (backend-result)
+                             (setq result
+                                   (proofread--handle-backend-result
+                                    backend-result)))
+                           'llm)))))
+            (pcase scenario
+              ('killed
+               (kill-buffer buffer))
+              ('disabled
+               (with-current-buffer buffer
+                 (proofread-mode -1)))
+              ('modified
+               (with-current-buffer buffer
+                 (goto-char (point-max))
+                 (insert "!")))
+              ('text-mismatch
+               (with-current-buffer buffer
+                 (delete-region (point-min) (point-max))
+                 (insert "halo")
+                 (plist-put request
+                            :modified-tick
+                            (buffer-chars-modified-tick)))))
+            (funcall
+             success
+             (proofread-test--ollama-diagnostics-content
+              (list (proofread-test--ollama-diagnostic-json 0 4 "helo"))))
+            (should (proofread-test--wait-for (lambda () result)))
+            (should (eq result 'stale))
+            (when (buffer-live-p buffer)
+              (with-current-buffer buffer
+                (should-not proofread--diagnostics)
+                (should-not proofread--overlays))))
+        (when (buffer-live-p buffer)
+          (kill-buffer buffer))))))
+
+(ert-deftest proofread-test-ollama-independent-from-llm-provider ()
+  "Direct Ollama backend remains selectable independently from LLM provider."
+  (let ((proofread-backend 'ollama)
+        (proofread-ollama-model "qwen3:1.7b")
+        (proofread-ollama-base-url "http://localhost:11434/api")
+        (proofread-llm-provider nil)
+        (proofread-llm-provider-identity "ignored-llm-provider"))
+    (should (proofread-backend-available-p))
+    (let ((identity (proofread--backend-identity)))
+      (should (eq (plist-get identity :backend) 'ollama))
+      (should (equal (plist-get identity :model) "qwen3:1.7b"))
+      (should-not (equal (plist-get identity :provider)
+                         "ignored-llm-provider")))))
+
 (ert-deftest proofread-test-ollama-prompt-requests-json-contract ()
   "Ollama prompts request JSON diagnostics with chunk-relative ranges."
   (with-temp-buffer

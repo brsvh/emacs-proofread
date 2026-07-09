@@ -60,6 +60,7 @@
                 package =
                   {
                     lib,
+                    llm,
                     melpaBuild,
                     projectRoot,
                     ...
@@ -71,6 +72,10 @@
                       ;
                   in
                   melpaBuild {
+                    packageRequires = [
+                      llm
+                    ];
+
                     meta = {
                       description = "Context-aware LLM proofreading for GNU Emacs";
                       homepage = "https://codeberg.org/bingshan/emacs-proofread";
@@ -164,6 +169,7 @@
                       (emacsPackagesFor base).emacsWithPackages
                         (
                           epkgs: with epkgs; [
+                            llm
                             proofread
                           ]
                         );

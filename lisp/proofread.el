@@ -4,7 +4,7 @@
 
 ;; Author: Bingshan Chang <chang@bingshan.org>
 ;; Keywords: convenience, wp
-;; Package-Requires: ((emacs "30.1"))
+;; Package-Requires: ((emacs "30.1") (llm "0.31.1"))
 ;; Version: 0.1.0
 
 ;; This file is not part of GNU Emacs.
@@ -31,6 +31,7 @@
 ;;; Code:
 
 (require 'json)
+(require 'llm)
 (require 'url)
 
 (defgroup proofread nil
@@ -69,11 +70,27 @@ configuration."
 (defcustom proofread-backend nil
   "Selected backend used to produce proofreading diagnostics.
 The built-in mock backend is selected with the symbol `mock'.  A nil value
-disables backend dispatch."
+disables backend dispatch.  The symbol `llm' uses `proofread-llm-provider'."
   :type '(choice (const :tag "None" nil)
                  (const :tag "Mock backend" mock)
+                 (const :tag "Generic llm backend" llm)
                  (const :tag "Ollama backend" ollama)
                  symbol)
+  :group 'proofread)
+
+(defcustom proofread-llm-provider nil
+  "Provider object used when `proofread-backend' is `llm'.
+Users should configure this with a provider constructor from the GNU ELPA
+`llm' package, such as `make-llm-ollama'."
+  :type 'sexp
+  :group 'proofread)
+
+(defcustom proofread-llm-provider-identity nil
+  "Stable cache identity for `proofread-llm-provider'.
+When nil, proofread uses `llm-name' as a conservative fallback.  Set this to a
+stable, non-secret value when provider configuration changes should invalidate
+old diagnostic cache entries."
+  :type 'sexp
   :group 'proofread)
 
 (defcustom proofread-backend-model nil
@@ -169,7 +186,7 @@ property has a non-nil value is not included in request-ready chunks."
      :language :major-mode :modified-tick :backend)
   "Required keys for proofread backend request plists.")
 
-(defconst proofread--ollama-json-prompt-contract
+(defconst proofread--json-diagnostic-prompt-contract
   (concat
    "Return only one JSON object.  Do not include Markdown, comments, "
    "prose, or reasoning outside the JSON object.\n"
@@ -184,7 +201,37 @@ property has a non-nil value is not included in request-ready chunks."
    "Use zero-based chunk-relative offsets; range end is exclusive.\n"
    "The text field must exactly equal the substring selected by range.\n"
    "Use {\"diagnostics\":[]} when there are no diagnostics.\n")
+  "Prompt contract for JSON diagnostics.")
+
+(defconst proofread--ollama-json-prompt-contract
+  proofread--json-diagnostic-prompt-contract
   "Prompt contract for Ollama JSON diagnostics.")
+
+(defconst proofread--json-diagnostic-response-format
+  '(:type
+    "object"
+    :properties
+    (:diagnostics
+     (:type
+      "array"
+      :items
+      (:type
+       "object"
+       :properties
+       (:kind (:type "string")
+              :message (:type "string")
+              :text (:type "string")
+              :range
+              (:type
+               "object"
+               :properties (:beg (:type "integer") :end (:type "integer"))
+               :required ["beg" "end"])
+              :suggestions (:type "array" :items (:type "string"))
+              :confidence (:type "number")
+              :source (:type "string"))
+       :required ["kind" "message" "text" "range" "suggestions"])))
+    :required ["diagnostics"])
+  "JSON response format requested from generic LLM providers.")
 
 (defconst proofread--overlay-category 'proofread-overlay
   "Overlay category used for proofread-owned overlays.")
@@ -223,6 +270,9 @@ property has a non-nil value is not included in request-ready chunks."
   "Idle timer scheduled for pending proofreading work in this buffer.")
 
 (defvar proofread-mode)
+
+(defvar warning-minimum-level)
+(defvar warning-minimum-log-level)
 
 (defvar proofread--mode-buffers nil
   "Live buffers where `proofread-mode' has installed local hooks.")
@@ -590,6 +640,19 @@ When MESSAGE is non-nil, include it as caller-readable error text."
   (push request proofread--requests)
   request)
 
+(defun proofread--record-active-request-handle (request handle)
+  "Record backend HANDLE for active REQUEST in the current buffer."
+  (let ((id (plist-get request :id))
+        retained)
+    (dolist (candidate proofread--requests)
+      (push
+       (if (equal id (plist-get candidate :id))
+           (plist-put (copy-sequence candidate) :handle handle)
+         candidate)
+       retained))
+    (setq proofread--requests (nreverse retained)))
+  handle)
+
 (defun proofread--remove-active-request (request)
   "Remove REQUEST from active request state in the current buffer."
   (let ((id (plist-get request :id))
@@ -618,11 +681,16 @@ When MESSAGE is non-nil, include it as caller-readable error text."
   (and (stringp value)
        (not (string= value ""))))
 
+(defun proofread--llm-provider-available-p ()
+  "Return non-nil when `proofread-llm-provider' is configured."
+  (not (null proofread-llm-provider)))
+
 (defun proofread-backend-available-p (&optional backend)
   "Return non-nil if BACKEND can accept proofreading requests.
 When BACKEND is nil, check the selected `proofread-backend'."
   (pcase (or backend proofread-backend)
     ('mock t)
+    ('llm (proofread--llm-provider-available-p))
     ('ollama (proofread--nonempty-string-p proofread-ollama-model))
     (_ nil)))
 
@@ -648,8 +716,8 @@ When BACKEND is nil, check the selected `proofread-backend'."
   (concat (replace-regexp-in-string "/\\'" "" proofread-ollama-base-url)
           "/generate"))
 
-(defun proofread--ollama-prompt (request)
-  "Return the Ollama prompt for backend REQUEST."
+(defun proofread--diagnostic-prompt (request)
+  "Return the provider-independent proofreading prompt for REQUEST."
   (format
    (concat "Proofread the following text.\n\n"
            "%s\n"
@@ -658,12 +726,16 @@ When BACKEND is nil, check the selected `proofread-backend'."
            "Context before:\n%s\n\n"
            "Text:\n%s\n\n"
            "Context after:\n%s\n")
-   proofread--ollama-json-prompt-contract
+   proofread--json-diagnostic-prompt-contract
    (plist-get request :language)
    (plist-get request :major-mode)
    (or (plist-get request :context-before) "")
    (or (plist-get request :text) "")
    (or (plist-get request :context-after) "")))
+
+(defun proofread--ollama-prompt (request)
+  "Return the Ollama prompt for backend REQUEST."
+  (proofread--diagnostic-prompt request))
 
 (defun proofread--ollama-payload (request)
   "Return an alist payload for Ollama backend REQUEST."
@@ -839,8 +911,9 @@ When BACKEND is nil, check the selected `proofread-backend'."
              (<= value 1))
     value))
 
-(defun proofread--ollama-diagnostic-source (candidate)
-  "Return normalized diagnostic source from CANDIDATE."
+(defun proofread--ollama-diagnostic-source (candidate &optional default-source)
+  "Return normalized diagnostic source from CANDIDATE.
+When CANDIDATE has no valid source, use DEFAULT-SOURCE or `ollama'."
   (let ((value (plist-get candidate :source)))
     (cond
      ((and (plist-member candidate :source)
@@ -851,9 +924,10 @@ When BACKEND is nil, check the selected `proofread-backend'."
            (stringp value)
            (not (string= value "")))
       value)
-     (t 'ollama))))
+     (t (or default-source 'ollama)))))
 
-(defun proofread--ollama-diagnostic-from-candidate (request candidate)
+(defun proofread--ollama-diagnostic-from-candidate
+    (request candidate &optional default-source)
   "Return proofread diagnostic for REQUEST and CANDIDATE, or nil."
   (let* ((range (proofread--ollama-diagnostic-range candidate))
          (relative-beg (car-safe range))
@@ -882,19 +956,38 @@ When BACKEND is nil, check the selected `proofread-backend'."
                      (plist-get candidate :suggestions))
        :confidence (proofread--ollama-diagnostic-confidence
                     (plist-get candidate :confidence))
-       :source (proofread--ollama-diagnostic-source candidate)))))
+       :source (proofread--ollama-diagnostic-source
+                candidate default-source)))))
 
-(defun proofread--ollama-diagnostics-from-payload (request payload)
-  "Return proofread diagnostics for REQUEST from parsed PAYLOAD."
+(defun proofread--ollama-diagnostics-from-payload
+    (request payload &optional default-source)
+  "Return proofread diagnostics for REQUEST from parsed PAYLOAD.
+DEFAULT-SOURCE is used for diagnostics without an explicit source."
   (let (diagnostics)
     (dolist (candidate (proofread--ollama-diagnostic-candidates payload))
       (let ((diagnostic
              (and (listp candidate)
                   (proofread--ollama-diagnostic-from-candidate
-                   request candidate))))
+                   request candidate default-source))))
         (when diagnostic
           (push diagnostic diagnostics))))
     (nreverse diagnostics)))
+
+(defun proofread--diagnostic-payload (content)
+  "Return parsed diagnostic payload from generated CONTENT."
+  (proofread--ollama-diagnostic-payload content))
+
+(defun proofread--diagnostics-from-payload
+    (request payload &optional default-source)
+  "Return proofread diagnostics for REQUEST from parsed PAYLOAD."
+  (proofread--ollama-diagnostics-from-payload
+   request payload default-source))
+
+(defun proofread--diagnostics-from-content
+    (request content &optional default-source)
+  "Return proofread diagnostics for REQUEST from generated CONTENT."
+  (proofread--diagnostics-from-payload
+   request (proofread--diagnostic-payload content) default-source))
 
 (defun proofread--ollama-parse-success (request body)
   "Return diagnostics for REQUEST from successful Ollama response BODY."
@@ -902,7 +995,8 @@ When BACKEND is nil, check the selected `proofread-backend'."
          (content (proofread--ollama-response-content response-payload))
          (diagnostic-payload
           (proofread--ollama-diagnostic-payload content)))
-    (proofread--ollama-diagnostics-from-payload request diagnostic-payload)))
+    (proofread--diagnostics-from-payload
+     request diagnostic-payload 'ollama)))
 
 (defun proofread--ollama-result-from-response (request status buffer)
   "Return backend result for REQUEST from Ollama STATUS and BUFFER."
@@ -985,6 +1079,82 @@ When BACKEND is nil, check the selected `proofread-backend'."
           :buffer response-buffer
           :timer timeout-timer)))
 
+(defun proofread--llm-prompt (request)
+  "Return an `llm-chat-prompt' for backend REQUEST."
+  (llm-make-chat-prompt
+   (proofread--diagnostic-prompt request)
+   :response-format proofread--json-diagnostic-response-format))
+
+(defun proofread--llm-response-text (response)
+  "Return generated text from an LLM RESPONSE."
+  (cond
+   ((stringp response) response)
+   ((and (listp response)
+         (plist-member response :text)
+         (stringp (plist-get response :text)))
+    (plist-get response :text))
+   (t (error "Invalid llm response text"))))
+
+(defun proofread--llm-success-result (request response)
+  "Return backend success or parse error result for LLM RESPONSE."
+  (condition-case err
+      (proofread--backend-success-result
+       request
+       (proofread--diagnostics-from-content
+        request (proofread--llm-response-text response) 'llm))
+    (error
+     (proofread--backend-error-result
+      request 'llm-invalid-response (error-message-string err)))))
+
+(defun proofread--llm-error-result (request error &optional message)
+  "Return backend error result for LLM ERROR and MESSAGE."
+  (proofread--backend-error-result
+   request
+   (or error 'llm-error)
+   (if message
+       (format "%s" message)
+     (format "%S" error))))
+
+(defun proofread--llm-defer-callback (callback result)
+  "Invoke CALLBACK with RESULT after the current call stack unwinds."
+  (run-at-time 0 nil #'proofread--invoke-backend-callback callback result))
+
+(defun proofread--llm-backend-check (request callback)
+  "Submit REQUEST to `proofread-llm-provider' asynchronously."
+  (if (not proofread-llm-provider)
+      (let ((timer
+             (proofread--llm-defer-callback
+              callback
+              (proofread--backend-error-result
+               request 'llm-provider-unavailable
+               "No proofread llm provider is configured"))))
+        (list :backend 'llm
+              :request nil
+              :timer timer))
+    (let* ((provider proofread-llm-provider)
+           (prompt (proofread--llm-prompt request))
+           (handle
+            (condition-case err
+                (llm-chat-async
+                 provider prompt
+                 (lambda (response)
+                   (proofread--llm-defer-callback
+                    callback
+                    (proofread--llm-success-result request response)))
+                 (lambda (error &optional message &rest _)
+                   (proofread--llm-defer-callback
+                    callback
+                    (proofread--llm-error-result
+                     request error message))))
+              (error
+               (proofread--llm-defer-callback
+                callback
+                (proofread--backend-error-result
+                 request 'llm-submit-error (error-message-string err)))
+               nil))))
+      (list :backend 'llm
+            :request handle))))
+
 (defun proofread--unsupported-backend-check (backend request callback)
   "Report unsupported BACKEND for REQUEST through CALLBACK asynchronously."
   (run-at-time
@@ -1003,6 +1173,7 @@ handle, such as a timer object for the built-in mock backend."
   (let ((backend (or backend proofread-backend)))
     (pcase backend
       ('mock (proofread--mock-backend-check request callback))
+      ('llm (proofread--llm-backend-check request callback))
       ('ollama (proofread--ollama-backend-check request callback))
       (_ (proofread--unsupported-backend-check backend request callback)))))
 
@@ -1014,14 +1185,19 @@ handle, such as a timer object for the built-in mock backend."
         (proofread--register-active-request request))
       (let ((wrapped-callback
              (proofread--wrap-backend-callback request callback)))
-        (condition-case err
-            (proofread-backend-check request wrapped-callback backend)
-          (error
-           (proofread--invoke-backend-callback
-            wrapped-callback
-            (proofread--backend-error-result
-             request err (error-message-string err)))
-           nil))))))
+        (let ((handle
+               (condition-case err
+                   (proofread-backend-check request wrapped-callback backend)
+                 (error
+                  (proofread--invoke-backend-callback
+                   wrapped-callback
+                   (proofread--backend-error-result
+                    request err (error-message-string err)))
+                  nil))))
+          (when handle
+            (with-current-buffer buffer
+              (proofread--record-active-request-handle request handle)))
+          handle)))))
 
 (defun proofread--request-range-valid-p (request)
   "Return non-nil if REQUEST range is valid in the current buffer."
@@ -1085,6 +1261,21 @@ Runtime-only options are intentionally excluded from this value."
         :prompt-version proofread-prompt-version
         :options (proofread--backend-cache-relevant-options backend)))
 
+(defun proofread--llm-provider-name ()
+  "Return a stable display name for `proofread-llm-provider', or nil."
+  (when proofread-llm-provider
+    (condition-case nil
+        (llm-name proofread-llm-provider)
+      (error nil))))
+
+(defun proofread--llm-provider-identity ()
+  "Return stable cache identity for the configured LLM provider."
+  (list :backend 'llm
+        :provider (or proofread-llm-provider-identity
+                      (proofread--llm-provider-name)
+                      'configured)
+        :prompt-version proofread-prompt-version))
+
 (defun proofread--backend-identity (&optional backend)
   "Return canonical identity for BACKEND.
 When BACKEND is nil, use the selected `proofread-backend'.  The mock backend
@@ -1095,6 +1286,7 @@ structured identity that excludes volatile request state."
      ((proofread--backend-identity-p backend) backend)
      ((null backend) nil)
      ((eq backend 'mock) 'mock)
+     ((eq backend 'llm) (proofread--llm-provider-identity))
      (t (proofread--model-backend-identity backend)))))
 
 (defun proofread--cache-backend-identity (&optional backend)
@@ -1241,6 +1433,22 @@ When BACKEND is nil, use `proofread-backend'.  Return dispatched requests."
                 (push request requests))))))
       (nreverse requests))))
 
+(defun proofread--cancel-request-handle (handle)
+  "Cancel backend HANDLE when the backend supports cancellation."
+  (when (and (listp handle)
+             (eq (plist-get handle :backend) 'llm)
+             (plist-get handle :request))
+    (let ((warning-minimum-level :error)
+          (warning-minimum-log-level :error))
+      (ignore-errors
+        (llm-cancel-request (plist-get handle :request))))))
+
+(defun proofread--cancel-active-requests ()
+  "Cancel cancellable active backend requests for the current buffer."
+  (dolist (request proofread--requests)
+    (proofread--cancel-request-handle (plist-get request :handle)))
+  (setq proofread--requests nil))
+
 (defun proofread--cancel-idle-timer ()
   "Cancel the current buffer's scheduled idle timer."
   (when (timerp proofread--idle-timer)
@@ -1351,6 +1559,7 @@ When BACKEND is nil, use `proofread-backend'.  Return dispatched requests."
 (defun proofread--kill-buffer ()
   "Clean up proofread scheduling state before killing the current buffer."
   (proofread--clear-scheduled-work)
+  (proofread--cancel-active-requests)
   (proofread--unregister-mode-buffer))
 
 (defun proofread--overlay-p (overlay)
@@ -1781,11 +1990,11 @@ navigation order."
 (defun proofread--clear-buffer-state ()
   "Clear proofread-owned state for the current buffer."
   (proofread--clear-scheduled-work)
+  (proofread--cancel-active-requests)
   (proofread--clear-overlays)
   (setq proofread--diagnostics nil)
   (setq proofread--current-diagnostic nil)
   (setq proofread--pending-ranges nil)
-  (setq proofread--requests nil)
   (setq proofread--next-request-id 0)
   (setq proofread--cache nil))
 
