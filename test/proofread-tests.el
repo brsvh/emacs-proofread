@@ -108,6 +108,37 @@
           (lambda ()
             (reverse callbacks)))))
 
+(defconst proofread-test--llm-provider 'proofread-test-provider
+  "Provider object used for local LLM backend tests.")
+
+(defconst proofread-test--llm-provider-identity "proofread-test-provider"
+  "Stable provider identity used for local LLM backend tests.")
+
+(defmacro proofread-test--with-llm-success (content &rest body)
+  "Run BODY with `llm-chat-async' stubbed to return CONTENT."
+  (declare (indent 1) (debug (form body)))
+  `(let ((proofread-llm-provider proofread-test--llm-provider)
+         (proofread-llm-provider-identity
+          proofread-test--llm-provider-identity))
+     (cl-letf (((symbol-function 'llm-chat-async)
+                (lambda (_provider _prompt success _error &optional _multi-output)
+                  (funcall success ,content)
+                  'proofread-test-llm-handle)))
+       ,@body)))
+
+(defmacro proofread-test--with-llm-error (error message &rest body)
+  "Run BODY with `llm-chat-async' stubbed to signal ERROR and MESSAGE."
+  (declare (indent 2) (debug (form form body)))
+  `(let ((proofread-llm-provider proofread-test--llm-provider)
+         (proofread-llm-provider-identity
+          proofread-test--llm-provider-identity))
+     (cl-letf (((symbol-function 'llm-chat-async)
+                (lambda (_provider _prompt _success error-callback
+                                   &optional _multi-output)
+                  (funcall error-callback ,error ,message)
+                  'proofread-test-llm-handle)))
+       ,@body)))
+
 (defun proofread-test--json-diagnostics-content (diagnostics)
   "Return a generated JSON content string containing DIAGNOSTICS."
   (proofread--json-encode
@@ -291,7 +322,7 @@
   (with-temp-buffer
     (insert "Alpha")
     (proofread-mode 1)
-    (let ((proofread-backend 'mock)
+    (let ((proofread-backend 'llm)
           backend-calls)
       (cl-letf (((symbol-function 'run-with-idle-timer)
                  (lambda (_seconds _repeat _function &rest _args)
@@ -1121,34 +1152,37 @@
     (text-mode)
     (let ((proofread-language "en")
           (proofread-prompt-version "prompt-a")
+          (proofread-llm-provider proofread-test--llm-provider)
+          (proofread-llm-provider-identity "provider-a")
           (proofread-cache-configuration-version 1))
       (insert "Alpha")
       (let* ((chunk (car (proofread--request-ready-chunks-for-ranges
                           (list (cons (point-min) (point-max))))))
-             (base-key (proofread--cache-key chunk 'mock)))
-        (should-not (equal base-key
-                           (proofread--cache-key chunk 'other-backend)))
+             (base-key (proofread--cache-key chunk 'llm)))
+        (let ((proofread-llm-provider-identity "provider-b"))
+          (should-not (equal base-key
+                             (proofread--cache-key chunk 'llm))))
         (let ((proofread-prompt-version "prompt-b"))
           (should-not (equal base-key
-                             (proofread--cache-key chunk 'mock))))
+                             (proofread--cache-key chunk 'llm))))
         (let ((proofread-cache-configuration-version 2))
           (should-not (equal base-key
-                             (proofread--cache-key chunk 'mock))))
+                             (proofread--cache-key chunk 'llm))))
         (let ((changed-language (copy-sequence chunk)))
           (setq changed-language
                 (plist-put changed-language :language "fr"))
           (should-not (equal base-key
-                             (proofread--cache-key changed-language 'mock))))
+                             (proofread--cache-key changed-language 'llm))))
         (let ((changed-mode (copy-sequence chunk)))
           (setq changed-mode
                 (plist-put changed-mode :major-mode 'org-mode))
           (should-not (equal base-key
-                             (proofread--cache-key changed-mode 'mock))))
+                             (proofread--cache-key changed-mode 'llm))))
         (let ((changed-text (copy-sequence chunk)))
           (setq changed-text
                 (plist-put changed-text :text "Beta"))
           (should-not (equal base-key
-                             (proofread--cache-key changed-text 'mock))))))))
+                             (proofread--cache-key changed-text 'llm))))))))
 
 (ert-deftest proofread-test-cache-key-varies-by-context ()
   "Cache keys distinguish context strategy, configuration, and content."
@@ -1160,16 +1194,16 @@
                         :context-after "后文。"
                         :language "zh"
                         :major-mode org-mode))
-         (base-key (proofread--cache-key chunk 'mock))
+         (base-key (proofread--cache-key chunk 'llm))
          (context (plist-get base-key :context)))
     (should (eq (plist-get context :strategy) 'sentence-window))
     (let ((proofread-context-sentences-before 2))
-      (should-not (equal base-key (proofread--cache-key chunk 'mock))))
+      (should-not (equal base-key (proofread--cache-key chunk 'llm))))
     (let ((proofread-context-size 40))
-      (should-not (equal base-key (proofread--cache-key chunk 'mock))))
+      (should-not (equal base-key (proofread--cache-key chunk 'llm))))
     (let ((changed (plist-put (copy-sequence chunk)
                               :context-before "别的前文。")))
-      (should-not (equal base-key (proofread--cache-key changed 'mock))))))
+      (should-not (equal base-key (proofread--cache-key changed 'llm))))))
 
 (ert-deftest proofread-test-cache-key-context-excludes-volatile-values ()
   "Context-aware cache keys exclude volatile objects and raw secrets."
@@ -1200,7 +1234,7 @@
     (insert "前文。目标句。后文。")
     (proofread-mode 1)
     (let* ((proofread-language "zh")
-           (proofread-backend 'mock)
+           (proofread-backend 'llm)
            (proofread-context-size 300)
            (chunk (proofread-test--chunk-with-text
                    (proofread--request-ready-chunks-for-ranges
@@ -1226,71 +1260,27 @@
                                request (list diagnostic)))
       (should-not (proofread--cache-read-request request)))))
 
-
-(ert-deftest proofread-test-model-backend-identity-fields ()
-  "Model backend identity records stable configuration fields only."
-  (let ((proofread-backend 'model-backend)
-        (proofread-backend-model "qwen3:1.7b")
-        (proofread-backend-endpoint "http://localhost:11434/api")
-        (proofread-prompt-version "prompt-a")
-        (proofread-backend-options '((temperature . 0.2))))
-    (let ((identity (proofread--backend-identity)))
-      (should (eq (plist-get identity :backend) 'model-backend))
-      (should (equal (plist-get identity :model) "qwen3:1.7b"))
-      (should (equal (plist-get identity :endpoint)
-                     "http://localhost:11434/api"))
-      (should (equal (plist-get identity :prompt-version) "prompt-a"))
-      (should (equal (plist-get identity :options)
-                     '((temperature . 0.2))))
-      (dolist (volatile-key '(:id :buffer :callback :timer :beg :end))
-        (should-not (plist-member identity volatile-key))))))
-
-(ert-deftest proofread-test-mock-backend-identity-remains-compatible ()
-  "Mock backend identity remains the symbol used by existing cache entries."
+(ert-deftest proofread-test-llm-backend-identity-is-cache-compatible ()
+  "LLM backend identity is structured and usable for cache entries."
   (with-temp-buffer
     (insert "Alpha")
     (proofread-mode 1)
-    (let* ((proofread-backend 'mock)
+    (let* ((proofread-backend 'llm)
+           (proofread-llm-provider proofread-test--llm-provider)
+           (proofread-llm-provider-identity
+            proofread-test--llm-provider-identity)
            (chunk (car (proofread--request-ready-chunks-for-ranges
                         (list (cons (point-min) (point-max))))))
            (request (proofread--make-backend-request chunk))
            (diagnostic
             (proofread-test--diagnostic-for-range 1 6 "Alpha")))
-      (should (eq (proofread--backend-identity) 'mock))
-      (should (eq (plist-get request :backend) 'mock))
+      (should (equal (proofread--backend-identity)
+                     `(:backend llm
+                                :provider ,proofread-test--llm-provider-identity
+                                :prompt-version ,proofread-prompt-version)))
+      (should (proofread--backend-identity-p (plist-get request :backend)))
       (proofread--cache-write-request request (list diagnostic))
       (should (proofread--cache-read-request request)))))
-
-(ert-deftest proofread-test-model-backend-cache-invalidation-misses ()
-  "Model-aware backend configuration changes miss old cache entries."
-  (with-temp-buffer
-    (insert "Alpha")
-    (proofread-mode 1)
-    (let* ((proofread-backend 'model-backend)
-           (proofread-backend-model "model-a")
-           (proofread-backend-endpoint "endpoint-a")
-           (proofread-backend-options '((temperature . 0.2)))
-           (proofread-prompt-version "prompt-a")
-           (chunk (car (proofread--request-ready-chunks-for-ranges
-                        (list (cons (point-min) (point-max))))))
-           (request (proofread--make-backend-request chunk))
-           (diagnostic
-            (proofread-test--diagnostic-for-range 1 6 "Alpha")))
-      (proofread--cache-write-request request (list diagnostic))
-      (let ((same-request (proofread--make-backend-request chunk)))
-        (should (proofread--cache-read-request same-request)))
-      (let ((proofread-backend-model "model-b"))
-        (should-not (proofread--cache-read-request
-                     (proofread--make-backend-request chunk))))
-      (let ((proofread-backend-endpoint "endpoint-b"))
-        (should-not (proofread--cache-read-request
-                     (proofread--make-backend-request chunk))))
-      (let ((proofread-backend-options '((temperature . 0.8))))
-        (should-not (proofread--cache-read-request
-                     (proofread--make-backend-request chunk))))
-      (let ((proofread-prompt-version "prompt-b"))
-        (should-not (proofread--cache-read-request
-                     (proofread--make-backend-request chunk)))))))
 
 (ert-deftest proofread-test-cache-read-write-hit-and-miss ()
   "Cache helpers read and write entries only for active proofread buffers."
@@ -1308,7 +1298,7 @@
 
 (ert-deftest proofread-test-cache-relative-diagnostic-conversion ()
   "Cached diagnostics convert exactly between absolute and relative ranges."
-  (let* ((request '(:beg 10 :end 20 :text "0123456789" :backend mock))
+  (let* ((request '(:beg 10 :end 20 :text "0123456789" :backend llm))
          (diagnostic
           (proofread-test--diagnostic-for-range 12 15 "234"))
          (relative
@@ -1332,7 +1322,10 @@
             (switch-to-buffer buffer)
             (insert "helo world")
             (proofread-mode 1)
-            (let ((proofread-backend 'mock)
+            (let ((proofread-backend 'llm)
+                  (proofread-llm-provider proofread-test--llm-provider)
+                  (proofread-llm-provider-identity
+                   proofread-test--llm-provider-identity)
                   request
                   callback
                   backend-calls)
@@ -1376,7 +1369,10 @@
             (switch-to-buffer buffer)
             (insert "helo")
             (proofread-mode 1)
-            (let* ((proofread-backend 'mock)
+            (let* ((proofread-backend 'llm)
+                   (proofread-llm-provider proofread-test--llm-provider)
+                   (proofread-llm-provider-identity
+                    proofread-test--llm-provider-identity)
                    (recorder (proofread-test--make-backend-recorder)))
               (cl-letf (((symbol-function 'window-start)
                          (lambda (&optional _window) (point-min)))
@@ -1404,7 +1400,10 @@
             (switch-to-buffer buffer)
             (insert "Alpha http://example.com/path Beta")
             (proofread-mode 1)
-            (let* ((proofread-backend 'mock)
+            (let* ((proofread-backend 'llm)
+                   (proofread-llm-provider proofread-test--llm-provider)
+                   (proofread-llm-provider-identity
+                    proofread-test--llm-provider-identity)
                    (proofread-context-size 0)
                    (chunks (proofread--request-ready-chunks-for-ranges
                             (list (cons (point-min) (point-max)))))
@@ -1415,7 +1414,7 @@
                      1 6 "Alpha" 'spelling))
                    (recorder (proofread-test--make-backend-recorder)))
               (setq cached-request
-                    (plist-put cached-request :backend 'mock))
+                    (plist-put cached-request :backend 'llm))
               (proofread--cache-write-request
                cached-request (list cached-diagnostic))
               (cl-letf (((symbol-function 'window-start)
@@ -1440,18 +1439,20 @@
   (with-temp-buffer
     (insert "Alpha")
     (proofread-mode 1)
-    (let* ((proofread-prompt-version "prompt-a")
+    (let* ((proofread-backend 'llm)
+           (proofread-llm-provider proofread-test--llm-provider)
+           (proofread-llm-provider-identity "provider-a")
+           (proofread-prompt-version "prompt-a")
            (proofread-cache-configuration-version 1)
            (chunk (car (proofread--request-ready-chunks-for-ranges
                         (list (cons (point-min) (point-max))))))
            (request (proofread--make-backend-request chunk))
            (diagnostic
             (proofread-test--diagnostic-for-range 1 6 "Alpha")))
-      (setq request (plist-put request :backend 'mock))
       (proofread--cache-write-request request (list diagnostic))
-      (let ((other-backend (plist-put (copy-sequence request)
-                                      :backend 'other-backend)))
-        (should-not (proofread--cache-read-request other-backend)))
+      (let ((proofread-llm-provider-identity "provider-b"))
+        (should-not (proofread--cache-read-request
+                     (proofread--make-backend-request chunk))))
       (let ((proofread-prompt-version "prompt-b"))
         (should-not (proofread--cache-read-request request)))
       (let ((proofread-cache-configuration-version 2))
@@ -1470,7 +1471,7 @@
            (request (proofread--make-backend-request chunk))
            (diagnostic
             (proofread-test--diagnostic-for-range 1 5 "helo")))
-      (setq request (plist-put request :backend 'mock))
+      (setq request (plist-put request :backend 'llm))
       (insert "!")
       (should (eq (proofread--handle-backend-result
                    (proofread--backend-success-result
@@ -1481,10 +1482,10 @@
                             (car (proofread--request-ready-chunks-for-ranges
                                   (list (cons (point-min)
                                               (point-max))))))))
-        (setq fresh-request (plist-put fresh-request :backend 'mock))
+        (setq fresh-request (plist-put fresh-request :backend 'llm))
         (should (eq (proofread--handle-backend-result
                      (proofread--backend-error-result
-                      fresh-request 'mock-failure "Mock failure"))
+                      fresh-request 'llm-failure "LLM failure"))
                     'error))
         (should (= (hash-table-count proofread--cache) 0))))))
 
@@ -1499,7 +1500,7 @@
            (diagnostic
             (proofread-test--diagnostic-for-range 1 5 "helo"))
            (entry (proofread--make-cache-entry request (list diagnostic))))
-      (setq request (plist-put request :backend 'mock))
+      (setq request (plist-put request :backend 'llm))
       (delete-region 1 5)
       (insert "hello")
       (let ((stale-request
@@ -1512,10 +1513,11 @@
         (should-not proofread--overlays)))))
 
 (ert-deftest proofread-test-backend-availability ()
-  "Backend availability reports support for the built-in mock backend."
-  (let ((proofread-backend 'mock))
+  "Backend availability is limited to a configured LLM backend."
+  (let ((proofread-backend 'llm)
+        (proofread-llm-provider proofread-test--llm-provider))
     (should (proofread-backend-available-p))
-    (should (proofread-backend-available-p 'mock))
+    (should (proofread-backend-available-p 'llm))
     (should-not (proofread-backend-available-p 'unknown-backend))))
 
 (ert-deftest proofread-test-ollama-backend-is-unavailable-and-unsupported ()
@@ -1583,7 +1585,9 @@
                  "qwen3:1.7b")))
       (let ((identity (proofread--backend-identity)))
         (should (eq (plist-get identity :backend) 'llm))
-        (should (equal (plist-get identity :provider) "qwen3:1.7b"))
+        (let ((provider (plist-get identity :provider)))
+          (should (equal (plist-get provider :name) "qwen3:1.7b"))
+          (should (integerp (plist-get provider :session))))
         (should (equal (plist-get identity :prompt-version) "prompt-a"))
         (should-not (string-match-p
                      "secret-token"
@@ -1609,6 +1613,32 @@
       (should (proofread--cache-read-request
                (proofread--make-backend-request chunk)))
       (let ((proofread-llm-provider-identity "provider-b"))
+        (should-not (proofread--cache-read-request
+                     (proofread--make-backend-request chunk)))))))
+
+(ert-deftest proofread-test-llm-provider-object-cache-miss ()
+  "Changing LLM provider objects misses cache without exposing the object."
+  (with-temp-buffer
+    (insert "Alpha")
+    (proofread-mode 1)
+    (let* ((proofread-backend 'llm)
+           (proofread-llm-provider [:provider-a :api-key "secret-token"])
+           (proofread-llm-provider-identity nil)
+           (chunk (car (proofread--request-ready-chunks-for-ranges
+                        (list (cons (point-min) (point-max))))))
+           (request (proofread--make-backend-request chunk))
+           (diagnostic
+            (proofread-test--diagnostic-for-range 1 6 "Alpha")))
+      (proofread--cache-write-request request (list diagnostic))
+      (should (proofread--cache-read-request
+               (proofread--make-backend-request chunk)))
+      (let ((proofread-llm-provider [:provider-b :api-key "secret-token"]))
+        (let ((key (proofread--cache-key
+                    (proofread--make-backend-request chunk))))
+          (should-not (proofread-test--tree-member-p
+                       proofread-llm-provider key))
+          (should-not (proofread-test--tree-member-p
+                       "secret-token" key)))
         (should-not (proofread--cache-read-request
                      (proofread--make-backend-request chunk)))))))
 
@@ -2186,7 +2216,7 @@
                                                 :hmm t
                                                 :prompt-version "2"
                                                 :user-dict nil)))
-         (base-key (proofread--cache-key chunk 'mock))
+         (base-key (proofread--cache-key chunk 'llm))
          (changed (copy-sequence chunk))
          (changed-prompt (copy-sequence chunk)))
     (setq changed
@@ -2203,9 +2233,9 @@
                                 :hmm t
                                 :prompt-version "3"
                                 :user-dict nil)))
-    (should-not (equal base-key (proofread--cache-key changed 'mock)))
+    (should-not (equal base-key (proofread--cache-key changed 'llm)))
     (should-not (equal base-key
-                       (proofread--cache-key changed-prompt 'mock)))))
+                       (proofread--cache-key changed-prompt 'llm)))))
 
 (ert-deftest proofread-test-tokenization-cache-key-excludes-volatile-values ()
   "Token-aware cache keys exclude volatile objects and secrets."
@@ -2285,46 +2315,47 @@
         (should (eq (plist-get request :major-mode) 'text-mode))
         (should (= (plist-get request :modified-tick) tick))))))
 
-(ert-deftest proofread-test-mock-backend-success-is-asynchronous ()
-  "Mock backend success callbacks happen after dispatch returns."
+(ert-deftest proofread-test-llm-backend-success-is-asynchronous ()
+  "LLM backend success callbacks happen after dispatch returns."
   (with-temp-buffer
     (insert "Alpha")
-    (let* ((chunk (car (proofread--request-ready-chunks-for-ranges
-                        (list (cons (point-min) (point-max))))))
-           (request (proofread--make-backend-request chunk))
-           result)
-      (should (proofread-backend-check
-               request
-               (lambda (backend-result)
-                 (setq result backend-result))
-               'mock))
-      (should-not result)
-      (should (proofread-test--wait-for (lambda () result)))
-      (should (eq (plist-get result :status) 'ok))
-      (should (eq (plist-get result :request) request))
-      (should (listp (plist-get result :diagnostics))))))
+    (proofread-test--with-llm-success
+     (proofread-test--json-diagnostics-content nil)
+     (let* ((chunk (car (proofread--request-ready-chunks-for-ranges
+                         (list (cons (point-min) (point-max))))))
+            (request (proofread--make-backend-request chunk))
+            result)
+       (should (proofread-backend-check
+                request
+                (lambda (backend-result)
+                  (setq result backend-result))
+                'llm))
+       (should-not result)
+       (should (proofread-test--wait-for (lambda () result)))
+       (should (eq (plist-get result :status) 'ok))
+       (should (eq (plist-get result :request) request))
+       (should (listp (plist-get result :diagnostics)))))))
 
-(ert-deftest proofread-test-mock-backend-error-is-asynchronous ()
-  "Mock backend error callbacks happen after dispatch returns."
+(ert-deftest proofread-test-llm-backend-error-is-asynchronous ()
+  "LLM backend error callbacks happen after dispatch returns."
   (with-temp-buffer
     (insert "Alpha")
-    (let* ((chunk (car (proofread--request-ready-chunks-for-ranges
-                        (list (cons (point-min) (point-max))))))
-           (request (proofread--make-backend-request chunk))
-           result)
-      (setq request (plist-put request :mock-error 'mock-failure))
-      (setq request (plist-put request :mock-message "Mock failure"))
-      (should (proofread-backend-check
-               request
-               (lambda (backend-result)
-                 (setq result backend-result))
-               'mock))
-      (should-not result)
-      (should (proofread-test--wait-for (lambda () result)))
-      (should (eq (plist-get result :status) 'error))
-      (should (eq (plist-get result :request) request))
-      (should (eq (plist-get result :error) 'mock-failure))
-      (should (equal (plist-get result :message) "Mock failure")))))
+    (proofread-test--with-llm-error 'llm-failure "LLM failure"
+                                    (let* ((chunk (car (proofread--request-ready-chunks-for-ranges
+                                                        (list (cons (point-min) (point-max))))))
+                                           (request (proofread--make-backend-request chunk))
+                                           result)
+                                      (should (proofread-backend-check
+                                               request
+                                               (lambda (backend-result)
+                                                 (setq result backend-result))
+                                               'llm))
+                                      (should-not result)
+                                      (should (proofread-test--wait-for (lambda () result)))
+                                      (should (eq (plist-get result :status) 'error))
+                                      (should (eq (plist-get result :request) request))
+                                      (should (eq (plist-get result :error) 'llm-failure))
+                                      (should (equal (plist-get result :message) "LLM failure"))))))
 
 (ert-deftest proofread-test-unsupported-backend-error-is-asynchronous ()
   "Unsupported backends report an asynchronous protocol error."
@@ -2350,24 +2381,26 @@
   (with-temp-buffer
     (insert "Alpha")
     (proofread-mode 1)
-    (let* ((buffer (current-buffer))
-           (chunk (car (proofread--request-ready-chunks-for-ranges
-                        (list (cons (point-min) (point-max))))))
-           (request (proofread--make-backend-request chunk))
-           result
-           active-at-callback)
-      (should (proofread--dispatch-backend-request
-               request
-               (lambda (backend-result)
-                 (setq result backend-result)
-                 (with-current-buffer buffer
-                   (setq active-at-callback proofread--requests)))
-               'mock))
-      (should (proofread--active-request-p request))
-      (should (proofread-test--wait-for (lambda () result)))
-      (should (eq (plist-get result :status) 'ok))
-      (should-not active-at-callback)
-      (should-not (proofread--active-request-p request)))))
+    (proofread-test--with-llm-success
+     (proofread-test--json-diagnostics-content nil)
+     (let* ((buffer (current-buffer))
+            (chunk (car (proofread--request-ready-chunks-for-ranges
+                         (list (cons (point-min) (point-max))))))
+            (request (proofread--make-backend-request chunk))
+            result
+            active-at-callback)
+       (should (proofread--dispatch-backend-request
+                request
+                (lambda (backend-result)
+                  (setq result backend-result)
+                  (with-current-buffer buffer
+                    (setq active-at-callback proofread--requests)))
+                'llm))
+       (should (proofread--active-request-p request))
+       (should (proofread-test--wait-for (lambda () result)))
+       (should (eq (plist-get result :status) 'ok))
+       (should-not active-at-callback)
+       (should-not (proofread--active-request-p request))))))
 
 (ert-deftest proofread-test-backend-error-preserves-buffer-and-clears-request ()
   "Backend error callbacks preserve text and clear active request state."
@@ -2381,20 +2414,20 @@
            (request (proofread--make-backend-request chunk))
            result
            active-at-callback)
-      (setq request (plist-put request :mock-error 'mock-failure))
-      (should (proofread--dispatch-backend-request
-               request
-               (lambda (backend-result)
-                 (setq result backend-result)
-                 (with-current-buffer buffer
-                   (setq active-at-callback proofread--requests)))
-               'mock))
-      (should (proofread--active-request-p request))
-      (should (proofread-test--wait-for (lambda () result)))
-      (should (eq (plist-get result :status) 'error))
-      (should (equal (buffer-string) before-text))
-      (should-not active-at-callback)
-      (should-not (proofread--active-request-p request)))))
+      (proofread-test--with-llm-error 'llm-failure "LLM failure"
+                                      (should (proofread--dispatch-backend-request
+                                               request
+                                               (lambda (backend-result)
+                                                 (setq result backend-result)
+                                                 (with-current-buffer buffer
+                                                   (setq active-at-callback proofread--requests)))
+                                               'llm))
+                                      (should (proofread--active-request-p request))
+                                      (should (proofread-test--wait-for (lambda () result)))
+                                      (should (eq (plist-get result :status) 'error))
+                                      (should (equal (buffer-string) before-text))
+                                      (should-not active-at-callback)
+                                      (should-not (proofread--active-request-p request))))))
 
 (ert-deftest proofread-test-check-visible-dispatches-request-ready-chunks ()
   "`proofread-check-visible' dispatches filtered visible chunks."
@@ -2405,7 +2438,10 @@
             (switch-to-buffer buffer)
             (insert "Alpha http://example.com/path Beta")
             (proofread-mode 1)
-            (let ((proofread-backend 'mock)
+            (let ((proofread-backend 'llm)
+                  (proofread-llm-provider proofread-test--llm-provider)
+                  (proofread-llm-provider-identity
+                   proofread-test--llm-provider-identity)
                   (proofread-context-size 0)
                   requests
                   callbacks)
@@ -2443,7 +2479,10 @@
                             "卖豆浆的滩主把炉子推到巷口。"
                             "几个上班的人撑着伞从桥边经过。"))
             (proofread-mode 1)
-            (let ((proofread-backend 'mock)
+            (let ((proofread-backend 'llm)
+                  (proofread-llm-provider proofread-test--llm-provider)
+                  (proofread-llm-provider-identity
+                   proofread-test--llm-provider-identity)
                   (proofread-context-size 0)
                   (proofread-max-concurrent-requests 10)
                   requests
@@ -2481,7 +2520,10 @@
   (let ((first-buffer (generate-new-buffer " *proofread-requests-a*"))
         (second-buffer (generate-new-buffer " *proofread-requests-b*")))
     (unwind-protect
-        (let ((proofread-backend 'mock))
+        (let ((proofread-backend 'llm)
+              (proofread-llm-provider proofread-test--llm-provider)
+              (proofread-llm-provider-identity
+               proofread-test--llm-provider-identity))
           (cl-letf (((symbol-function 'proofread-backend-check)
                      (lambda (_request _callback &optional _backend)
                        'proofread-test-handle)))
@@ -2517,7 +2559,10 @@
             (switch-to-buffer buffer)
             (insert "helo world")
             (proofread-mode 1)
-            (let ((proofread-backend 'mock)
+            (let ((proofread-backend 'llm)
+                  (proofread-llm-provider proofread-test--llm-provider)
+                  (proofread-llm-provider-identity
+                   proofread-test--llm-provider-identity)
                   request
                   callback)
               (cl-letf (((symbol-function 'window-start)
@@ -2551,7 +2596,7 @@
     (insert "前文。目标句。后文。")
     (proofread-mode 1)
     (let* ((proofread-language "zh")
-           (proofread-backend 'mock)
+           (proofread-backend 'llm)
            (proofread-context-size 300)
            (chunk (proofread-test--chunk-with-text
                    (proofread--request-ready-chunks-for-ranges
@@ -2583,7 +2628,10 @@
       (switch-to-buffer buffer)
       (insert "helo world")
       (proofread-mode 1)
-      (let ((proofread-backend 'mock))
+      (let ((proofread-backend 'llm)
+            (proofread-llm-provider proofread-test--llm-provider)
+            (proofread-llm-provider-identity
+             proofread-test--llm-provider-identity))
         (cl-letf (((symbol-function 'window-start)
                    (lambda (&optional _window) (point-min)))
                   ((symbol-function 'window-end)
@@ -2613,7 +2661,10 @@
             (switch-to-buffer buffer)
             (insert "helo world")
             (proofread-mode 1)
-            (let ((proofread-backend 'mock)
+            (let ((proofread-backend 'llm)
+                  (proofread-llm-provider proofread-test--llm-provider)
+                  (proofread-llm-provider-identity
+                   proofread-test--llm-provider-identity)
                   request
                   callback)
               (cl-letf (((symbol-function 'window-start)
@@ -2649,7 +2700,10 @@
             (switch-to-buffer buffer)
             (insert "helo world")
             (proofread-mode 1)
-            (let ((proofread-backend 'mock)
+            (let ((proofread-backend 'llm)
+                  (proofread-llm-provider proofread-test--llm-provider)
+                  (proofread-llm-provider-identity
+                   proofread-test--llm-provider-identity)
                   request
                   callback)
               (cl-letf (((symbol-function 'window-start)
@@ -2686,7 +2740,10 @@
             (switch-to-buffer buffer)
             (insert "helo world")
             (proofread-mode 1)
-            (let ((proofread-backend 'mock)
+            (let ((proofread-backend 'llm)
+                  (proofread-llm-provider proofread-test--llm-provider)
+                  (proofread-llm-provider-identity
+                   proofread-test--llm-provider-identity)
                   request
                   callback)
               (cl-letf (((symbol-function 'window-start)
@@ -2727,7 +2784,10 @@
             (switch-to-buffer buffer)
             (insert "helo world")
             (proofread-mode 1)
-            (let ((proofread-backend 'mock)
+            (let ((proofread-backend 'llm)
+                  (proofread-llm-provider proofread-test--llm-provider)
+                  (proofread-llm-provider-identity
+                   proofread-test--llm-provider-identity)
                   (before-text (buffer-string))
                   request
                   callback)
@@ -2745,7 +2805,7 @@
                 (should (eq (funcall
                              callback
                              (proofread--backend-error-result
-                              request 'mock-failure "Mock failure"))
+                              request 'llm-failure "LLM failure"))
                             'error))
                 (should (equal (buffer-string) before-text))
                 (should-not proofread--diagnostics)
@@ -2990,7 +3050,7 @@
            :message "Possible misspelling"
            :suggestions '("hello")
            :confidence 0.92
-           :source 'mock))
+           :source 'llm))
          (description
           (proofread--format-diagnostic-description diagnostic)))
     (should (string-match-p "Kind: spelling" description))
@@ -2998,7 +3058,7 @@
     (should (string-match-p "Original text:\nhelo" description))
     (should (string-match-p "1\\. hello" description))
     (should (string-match-p "Confidence: 0.92" description))
-    (should (string-match-p "Source: mock" description))))
+    (should (string-match-p "Source: llm" description))))
 
 (ert-deftest proofread-test-describe-displays-diagnostic-details ()
   "`proofread-describe' displays diagnostic details at point."
@@ -3015,7 +3075,7 @@
               :message "Possible misspelling"
               :suggestions '("hello")
               :confidence 0.91
-              :source 'mock)))
+              :source 'llm)))
         (proofread-test--install-diagnostics (list diagnostic))
         (goto-char 2)
         (proofread-describe)
@@ -3027,7 +3087,7 @@
             (should (string-match-p "Original text:\nhelo" description))
             (should (string-match-p "1\\. hello" description))
             (should (string-match-p "Confidence: 0.91" description))
-            (should (string-match-p "Source: mock" description))))))))
+            (should (string-match-p "Source: llm" description))))))))
 
 (ert-deftest proofread-test-describe-preserves-suggestion-order ()
   "`proofread-describe' displays suggestions in stored order."
@@ -3474,7 +3534,7 @@
                     :end 5
                     :text "helo"
                     :modified-tick (buffer-chars-modified-tick)
-                    :backend 'mock))
+                    :backend 'llm))
              (diagnostic
               (proofread-test--diagnostic-with-kind
                1 5 "helo" 'spelling))

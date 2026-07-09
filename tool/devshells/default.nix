@@ -241,10 +241,6 @@ in
           markdown = {
             command = "mdformat";
 
-            excludes = [
-              ".agents/skills/openspec-*/*.md"
-            ];
-
             includes = [
               "*.md"
             ];
