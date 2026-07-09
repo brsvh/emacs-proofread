@@ -499,7 +499,7 @@
     (should-not (proofread--idle-timer-run buffer))))
 
 (ert-deftest proofread-test-chunks-for-ranges-ordinary-paragraph ()
-  "Paragraph chunking records exact boundaries and text."
+  "Sentence chunking records exact boundaries and text."
   (with-temp-buffer
     (insert "First paragraph. Second line.\n\nIgnored")
     (let* ((paragraph-end (save-excursion
@@ -508,15 +508,17 @@
                             (- (point) 2)))
            (proofread-context-size 0)
            (chunks (proofread--chunks-for-ranges
-                    (list (cons (point-min) paragraph-end))))
-           (chunk (car chunks)))
-      (should (= (length chunks) 1))
-      (should (= (plist-get chunk :beg) (point-min)))
-      (should (= (plist-get chunk :end) paragraph-end))
-      (should (equal (plist-get chunk :text)
-                     (buffer-substring-no-properties
-                      (plist-get chunk :beg)
-                      (plist-get chunk :end)))))))
+                    (list (cons (point-min) paragraph-end)))))
+      (should (= (length chunks) 2))
+      (should (equal (proofread-test--chunk-texts chunks)
+                     '("First paragraph." "Second line.")))
+      (should (= (plist-get (car chunks) :beg) (point-min)))
+      (should (= (plist-get (car (last chunks)) :end) paragraph-end))
+      (dolist (chunk chunks)
+        (should (equal (plist-get chunk :text)
+                       (buffer-substring-no-properties
+                        (plist-get chunk :beg)
+                        (plist-get chunk :end))))))))
 
 (ert-deftest proofread-test-chunks-for-ranges-skips-whitespace ()
   "Paragraph chunking skips empty and whitespace-only paragraphs."
@@ -605,18 +607,40 @@
                         (plist-get chunk :beg)
                         (plist-get chunk :end))))))))
 
-(ert-deftest proofread-test-sentence-chunking-splits-newline ()
-  "Newline sentence boundaries can split visible text."
+(ert-deftest proofread-test-sentence-chunking-keeps-hard-wrapped-sentence ()
+  "A single hard-wrap newline does not split a logical sentence."
   (with-temp-buffer
     (insert "第一句\n第二句")
     (let* ((proofread-context-size 0)
            (chunks (proofread--chunks-for-ranges
                     (list (cons (point-min) (point-max))))))
       (should (equal (proofread-test--chunk-texts chunks)
-                     '("第一句\n" "第二句")))
+                     '("第一句\n第二句")))
       (should (equal (proofread-test--chunk-ranges chunks)
-                     (list (cons (point-min) 5)
-                           (cons 5 (point-max))))))))
+                     (list (cons (point-min) (point-max))))))))
+
+(ert-deftest proofread-test-sentence-chunking-splits-english-paragraph ()
+  "English punctuation splits sentences without breaking common inline forms."
+  (with-temp-buffer
+    (insert "Dr. Smith measured 3.14. It rained. Visit example.com/path? Done!")
+    (let* ((proofread-context-size 0)
+           (chunks (proofread--chunks-for-ranges
+                    (list (cons (point-min) (point-max))))))
+      (should (equal (proofread-test--chunk-texts chunks)
+                     '("Dr. Smith measured 3.14."
+                       "It rained."
+                       "Visit example.com/path?"
+                       "Done!"))))))
+
+(ert-deftest proofread-test-sentence-chunking-keeps-closing-quote ()
+  "Closing quotes and brackets stay with preceding sentence punctuation."
+  (with-temp-buffer
+    (insert "他说“第一句。”第二句。")
+    (let* ((proofread-context-size 0)
+           (chunks (proofread--chunks-for-ranges
+                    (list (cons (point-min) (point-max))))))
+      (should (equal (proofread-test--chunk-texts chunks)
+                     '("他说“第一句。”" "第二句。"))))))
 
 (ert-deftest proofread-test-sentence-chunking-preserves-metadata-and-context ()
   "Sentence chunks preserve exact text, metadata, and context."
@@ -769,34 +793,16 @@
           (should (equal (proofread-test--chunk-texts chunks)
                          '("超长" "词汇"))))))))
 
-(ert-deftest proofread-test-sentence-chunking-falls-back-on-error ()
-  "Sentence boundary failures fall back to paragraph chunking."
+(ert-deftest proofread-test-sentence-chunking-keeps-unpunctuated-paragraph ()
+  "Unpunctuated paragraphs stay one logical sentence."
   (with-temp-buffer
-    (insert "第一句。第二句。")
+    (insert "第一句 第二句")
     (let ((proofread-context-size 0))
-      (cl-letf (((symbol-function 'proofread--sentence-boundary-available-p)
-                 (lambda () t))
-                ((symbol-function 'jieba-rs-forward-sentence)
-                 (lambda (&optional _arg)
-                   (error "synthetic sentence failure"))))
-        (let ((chunks (proofread--chunks-for-ranges
-                       (list (cons (point-min) (point-max))))))
-          (should (equal (proofread-test--chunk-texts chunks)
-                         '("第一句。第二句。")))
-          (should (= (length chunks) 1)))))))
-
-(ert-deftest proofread-test-sentence-chunking-falls-back-unavailable ()
-  "Unavailable sentence boundaries fall back without signaling."
-  (with-temp-buffer
-    (insert "第一句。第二句。")
-    (let ((proofread-context-size 0))
-      (cl-letf (((symbol-function 'proofread--sentence-boundary-available-p)
-                 (lambda () nil)))
-        (let ((chunks (proofread--chunks-for-ranges
-                       (list (cons (point-min) (point-max))))))
-          (should (equal (proofread-test--chunk-texts chunks)
-                         '("第一句。第二句。")))
-          (should (= (length chunks) 1)))))))
+      (let ((chunks (proofread--chunks-for-ranges
+                     (list (cons (point-min) (point-max))))))
+        (should (equal (proofread-test--chunk-texts chunks)
+                       '("第一句 第二句")))
+        (should (= (length chunks) 1))))))
 
 (ert-deftest proofread-test-sentence-chunking-filtering-still-applies ()
   "Request-ready filtering still excludes ignored text after sentence splitting."
@@ -1151,19 +1157,17 @@
                       (plist-get chunk :beg)
                       (plist-get chunk :end)))))))
 
-(ert-deftest proofread-test-request-ready-context-boundary-fallback ()
-  "Unavailable sentence boundaries fall back to character context."
+(ert-deftest proofread-test-request-ready-context-fragment-fallback ()
+  "Oversized unpunctuated context uses bounded character context."
   (with-temp-buffer
-    (insert "abcTARGETxyz")
+    (insert "abcdefTARGETuvwxyz")
     (let ((proofread-context-size 3)
           (proofread-context-sentences-before 1)
           (proofread-context-sentences-after 1))
-      (cl-letf (((symbol-function 'proofread--sentence-boundary-available-p)
-                 (lambda () nil)))
-        (let ((chunk (proofread--make-request-ready-chunk 4 10)))
-          (should (equal (plist-get chunk :text) "TARGET"))
-          (should (equal (plist-get chunk :context-before) "abc"))
-          (should (equal (plist-get chunk :context-after) "xyz")))))))
+      (let ((chunk (proofread--make-request-ready-chunk 7 13)))
+        (should (equal (plist-get chunk :text) "TARGET"))
+        (should (equal (plist-get chunk :context-before) "def"))
+        (should (equal (plist-get chunk :context-after) "uvw"))))))
 
 (ert-deftest proofread-test-cache-key-varies-by-identity ()
   "Cache keys change when text or environment identity changes."

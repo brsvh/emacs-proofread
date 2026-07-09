@@ -35,7 +35,6 @@
 (require 'llm)
 (require 'subr-x)
 
-(declare-function jieba-rs-forward-sentence "jieba-rs" (&optional arg))
 (declare-function jieba-rs-module-segment "jieba-rs" (text hmm))
 
 (defvar jieba-rs-hmm)
@@ -365,7 +364,7 @@ are discarded.  Overlapping or adjacent ranges are merged."
 
 (defun proofread--paragraph-spans-in-range (beg end)
   "Return nonblank paragraph spans between BEG and END.
-Paragraphs are nonblank runs of lines separated by one or more blank lines."
+Paragraphs are nonblank runs of lines separated by blank or structural lines."
   (let ((beg (max (point-min) beg))
         (end (min (point-max) end))
         paragraph-beg
@@ -377,15 +376,23 @@ Paragraphs are nonblank runs of lines separated by one or more blank lines."
         (while (< (point) end)
           (let ((line-beg (point))
                 (line-end (min (line-end-position) end)))
-            (if (proofread--range-nonblank-p line-beg line-end)
+            (if (proofread--context-stop-line-at-point-p)
                 (progn
-                  (unless paragraph-beg
-                    (setq paragraph-beg line-beg))
-                  (setq paragraph-end line-end))
-              (when paragraph-beg
-                (push (cons paragraph-beg paragraph-end) spans)
-                (setq paragraph-beg nil)
-                (setq paragraph-end nil)))
+                  (when paragraph-beg
+                    (push (cons paragraph-beg paragraph-end) spans)
+                    (setq paragraph-beg nil)
+                    (setq paragraph-end nil))
+                  (when (proofread--range-nonblank-p line-beg line-end)
+                    (push (cons line-beg line-end) spans)))
+              (if (proofread--range-nonblank-p line-beg line-end)
+                  (progn
+                    (unless paragraph-beg
+                      (setq paragraph-beg line-beg))
+                    (setq paragraph-end line-end))
+                (when paragraph-beg
+                  (push (cons paragraph-beg paragraph-end) spans)
+                  (setq paragraph-beg nil)
+                  (setq paragraph-end nil))))
             (forward-line 1)
             (when (> (point) end)
               (goto-char end))))
@@ -402,59 +409,98 @@ Paragraphs are nonblank runs of lines separated by one or more blank lines."
         (push span spans)))
     (nreverse spans)))
 
-(defun proofread--sentence-boundary-available-p ()
-  "Return non-nil when Chinese sentence boundary movement is available."
-  (or (fboundp 'jieba-rs-forward-sentence)
-      (and (require 'jieba-rs nil t)
-           (fboundp 'jieba-rs-forward-sentence))))
+(defconst proofread--sentence-closing-characters
+  "\"'”’»）]}】》」』"
+  "Characters included after sentence-ending punctuation.")
 
-(defun proofread--forward-sentence-boundary (limit)
-  "Move to the next sentence boundary before LIMIT and return point.
-Return nil when sentence boundary movement is unavailable, fails, does not move
-point, or moves outside LIMIT."
-  (when (proofread--sentence-boundary-available-p)
-    (let ((origin (point)))
-      (condition-case nil
-          (progn
-            (jieba-rs-forward-sentence 1)
-            (if (and (> (point) origin)
-                     (<= (point) limit))
-                (point)
-              (goto-char origin)
-              nil))
-        (error
-         (goto-char origin)
-         nil)))))
+(defun proofread--sentence-ending-character-p (character)
+  "Return non-nil when CHARACTER is sentence-ending punctuation."
+  (memq character
+        '(?。 ?！ ?？ ?! ?? ?. ?； ?\; ?…)))
+
+(defun proofread--sentence-closing-character-p (character)
+  "Return non-nil when CHARACTER closes a sentence after punctuation."
+  (and character
+       (string-search (char-to-string character)
+                      proofread--sentence-closing-characters)))
+
+(defun proofread--ascii-alnum-character-p (character)
+  "Return non-nil when CHARACTER is an ASCII letter or digit."
+  (and character
+       (or (<= ?0 character ?9)
+           (<= ?A character ?Z)
+           (<= ?a character ?z))))
+
+(defun proofread--period-between-ascii-alnum-p (position)
+  "Return non-nil when the period at POSITION is inside a word-like token."
+  (and (eq (char-after position) ?.)
+       (proofread--ascii-alnum-character-p (char-before position))
+       (proofread--ascii-alnum-character-p (char-after (1+ position)))))
+
+(defun proofread--english-abbreviation-period-p (position)
+  "Return non-nil when the period at POSITION follows a common abbreviation."
+  (and (eq (char-after position) ?.)
+       (let ((case-fold-search t)
+             (text (buffer-substring-no-properties
+                    (line-beginning-position)
+                    (1+ position))))
+         (string-match-p
+          "\\(?:\\b\\(?:Mr\\|Mrs\\|Ms\\|Dr\\|Prof\\|Sr\\|Jr\\|St\\|vs\\|etc\\)\\|\\be\\.g\\|\\bi\\.e\\|\\ba\\.m\\|\\bp\\.m\\)\\.$"
+          text))))
+
+(defun proofread--sentence-boundary-at-point-p ()
+  "Return non-nil when point is at an internal sentence boundary."
+  (let ((character (char-after)))
+    (and (proofread--sentence-ending-character-p character)
+         (not (proofread--period-between-ascii-alnum-p (point)))
+         (not (proofread--english-abbreviation-period-p (point))))))
+
+(defun proofread--sentence-boundary-end (limit)
+  "Return the end of the sentence boundary at point, not beyond LIMIT."
+  (save-excursion
+    (while (and (< (point) limit)
+                (proofread--sentence-ending-character-p (char-after)))
+      (forward-char 1))
+    (while (and (< (point) limit)
+                (proofread--sentence-closing-character-p (char-after)))
+      (forward-char 1))
+    (point)))
+
+(defun proofread--skip-sentence-separator-whitespace (limit)
+  "Move point past whitespace between sentences, not beyond LIMIT."
+  (while (and (< (point) limit)
+              (memq (char-after) '(?\s ?\t ?\n ?\r)))
+    (forward-char 1)))
 
 (defun proofread--sentence-spans-in-paragraph (span)
-  "Return sentence spans inside paragraph SPAN, or nil if unavailable."
+  "Return sentence spans inside paragraph SPAN.
+The splitter is intentionally local and punctuation-based for Chinese and
+English prose.  Single hard-wrap newlines are not sentence boundaries unless
+the preceding text ends with sentence punctuation."
   (let ((beg (car span))
         (end (cdr span))
-        spans
-        moved)
+        spans)
     (save-mark-and-excursion
       (save-restriction
         (narrow-to-region beg end)
-        (goto-char beg)
-        (while (< (point) end)
-          (let ((span-beg (point))
-                (span-end (proofread--forward-sentence-boundary end)))
-            (if span-end
-                (progn
+        (let ((span-beg beg))
+          (goto-char beg)
+          (while (< (point) end)
+            (if (proofread--sentence-boundary-at-point-p)
+                (let ((span-end (proofread--sentence-boundary-end end)))
                   (when (proofread--range-nonblank-p span-beg span-end)
                     (push (cons span-beg span-end) spans))
-                  (setq moved t)
-                  (goto-char span-end))
-              (goto-char end)
-              (when (proofread--range-nonblank-p span-beg end)
-                (push (cons span-beg end) spans)))))))
-    (when (and moved spans)
-      (nreverse spans))))
+                  (goto-char span-end)
+                  (proofread--skip-sentence-separator-whitespace end)
+                  (setq span-beg (point)))
+              (forward-char 1)))
+          (when (proofread--range-nonblank-p span-beg end)
+            (push (cons span-beg end) spans)))))
+    (nreverse spans)))
 
 (defun proofread--sentence-or-paragraph-spans (span)
-  "Return sentence spans for SPAN, falling back to paragraph SPAN."
-  (or (proofread--sentence-spans-in-paragraph span)
-      (list span)))
+  "Return sentence spans for SPAN."
+  (proofread--sentence-spans-in-paragraph span))
 
 (defun proofread--sentence-spans-for-ranges (ranges)
   "Return sentence-aware spans for visible RANGES."
@@ -847,44 +893,11 @@ chunks within `proofread-max-chunk-size'."
             (setq boundary (line-beginning-position)))))
       (max end (or boundary (point-max))))))
 
-(defun proofread--sentence-ending-character-p (character)
-  "Return non-nil when CHARACTER is sentence-ending punctuation."
-  (memq character
-        '(?。 ?！ ?？ ?! ?? ?. ?； ?\; ?…)))
-
-(defun proofread--hard-wrap-sentence-boundary-p (left _right)
-  "Return non-nil when LEFT and _RIGHT meet at a hard-wrap newline."
-  (let ((end (cdr left)))
-    (and (> end (car left))
-         (eq (char-before end) ?\n)
-         (> (1- end) (car left))
-         (not (proofread--sentence-ending-character-p
-               (char-before (1- end)))))))
-
-(defun proofread--merge-hard-wrapped-sentence-spans (spans)
-  "Return SPANS with hard-wrap newline sentence boundaries merged."
-  (let (merged)
-    (dolist (span spans)
-      (if (and merged
-               (proofread--hard-wrap-sentence-boundary-p
-                (car merged) span))
-          (setcdr (car merged) (cdr span))
-        (push (cons (car span) (cdr span)) merged)))
-    (nreverse merged)))
-
 (defun proofread--context-sentence-spans (beg end)
-  "Return logical context sentence spans between BEG and END.
-Return the symbol `fallback' when sentence spans cannot be computed for
-nonblank text."
-  (cond
-   ((not (< beg end)) nil)
-   ((not (proofread--range-nonblank-p beg end)) nil)
-   ((not (proofread--sentence-boundary-available-p)) 'fallback)
-   (t
-    (let ((spans (proofread--sentence-spans-in-paragraph (cons beg end))))
-      (if spans
-          (proofread--merge-hard-wrapped-sentence-spans spans)
-        'fallback)))))
+  "Return logical context sentence spans between BEG and END."
+  (when (and (< beg end)
+             (proofread--range-nonblank-p beg end))
+    (proofread--sentence-spans-in-paragraph (cons beg end))))
 
 (defun proofread--take-spans (count spans)
   "Return the first COUNT items from SPANS."
@@ -918,7 +931,7 @@ nonblank text."
   "Return sentence-window context in REGION-BEG to REGION-END.
 DIRECTION is either `before' or `after'.  COUNT is the desired sentence count.
 FALLBACK is the bounded character-window context used when sentence context is
-unavailable or a single context sentence is too large."
+too large for `proofread-context-size'."
   (let ((count (max 0 count))
         (size (max 0 proofread-context-size)))
     (cond
@@ -927,7 +940,6 @@ unavailable or a single context sentence is too large."
      (t
       (let ((spans (proofread--context-sentence-spans region-beg region-end)))
         (cond
-         ((eq spans 'fallback) fallback)
          ((null spans) "")
          (t
           (let ((sentence-count (min count (length spans)))
