@@ -118,6 +118,12 @@
     ("suggestions" . ,(vconcat (or suggestions '("hello"))))
     ("confidence" . 0.9)))
 
+(defun proofread-test--json-diagnostic-with-fields
+    (beg end text fields)
+  "Return a JSON diagnostic for BEG, END, and TEXT plus FIELDS."
+  (append (proofread-test--json-diagnostic beg end text)
+          fields))
+
 (ert-deftest proofread-test-normalize-ranges-merges-adjacent-ranges ()
   "Visible range normalization discards invalid ranges and merges duplicates."
   (should (equal (proofread--normalize-ranges
@@ -582,18 +588,130 @@
   "A single oversized sentence still splits into bounded chunks."
   (with-temp-buffer
     (insert "一二三四五六。")
-    (let* ((proofread-max-chunk-size 3)
-           (proofread-context-size 0)
-           (chunks (proofread--chunks-for-ranges
-                    (list (cons (point-min) (point-max))))))
-      (should (equal (proofread-test--chunk-texts chunks)
-                     '("一二三" "四五六" "。")))
-      (should (equal (proofread-test--chunk-ranges chunks)
-                     '((1 . 4) (4 . 7) (7 . 8))))
-      (should (cl-every (lambda (chunk)
-                          (<= (length (plist-get chunk :text))
-                              proofread-max-chunk-size))
-                        chunks)))))
+    (let ((proofread-max-chunk-size 3)
+          (proofread-context-size 0)
+          (proofread-token-map-enabled nil))
+      (let ((chunks (proofread--chunks-for-ranges
+                     (list (cons (point-min) (point-max))))))
+        (should (equal (proofread-test--chunk-texts chunks)
+                       '("一二三" "四五六" "。")))
+        (should (equal (proofread-test--chunk-ranges chunks)
+                       '((1 . 4) (4 . 7) (7 . 8))))
+        (should (cl-every (lambda (chunk)
+                            (<= (length (plist-get chunk :text))
+                                proofread-max-chunk-size))
+                          chunks))))))
+
+(ert-deftest proofread-test-token-map-generation-exact-offsets ()
+  "Token maps use exact chunk-relative offsets."
+  (with-temp-buffer
+    (insert "青晨六点，小城。")
+    (let ((proofread-language "zh")
+          (proofread-context-size 0))
+      (cl-letf (((symbol-function 'jieba-rs-module-segment)
+                 (lambda (_text _hmm)
+                   '("青晨" "六点" "，" "小城" "。"))))
+        (let* ((chunk (car (proofread--request-ready-chunks-for-ranges
+                            (list (cons (point-min) (point-max))))))
+               (tokens (plist-get chunk :tokens)))
+          (should (equal (mapcar (lambda (token)
+                                   (list (plist-get token :index)
+                                         (plist-get token :beg)
+                                         (plist-get token :end)
+                                         (plist-get token :text)))
+                                 tokens)
+                         '((0 0 2 "青晨")
+                           (1 2 4 "六点")
+                           (2 4 5 "，")
+                           (3 5 7 "小城")
+                           (4 7 8 "。"))))
+          (should (equal (plist-get (plist-get chunk :tokenization)
+                                    :prompt-version)
+                         proofread-prompt-version))
+          (dolist (token tokens)
+            (should (equal (plist-get token :text)
+                           (substring (plist-get chunk :text)
+                                      (plist-get token :beg)
+                                      (plist-get token :end))))))))))
+
+(ert-deftest proofread-test-token-map-runs-after-request-filtering ()
+  "Token maps are built only for retained request-ready text."
+  (with-temp-buffer
+    (insert "青晨 http://example.com 小城。")
+    (let ((proofread-language "zh")
+          (proofread-context-size 0))
+      (cl-letf (((symbol-function 'jieba-rs-module-segment)
+                 (lambda (text _hmm)
+                   (pcase text
+                     ("青晨 " '("青晨" " "))
+                     (" 小城。" '(" " "小城" "。"))))))
+        (let* ((chunks (proofread--request-ready-chunks-for-ranges
+                        (list (cons (point-min) (point-max)))))
+               (token-texts
+                (mapcan (lambda (chunk)
+                          (mapcar (lambda (token)
+                                    (plist-get token :text))
+                                  (plist-get chunk :tokens)))
+                        chunks)))
+          (should (equal (proofread-test--chunk-texts chunks)
+                         '("青晨 " " 小城。")))
+          (should (equal token-texts '("青晨" "小城" "。")))
+          (should-not (member "http://example.com" token-texts)))))))
+
+(ert-deftest proofread-test-token-map-falls-back-safely ()
+  "Unavailable, failing, or invalid tokenization creates no token map."
+  (dolist (scenario '(unavailable failing invalid))
+    (with-temp-buffer
+      (insert "青晨")
+      (let ((proofread-language "zh")
+            (proofread-context-size 0))
+        (cl-letf (((symbol-function 'proofread--jieba-tokenization-available-p)
+                   (lambda ()
+                     (not (eq scenario 'unavailable))))
+                  ((symbol-function 'jieba-rs-module-segment)
+                   (lambda (_text _hmm)
+                     (pcase scenario
+                       ('failing (error "synthetic token failure"))
+                       ('invalid '("青" "BAD"))
+                       (_ '("青晨"))))))
+          (let ((chunk (car (proofread--request-ready-chunks-for-ranges
+                             (list (cons (point-min) (point-max)))))))
+            (should-not (plist-get chunk :tokens))
+            (should-not (plist-get chunk :tokenization))))))))
+
+(ert-deftest proofread-test-token-boundary-splits-oversized-sentence ()
+  "Oversized sentences prefer token-boundary splits."
+  (with-temp-buffer
+    (insert "青晨六点小城安静。")
+    (let ((proofread-language "zh")
+          (proofread-context-size 0)
+          (proofread-max-chunk-size 4))
+      (cl-letf (((symbol-function 'jieba-rs-module-segment)
+                 (lambda (_text _hmm)
+                   '("青晨" "六点" "小城" "安静" "。"))))
+        (let ((chunks (proofread--chunks-for-ranges
+                       (list (cons (point-min) (point-max))))))
+          (should (equal (proofread-test--chunk-texts chunks)
+                         '("青晨六点" "小城安静" "。")))
+          (should (cl-every (lambda (chunk)
+                              (<= (length (plist-get chunk :text))
+                                  proofread-max-chunk-size))
+                            chunks)))))))
+
+(ert-deftest proofread-test-oversized-token-falls-back-to-bounded-split ()
+  "A token larger than the chunk limit falls back to character splitting."
+  (with-temp-buffer
+    (insert "超长词汇")
+    (let ((proofread-language "zh")
+          (proofread-context-size 0)
+          (proofread-max-chunk-size 2))
+      (cl-letf (((symbol-function 'jieba-rs-module-segment)
+                 (lambda (_text _hmm)
+                   '("超长词汇"))))
+        (let ((chunks (proofread--chunks-for-ranges
+                       (list (cons (point-min) (point-max))))))
+          (should (equal (proofread-test--chunk-texts chunks)
+                         '("超长" "词汇"))))))))
 
 (ert-deftest proofread-test-sentence-chunking-falls-back-on-error ()
   "Sentence boundary failures fall back to paragraph chunking."
@@ -1279,6 +1397,42 @@
                        :source)
                       'llm)))))))
 
+(ert-deftest proofread-test-llm-prompt-includes-token-list ()
+  "LLM prompts include token maps when request tokens are present."
+  (with-temp-buffer
+    (org-mode)
+    (insert "青晨六点。")
+    (let ((proofread-language "zh")
+          (proofread-context-size 0)
+          (proofread-llm-provider 'proofread-test-provider)
+          captured-prompt)
+      (cl-letf (((symbol-function 'jieba-rs-module-segment)
+                 (lambda (_text _hmm)
+                   '("青晨" "六点" "。")))
+                ((symbol-function 'llm-chat-async)
+                 (lambda (_provider prompt _success _error
+                                    &optional _multi-output)
+                   (setq captured-prompt prompt)
+                   'proofread-test-llm-handle)))
+        (let* ((chunk (car (proofread--request-ready-chunks-for-ranges
+                            (list (cons (point-min) (point-max))))))
+               (request (proofread--make-backend-request chunk 'llm)))
+          (proofread-backend-check request #'ignore 'llm)
+          (let* ((interaction
+                  (car (llm-chat-prompt-interactions captured-prompt)))
+                 (prompt-text
+                  (llm-chat-prompt-interaction-content interaction)))
+            (should (string-match-p "Text:\n青晨六点。" prompt-text))
+            (should (string-match-p "Tokens:" prompt-text))
+            (should (string-match-p "0 \\[0,2\\] \"青晨\""
+                                    prompt-text))
+            (should (string-match-p "1 \\[2,4\\] \"六点\""
+                                    prompt-text))
+            (should (string-match-p "token_index" prompt-text))
+            (should (string-match-p "token_range" prompt-text))
+            (should (string-match-p "range and text fields are still required"
+                                    prompt-text))))))))
+
 (ert-deftest proofread-test-llm-success-enters-overlay-pipeline ()
   "Fresh LLM diagnostics use the existing result, cache, and overlay path."
   (with-temp-buffer
@@ -1453,6 +1607,20 @@
       (should (string-match-p "Text:\nhelo" prompt))
       (should-not (string-match-p "absolute buffer" prompt)))))
 
+(ert-deftest proofread-test-json-diagnostic-prompt-without-tokens-falls-back ()
+  "Token locator details are not required when requests have no tokens."
+  (with-temp-buffer
+    (text-mode)
+    (insert "helo")
+    (let* ((chunk (car (proofread--request-ready-chunks-for-ranges
+                        (list (cons (point-min) (point-max))))))
+           (request (proofread--make-backend-request chunk 'llm))
+           (prompt (proofread--diagnostic-prompt request)))
+      (should-not (string-match-p "Tokens:" prompt))
+      (should-not (string-match-p "When you can localize" prompt))
+      (should (string-match-p "Token fields are optional locator hints"
+                              prompt)))))
+
 (ert-deftest proofread-test-json-diagnostic-extra-text-around-payload ()
   "JSON diagnostic parser accepts extra text around one payload."
   (with-temp-buffer
@@ -1611,6 +1779,90 @@
       (should-not (plist-get (cadr diagnostics) :confidence))
       (should (eq (plist-get (cadr diagnostics) :source) 'llm)))))
 
+(ert-deftest proofread-test-json-diagnostic-token-locators ()
+  "Token locators are consistency hints for otherwise valid diagnostics."
+  (let* ((request '(:beg 10
+                         :end 18
+                         :text "青晨六点"
+                         :tokens ((:index 0 :beg 0 :end 2 :text "青晨")
+                                  (:index 1 :beg 2 :end 4 :text "六点"))))
+         (content
+          (proofread-test--json-diagnostics-content
+           (list
+            (proofread-test--json-diagnostic-with-fields
+             0 2 "青晨" '(("token_index" . 0)))
+            (proofread-test--json-diagnostic
+             2 4 "六点" '("六点钟"))
+            (proofread-test--json-diagnostic-with-fields
+             0 2 "青晨" '(("token_index" . "0"))))))
+         (diagnostics
+          (proofread--diagnostics-from-content request content 'llm)))
+    (should (= (length diagnostics) 3))
+    (should (equal (mapcar (lambda (diagnostic)
+                             (plist-get diagnostic :text))
+                           diagnostics)
+                   '("青晨" "六点" "青晨")))
+    (should (equal (mapcar (lambda (diagnostic)
+                             (cons (plist-get diagnostic :beg)
+                                   (plist-get diagnostic :end)))
+                           diagnostics)
+                   '((10 . 12) (12 . 14) (10 . 12))))))
+
+(ert-deftest proofread-test-json-diagnostic-token-range-locator ()
+  "Token ranges validate against required diagnostic ranges."
+  (let* ((request '(:beg 1
+                         :end 5
+                         :text "青晨六点"
+                         :tokens ((:index 0 :beg 0 :end 2 :text "青晨")
+                                  (:index 1 :beg 2 :end 4 :text "六点"))))
+         (content
+          (proofread-test--json-diagnostics-content
+           (list
+            (proofread-test--json-diagnostic-with-fields
+             0 4 "青晨六点"
+             '(("token_range" . (("beg" . 0)
+                                 ("end" . 2))))))))
+         (diagnostic
+          (car (proofread--diagnostics-from-content
+                request content 'llm))))
+    (should diagnostic)
+    (should (= (plist-get diagnostic :beg) 1))
+    (should (= (plist-get diagnostic :end) 5))))
+
+(ert-deftest proofread-test-json-diagnostic-contradictory-token-is-dropped ()
+  "Token locators that contradict range and text reject only that candidate."
+  (let* ((request '(:beg 1
+                         :end 9
+                         :text "青晨六点小城"
+                         :tokens ((:index 0 :beg 0 :end 2 :text "青晨")
+                                  (:index 1 :beg 2 :end 4 :text "六点")
+                                  (:index 2 :beg 4 :end 6 :text "小城"))))
+         (content
+          (proofread-test--json-diagnostics-content
+           (list
+            (proofread-test--json-diagnostic-with-fields
+             0 2 "青晨" '(("token_index" . 1)))
+            (proofread-test--json-diagnostic-with-fields
+             4 6 "小城" '(("token_index" . 2)))))))
+    (let ((diagnostics
+           (proofread--diagnostics-from-content request content 'llm)))
+      (should (= (length diagnostics) 1))
+      (should (equal (plist-get (car diagnostics) :text) "小城")))))
+
+(ert-deftest proofread-test-json-diagnostic-token-only-is-rejected ()
+  "Token-only diagnostics without range and text are rejected."
+  (let* ((request '(:beg 1
+                         :end 5
+                         :text "青晨六点"
+                         :tokens ((:index 0 :beg 0 :end 2 :text "青晨"))))
+         (content
+          (proofread-test--json-diagnostics-content
+           (list '(("kind" . "spelling")
+                   ("message" . "Possible misspelling")
+                   ("token_index" . 0)
+                   ("suggestions" . ["清晨"]))))))
+    (should-not (proofread--diagnostics-from-content request content 'llm))))
+
 (ert-deftest proofread-test-json-diagnostic-parsed-results-still-stale-check ()
   "Parsed JSON diagnostics still require stale validation."
   (with-temp-buffer
@@ -1654,6 +1906,91 @@
       (let ((proofread-prompt-version "json-v2"))
         (should-not (proofread--cache-read-request
                      (proofread--make-backend-request chunk)))))))
+
+(ert-deftest proofread-test-tokenization-identity-cache-miss ()
+  "Tokenization identity changes miss old cache entries."
+  (let* ((chunk '(:text "青晨"
+                        :language "zh"
+                        :major-mode org-mode
+                        :tokenization (:enabled t
+                                                :function jieba-rs-module-segment
+                                                :hmm t
+                                                :prompt-version "2"
+                                                :user-dict nil)))
+         (base-key (proofread--cache-key chunk 'mock))
+         (changed (copy-sequence chunk))
+         (changed-prompt (copy-sequence chunk)))
+    (setq changed
+          (plist-put changed :tokenization
+                     '(:enabled t
+                                :function jieba-rs-module-segment
+                                :hmm nil
+                                :prompt-version "2"
+                                :user-dict nil)))
+    (setq changed-prompt
+          (plist-put changed-prompt :tokenization
+                     '(:enabled t
+                                :function jieba-rs-module-segment
+                                :hmm t
+                                :prompt-version "3"
+                                :user-dict nil)))
+    (should-not (equal base-key (proofread--cache-key changed 'mock)))
+    (should-not (equal base-key
+                       (proofread--cache-key changed-prompt 'mock)))))
+
+(ert-deftest proofread-test-tokenization-cache-key-excludes-volatile-values ()
+  "Token-aware cache keys exclude volatile objects and secrets."
+  (with-temp-buffer
+    (let* ((proofread-backend 'llm)
+           (proofread-llm-provider [:api-key "secret-token"])
+           (proofread-llm-provider-identity "provider-a")
+           (chunk (list :text "青晨"
+                        :language "zh"
+                        :major-mode 'org-mode
+                        :buffer (current-buffer)
+                        :callback #'ignore
+                        :tokens '((:index 0
+                                          :beg 0
+                                          :end 2
+                                          :text "青晨"))
+                        :tokenization '(:enabled t
+                                                 :function jieba-rs-module-segment
+                                                 :hmm t
+                                                 :prompt-version "2"
+                                                 :user-dict nil)))
+           (key (proofread--cache-key chunk)))
+      (should-not (plist-member key :buffer))
+      (should-not (plist-member key :callback))
+      (should-not (plist-member key :tokens))
+      (should-not (string-match-p "secret-token" (prin1-to-string key)))
+      (should-not (string-match-p (buffer-name) (prin1-to-string key))))))
+
+(ert-deftest proofread-test-token-aware-stale-result-is-dropped ()
+  "Token-aware successful results still require stale validation."
+  (with-temp-buffer
+    (insert "青晨")
+    (proofread-mode 1)
+    (let ((proofread-language "zh"))
+      (cl-letf (((symbol-function 'jieba-rs-module-segment)
+                 (lambda (_text _hmm)
+                   '("青晨"))))
+        (let* ((chunk (car (proofread--request-ready-chunks-for-ranges
+                            (list (cons (point-min) (point-max))))))
+               (request (proofread--make-backend-request chunk 'llm))
+               (content
+                (proofread-test--json-diagnostics-content
+                 (list (proofread-test--json-diagnostic-with-fields
+                        0 2 "青晨" '(("token_index" . 0))))))
+               (diagnostics
+                (proofread--diagnostics-from-content request content 'llm)))
+          (goto-char (point-max))
+          (insert "!")
+          (should (eq (proofread--handle-backend-result
+                       (proofread--backend-success-result
+                        request diagnostics))
+                      'stale))
+          (should-not proofread--diagnostics)
+          (should-not proofread--overlays))))))
 
 (ert-deftest proofread-test-backend-request-records-chunk-fields ()
   "Backend requests preserve request-ready chunk metadata."
