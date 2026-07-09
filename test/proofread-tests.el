@@ -2095,6 +2095,8 @@
       (should (string-match-p "Do not stop after the first" prompt))
       (should (string-match-p "one diagnostic per issue" prompt))
       (should (string-match-p "adjacent characters and tokens" prompt))
+      (should (string-match-p "multiple suggestions" prompt))
+      (should (string-match-p "best-first order" prompt))
       (should (string-match-p "only for the Text section" prompt))
       (should (string-match-p "zero-based chunk-relative offsets" prompt))
       (should (string-match-p "range end is exclusive" prompt))
@@ -3538,8 +3540,8 @@
     (should (equal (proofread--diagnostic-suggestions diagnostic)
                    '("hello" "hullo" "42")))))
 
-(ert-deftest proofread-test-apply-single-suggestion-replaces-range ()
-  "`proofread-apply-suggestion' applies one suggestion without prompting."
+(ert-deftest proofread-test-correct-single-suggestion-replaces-range ()
+  "`proofread-correct' applies one suggestion without prompting."
   (with-temp-buffer
     (insert "aa helo zz")
     (proofread-mode 1)
@@ -3556,11 +3558,11 @@
       (cl-letf (((symbol-function 'completing-read)
                  (lambda (&rest _args)
                    (error "Unexpected completion prompt"))))
-        (should (eq (proofread-apply-suggestion) 'applied)))
+        (should (eq (proofread-correct) 'applied)))
       (should (equal (buffer-string) "aa hello zz")))))
 
-(ert-deftest proofread-test-apply-multiple-suggestions-uses-completion ()
-  "`proofread-apply-suggestion' preserves candidate order for completion."
+(ert-deftest proofread-test-correct-multiple-suggestions-uses-completion ()
+  "`proofread-correct' preserves candidate order for completion."
   (with-temp-buffer
     (insert "aa helo zz")
     (proofread-mode 1)
@@ -3579,9 +3581,44 @@
                  (lambda (_prompt candidates &rest _args)
                    (setq candidates-seen candidates)
                    "hullo")))
-        (should (eq (proofread-apply-suggestion) 'applied)))
+        (should (eq (proofread-correct) 'applied)))
       (should (equal candidates-seen '("hello" "hullo" "hallo")))
       (should (equal (buffer-string) "aa hullo zz")))))
+
+(ert-deftest proofread-test-correct-uses-native-completion ()
+  "`proofread-correct' uses `completing-read' for multiple suggestions."
+  (let ((description-buffer (get-buffer proofread--description-buffer-name)))
+    (when description-buffer
+      (kill-buffer description-buffer)))
+  (with-temp-buffer
+    (insert "aa helo zz")
+    (proofread-mode 1)
+    (let ((diagnostic
+           (proofread--make-diagnostic
+            :beg 4
+            :end 8
+            :text "helo"
+            :kind 'spelling
+            :message "Possible misspelling"
+            :suggestions '("hello" "hullo" "hallo")))
+          prompt-seen
+          candidates-seen
+          require-match-seen)
+      (proofread-test--install-diagnostics (list diagnostic))
+      (goto-char 5)
+      (cl-letf (((symbol-function 'completing-read)
+                 (lambda (prompt candidates _predicate require-match
+                                 &rest _args)
+                   (setq prompt-seen prompt)
+                   (setq candidates-seen candidates)
+                   (setq require-match-seen require-match)
+                   "hallo")))
+        (should (eq (proofread-correct) 'applied)))
+      (should (equal prompt-seen "Apply suggestion: "))
+      (should (equal candidates-seen '("hello" "hullo" "hallo")))
+      (should require-match-seen)
+      (should (equal (buffer-string) "aa hallo zz"))
+      (should-not (get-buffer proofread--description-buffer-name)))))
 
 (ert-deftest proofread-test-apply-no-suggestion-reports-unavailable ()
   "Suggestion application reports no available suggestion without editing."
@@ -3597,7 +3634,7 @@
             :message "Possible misspelling")))
       (proofread-test--install-diagnostics (list diagnostic))
       (goto-char 2)
-      (should-error (proofread-apply-suggestion) :type 'user-error)
+      (should-error (proofread-correct) :type 'user-error)
       (should (equal (buffer-string) "helo")))))
 
 (ert-deftest proofread-test-apply-invalid-range-rejected ()
@@ -3614,7 +3651,7 @@
             :suggestions '("hello"))))
       (setq proofread--diagnostics (list diagnostic))
       (goto-char 2)
-      (should-error (proofread-apply-suggestion) :type 'user-error)
+      (should-error (proofread-correct) :type 'user-error)
       (should (equal (buffer-string) "helo")))))
 
 (ert-deftest proofread-test-apply-stale-overlay-rejected ()
@@ -3634,7 +3671,7 @@
                   (list diagnostic)))))
       (delete-overlay overlay)
       (goto-char 2)
-      (should-error (proofread-apply-suggestion) :type 'user-error)
+      (should-error (proofread-correct) :type 'user-error)
       (should (equal (buffer-string) "helo")))))
 
 (ert-deftest proofread-test-apply-text-mismatch-rejected ()
@@ -3651,11 +3688,11 @@
             :suggestions '("hello"))))
       (proofread-test--install-diagnostics (list diagnostic))
       (goto-char 2)
-      (should-error (proofread-apply-suggestion) :type 'user-error)
+      (should-error (proofread-correct) :type 'user-error)
       (should (equal (buffer-string) "hell")))))
 
 (ert-deftest proofread-test-apply-undo-restores-original-text ()
-  "Undo restores text replaced by `proofread-apply-suggestion'."
+  "Undo restores text replaced by `proofread-correct'."
   (with-temp-buffer
     (insert "aa helo zz")
     (buffer-enable-undo)
@@ -3670,7 +3707,7 @@
             :suggestions '("hello"))))
       (proofread-test--install-diagnostics (list diagnostic))
       (goto-char 5)
-      (proofread-apply-suggestion)
+      (proofread-correct)
       (should (equal (buffer-string) "aa hello zz"))
       (undo)
       (should (equal (buffer-string) "aa helo zz")))))
@@ -3701,7 +3738,7 @@
       (overlay-put foreign-overlay 'category 'foreign-overlay)
       (proofread--mark-current-diagnostic target)
       (goto-char 5)
-      (proofread-apply-suggestion)
+      (proofread-correct)
       (should-not (overlay-buffer target-overlay))
       (should-not (overlay-buffer overlap-overlay))
       (should (overlay-buffer outside-overlay))

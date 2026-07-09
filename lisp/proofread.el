@@ -127,7 +127,7 @@ uses a single LLM call."
   :type 'natnum
   :group 'proofread)
 
-(defcustom proofread-prompt-version "6"
+(defcustom proofread-prompt-version "7"
   "Prompt contract version used to invalidate diagnostic cache entries."
   :type 'string
   :group 'proofread)
@@ -209,6 +209,10 @@ property has a non-nil value is not included in request-ready chunks."
    "Use zero-based chunk-relative offsets; range end is exclusive.\n"
    "The text field must exactly equal the substring selected by range.\n"
    "Use kind values spelling, grammar, style, or other.\n"
+   "For suggestions, return practical replacement text in best-first order.  "
+   "Include multiple suggestions when several distinct corrections are useful; "
+   "one suggestion or an empty suggestions array is acceptable when there is no "
+   "real alternative.\n"
    "Set token_index and token_range to null when token locators are not "
    "useful or no token list is provided; range and text remain required.\n"
    "Set confidence and source to null when unknown.\n"
@@ -2601,16 +2605,23 @@ configured backend."
         (proofread--display-diagnostic-description diagnostic)
       (user-error "No proofread diagnostic at point"))))
 
-;;;###autoload
-(defun proofread-apply-suggestion ()
-  "Apply a proofreading suggestion at point."
-  (interactive)
+(defun proofread--correct-at-point ()
+  "Apply a selected proofreading suggestion at point."
   (let ((diagnostic (proofread--diagnostic-at-point)))
     (unless diagnostic
       (user-error "No proofread diagnostic at point"))
     (proofread--apply-suggestion-to-diagnostic
      diagnostic
      (proofread--select-diagnostic-suggestion diagnostic))))
+
+;;;###autoload
+(defun proofread-correct ()
+  "Correct the proofreading diagnostic at point.
+When the diagnostic has multiple suggestions, choose one using
+`completing-read'.  Completion UIs such as Vertico and Consult can provide the
+selection interface."
+  (interactive)
+  (proofread--correct-at-point))
 
 ;;;###autoload
 (defun proofread-ignore ()
