@@ -32,7 +32,6 @@
 
 (require 'json)
 (require 'llm)
-(require 'url)
 
 (declare-function jieba-rs-forward-sentence "jieba-rs" (&optional arg))
 
@@ -76,7 +75,6 @@ disables backend dispatch.  The symbol `llm' uses `proofread-llm-provider'."
   :type '(choice (const :tag "None" nil)
                  (const :tag "Mock backend" mock)
                  (const :tag "Generic llm backend" llm)
-                 (const :tag "Ollama backend" ollama)
                  symbol)
   :group 'proofread)
 
@@ -117,31 +115,6 @@ Put only options that can affect returned diagnostics here.  Runtime-only
 controls, such as timeouts, should use backend-specific variables and are not
 part of model-aware cache identity."
   :type 'sexp
-  :group 'proofread)
-
-(defcustom proofread-ollama-base-url "http://localhost:11434/api"
-  "Base URL for the Ollama API.
-The default points at the local Ollama service.  Changing this value sends
-filtered visible chunks and context to the configured endpoint."
-  :type 'string
-  :group 'proofread)
-
-(defcustom proofread-ollama-model nil
-  "Ollama model name used by the Ollama backend."
-  :type '(choice (const :tag "Unspecified" nil)
-                 string)
-  :group 'proofread)
-
-(defcustom proofread-ollama-options nil
-  "Ollama generation options that can affect returned diagnostics.
-This value participates in the Ollama backend identity and diagnostic cache
-keys."
-  :type 'sexp
-  :group 'proofread)
-
-(defcustom proofread-ollama-timeout 30
-  "Seconds to wait before an Ollama request fails with a timeout."
-  :type 'number
   :group 'proofread)
 
 (defcustom proofread-prompt-version "2"
@@ -204,10 +177,6 @@ property has a non-nil value is not included in request-ready chunks."
    "The text field must exactly equal the substring selected by range.\n"
    "Use {\"diagnostics\":[]} when there are no diagnostics.\n")
   "Prompt contract for JSON diagnostics.")
-
-(defconst proofread--ollama-json-prompt-contract
-  proofread--json-diagnostic-prompt-contract
-  "Prompt contract for Ollama JSON diagnostics.")
 
 (defconst proofread--json-diagnostic-response-format
   '(:type
@@ -740,11 +709,6 @@ When MESSAGE is non-nil, include it as caller-readable error text."
           (proofread--remove-active-request request))))
     (proofread--invoke-backend-callback callback result)))
 
-(defun proofread--nonempty-string-p (value)
-  "Return non-nil when VALUE is a non-empty string."
-  (and (stringp value)
-       (not (string= value ""))))
-
 (defun proofread--llm-provider-available-p ()
   "Return non-nil when `proofread-llm-provider' is configured."
   (not (null proofread-llm-provider)))
@@ -755,7 +719,6 @@ When BACKEND is nil, check the selected `proofread-backend'."
   (pcase (or backend proofread-backend)
     ('mock t)
     ('llm (proofread--llm-provider-available-p))
-    ('ollama (proofread--nonempty-string-p proofread-ollama-model))
     (_ nil)))
 
 (defun proofread--mock-backend-complete (request callback)
@@ -775,11 +738,6 @@ When BACKEND is nil, check the selected `proofread-backend'."
   "Submit REQUEST to the asynchronous mock backend."
   (run-at-time 0 nil #'proofread--mock-backend-complete request callback))
 
-(defun proofread--ollama-generate-url ()
-  "Return the configured Ollama generate endpoint URL."
-  (concat (replace-regexp-in-string "/\\'" "" proofread-ollama-base-url)
-          "/generate"))
-
 (defun proofread--diagnostic-prompt (request)
   "Return the provider-independent proofreading prompt for REQUEST."
   (format
@@ -797,28 +755,9 @@ When BACKEND is nil, check the selected `proofread-backend'."
    (or (plist-get request :text) "")
    (or (plist-get request :context-after) "")))
 
-(defun proofread--ollama-prompt (request)
-  "Return the Ollama prompt for backend REQUEST."
-  (proofread--diagnostic-prompt request))
-
-(defun proofread--ollama-payload (request)
-  "Return an alist payload for Ollama backend REQUEST."
-  (let ((payload `(("model" . ,proofread-ollama-model)
-                   ("prompt" . ,(proofread--ollama-prompt request))
-                   ("stream" . :json-false))))
-    (when proofread-ollama-options
-      (setq payload
-            (append payload
-                    `(("options" . ,proofread-ollama-options)))))
-    payload))
-
 (defun proofread--json-encode (value)
   "Return JSON encoding for VALUE."
   (json-encode value))
-
-(defun proofread--encode-http-request-data (data)
-  "Return DATA encoded as UTF-8 unibyte data for `url-request-data'."
-  (encode-coding-string data 'utf-8))
 
 (defun proofread--json-read-string (string)
   "Read STRING as JSON and return plist/list data."
@@ -828,54 +767,7 @@ When BACKEND is nil, check the selected `proofread-backend'."
         (json-false nil))
     (json-read-from-string string)))
 
-(defun proofread--ollama-url-retrieve-callback (status callback)
-  "Invoke CALLBACK with STATUS and the current response buffer."
-  (funcall callback status (current-buffer)))
-
-(defun proofread--ollama-url-retrieve (url data callback)
-  "Submit DATA to URL and invoke CALLBACK asynchronously."
-  (let ((url-request-method "POST")
-        (url-request-extra-headers
-         '(("Content-Type" . "application/json; charset=utf-8")))
-        (url-request-data (proofread--encode-http-request-data data)))
-    (url-retrieve
-     url #'proofread--ollama-url-retrieve-callback
-     (list callback) t t)))
-
-(defun proofread--kill-response-buffer (buffer)
-  "Kill response BUFFER without prompting about live processes."
-  (when (buffer-live-p buffer)
-    (let ((process (get-buffer-process buffer)))
-      (when (processp process)
-        (set-process-query-on-exit-flag process nil)
-        (delete-process process)))
-    (let ((kill-buffer-query-functions nil))
-      (kill-buffer buffer))))
-
-(defun proofread--ollama-http-status ()
-  "Return HTTP status code from the current response buffer."
-  (save-excursion
-    (goto-char (point-min))
-    (when (looking-at "HTTP/[0-9.]+ \\([0-9]+\\)")
-      (string-to-number (match-string 1)))))
-
-(defun proofread--ollama-response-body ()
-  "Return HTTP response body from the current response buffer."
-  (save-excursion
-    (goto-char (point-min))
-    (if (re-search-forward "\r?\n\r?\n" nil t)
-        (buffer-substring-no-properties (point) (point-max))
-      "")))
-
-(defun proofread--ollama-response-payload (body)
-  "Return parsed Ollama JSON response payload from BODY."
-  (proofread--json-read-string body))
-
-(defun proofread--ollama-response-content (payload)
-  "Return generated content from Ollama response PAYLOAD."
-  (plist-get payload :response))
-
-(defun proofread--ollama-json-object-substrings (string)
+(defun proofread--json-diagnostic-object-substrings (string)
   "Return top-level JSON object substrings found in STRING."
   (let ((index 0)
         (length (length string))
@@ -906,31 +798,31 @@ When BACKEND is nil, check the selected `proofread-backend'."
       (setq index (1+ index)))
     (nreverse objects)))
 
-(defun proofread--ollama-parse-diagnostic-json (content)
+(defun proofread--json-diagnostic-parse-json (content)
   "Parse one JSON diagnostic object from CONTENT."
-  (let ((objects (proofread--ollama-json-object-substrings content)))
+  (let ((objects (proofread--json-diagnostic-object-substrings content)))
     (unless (= (length objects) 1)
-      (error "Expected exactly one Ollama diagnostic JSON object"))
+      (error "Expected exactly one diagnostic JSON object"))
     (proofread--json-read-string (car objects))))
 
-(defun proofread--ollama-diagnostic-payload (content)
-  "Return parsed diagnostic payload from Ollama CONTENT."
+(defun proofread--json-diagnostic-payload (content)
+  "Return parsed diagnostic payload from CONTENT."
   (cond
    ((stringp content)
-    (proofread--ollama-parse-diagnostic-json content))
+    (proofread--json-diagnostic-parse-json content))
    ((listp content) content)
-   (t (error "Invalid Ollama response content"))))
+   (t (error "Invalid diagnostic response content"))))
 
-(defun proofread--ollama-diagnostic-candidates (payload)
-  "Return diagnostic candidates from parsed Ollama PAYLOAD."
+(defun proofread--json-diagnostic-candidates (payload)
+  "Return diagnostic candidates from parsed PAYLOAD."
   (unless (plist-member payload :diagnostics)
-    (error "Missing Ollama diagnostics payload"))
+    (error "Missing diagnostics payload"))
   (let ((diagnostics (plist-get payload :diagnostics)))
     (unless (listp diagnostics)
-      (error "Invalid Ollama diagnostics payload"))
+      (error "Invalid diagnostics payload"))
     diagnostics))
 
-(defun proofread--ollama-diagnostic-range (candidate)
+(defun proofread--json-diagnostic-range (candidate)
   "Return CANDIDATE's chunk-relative range as a cons cell."
   (let ((range (plist-get candidate :range)))
     (when (and (listp range)
@@ -939,7 +831,7 @@ When BACKEND is nil, check the selected `proofread-backend'."
       (cons (plist-get range :beg)
             (plist-get range :end)))))
 
-(defun proofread--ollama-diagnostic-range-valid-p (request beg end)
+(defun proofread--json-diagnostic-range-valid-p (request beg end)
   "Return non-nil if relative BEG and END are valid for REQUEST."
   (let ((text (plist-get request :text)))
     (and (integerp beg)
@@ -949,7 +841,7 @@ When BACKEND is nil, check the selected `proofread-backend'."
          (<= beg end)
          (<= end (length text)))))
 
-(defun proofread--ollama-diagnostic-suggestions (value)
+(defun proofread--json-diagnostic-suggestions (value)
   "Return string suggestions from VALUE in original order."
   (when (listp value)
     (let (strings)
@@ -958,7 +850,7 @@ When BACKEND is nil, check the selected `proofread-backend'."
           (push suggestion strings)))
       (nreverse strings))))
 
-(defun proofread--ollama-diagnostic-kind (value)
+(defun proofread--json-diagnostic-kind (value)
   "Return normalized diagnostic kind for VALUE."
   (cond
    ((and (symbolp value)
@@ -968,16 +860,16 @@ When BACKEND is nil, check the selected `proofread-backend'."
          (string-match-p "\\`[[:alnum:]_-]+\\'" value))
     (intern value))))
 
-(defun proofread--ollama-diagnostic-confidence (value)
+(defun proofread--json-diagnostic-confidence (value)
   "Return normalized diagnostic confidence for VALUE, or nil."
   (when (and (numberp value)
              (<= 0 value)
              (<= value 1))
     value))
 
-(defun proofread--ollama-diagnostic-source (candidate &optional default-source)
+(defun proofread--json-diagnostic-source (candidate &optional default-source)
   "Return normalized diagnostic source from CANDIDATE.
-When CANDIDATE has no valid source, use DEFAULT-SOURCE or `ollama'."
+When CANDIDATE has no valid source, use DEFAULT-SOURCE or `llm'."
   (let ((value (plist-get candidate :source)))
     (cond
      ((and (plist-member candidate :source)
@@ -988,21 +880,21 @@ When CANDIDATE has no valid source, use DEFAULT-SOURCE or `ollama'."
            (stringp value)
            (not (string= value "")))
       value)
-     (t (or default-source 'ollama)))))
+     (t (or default-source 'llm)))))
 
-(defun proofread--ollama-diagnostic-from-candidate
+(defun proofread--json-diagnostic-from-candidate
     (request candidate &optional default-source)
   "Return proofread diagnostic for REQUEST and CANDIDATE, or nil."
-  (let* ((range (proofread--ollama-diagnostic-range candidate))
+  (let* ((range (proofread--json-diagnostic-range candidate))
          (relative-beg (car-safe range))
          (relative-end (cdr-safe range))
          (request-beg (plist-get request :beg))
          (request-text (plist-get request :text))
          (text (plist-get candidate :text))
-         (kind (proofread--ollama-diagnostic-kind
+         (kind (proofread--json-diagnostic-kind
                 (plist-get candidate :kind)))
          (message (plist-get candidate :message)))
-    (when (and (proofread--ollama-diagnostic-range-valid-p
+    (when (and (proofread--json-diagnostic-range-valid-p
                 request relative-beg relative-end)
                (integerp request-beg)
                (stringp text)
@@ -1016,22 +908,22 @@ When CANDIDATE has no valid source, use DEFAULT-SOURCE or `ollama'."
        :text text
        :kind kind
        :message message
-       :suggestions (proofread--ollama-diagnostic-suggestions
+       :suggestions (proofread--json-diagnostic-suggestions
                      (plist-get candidate :suggestions))
-       :confidence (proofread--ollama-diagnostic-confidence
+       :confidence (proofread--json-diagnostic-confidence
                     (plist-get candidate :confidence))
-       :source (proofread--ollama-diagnostic-source
+       :source (proofread--json-diagnostic-source
                 candidate default-source)))))
 
-(defun proofread--ollama-diagnostics-from-payload
+(defun proofread--json-diagnostics-from-payload
     (request payload &optional default-source)
   "Return proofread diagnostics for REQUEST from parsed PAYLOAD.
 DEFAULT-SOURCE is used for diagnostics without an explicit source."
   (let (diagnostics)
-    (dolist (candidate (proofread--ollama-diagnostic-candidates payload))
+    (dolist (candidate (proofread--json-diagnostic-candidates payload))
       (let ((diagnostic
              (and (listp candidate)
-                  (proofread--ollama-diagnostic-from-candidate
+                  (proofread--json-diagnostic-from-candidate
                    request candidate default-source))))
         (when diagnostic
           (push diagnostic diagnostics))))
@@ -1039,12 +931,12 @@ DEFAULT-SOURCE is used for diagnostics without an explicit source."
 
 (defun proofread--diagnostic-payload (content)
   "Return parsed diagnostic payload from generated CONTENT."
-  (proofread--ollama-diagnostic-payload content))
+  (proofread--json-diagnostic-payload content))
 
 (defun proofread--diagnostics-from-payload
     (request payload &optional default-source)
   "Return proofread diagnostics for REQUEST from parsed PAYLOAD."
-  (proofread--ollama-diagnostics-from-payload
+  (proofread--json-diagnostics-from-payload
    request payload default-source))
 
 (defun proofread--diagnostics-from-content
@@ -1052,96 +944,6 @@ DEFAULT-SOURCE is used for diagnostics without an explicit source."
   "Return proofread diagnostics for REQUEST from generated CONTENT."
   (proofread--diagnostics-from-payload
    request (proofread--diagnostic-payload content) default-source))
-
-(defun proofread--ollama-parse-success (request body)
-  "Return diagnostics for REQUEST from successful Ollama response BODY."
-  (let* ((response-payload (proofread--ollama-response-payload body))
-         (content (proofread--ollama-response-content response-payload))
-         (diagnostic-payload
-          (proofread--ollama-diagnostic-payload content)))
-    (proofread--diagnostics-from-payload
-     request diagnostic-payload 'ollama)))
-
-(defun proofread--ollama-result-from-response (request status buffer)
-  "Return backend result for REQUEST from Ollama STATUS and BUFFER."
-  (let ((transport-error (plist-get status :error)))
-    (cond
-     (transport-error
-      (proofread--backend-error-result
-       request 'ollama-connection-error
-       (format "%S" transport-error)))
-     ((not (buffer-live-p buffer))
-      (proofread--backend-error-result
-       request 'ollama-response-error "Ollama response buffer is not live"))
-     (t
-      (with-current-buffer buffer
-        (let ((http-status (proofread--ollama-http-status)))
-          (cond
-           ((not (and http-status
-                      (<= 200 http-status)
-                      (< http-status 300)))
-            (proofread--backend-error-result
-             request 'ollama-http-error
-             (format "Ollama HTTP status: %S" http-status)))
-           (t
-            (condition-case err
-                (proofread--backend-success-result
-                 request
-                 (proofread--ollama-parse-success
-                  request (proofread--ollama-response-body)))
-              (error
-               (proofread--backend-error-result
-                request 'ollama-invalid-response
-                (error-message-string err))))))))))))
-
-(defun proofread--ollama-backend-check (request callback)
-  "Submit REQUEST to Ollama and invoke CALLBACK asynchronously."
-  (let ((finished nil)
-        (url (proofread--ollama-generate-url))
-        (data (proofread--json-encode
-               (proofread--ollama-payload request)))
-        response-buffer
-        timeout-timer
-        finish)
-    (setq finish
-          (lambda (result &optional buffer)
-            (unless finished
-              (setq finished t)
-              (when (timerp timeout-timer)
-                (cancel-timer timeout-timer))
-              (when (buffer-live-p buffer)
-                (proofread--kill-response-buffer buffer))
-              (proofread--invoke-backend-callback callback result))))
-    (when (and (numberp proofread-ollama-timeout)
-               (> proofread-ollama-timeout 0))
-      (setq timeout-timer
-            (run-at-time
-             proofread-ollama-timeout nil
-             (lambda ()
-               (funcall
-                finish
-                (proofread--backend-error-result
-                 request 'ollama-timeout
-                 "Ollama request timed out")
-                response-buffer)))))
-    (condition-case err
-        (setq response-buffer
-              (proofread--ollama-url-retrieve
-               url data
-               (lambda (status buffer)
-                 (funcall
-                  finish
-                  (proofread--ollama-result-from-response
-                   request status buffer)
-                  buffer))))
-      (error
-       (funcall
-        finish
-        (proofread--backend-error-result
-         request 'ollama-submit-error (error-message-string err)))))
-    (list :backend 'ollama
-          :buffer response-buffer
-          :timer timeout-timer)))
 
 (defun proofread--llm-prompt (request)
   "Return an `llm-chat-prompt' for backend REQUEST."
@@ -1238,7 +1040,6 @@ handle, such as a timer object for the built-in mock backend."
     (pcase backend
       ('mock (proofread--mock-backend-check request callback))
       ('llm (proofread--llm-backend-check request callback))
-      ('ollama (proofread--ollama-backend-check request callback))
       (_ (proofread--unsupported-backend-check backend request callback)))))
 
 (defun proofread--dispatch-backend-request (request callback &optional backend)
@@ -1300,22 +1101,18 @@ handle, such as a timer object for the built-in mock backend."
 (defun proofread--backend-cache-relevant-options (&optional backend)
   "Return cache-relevant options for BACKEND.
 Runtime-only options are intentionally excluded from this value."
-  (copy-tree
-   (pcase backend
-     ('ollama proofread-ollama-options)
-     (_ proofread-backend-options))))
+  (ignore backend)
+  (copy-tree proofread-backend-options))
 
 (defun proofread--backend-model-name (&optional backend)
   "Return model name for BACKEND."
-  (pcase backend
-    ('ollama proofread-ollama-model)
-    (_ proofread-backend-model)))
+  (ignore backend)
+  proofread-backend-model)
 
 (defun proofread--backend-endpoint (&optional backend)
   "Return endpoint for BACKEND."
-  (pcase backend
-    ('ollama proofread-ollama-base-url)
-    (_ proofread-backend-endpoint)))
+  (ignore backend)
+  proofread-backend-endpoint)
 
 (defun proofread--model-backend-identity (backend)
   "Return structured identity for configurable model BACKEND."
