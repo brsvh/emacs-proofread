@@ -62,7 +62,7 @@ configuration."
 (defcustom proofread-auto-check t
   "Non-nil means schedule automatic checks in `proofread-mode'.
 When nil, buffer changes and window activity do not schedule proofreading;
-use commands such as `proofread-check-visible' to start checks manually.
+use commands such as `proofread-check-visible-range' to start checks manually.
 This option becomes buffer-local when set."
   :type 'boolean
   :local t
@@ -2560,7 +2560,7 @@ When BACKEND is nil, use `proofread-backend'.  Return dispatched requests."
           (setq proofread--pending-work nil)
           (setq proofread--idle-timer nil)
           (when run-p
-            (proofread-check-visible)
+            (proofread-check-visible-range)
             'ran))))))
 
 (defun proofread--schedule-idle-timer ()
@@ -4199,10 +4199,11 @@ When enabled and `proofread-auto-check' is non-nil, proofread schedules
 visible-buffer checks after editing and window activity, then dispatches
 request-ready visible chunks through the configured backend.  The option
 `proofread-targets' controls which kinds of text are selected.  When automatic
-checking is disabled, use `proofread-check-visible', `proofread-check-buffer',
-`proofread-check-region', or `proofread-check-point' manually.  Apply available
-suggestions with `proofread-correct-at-point', `proofread-correct-region',
-`proofread-correct-buffer', or `proofread-correct-visible-range'."
+checking is disabled, use `proofread-check-at-point', `proofread-check-region',
+`proofread-check-buffer', or `proofread-check-visible-range' manually.  Apply
+available suggestions with `proofread-correct-at-point',
+`proofread-correct-region', `proofread-correct-buffer', or
+`proofread-correct-visible-range'."
   :lighter " Proofread"
   :group 'proofread
   (if proofread-mode
@@ -4210,10 +4211,11 @@ suggestions with `proofread-correct-at-point', `proofread-correct-region',
     (proofread--disable-buffer)))
 
 ;;;###autoload
-(defun proofread-check-visible (&optional force-feedback)
-  "Check visible text in the current buffer for proofreading diagnostics.
-When FORCE-FEEDBACK is non-nil, report command feedback even when routine
-progress messages are inhibited."
+(defun proofread-check-visible-range (&optional force-feedback)
+  "Check visible ranges of the current buffer for proofreading diagnostics.
+Visible ranges come from all live windows displaying the current buffer.  When
+FORCE-FEEDBACK is non-nil, report command feedback even when routine progress
+messages are inhibited."
   (interactive (list t))
   (proofread--check-ranges
    (proofread--visible-ranges) "visible" force-feedback))
@@ -4252,7 +4254,7 @@ routine progress messages are inhibited."
      force-feedback)))
 
 ;;;###autoload
-(defun proofread-check-point (&optional force-feedback)
+(defun proofread-check-at-point (&optional force-feedback)
   "Check the request-ready proofreading chunk at point.
 When FORCE-FEEDBACK is non-nil, report command feedback even when routine
 progress messages are inhibited."

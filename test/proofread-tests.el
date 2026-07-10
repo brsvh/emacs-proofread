@@ -308,8 +308,8 @@
       (should (overlay-buffer foreign-overlay))
       (should-not proofread--overlays))))
 
-(ert-deftest proofread-test-check-visible-collects-single-window-range ()
-  "`proofread-check-visible' records the selected visible window range."
+(ert-deftest proofread-test-check-visible-range-collects-single-window-range ()
+  "`proofread-check-visible-range' records the selected visible window range."
   (save-window-excursion
     (let ((buffer (generate-new-buffer " *proofread-visible-single*")))
       (unwind-protect
@@ -321,7 +321,7 @@
                        (lambda (&optional _window) 3))
                       ((symbol-function 'window-end)
                        (lambda (&optional _window _update) 16)))
-              (proofread-check-visible)
+              (proofread-check-visible-range)
               (should (equal proofread--pending-ranges '((3 . 16))))
               (should-not proofread--diagnostics)
               (should-not proofread--overlays)
@@ -329,8 +329,8 @@
               (should (= (hash-table-count proofread--cache) 0))))
         (kill-buffer buffer)))))
 
-(ert-deftest proofread-test-check-visible-deduplicates-multiple-windows ()
-  "`proofread-check-visible' merges overlapping ranges from visible windows."
+(ert-deftest proofread-test-check-visible-range-deduplicates-multiple-windows ()
+  "Visible-range checking merges overlapping ranges from multiple windows."
   (save-window-excursion
     (let ((buffer (generate-new-buffer " *proofread-visible-multiple*")))
       (unwind-protect
@@ -350,29 +350,29 @@
                         ((symbol-function 'window-end)
                          (lambda (&optional window _update)
                            (cdr (cdr (assq window window-ranges))))))
-                (proofread-check-visible)
+                (proofread-check-visible-range)
                 (should (equal proofread--pending-ranges '((3 . 16)))))))
         (kill-buffer buffer)))))
 
-(ert-deftest proofread-test-check-visible-no-window-produces-no-ranges ()
-  "`proofread-check-visible' does not fall back to the whole buffer."
+(ert-deftest proofread-test-check-visible-range-no-window-produces-no-ranges ()
+  "`proofread-check-visible-range' does not fall back to the whole buffer."
   (with-temp-buffer
     (insert "hello hidden world")
     (proofread-mode 1)
     (setq proofread--pending-ranges '((1 . 7)))
-    (proofread-check-visible)
+    (proofread-check-visible-range)
     (should-not proofread--pending-ranges)))
 
 (ert-deftest proofread-test-check-commands-require-mode ()
   "Proofread check commands require `proofread-mode'."
   (with-temp-buffer
     (insert "Alpha")
-    (should-error (proofread-check-visible) :type 'user-error)
+    (should-error (proofread-check-visible-range) :type 'user-error)
     (should-error (proofread-check-buffer) :type 'user-error)
     (should-error (proofread-check-region (point-min) (point-max))
                   :type 'user-error)
     (goto-char (point-min))
-    (should-error (proofread-check-point) :type 'user-error)
+    (should-error (proofread-check-at-point) :type 'user-error)
     (should-not proofread--pending-ranges)))
 
 (ert-deftest proofread-test-check-buffer-dispatches-accessible-buffer ()
@@ -519,8 +519,8 @@
                 (list (concat "proofread: collected 1 selected range; "
                               "no available backend"))))))))
 
-(ert-deftest proofread-test-check-point-dispatches-containing-chunk ()
-  "`proofread-check-point' checks one chunk and sends surrounding context."
+(ert-deftest proofread-test-check-at-point-dispatches-containing-chunk ()
+  "`proofread-check-at-point' checks one chunk and sends surrounding context."
   (with-temp-buffer
     (insert "First.  Second sentence. Third.")
     (goto-char (point-min))
@@ -543,7 +543,7 @@
         (proofread-test--with-llm-capabilities
          (cl-letf (((symbol-function 'proofread-backend-check)
                     (plist-get recorder :function)))
-           (proofread-check-point)
+           (proofread-check-at-point)
            (let* ((requests (funcall (plist-get recorder :requests)))
                   (request (car requests)))
              (should (= (length requests) 1))
@@ -558,7 +558,7 @@
                           (list (cons beg end))))
            (should (= (point) before-point))))))))
 
-(ert-deftest proofread-test-check-point-range-boundaries ()
+(ert-deftest proofread-test-request-ready-range-at-point-boundaries ()
   "Point range selection handles sentence, whitespace, and buffer boundaries."
   (with-temp-buffer
     (insert "First.  Second.")
@@ -603,8 +603,8 @@
     (goto-char (point-max))
     (should-not (proofread--request-ready-range-at-point))))
 
-(ert-deftest proofread-test-check-point-rejects-ignored-text ()
-  "`proofread-check-point' rejects text excluded by ignored properties."
+(ert-deftest proofread-test-check-at-point-rejects-ignored-text ()
+  "`proofread-check-at-point' rejects text excluded by ignored properties."
   (with-temp-buffer
     (insert "Alpha SECRET beta.")
     (goto-char (point-min))
@@ -616,7 +616,7 @@
       (setq-local proofread-auto-check nil)
       (proofread-mode 1)
       (let ((proofread-ignored-properties '(proofread-test-ignore)))
-        (should-error (proofread-check-point) :type 'user-error)
+        (should-error (proofread-check-at-point) :type 'user-error)
         (should-not proofread--pending-ranges)
         (should-not proofread--requests)))))
 
@@ -640,8 +640,8 @@
       (proofread--progress-message "proofread: %s" "checking")
       (should (equal messages '("proofread: checking"))))))
 
-(ert-deftest proofread-test-check-visible-background-progress-is-inhibited ()
-  "`proofread-check-visible' is quiet when called noninteractively."
+(ert-deftest proofread-test-check-visible-range-is-quiet-in-background ()
+  "`proofread-check-visible-range' is quiet when called noninteractively."
   (save-window-excursion
     (let ((buffer (generate-new-buffer " *proofread-background-message*")))
       (unwind-protect
@@ -660,12 +660,12 @@
                         ((symbol-function 'window-end)
                          (lambda (&optional _window _update)
                            (point-max))))
-                (proofread-check-visible)
+                (proofread-check-visible-range)
                 (should-not messages))))
         (kill-buffer buffer)))))
 
-(ert-deftest proofread-test-check-visible-interactive-progress-is-shown ()
-  "`proofread-check-visible' reports feedback when called interactively."
+(ert-deftest proofread-test-check-visible-range-interactive-progress-is-shown ()
+  "`proofread-check-visible-range' reports feedback when called interactively."
   (save-window-excursion
     (let ((buffer (generate-new-buffer " *proofread-interactive-message*")))
       (unwind-protect
@@ -684,7 +684,7 @@
                         ((symbol-function 'window-end)
                          (lambda (&optional _window _update)
                            (point-max))))
-                (call-interactively #'proofread-check-visible)
+                (call-interactively #'proofread-check-visible-range)
                 (should
                  (equal messages
                         '("proofread: collected 1 visible range; no available backend"))))))
@@ -770,7 +770,7 @@
                          (lambda (chunks)
                            (setq dispatched chunks)
                            '(proofread-test-request))))
-                (proofread-check-visible)
+                (proofread-check-visible-range)
                 (should (equal proofread--pending-ranges
                                (list (cons (point-min) (point-max)))))
                 (should (equal dispatched '((:text "Alpha")))))))
@@ -788,7 +788,7 @@
                  (lambda (_seconds _repeat _function &rest _args)
                    (setq timer-count (1+ (or timer-count 0)))
                    (intern (format "proofread-test-timer-%d" timer-count))))
-                ((symbol-function 'proofread-check-visible)
+                ((symbol-function 'proofread-check-visible-range)
                  (lambda ()
                    (setq visible-checks (1+ (or visible-checks 0))))))
         (insert "!")
@@ -851,7 +851,7 @@
                    (setq timer-count (1+ (or timer-count 0)))
                    (intern (format "proofread-test-timer-%d"
                                    timer-count))))
-                ((symbol-function 'proofread-check-visible)
+                ((symbol-function 'proofread-check-visible-range)
                  (lambda ()
                    (setq visible-checks (1+ (or visible-checks 0))))))
         (insert "!")
@@ -876,7 +876,7 @@
                    (setq timer-count (1+ (or timer-count 0)))
                    (intern (format "proofread-test-timer-%d"
                                    timer-count))))
-                ((symbol-function 'proofread-check-visible)
+                ((symbol-function 'proofread-check-visible-range)
                  (lambda ()
                    (setq visible-checks (1+ (or visible-checks 0))))))
         (insert "!")
@@ -965,7 +965,7 @@
       (cl-letf (((symbol-function 'run-with-idle-timer)
                  (lambda (_seconds _repeat _function &rest _args)
                    'proofread-test-timer))
-                ((symbol-function 'proofread-check-visible)
+                ((symbol-function 'proofread-check-visible-range)
                  (lambda ()
                    (setq visible-checks (1+ (or visible-checks 0))))))
         (insert "!")
@@ -1742,7 +1742,7 @@
                             (setq request backend-request)
                             (setq callback backend-callback)
                             'proofread-test-handle)))
-                 (proofread-check-visible)
+                 (proofread-check-visible-range)
                  (should (= backend-calls 1))
                  (let ((diagnostic
                         (proofread-test--diagnostic-for-range 1 5 "helo")))
@@ -1752,14 +1752,14 @@
                                  request (list diagnostic)))
                                'applied))
                    (should (= (hash-table-count proofread--cache) 1))
-                   (proofread-check-visible)
+                   (proofread-check-visible-range)
                    (should (= backend-calls 1))
                    (should (equal proofread--diagnostics
                                   (list diagnostic)))
                    (should (= (length proofread--overlays) 1))
                    (proofread-clear)
                    (setq proofread--diagnostics nil)
-                   (proofread-check-visible)
+                   (proofread-check-visible-range)
                    (should (= backend-calls 1))
                    (should (equal proofread--diagnostics
                                   (list diagnostic)))
@@ -1816,7 +1816,7 @@
                           (lambda (&optional _window _update) (point-max)))
                          ((symbol-function 'proofread-backend-check)
                           (plist-get recorder :function)))
-                 (proofread-check-visible)
+                 (proofread-check-visible-range)
                  (should (= (length (funcall
                                      (plist-get recorder :requests)))
                             1))
@@ -1861,7 +1861,7 @@
                           (lambda (&optional _window _update) (point-max)))
                          ((symbol-function 'proofread-backend-check)
                           (plist-get recorder :function)))
-                 (proofread-check-visible)
+                 (proofread-check-visible-range)
                  (should (equal (mapcar
                                  (lambda (request)
                                    (plist-get request :text))
@@ -3060,8 +3060,8 @@
                                       (should-not active-at-callback)
                                       (should-not (proofread--active-request-p request))))))
 
-(ert-deftest proofread-test-check-visible-dispatches-request-ready-chunks ()
-  "`proofread-check-visible' dispatches filtered visible chunks."
+(ert-deftest proofread-test-check-visible-range-dispatches-ready-chunks ()
+  "`proofread-check-visible-range' dispatches filtered visible chunks."
   (save-window-excursion
     (let ((buffer (generate-new-buffer " *proofread-visible-dispatch*")))
       (unwind-protect
@@ -3086,7 +3086,7 @@
                             (push request requests)
                             (push callback callbacks)
                             'proofread-test-handle)))
-                 (proofread-check-visible)
+                 (proofread-check-visible-range)
                  (setq requests (nreverse requests))
                  (should (equal proofread--pending-ranges
                                 (list (cons (point-min) (point-max)))))
@@ -3100,8 +3100,8 @@
                  (should-not proofread--overlays)))))
         (kill-buffer buffer)))))
 
-(ert-deftest proofread-test-check-visible-dispatches-sentence-chunks ()
-  "`proofread-check-visible' dispatches sentence-level visible chunks."
+(ert-deftest proofread-test-check-visible-range-dispatches-sentence-chunks ()
+  "`proofread-check-visible-range' dispatches sentence-level visible chunks."
   (save-window-excursion
     (let ((buffer (generate-new-buffer " *proofread-visible-sentences*")))
       (unwind-protect
@@ -3129,7 +3129,7 @@
                             (push request requests)
                             (push callback callbacks)
                             'proofread-test-handle)))
-                 (proofread-check-visible)
+                 (proofread-check-visible-range)
                  (setq requests (nreverse requests))
                  (should (equal
                           (mapcar (lambda (request)
@@ -3175,7 +3175,7 @@
                          ((symbol-function 'proofread-backend-check)
                           (plist-get recorder :function)))
                  (proofread-show-buffer-requests buffer)
-                 (proofread-check-visible)
+                 (proofread-check-visible-range)
                  (should (= (length (funcall
                                      (plist-get recorder :requests)))
                             2))
@@ -3294,7 +3294,7 @@
                             (setq request backend-request)
                             (setq callback backend-callback)
                             'proofread-test-handle)))
-                 (proofread-check-visible)
+                 (proofread-check-visible-range)
                  (should (proofread--active-request-p request))
                  (let ((diagnostic
                         (proofread-test--diagnostic-for-range 1 5 "helo")))
@@ -3362,7 +3362,7 @@
                       (setq request backend-request)
                       (setq callback backend-callback)
                       'proofread-test-handle)))
-           (proofread-check-visible))))
+           (proofread-check-visible-range))))
       (kill-buffer buffer)
       (should-not (buffer-live-p buffer))
       (should (eq (funcall
@@ -3398,7 +3398,7 @@
                             (setq request backend-request)
                             (setq callback backend-callback)
                             'proofread-test-handle)))
-                 (proofread-check-visible)
+                 (proofread-check-visible-range)
                  (proofread-mode -1)
                  (should (eq (funcall
                               callback
@@ -3438,7 +3438,7 @@
                             (setq request backend-request)
                             (setq callback backend-callback)
                             'proofread-test-handle)))
-                 (proofread-check-visible)
+                 (proofread-check-visible-range)
                  (goto-char (point-max))
                  (insert "!")
                  (should (eq (funcall
@@ -3479,7 +3479,7 @@
                             (setq request backend-request)
                             (setq callback backend-callback)
                             'proofread-test-handle)))
-                 (proofread-check-visible)
+                 (proofread-check-visible-range)
                  (delete-region 1 5)
                  (insert "hello")
                  (let ((mismatched-request
@@ -3525,7 +3525,7 @@
                             (setq request backend-request)
                             (setq callback backend-callback)
                             'proofread-test-handle)))
-                 (proofread-check-visible)
+                 (proofread-check-visible-range)
                  (should (eq (funcall
                               callback
                               (proofread--backend-error-result
@@ -4269,14 +4269,17 @@
       (should (equal (buffer-string) "aXb"))
       (should-not proofread--diagnostics))))
 
-(ert-deftest proofread-test-correct-public-command-scopes ()
-  "Correction commands expose point, region, buffer, and visible scopes."
-  (dolist (command '(proofread-correct-at-point
-                     proofread-correct-region
-                     proofread-correct-buffer
-                     proofread-correct-visible-range))
-    (should (commandp command)))
-  (should-not (fboundp 'proofread-correct)))
+(ert-deftest proofread-test-public-command-scope-names ()
+  "Check and correction commands use matching scope suffixes."
+  (dolist (operation '(check correct))
+    (dolist (scope '(at-point region buffer visible-range))
+      (should
+       (commandp
+        (intern (format "proofread-%s-%s" operation scope))))))
+  (dolist (old-command '(proofread-check-point
+                         proofread-check-visible
+                         proofread-correct))
+    (should-not (fboundp old-command))))
 
 (ert-deftest proofread-test-correct-region-applies-from-end-to-beginning ()
   "Region correction handles reversed bounds and changing text lengths."
@@ -4919,7 +4922,7 @@
                              ((symbol-function 'proofread-backend-check)
                               (plist-get recorder :function)))
                      (proofread-show-buffer-requests source)
-                     (proofread-check-visible)
+                     (proofread-check-visible-range)
                      (with-current-buffer name
                        (should (= (length tabulated-list-entries) 2))
                        (let ((statuses
@@ -5184,7 +5187,7 @@
               (should-not (string-match-p "Outside suffix" payload))
               (should-not (string-match-p "code-token" payload)))))))))
 
-(ert-deftest proofread-test-check-point-programming-targets ()
+(ert-deftest proofread-test-check-at-point-programming-targets ()
   "Point checking rejects code and dispatches the containing comment."
   (with-temp-buffer
     (emacs-lisp-mode)
@@ -5193,7 +5196,7 @@
     (proofread-mode 1)
     (goto-char (point-min))
     (search-forward "code-token")
-    (should-error (proofread-check-point) :type 'user-error)
+    (should-error (proofread-check-at-point) :type 'user-error)
     (should-not proofread--pending-ranges)
     (goto-char (point-min))
     (search-forward "point prose")
@@ -5206,7 +5209,7 @@
       (proofread-test--with-llm-capabilities
        (cl-letf (((symbol-function 'proofread-backend-check)
                   (plist-get recorder :function)))
-         (proofread-check-point)
+         (proofread-check-at-point)
          (let* ((requests (funcall (plist-get recorder :requests)))
                 (request (car requests)))
            (should (= (length requests) 1))
