@@ -48,6 +48,7 @@
 (defcustom proofread-popup-max-width 80
   "Maximum width of the Proofread child-frame message."
   :type 'natnum
+  :set #'proofread--set-positive-integer-option
   :group 'proofread-popup)
 
 (defface proofread-popup-face
@@ -78,21 +79,24 @@
 (defvar-local proofread-popup--window nil
   "Window where the Proofread child frame was last positioned.")
 
-(defvar-local proofread-popup--window-start nil
-  "Window start used for the current Proofread child-frame position.")
-
 (defvar-local proofread-popup--visible-p nil
   "Non-nil when the current Proofread child frame should be visible.")
+
+(defvar-local proofread-popup--render-state nil
+  "Window and appearance state used for the current child frame.")
+
+(defvar-local proofread-popup--user-disabled-p nil
+  "Non-nil when the user disabled popup integration in this buffer.")
 
 (defun proofread-popup--reset-state ()
   "Forget the child frame currently associated with this buffer."
   (setq proofread-popup--diagnostic nil)
   (setq proofread-popup--position nil)
   (setq proofread-popup--window nil)
-  (setq proofread-popup--window-start nil)
-  (setq proofread-popup--visible-p nil))
+  (setq proofread-popup--visible-p nil)
+  (setq proofread-popup--render-state nil))
 
-(defun proofread-popup--buffer ()
+(defun proofread-popup--ensure-buffer-name ()
   "Return the hidden buffer name used for the current child frame."
   (or proofread-popup--buffer-name
       (setq proofread-popup--buffer-name
@@ -108,10 +112,6 @@
   (eq (window-buffer (selected-window))
       (current-buffer)))
 
-(defun proofread-popup--window-start-position ()
-  "Return the selected window start as an integer position."
-  (window-start (selected-window)))
-
 (defun proofread-popup--format-field (value)
   "Return VALUE formatted for a child-frame message."
   (cond
@@ -121,17 +121,17 @@
 
 (defun proofread-popup--message (diagnostic)
   "Return the child-frame message for DIAGNOSTIC."
-  (let ((message (plist-get diagnostic :message)))
+  (let* ((raw-message (proofread-diagnostic-message diagnostic))
+         (message (and (stringp raw-message)
+                       (string-trim raw-message))))
     (cond
-     ((and (stringp message)
-           (not (string-empty-p (string-trim message))))
-      (string-trim message))
-     (message
-      (proofread-popup--format-field message))
-     ((plist-get diagnostic :text)
+     ((and message (not (string-empty-p message))) message)
+     ((and raw-message (not (stringp raw-message)))
+      (proofread-popup--format-field raw-message))
+     ((proofread-diagnostic-text diagnostic)
       (format "Proofread: %s"
               (proofread-popup--format-field
-               (plist-get diagnostic :text))))
+               (proofread-diagnostic-text diagnostic))))
      (t "Proofread diagnostic"))))
 
 (defun proofread-popup--face-color (face attribute)
@@ -140,13 +140,27 @@
     (unless (eq value 'unspecified)
       value)))
 
+(defun proofread-popup--current-render-state ()
+  "Return state that affects child-frame placement and appearance."
+  (list (window-start)
+        (window-hscroll)
+        (window-body-width)
+        (window-body-height)
+        (window-edges)
+        (bound-and-true-p text-scale-mode-amount)
+        proofread-popup-max-width
+        (proofread-popup--face-color 'proofread-popup-face :foreground)
+        (proofread-popup--face-color 'proofread-popup-face :background)
+        (proofread-popup--face-color
+         'proofread-popup-border-face :background)))
+
 (defun proofread-popup--needs-refresh-p (diagnostic position)
   "Return non-nil when the child frame needs DIAGNOSTIC at POSITION."
   (not (and (eq diagnostic proofread-popup--diagnostic)
             (equal position proofread-popup--position)
             (eq (selected-window) proofread-popup--window)
-            (equal (proofread-popup--window-start-position)
-                   proofread-popup--window-start))))
+            (equal (proofread-popup--current-render-state)
+                   proofread-popup--render-state))))
 
 (defun proofread-popup--hide ()
   "Hide the current Proofread child frame."
@@ -159,11 +173,12 @@
   "Delete the current Proofread child frame and hidden buffer."
   (when proofread-popup--buffer-name
     (condition-case err
-        (posframe-delete proofread-popup--buffer-name)
+        (progn
+          (posframe-delete proofread-popup--buffer-name)
+          (setq proofread-popup--buffer-name nil))
       (error
        (message "proofread popup delete error: %s"
                 (error-message-string err)))))
-  (setq proofread-popup--buffer-name nil)
   (proofread-popup--reset-state))
 
 (defun proofread-popup--hidehandler (info)
@@ -176,16 +191,24 @@
         (proofread-popup--reset-state)))
     t))
 
+(defun proofread-popup--anchor-position (diagnostic)
+  "Return a visible, accessible anchor position for DIAGNOSTIC."
+  (when-let* ((range (proofread-diagnostic-range diagnostic)))
+    (if (and (<= (point-min) (car range))
+             (<= (car range) (point-max))
+             (pos-visible-in-window-p (car range)))
+        (car range)
+      (point))))
+
 (defun proofread-popup--show (diagnostic)
   "Show DIAGNOSTIC's message in a child frame."
-  (let ((range (proofread-diagnostic-range diagnostic)))
-    (if (and range
+  (let ((position (proofread-popup--anchor-position diagnostic)))
+    (if (and position
              (proofread-popup--selected-buffer-p)
              (proofread-popup--available-p))
-        (let ((position (car range))
-              (message (proofread-popup--message diagnostic)))
+        (let ((message (proofread-popup--message diagnostic)))
           (posframe-show
-           (proofread-popup--buffer)
+           (proofread-popup--ensure-buffer-name)
            :string (propertize message 'face 'proofread-popup-face)
            :position position
            :poshandler
@@ -213,8 +236,8 @@
           (setq proofread-popup--diagnostic diagnostic)
           (setq proofread-popup--position position)
           (setq proofread-popup--window (selected-window))
-          (setq proofread-popup--window-start
-                (proofread-popup--window-start-position))
+          (setq proofread-popup--render-state
+                (proofread-popup--current-render-state))
           (setq proofread-popup--visible-p t))
       (proofread-popup--hide))))
 
@@ -225,24 +248,19 @@
            proofread-popup-enabled
            (proofread-popup--selected-buffer-p))
       (let* ((diagnostic (proofread-diagnostic-at-point))
-             (range (and diagnostic
-                         (proofread-diagnostic-range diagnostic)))
-             (position (car-safe range)))
+             (position (and diagnostic
+                            (proofread-popup--anchor-position diagnostic))))
         (if (and diagnostic position)
             (when (proofread-popup--needs-refresh-p diagnostic position)
               (proofread-popup--show diagnostic))
           (proofread-popup--hide)))
     (proofread-popup--hide)))
 
-(defun proofread-popup--diagnostics-changed ()
-  "Update the child frame after Proofread diagnostics change."
-  (proofread-popup--update))
-
 (defun proofread-popup--enable ()
   "Install the buffer-local hooks used by `proofread-popup-mode'."
   (add-hook 'post-command-hook #'proofread-popup--update nil t)
   (add-hook 'proofread-diagnostics-changed-hook
-            #'proofread-popup--diagnostics-changed nil t)
+            #'proofread-popup--update nil t)
   (add-hook 'kill-buffer-hook #'proofread-popup--delete nil t)
   (add-hook 'change-major-mode-hook
             #'proofread-popup--change-major-mode nil t)
@@ -252,13 +270,12 @@
   "Remove buffer-local popup hooks and delete the current child frame."
   (remove-hook 'post-command-hook #'proofread-popup--update t)
   (remove-hook 'proofread-diagnostics-changed-hook
-               #'proofread-popup--diagnostics-changed t)
+               #'proofread-popup--update t)
   (remove-hook 'kill-buffer-hook #'proofread-popup--delete t)
   (remove-hook 'change-major-mode-hook
                #'proofread-popup--change-major-mode t)
   (proofread-popup--delete))
 
-;;;###autoload
 (define-minor-mode proofread-popup-mode
   "Toggle child-frame messages for Proofread diagnostics in this buffer.
 
@@ -267,6 +284,8 @@ the optional `proofread-popup' library has been loaded.  To opt one buffer out
 of popup messages, disable this mode locally."
   :lighter nil
   :group 'proofread-popup
+  (when (called-interactively-p 'interactive)
+    (setq proofread-popup--user-disabled-p (not proofread-popup-mode)))
   (if proofread-popup-mode
       (proofread-popup--enable)
     (proofread-popup--disable)))
@@ -277,11 +296,13 @@ of popup messages, disable this mode locally."
 
 (defun proofread-popup--sync-with-proofread-mode ()
   "Enable or disable popup messages to follow `proofread-mode'."
-  (proofread-popup-mode (if proofread-mode 1 -1)))
+  (proofread-popup-mode
+   (if (and proofread-mode (not proofread-popup--user-disabled-p)) 1 -1)))
 
 (defun proofread-popup--enable-in-existing-buffer ()
   "Enable popup messages in the current Proofread buffer."
-  (when (bound-and-true-p proofread-mode)
+  (when (and (bound-and-true-p proofread-mode)
+             (not proofread-popup--user-disabled-p))
     (proofread-popup-mode 1)))
 
 (add-hook 'proofread-mode-hook #'proofread-popup--sync-with-proofread-mode)

@@ -15,25 +15,16 @@
 (require 'proofread)
 (require 'proofread-popup)
 
-(defun proofread-popup-test--tree-member-p (needle tree)
-  "Return non-nil if NEEDLE appears anywhere in TREE."
-  (cond
-   ((eq needle tree) t)
-   ((consp tree)
-    (or (proofread-popup-test--tree-member-p needle (car tree))
-        (proofread-popup-test--tree-member-p needle (cdr tree))))
-   (t nil)))
-
-(defun proofread-popup-test--diagnostic (beg end text &optional suggestions)
-  "Return a sample diagnostic for BEG, END, TEXT, and SUGGESTIONS."
+(defun proofread-popup-test--diagnostic
+    (beg end text &optional suggestions message)
+  "Return a sample diagnostic for BEG, END, TEXT, SUGGESTIONS, and MESSAGE."
   (proofread--make-diagnostic
    :beg beg
    :end end
    :text text
    :kind 'spelling
-   :message "Possible misspelling"
+   :message (or message "Possible misspelling")
    :suggestions suggestions
-   :confidence 0.9
    :source 'test))
 
 (defun proofread-popup-test--install-diagnostics (diagnostics)
@@ -50,6 +41,9 @@
      (cl-letf (((symbol-function 'posframe-workable-p)
                 (lambda ()
                   t))
+               ((symbol-function 'pos-visible-in-window-p)
+                (lambda (&rest _args)
+                  t))
                ((symbol-function 'posframe-show)
                 (lambda (buffer-or-name &rest args)
                   (push (cons buffer-or-name args)
@@ -63,16 +57,29 @@
                   (push buffer-or-name proofread-popup-test--deletes))))
        ,@body)))
 
-(ert-deftest proofread-popup-test-faces-use-own-defaults ()
-  "Proofread popup faces do not depend on external face definitions."
-  (let ((spec (face-default-spec 'proofread-popup-face)))
-    (should-not
-     (proofread-popup-test--tree-member-p 'eldoc-box-body spec))
-    (should-not
-     (proofread-popup-test--tree-member-p 'eldoc-box-border spec)))
+(ert-deftest proofread-popup-test-faces-have-package-defaults ()
+  "Proofread popup faces use the package defaults."
+  (should (equal (face-default-spec 'proofread-popup-face)
+                 '((t :inherit default))))
   (should (equal (face-default-spec 'proofread-popup-border-face)
                  '((((background dark)) :background "white")
                    (((background light)) :background "black")))))
+
+(ert-deftest proofread-popup-test-max-width-rejects-zero-in-customize ()
+  "Customize rejects a nonpositive popup width."
+  (should (eq (get 'proofread-popup-max-width 'custom-set)
+              #'proofread--set-positive-integer-option))
+  (should-error
+   (funcall (get 'proofread-popup-max-width 'custom-set)
+            'proofread-popup-max-width 0)))
+
+(ert-deftest proofread-popup-test-blank-message-falls-back-to-text ()
+  "A blank diagnostic message falls back to the diagnostic text."
+  (dolist (message '("" " \t\n"))
+    (let ((diagnostic
+           (proofread-popup-test--diagnostic 1 5 "helo" nil message)))
+      (should (equal (proofread-popup--message diagnostic)
+                     "Proofread: helo")))))
 
 (ert-deftest proofread-popup-test-mode-follows-proofread-mode ()
   "The popup frontend follows the core minor mode automatically."
@@ -82,12 +89,12 @@
     (proofread-mode 1)
     (should proofread-popup-mode)
     (should (memq #'proofread-popup--update post-command-hook))
-    (should (memq #'proofread-popup--diagnostics-changed
+    (should (memq #'proofread-popup--update
                   proofread-diagnostics-changed-hook))
     (proofread-mode -1)
     (should-not proofread-popup-mode)
     (should-not (memq #'proofread-popup--update post-command-hook))
-    (should-not (memq #'proofread-popup--diagnostics-changed
+    (should-not (memq #'proofread-popup--update
                       proofread-diagnostics-changed-hook))))
 
 (ert-deftest proofread-popup-test-diagnostics-change-shows-automatically ()
@@ -103,7 +110,9 @@
               (proofread-popup-test--diagnostic 1 5 "helo")))
          (proofread--apply-backend-diagnostics (list diagnostic))
          (should (= (length proofread-popup-test--shows) 1))
-         (should (eq proofread-popup--diagnostic diagnostic)))))))
+         (should (equal proofread-popup--diagnostic diagnostic))
+         (should (eq proofread-popup--diagnostic
+                     (car proofread--diagnostics))))))))
 
 (ert-deftest proofread-popup-test-shows-message-above-diagnostic-start ()
   "The child frame uses the diagnostic message and range start."
@@ -190,6 +199,47 @@
          (proofread-popup--update)
          (should (= (length proofread-popup-test--shows) 1)))))))
 
+(ert-deftest proofread-popup-test-refreshes-after-window-state-change ()
+  "A window layout state change redraws the current diagnostic."
+  (proofread-popup-test--with-posframe-recorder
+   (save-window-excursion
+     (with-temp-buffer
+       (switch-to-buffer (current-buffer))
+       (insert "aa helo zz")
+       (proofread-mode 1)
+       (let ((diagnostic
+              (proofread-popup-test--diagnostic 4 8 "helo"))
+             (window-start-position 1))
+         (proofread-popup-test--install-diagnostics (list diagnostic))
+         (goto-char 5)
+         (cl-letf (((symbol-function 'window-start)
+                    (lambda (&optional _window)
+                      window-start-position)))
+           (proofread-popup--update)
+           (proofread-popup--update)
+           (should (= (length proofread-popup-test--shows) 1))
+           (setq window-start-position 2)
+           (proofread-popup--update)
+           (should (= (length proofread-popup-test--shows) 2))))))))
+
+(ert-deftest proofread-popup-test-inaccessible-start-anchors-at-point ()
+  "A diagnostic starting outside narrowing is anchored at point."
+  (proofread-popup-test--with-posframe-recorder
+   (save-window-excursion
+     (with-temp-buffer
+       (switch-to-buffer (current-buffer))
+       (insert "aa helo zz")
+       (proofread-mode 1)
+       (let ((diagnostic
+              (proofread-popup-test--diagnostic 1 8 "aa helo")))
+         (proofread-popup-test--install-diagnostics (list diagnostic))
+         (narrow-to-region 4 (point-max))
+         (goto-char 5)
+         (proofread-popup--update)
+         (should (= (length proofread-popup-test--shows) 1))
+         (should (= (plist-get (cdar proofread-popup-test--shows) :position)
+                    (point))))))))
+
 (ert-deftest proofread-popup-test-hides-away-from-diagnostic ()
   "The child frame hides when point leaves diagnostics."
   (proofread-popup-test--with-posframe-recorder
@@ -232,7 +282,7 @@
                   (funcall
                    hidehandler
                    (list :posframe-parent-buffer
-			 (cons nil source))))
+                         (cons nil source))))
                  (switch-to-buffer source)
                  (proofread-popup--update)
                  (should (= (length proofread-popup-test--shows) 2)))))
@@ -257,6 +307,28 @@
          (proofread-popup--update)
          (should-not proofread-popup-test--shows))))))
 
+(ert-deftest proofread-popup-test-manual-opt-out-persists ()
+  "A manual popup opt-out survives core mode disable and re-enable."
+  (with-temp-buffer
+    (proofread-mode 1)
+    (should proofread-popup-mode)
+    (cl-letf (((symbol-function 'called-interactively-p)
+               (lambda (&optional _kind)
+                 t)))
+      (proofread-popup-mode -1))
+    (should-not proofread-popup-mode)
+    (should proofread-popup--user-disabled-p)
+    (proofread-mode -1)
+    (proofread-mode 1)
+    (should-not proofread-popup-mode)
+    (should proofread-popup--user-disabled-p)
+    (cl-letf (((symbol-function 'called-interactively-p)
+               (lambda (&optional _kind)
+                 t)))
+      (proofread-popup-mode 1))
+    (should proofread-popup-mode)
+    (should-not proofread-popup--user-disabled-p)))
+
 (ert-deftest proofread-popup-test-disable-core-mode-cleans-up ()
   "Disabling `proofread-mode' disables and cleans up the popup frontend."
   (proofread-popup-test--with-posframe-recorder
@@ -275,7 +347,7 @@
          (should proofread-popup-test--hides)
          (should proofread-popup-test--deletes)
          (should-not (memq #'proofread-popup--update post-command-hook))
-         (should-not (memq #'proofread-popup--diagnostics-changed
+         (should-not (memq #'proofread-popup--update
                            proofread-diagnostics-changed-hook))
          (should-not proofread-popup--diagnostic))))))
 
@@ -297,7 +369,7 @@
          (should-not proofread-popup-mode)
          (should proofread-popup-test--deletes)
          (should-not (memq #'proofread-popup--update post-command-hook))
-         (should-not (memq #'proofread-popup--diagnostics-changed
+         (should-not (memq #'proofread-popup--update
                            proofread-diagnostics-changed-hook)))))))
 
 (ert-deftest proofread-popup-test-kill-buffer-deletes-frame ()

@@ -33,7 +33,6 @@
    :kind 'spelling
    :message "Possible misspelling"
    :suggestions '("hello")
-   :confidence 0.9
    :source 'test))
 
 (defun proofread-test--diagnostic-for-range (beg end text)
@@ -45,7 +44,6 @@
    :kind 'spelling
    :message "Possible misspelling"
    :suggestions '("hello")
-   :confidence 0.9
    :source 'test))
 
 (defun proofread-test--diagnostic-with-kind (beg end text kind)
@@ -57,7 +55,6 @@
    :kind kind
    :message "Possible issue"
    :suggestions '("fixed")
-   :confidence 0.9
    :source 'test))
 
 (defun proofread-test--diagnostic-with-suggestions
@@ -70,9 +67,7 @@
    :kind 'spelling
    :message "Possible misspelling"
    :suggestions suggestions
-   :confidence 0.9
-   :source 'test
-   :locator (proofread--char-range-locator beg end)))
+   :source 'test))
 
 (defun proofread-test--install-diagnostics (diagnostics)
   "Install DIAGNOSTICS and return their proofread overlays."
@@ -98,6 +93,12 @@
             (cons (plist-get chunk :beg)
                   (plist-get chunk :end)))
           chunks))
+
+(defun proofread-test--span-texts (spans)
+  "Return buffer text selected by SPANS."
+  (mapcar (lambda (span)
+            (buffer-substring-no-properties (car span) (cdr span)))
+          spans))
 
 (defun proofread-test--chunk-with-text (chunks text)
   "Return the first chunk from CHUNKS whose text is TEXT."
@@ -187,8 +188,7 @@
     ("text" . ,text)
     ("range" . (("beg" . ,beg)
                 ("end" . ,end)))
-    ("suggestions" . ,(vconcat (or suggestions '("hello"))))
-    ("confidence" . 0.9)))
+    ("suggestions" . ,(vconcat (or suggestions '("hello"))))))
 
 (defun proofread-test--response-diagnostic-with-fields
     (beg end text fields)
@@ -243,7 +243,7 @@
         (should (equal proofread--diagnostics (list diagnostic)))))))
 
 (ert-deftest proofread-test-clear-preserves-unrelated-overlays ()
-  "Clearing proofread overlays preserves unrelated overlays and diagnostics."
+  "Clearing diagnostics preserves unrelated overlays."
   (with-temp-buffer
     (insert "hello world")
     (proofread-mode 1)
@@ -256,7 +256,7 @@
       (should-not (overlay-buffer proofread-overlay))
       (should (overlay-buffer foreign-overlay))
       (should-not proofread--overlays)
-      (should (equal proofread--diagnostics (list diagnostic))))))
+      (should-not proofread--diagnostics))))
 
 (ert-deftest proofread-test-edit-invalidates-proofread-overlay ()
   "Editing covered text deletes only the proofread-owned overlay."
@@ -270,7 +270,8 @@
       (goto-char 3)
       (insert "x")
       (should-not (overlay-buffer proofread-overlay))
-      (should (overlay-buffer foreign-overlay)))))
+      (should (overlay-buffer foreign-overlay))
+      (should-not proofread--diagnostics))))
 
 (ert-deftest proofread-test-disable-mode-clears-proofread-overlays ()
   "Disabling `proofread-mode' deletes proofread overlays only."
@@ -321,11 +322,11 @@
                        (lambda (&optional _window) 3))
                       ((symbol-function 'window-end)
                        (lambda (&optional _window _update) 16)))
+              (should (equal (proofread--visible-ranges) '((3 . 16))))
               (proofread-check-visible-range)
-              (should (equal proofread--pending-ranges '((3 . 16))))
               (should-not proofread--diagnostics)
               (should-not proofread--overlays)
-              (should-not proofread--requests)
+              (should-not proofread--active-requests)
               (should (= (hash-table-count proofread--cache) 0))))
         (kill-buffer buffer)))))
 
@@ -350,8 +351,8 @@
                         ((symbol-function 'window-end)
                          (lambda (&optional window _update)
                            (cdr (cdr (assq window window-ranges))))))
-                (proofread-check-visible-range)
-                (should (equal proofread--pending-ranges '((3 . 16)))))))
+                (should (equal (proofread--visible-ranges) '((3 . 16))))
+                (proofread-check-visible-range))))
         (kill-buffer buffer)))))
 
 (ert-deftest proofread-test-check-visible-range-no-window-produces-no-ranges ()
@@ -359,9 +360,8 @@
   (with-temp-buffer
     (insert "hello hidden world")
     (proofread-mode 1)
-    (setq proofread--pending-ranges '((1 . 7)))
     (proofread-check-visible-range)
-    (should-not proofread--pending-ranges)))
+    (should-not proofread--active-requests)))
 
 (ert-deftest proofread-test-check-commands-require-mode ()
   "Proofread check commands require `proofread-mode'."
@@ -372,8 +372,7 @@
     (should-error (proofread-check-region (point-min) (point-max))
                   :type 'user-error)
     (goto-char (point-min))
-    (should-error (proofread-check-at-point) :type 'user-error)
-    (should-not proofread--pending-ranges)))
+    (should-error (proofread-check-at-point) :type 'user-error)))
 
 (ert-deftest proofread-test-check-buffer-dispatches-accessible-buffer ()
   "`proofread-check-buffer' checks only accessible text with current options."
@@ -408,7 +407,7 @@
               (before-min (point-min))
               (before-max (point-max)))
           (proofread-test--with-llm-capabilities
-           (cl-letf (((symbol-function 'proofread-backend-check)
+           (cl-letf (((symbol-function 'proofread--backend-check)
                       (plist-get recorder :function)))
              (proofread-check-buffer)
              (let ((requests (funcall (plist-get recorder :requests))))
@@ -416,11 +415,9 @@
                         (mapcar (lambda (request)
                                   (plist-get request :text))
                                 requests)
-                        '("Alpha b" "eta." "Gamma.")))
+                        '("Alpha " "beta." "Gamma.")))
                (dolist (request requests)
                  (should (equal (plist-get request :language) "en"))))
-             (should (equal proofread--pending-ranges
-                            (list (cons before-min before-max))))
              (should-not proofread-auto-check)
              (should (eq (current-buffer) source))
              (should (equal (buffer-string) before-text))
@@ -453,11 +450,9 @@
               (proofread-ignored-properties '(proofread-test-ignore))
               (recorder (proofread-test--make-backend-recorder)))
           (proofread-test--with-llm-capabilities
-           (cl-letf (((symbol-function 'proofread-backend-check)
+           (cl-letf (((symbol-function 'proofread--backend-check)
                       (plist-get recorder :function)))
              (proofread-check-region end beg)
-             (should (equal proofread--pending-ranges
-                            (list (cons beg end))))
              (should
               (equal
                (mapcar (lambda (request)
@@ -477,8 +472,7 @@
       (setq mark-active nil)
       (should-error (call-interactively #'proofread-check-region)
                     :type 'user-error)
-      (should-not proofread--pending-ranges)
-      (should-not proofread--requests))))
+      (should-not proofread--active-requests))))
 
 (ert-deftest proofread-test-check-region-rejects-foreign-markers ()
   "`proofread-check-region' rejects markers from another buffer."
@@ -495,8 +489,7 @@
             (should-error
              (proofread-check-region foreign (point-max))
              :type 'user-error)
-            (should-not proofread--pending-ranges)
-            (should-not proofread--requests))
+            (should-not proofread--active-requests))
         (kill-buffer other)))))
 
 (ert-deftest proofread-test-check-region-interactive-feedback-is-shown ()
@@ -541,7 +534,7 @@
             (recorder (proofread-test--make-backend-recorder))
             (before-point (point)))
         (proofread-test--with-llm-capabilities
-         (cl-letf (((symbol-function 'proofread-backend-check)
+         (cl-letf (((symbol-function 'proofread--backend-check)
                     (plist-get recorder :function)))
            (proofread-check-at-point)
            (let* ((requests (funcall (plist-get recorder :requests)))
@@ -554,8 +547,6 @@
                       "First" (plist-get request :context-before)))
              (should (string-match-p
                       "Third" (plist-get request :context-after))))
-           (should (equal proofread--pending-ranges
-                          (list (cons beg end))))
            (should (= (point) before-point))))))))
 
 (ert-deftest proofread-test-request-ready-range-at-point-boundaries ()
@@ -617,8 +608,7 @@
       (proofread-mode 1)
       (let ((proofread-ignored-properties '(proofread-test-ignore)))
         (should-error (proofread-check-at-point) :type 'user-error)
-        (should-not proofread--pending-ranges)
-        (should-not proofread--requests)))))
+        (should-not proofread--active-requests)))))
 
 (ert-deftest proofread-test-progress-messages-inhibited-by-default ()
   "Routine progress messages are quiet by default."
@@ -702,6 +692,15 @@
     (with-temp-buffer
       (should proofread-auto-check))))
 
+(ert-deftest proofread-test-positive-options-reject-zero-in-customize ()
+  "Customize setters reject invalid positive Proofread options."
+  (dolist (symbol '(proofread-max-chunk-size
+                    proofread-llm-max-diagnostic-passes))
+    (should (eq (get symbol 'custom-set)
+                #'proofread--set-positive-integer-option))
+    (should-error
+     (funcall (get symbol 'custom-set) symbol 0))))
+
 (ert-deftest proofread-test-auto-check-disabled-does-not-schedule-edit-work ()
   "Editing does not schedule work when automatic checking is disabled."
   (with-temp-buffer
@@ -760,7 +759,7 @@
                          (lambda (&optional _window) (point-min)))
                         ((symbol-function 'window-end)
                          (lambda (&optional _window _update) (point-max)))
-                        ((symbol-function 'proofread-backend-available-p)
+                        ((symbol-function 'proofread--supported-backend-p)
                          (lambda () t))
                         ((symbol-function
                           'proofread--request-ready-chunks-for-islands)
@@ -771,8 +770,6 @@
                            (setq dispatched chunks)
                            '(proofread-test-request))))
                 (proofread-check-visible-range)
-                (should (equal proofread--pending-ranges
-                               (list (cons (point-min) (point-max)))))
                 (should (equal dispatched '((:text "Alpha")))))))
         (kill-buffer buffer)))))
 
@@ -831,7 +828,7 @@
       (cl-letf (((symbol-function 'run-with-idle-timer)
                  (lambda (_seconds _repeat _function &rest _args)
                    'proofread-test-timer))
-                ((symbol-function 'proofread-backend-check)
+                ((symbol-function 'proofread--backend-check)
                  (lambda (_request _callback &optional _backend)
                    (setq backend-calls (1+ (or backend-calls 0))))))
         (insert "!")
@@ -983,79 +980,43 @@
     (should-not (buffer-live-p buffer))
     (should-not (proofread--idle-timer-run buffer))))
 
-(ert-deftest proofread-test-chunks-for-ranges-ordinary-paragraph ()
-  "Sentence chunking records exact boundaries and text."
+(ert-deftest proofread-test-chunk-spans-for-ranges-ordinary-paragraph ()
+  "Sentence chunk spans record exact buffer boundaries."
   (with-temp-buffer
     (insert "First paragraph. Second line.\n\nIgnored")
     (let* ((paragraph-end (save-excursion
                             (goto-char (point-min))
                             (search-forward "\n\n")
                             (- (point) 2)))
-           (proofread-context-size 0)
-           (chunks (proofread--chunks-for-ranges
-                    (list (cons (point-min) paragraph-end)))))
-      (should (= (length chunks) 2))
-      (should (equal (proofread-test--chunk-texts chunks)
+           (spans (proofread--chunk-spans-for-ranges
+                   (list (cons (point-min) paragraph-end)))))
+      (should (= (length spans) 2))
+      (should (equal (proofread-test--span-texts spans)
                      '("First paragraph." "Second line.")))
-      (should (= (plist-get (car chunks) :beg) (point-min)))
-      (should (= (plist-get (car (last chunks)) :end) paragraph-end))
-      (dolist (chunk chunks)
-        (should (equal (plist-get chunk :text)
-                       (buffer-substring-no-properties
-                        (plist-get chunk :beg)
-                        (plist-get chunk :end))))))))
+      (should (= (caar spans) (point-min)))
+      (should (= (cdr (car (last spans))) paragraph-end)))))
 
-(ert-deftest proofread-test-chunks-for-ranges-skips-whitespace ()
-  "Paragraph chunking skips empty and whitespace-only paragraphs."
+(ert-deftest proofread-test-chunk-spans-for-ranges-skips-whitespace ()
+  "Chunk spans skip empty and whitespace-only paragraphs."
   (with-temp-buffer
     (insert "  \n\t\n\n")
-    (should-not (proofread--chunks-for-ranges
+    (should-not (proofread--chunk-spans-for-ranges
                  (list (cons (point-min) (point-max)))))))
 
-(ert-deftest proofread-test-chunks-for-ranges-splits-oversized-paragraph ()
+(ert-deftest proofread-test-chunk-spans-split-oversized-paragraph ()
   "Oversized paragraphs split into bounded contiguous chunks."
   (with-temp-buffer
     (insert "abcdefghijkl")
     (let* ((proofread-max-chunk-size 5)
-           (proofread-context-size 0)
-           (chunks (proofread--chunks-for-ranges
-                    (list (cons (point-min) (point-max))))))
-      (should (equal (mapcar (lambda (chunk)
-                               (cons (plist-get chunk :beg)
-                                     (plist-get chunk :end)))
-                             chunks)
-                     '((1 . 6) (6 . 11) (11 . 13))))
-      (should (equal (mapcar (lambda (chunk)
-                               (plist-get chunk :text))
-                             chunks)
+           (spans (proofread--chunk-spans-for-ranges
+                   (list (cons (point-min) (point-max))))))
+      (should (equal spans '((1 . 6) (6 . 11) (11 . 13))))
+      (should (equal (proofread-test--span-texts spans)
                      '("abcde" "fghij" "kl")))
-      (should (cl-every (lambda (chunk)
-                          (<= (length (plist-get chunk :text))
+      (should (cl-every (lambda (span)
+                          (<= (- (cdr span) (car span))
                               proofread-max-chunk-size))
-                        chunks)))))
-
-(ert-deftest proofread-test-chunk-records-metadata-and-context ()
-  "Constructed chunks record mode, language, context, and modified tick."
-  (with-temp-buffer
-    (text-mode)
-    (let ((proofread-language "en")
-          (proofread-context-size 3))
-      (insert (propertize "abcTARGETxyz" 'face 'shadow))
-      (let* ((tick (buffer-chars-modified-tick))
-             (chunk (proofread--make-chunk 4 10)))
-        (should (= (plist-get chunk :beg) 4))
-        (should (= (plist-get chunk :end) 10))
-        (should (equal (plist-get chunk :text) "TARGET"))
-        (should (eq (plist-get chunk :major-mode) 'text-mode))
-        (should (equal (plist-get chunk :language) "en"))
-        (should (equal (plist-get chunk :context-before) "abc"))
-        (should (equal (plist-get chunk :context-after) "xyz"))
-        (should (= (plist-get chunk :modified-tick) tick))
-        (should-not (text-properties-at 0 (plist-get chunk :text)))
-        (should-not (text-properties-at
-                     0 (plist-get chunk :context-before)))
-        (should-not (text-properties-at
-                     0 (plist-get chunk :context-after)))))))
+                        spans)))))
 
 (ert-deftest proofread-test-chunking-preserves-buffer-and-state ()
   "Chunking preserves buffer contents, text properties, and proofread state."
@@ -1064,54 +1025,45 @@
     (proofread-mode 1)
     (let ((before-text (buffer-string))
           (before-tick (buffer-chars-modified-tick)))
-      (let ((chunks (proofread--chunks-for-ranges
-                     (list (cons (point-min) (point-max))))))
-        (should (= (length chunks) 1))
+      (let ((spans (proofread--chunk-spans-for-ranges
+                    (list (cons (point-min) (point-max))))))
+        (should (= (length spans) 1))
         (should (equal (buffer-string) before-text))
         (should (= (buffer-chars-modified-tick) before-tick))
         (should (eq (get-text-property (point-min) 'face) 'bold))
         (should (get-text-property (point-min) 'proofread-test))
-        (should-not (text-properties-at 0 (plist-get (car chunks) :text)))
         (should-not proofread--diagnostics)
         (should-not proofread--overlays)
-        (should-not proofread--requests)
+        (should-not proofread--active-requests)
         (should (= (hash-table-count proofread--cache) 0))))))
 
 (ert-deftest proofread-test-sentence-chunking-splits-chinese-paragraph ()
   "Chinese sentence punctuation splits a paragraph into sentence chunks."
   (with-temp-buffer
     (insert "第一句。第二句！第三句？")
-    (let* ((proofread-context-size 0)
-           (chunks (proofread--chunks-for-ranges
-                    (list (cons (point-min) (point-max))))))
-      (should (equal (proofread-test--chunk-texts chunks)
-                     '("第一句。" "第二句！" "第三句？")))
-      (dolist (chunk chunks)
-        (should (equal (plist-get chunk :text)
-                       (buffer-substring-no-properties
-                        (plist-get chunk :beg)
-                        (plist-get chunk :end))))))))
+    (let ((spans (proofread--chunk-spans-for-ranges
+                  (list (cons (point-min) (point-max))))))
+      (should (equal (proofread-test--span-texts spans)
+                     '("第一句。" "第二句！" "第三句？"))))))
 
 (ert-deftest proofread-test-sentence-chunking-keeps-hard-wrapped-sentence ()
   "A single hard-wrap newline does not split a logical sentence."
   (with-temp-buffer
     (insert "第一句\n第二句")
-    (let* ((proofread-context-size 0)
-           (chunks (proofread--chunks-for-ranges
-                    (list (cons (point-min) (point-max))))))
-      (should (equal (proofread-test--chunk-texts chunks)
+    (let ((spans (proofread--chunk-spans-for-ranges
+                  (list (cons (point-min) (point-max))))))
+      (should (equal (proofread-test--span-texts spans)
                      '("第一句\n第二句")))
-      (should (equal (proofread-test--chunk-ranges chunks)
+      (should (equal spans
                      (list (cons (point-min) (point-max))))))))
 
 (ert-deftest proofread-test-sentence-chunking-splits-english-paragraph ()
   "English punctuation splits sentences without breaking common inline forms."
   (with-temp-buffer
     (insert "Dr. Smith measured 3.14. It rained. Visit example.com/path? Done!")
-    (let* ((proofread-context-size 0)
-           (chunks (proofread--chunks-for-ranges
-                    (list (cons (point-min) (point-max))))))
-      (should (equal (proofread-test--chunk-texts chunks)
+    (let ((spans (proofread--chunk-spans-for-ranges
+                  (list (cons (point-min) (point-max))))))
+      (should (equal (proofread-test--span-texts spans)
                      '("Dr. Smith measured 3.14."
                        "It rained."
                        "Visit example.com/path?"
@@ -1121,61 +1073,36 @@
   "Closing quotes and brackets stay with preceding sentence punctuation."
   (with-temp-buffer
     (insert "他说“第一句。”第二句。")
-    (let* ((proofread-context-size 0)
-           (chunks (proofread--chunks-for-ranges
-                    (list (cons (point-min) (point-max))))))
-      (should (equal (proofread-test--chunk-texts chunks)
+    (let ((spans (proofread--chunk-spans-for-ranges
+                  (list (cons (point-min) (point-max))))))
+      (should (equal (proofread-test--span-texts spans)
                      '("他说“第一句。”" "第二句。"))))))
-
-(ert-deftest proofread-test-sentence-chunking-preserves-metadata-and-context ()
-  "Sentence chunks preserve exact text, metadata, and context."
-  (with-temp-buffer
-    (org-mode)
-    (let ((proofread-language "zh")
-          (proofread-context-size 3))
-      (insert "前文。目标句。后文。")
-      (let* ((tick (buffer-chars-modified-tick))
-             (chunks (proofread--chunks-for-ranges
-                      (list (cons (point-min) (point-max)))))
-             (chunk (cadr chunks)))
-        (should (equal (plist-get chunk :text) "目标句。"))
-        (should (equal (plist-get chunk :text)
-                       (buffer-substring-no-properties
-                        (plist-get chunk :beg)
-                        (plist-get chunk :end))))
-        (should (eq (plist-get chunk :major-mode) 'org-mode))
-        (should (equal (plist-get chunk :language) "zh"))
-        (should (= (plist-get chunk :modified-tick) tick))
-        (should (equal (plist-get chunk :context-before) "前文。"))
-        (should (equal (plist-get chunk :context-after) "后文。"))))))
 
 (ert-deftest proofread-test-sentence-chunking-bounds-oversized-sentence ()
   "A single oversized sentence still splits into bounded chunks."
   (with-temp-buffer
     (insert "一二三四五六。")
-    (let ((proofread-max-chunk-size 3)
-          (proofread-context-size 0))
-      (let ((chunks (proofread--chunks-for-ranges
-                     (list (cons (point-min) (point-max))))))
-        (should (equal (proofread-test--chunk-texts chunks)
+    (let ((proofread-max-chunk-size 3))
+      (let ((spans (proofread--chunk-spans-for-ranges
+                    (list (cons (point-min) (point-max))))))
+        (should (equal (proofread-test--span-texts spans)
                        '("一二三" "四五六" "。")))
-        (should (equal (proofread-test--chunk-ranges chunks)
+        (should (equal spans
                        '((1 . 4) (4 . 7) (7 . 8))))
-        (should (cl-every (lambda (chunk)
-                            (<= (length (plist-get chunk :text))
+        (should (cl-every (lambda (span)
+                            (<= (- (cdr span) (car span))
                                 proofread-max-chunk-size))
-                          chunks))))))
+                          spans))))))
 
 (ert-deftest proofread-test-sentence-chunking-keeps-unpunctuated-paragraph ()
   "Unpunctuated paragraphs stay one logical sentence."
   (with-temp-buffer
     (insert "第一句 第二句")
-    (let ((proofread-context-size 0))
-      (let ((chunks (proofread--chunks-for-ranges
-                     (list (cons (point-min) (point-max))))))
-        (should (equal (proofread-test--chunk-texts chunks)
-                       '("第一句 第二句")))
-        (should (= (length chunks) 1))))))
+    (let ((spans (proofread--chunk-spans-for-ranges
+                  (list (cons (point-min) (point-max))))))
+      (should (equal (proofread-test--span-texts spans)
+                     '("第一句 第二句")))
+      (should (= (length spans) 1)))))
 
 (ert-deftest proofread-test-sentence-chunking-filtering-still-applies ()
   "Request-ready filtering still excludes ignored text after sentence splitting."
@@ -1237,9 +1164,9 @@
           (before-tick (buffer-chars-modified-tick))
           (before-point (point))
           (before-mark (mark t)))
-      (let ((chunks (proofread--chunks-for-ranges
-                     (list (cons (point-min) (point-max))))))
-        (should (equal (proofread-test--chunk-texts chunks)
+      (let ((spans (proofread--chunk-spans-for-ranges
+                    (list (cons (point-min) (point-max))))))
+        (should (equal (proofread-test--span-texts spans)
                        '("第一句。" "第二句。")))
         (should (equal (buffer-string) before-text))
         (should (= (buffer-chars-modified-tick) before-tick))
@@ -1249,7 +1176,7 @@
         (should (get-text-property (point-min) 'proofread-test))
         (should-not proofread--diagnostics)
         (should-not proofread--overlays)
-        (should-not proofread--requests)
+        (should-not proofread--active-requests)
         (should (= (hash-table-count proofread--cache) 0))))))
 
 (ert-deftest proofread-test-request-ready-chunks-filter-url ()
@@ -1338,9 +1265,8 @@
     (let ((proofread-language "en")
           (proofread-context-size 80))
       (insert "Keep http://example.com TARGET tail")
-      (let* ((tick (buffer-chars-modified-tick))
-             (chunks (proofread--request-ready-chunks-for-ranges
-                      (list (cons (point-min) (point-max))))))
+      (let ((chunks (proofread--request-ready-chunks-for-ranges
+                     (list (cons (point-min) (point-max))))))
         (should (equal (proofread-test--chunk-texts chunks)
                        '("Keep " " TARGET tail")))
         (dolist (chunk chunks)
@@ -1350,7 +1276,6 @@
                           (plist-get chunk :end))))
           (should (eq (plist-get chunk :major-mode) 'text-mode))
           (should (equal (plist-get chunk :language) "en"))
-          (should (= (plist-get chunk :modified-tick) tick))
           (should-not (string-match-p "http://example.com"
                                       (plist-get chunk :text)))
           (should-not (string-match-p "http://example.com"
@@ -1547,21 +1472,13 @@
   (with-temp-buffer
     (text-mode)
     (let ((proofread-language "en")
-          (proofread-prompt-version "prompt-a")
           (proofread-llm-provider proofread-test--llm-provider)
-          (proofread-llm-provider-identity "provider-a")
-          (proofread-cache-configuration-version 1))
+          (proofread-llm-provider-identity "provider-a"))
       (insert "Alpha")
       (let* ((chunk (car (proofread--request-ready-chunks-for-ranges
                           (list (cons (point-min) (point-max))))))
              (base-key (proofread--cache-key chunk 'llm)))
         (let ((proofread-llm-provider-identity "provider-b"))
-          (should-not (equal base-key
-                             (proofread--cache-key chunk 'llm))))
-        (let ((proofread-prompt-version "prompt-b"))
-          (should-not (equal base-key
-                             (proofread--cache-key chunk 'llm))))
-        (let ((proofread-cache-configuration-version 2))
           (should-not (equal base-key
                              (proofread--cache-key chunk 'llm))))
         (let ((changed-language (copy-sequence chunk)))
@@ -1622,38 +1539,6 @@
       (should-not (proofread-test--tree-member-p proofread-llm-provider key))
       (should-not (proofread-test--tree-member-p "secret-token" key)))))
 
-(ert-deftest proofread-test-cache-read-misses-old-context-strategy-key ()
-  "Cache entries without context identity miss current request keys."
-  (with-temp-buffer
-    (insert "前文。目标句。后文。")
-    (proofread-mode 1)
-    (let* ((proofread-language "zh")
-           (proofread-backend 'llm)
-           (proofread-context-size 300)
-           (chunk (proofread-test--chunk-with-text
-                   (proofread--request-ready-chunks-for-ranges
-                    (list (cons (point-min) (point-max))))
-                   "目标句。"))
-           (request (proofread--make-backend-request chunk))
-           (diagnostic
-            (proofread-test--diagnostic-for-range
-             (plist-get request :beg)
-             (+ (plist-get request :beg) 2)
-             "目标"))
-           (old-key (list :text-hash
-                          (proofread--chunk-text-hash
-                           (plist-get request :text))
-                          :language (plist-get request :language)
-                          :major-mode (plist-get request :major-mode)
-                          :backend (plist-get request :backend)
-                          :prompt-version proofread-prompt-version
-                          :configuration-version
-                          proofread-cache-configuration-version)))
-      (proofread--cache-write old-key
-                              (proofread--make-cache-entry
-                               request (list diagnostic)))
-      (should-not (proofread--cache-read-request request)))))
-
 (ert-deftest proofread-test-llm-backend-identity-is-cache-compatible ()
   "LLM backend identity is structured and usable for cache entries."
   (with-temp-buffer
@@ -1665,7 +1550,7 @@
             proofread-test--llm-provider-identity)
            (chunk (car (proofread--request-ready-chunks-for-ranges
                         (list (cons (point-min) (point-max))))))
-           (request (proofread--make-backend-request chunk))
+           (request (proofread--make-backend-request chunk 'llm))
            (diagnostic
             (proofread-test--diagnostic-for-range 1 6 "Alpha")))
       (should (equal (proofread--backend-identity)
@@ -1673,8 +1558,9 @@
                                 :provider ,proofread-test--llm-provider-identity
                                 :response-strategy prompt-json
                                 :diagnostic-passes 3
-                                :prompt-version ,proofread-prompt-version)))
-      (should (proofread--backend-identity-p (plist-get request :backend)))
+                                :contract-version 1)))
+      (should (proofread--backend-identity-p
+               (plist-get request :backend-identity)))
       (proofread--cache-write-request request (list diagnostic))
       (should (proofread--cache-read-request request)))))
 
@@ -1693,12 +1579,9 @@
     (should-not (proofread--cache-read 'key))))
 
 (ert-deftest proofread-test-cache-relative-diagnostic-conversion ()
-  "Cached diagnostics convert ranges and locators between coordinate systems."
+  "Cached diagnostics convert ranges between coordinate systems."
   (let* ((request '(:beg 10 :end 20 :text "0123456789" :backend llm))
-         (diagnostic
-          (plist-put (proofread-test--diagnostic-for-range 12 15 "234")
-                     :locator
-                     '(:kind char-range :beg 12 :end 15)))
+         (diagnostic (proofread-test--diagnostic-for-range 12 15 "234"))
          (relative
           (proofread--diagnostic-to-relative diagnostic request))
          (absolute
@@ -1709,8 +1592,6 @@
                    (plist-get diagnostic :beg)))
     (should-not (= (plist-get relative :end)
                    (plist-get diagnostic :end)))
-    (should (equal (plist-get relative :locator)
-                   '(:kind char-range :beg 2 :end 5)))
     (should (equal absolute diagnostic))))
 
 (ert-deftest proofread-test-cache-hit-skips-backend-dispatch ()
@@ -1734,7 +1615,7 @@
                           (lambda (&optional _window) (point-min)))
                          ((symbol-function 'window-end)
                           (lambda (&optional _window _update) 5))
-                         ((symbol-function 'proofread-backend-check)
+                         ((symbol-function 'proofread--backend-check)
                           (lambda (backend-request backend-callback
                                                    &optional _backend)
                             (setq backend-calls
@@ -1814,7 +1695,7 @@
                           (lambda (&optional _window) (point-min)))
                          ((symbol-function 'window-end)
                           (lambda (&optional _window _update) (point-max)))
-                         ((symbol-function 'proofread-backend-check)
+                         ((symbol-function 'proofread--backend-check)
                           (plist-get recorder :function)))
                  (proofread-check-visible-range)
                  (should (= (length (funcall
@@ -1845,13 +1726,11 @@
                    (chunks (proofread--request-ready-chunks-for-ranges
                             (list (cons (point-min) (point-max)))))
                    (cached-request
-                    (proofread--make-backend-request (car chunks)))
+                    (proofread--make-backend-request (car chunks) 'llm))
                    (cached-diagnostic
                     (proofread-test--diagnostic-with-kind
                      1 6 "Alpha" 'spelling))
                    (recorder (proofread-test--make-backend-recorder)))
-              (setq cached-request
-                    (plist-put cached-request :backend 'llm))
               (proofread--cache-write-request
                cached-request (list cached-diagnostic))
               (proofread-test--with-llm-capabilities
@@ -1859,7 +1738,7 @@
                           (lambda (&optional _window) (point-min)))
                          ((symbol-function 'window-end)
                           (lambda (&optional _window _update) (point-max)))
-                         ((symbol-function 'proofread-backend-check)
+                         ((symbol-function 'proofread--backend-check)
                           (plist-get recorder :function)))
                  (proofread-check-visible-range)
                  (should (equal (mapcar
@@ -1873,31 +1752,27 @@
         (kill-buffer buffer)))))
 
 (ert-deftest proofread-test-cache-invalidation-misses ()
-  "Backend, prompt, configuration, and text changes miss old cache entries."
+  "Backend identity and text changes miss old cache entries."
   (with-temp-buffer
     (insert "Alpha")
     (proofread-mode 1)
     (let* ((proofread-backend 'llm)
            (proofread-llm-provider proofread-test--llm-provider)
            (proofread-llm-provider-identity "provider-a")
-           (proofread-prompt-version "prompt-a")
-           (proofread-cache-configuration-version 1)
            (chunk (car (proofread--request-ready-chunks-for-ranges
                         (list (cons (point-min) (point-max))))))
-           (request (proofread--make-backend-request chunk))
+           (request (proofread--make-backend-request chunk 'llm))
            (diagnostic
             (proofread-test--diagnostic-for-range 1 6 "Alpha")))
       (proofread--cache-write-request request (list diagnostic))
       (let ((proofread-llm-provider-identity "provider-b"))
         (should-not (proofread--cache-read-request
                      (proofread--make-backend-request chunk))))
-      (let ((proofread-prompt-version "prompt-b"))
-        (should-not (proofread--cache-read-request request)))
-      (let ((proofread-cache-configuration-version 2))
-        (should-not (proofread--cache-read-request request)))
-      (let ((changed-text (plist-put (copy-sequence request)
-                                     :text "Beta")))
-        (should-not (proofread--cache-read-request changed-text))))))
+      (let ((changed-chunk (plist-put (copy-sequence chunk)
+                                      :text "Beta")))
+        (should-not
+         (proofread--cache-read-request
+          (proofread--make-backend-request changed-chunk)))))))
 
 (ert-deftest proofread-test-stale-and-error-results-are-not-cached ()
   "Stale and error backend results do not write diagnostics to the cache."
@@ -1906,21 +1781,20 @@
     (proofread-mode 1)
     (let* ((chunk (car (proofread--request-ready-chunks-for-ranges
                         (list (cons (point-min) (point-max))))))
-           (request (proofread--make-backend-request chunk))
+           (request (proofread--make-backend-request chunk 'llm))
            (diagnostic
             (proofread-test--diagnostic-for-range 1 5 "helo")))
-      (setq request (plist-put request :backend 'llm))
       (insert "!")
       (should (eq (proofread--handle-backend-result
                    (proofread--backend-success-result
                     request (list diagnostic)))
                   'stale))
       (should (= (hash-table-count proofread--cache) 0))
-      (let ((fresh-request (proofread--make-backend-request
-                            (car (proofread--request-ready-chunks-for-ranges
-                                  (list (cons (point-min)
-                                              (point-max))))))))
-        (setq fresh-request (plist-put fresh-request :backend 'llm))
+      (let ((fresh-request
+             (proofread--make-backend-request
+              (car (proofread--request-ready-chunks-for-ranges
+                    (list (cons (point-min) (point-max)))))
+              'llm)))
         (should (eq (proofread--handle-backend-result
                      (proofread--backend-error-result
                       fresh-request 'llm-failure "LLM failure"))
@@ -1938,29 +1812,23 @@
            (diagnostic
             (proofread-test--diagnostic-for-range 1 5 "helo"))
            (entry (proofread--make-cache-entry request (list diagnostic))))
-      (setq request (plist-put request :backend 'llm))
       (delete-region 1 5)
       (insert "hello")
-      (let ((stale-request
-             (plist-put (copy-sequence request)
-                        :modified-tick
-                        (buffer-chars-modified-tick))))
-        (should (eq (proofread--apply-cache-entry stale-request entry)
-                    'stale))
-        (should-not proofread--diagnostics)
-        (should-not proofread--overlays)))))
+      (should (eq (proofread--apply-cache-entry request entry) 'stale))
+      (should-not proofread--diagnostics)
+      (should-not proofread--overlays))))
 
-(ert-deftest proofread-test-backend-availability ()
-  "Backend availability is limited to a configured LLM backend."
+(ert-deftest proofread-test-supported-backend ()
+  "Only the LLM backend symbol is supported."
   (proofread-test--with-llm-capabilities
    (let ((proofread-backend 'llm)
          (proofread-llm-provider proofread-test--llm-provider))
-     (should (proofread-backend-available-p))
-     (should (proofread-backend-available-p 'llm))
-     (should-not (proofread-backend-available-p 'unknown-backend)))))
+     (should (proofread--supported-backend-p))
+     (should (proofread--supported-backend-p 'llm))
+     (should-not (proofread--supported-backend-p 'unknown-backend)))))
 
-(ert-deftest proofread-test-unknown-backend-is-unavailable-and-unsupported ()
-  "Unknown backend symbols are unavailable and use unsupported dispatch."
+(ert-deftest proofread-test-unknown-backend-is-unsupported ()
+  "Unknown backend symbols use unsupported dispatch."
   (with-temp-buffer
     (insert "helo")
     (let* ((proofread-backend 'unknown-backend)
@@ -1968,9 +1836,9 @@
                         (list (cons (point-min) (point-max))))))
            (request (proofread--make-backend-request chunk 'unknown-backend))
            result)
-      (should-not (proofread-backend-available-p))
-      (should-not (proofread-backend-available-p 'unknown-backend))
-      (should (proofread-backend-check
+      (should-not (proofread--supported-backend-p))
+      (should-not (proofread--supported-backend-p 'unknown-backend))
+      (should (proofread--backend-check
                request
                (lambda (backend-result)
                  (setq result backend-result))
@@ -1981,26 +1849,26 @@
       (should (eq (plist-get result :request) request))
       (should (eq (plist-get result :error) 'unsupported-backend)))))
 
-(ert-deftest proofread-test-llm-backend-availability ()
-  "LLM availability depends on provider and selected response strategy."
+(ert-deftest proofread-test-llm-backend-support-is-configuration-independent ()
+  "LLM support remains detectable so configuration errors stay asynchronous."
   (let ((proofread-backend 'llm)
         (proofread-llm-provider nil))
-    (should-not (proofread-backend-available-p))
-    (should-not (proofread-backend-available-p 'llm)))
+    (should (proofread--supported-backend-p))
+    (should (proofread--supported-backend-p 'llm)))
   (let ((proofread-backend 'llm)
         (proofread-llm-provider 'proofread-test-provider))
-    (should (proofread-backend-available-p))
-    (should (proofread-backend-available-p 'llm)))
+    (should (proofread--supported-backend-p))
+    (should (proofread--supported-backend-p 'llm)))
   (let ((proofread-backend 'llm)
         (proofread-llm-provider 'proofread-test-provider)
         (proofread-llm-response-strategy 'provider-json))
-    (should-not (proofread-backend-available-p))
-    (should-not (proofread-backend-available-p 'llm)))
+    (should (proofread--supported-backend-p))
+    (should (proofread--supported-backend-p 'llm)))
   (proofread-test--with-llm-capabilities
    (let ((proofread-backend 'llm)
          (proofread-llm-provider proofread-test--llm-provider))
-     (should (proofread-backend-available-p))
-     (should (proofread-backend-available-p 'llm)))))
+     (should (proofread--supported-backend-p))
+     (should (proofread--supported-backend-p 'llm)))))
 
 (ert-deftest proofread-test-llm-provider-unavailable-is-asynchronous-error ()
   "Missing LLM provider reports an asynchronous backend error."
@@ -2011,7 +1879,7 @@
                         (list (cons (point-min) (point-max))))))
            (request (proofread--make-backend-request chunk 'llm))
            result)
-      (should (proofread-backend-check
+      (should (proofread--backend-check
                request
                (lambda (backend-result)
                  (setq result backend-result))
@@ -2038,7 +1906,7 @@
                 ((symbol-function 'llm-chat-async)
                  (lambda (&rest _)
                    (error "Unexpected llm-chat-async call"))))
-        (should (proofread-backend-check
+        (should (proofread--backend-check
                  request
                  (lambda (backend-result)
                    (setq result backend-result))
@@ -2070,7 +1938,7 @@
                    (setq captured-prompt prompt)
                    (funcall success content)
                    'proofread-test-llm-handle)))
-        (should (proofread-backend-check
+        (should (proofread--backend-check
                  request
                  (lambda (backend-result)
                    (setq result backend-result))
@@ -2093,8 +1961,7 @@
   (let ((proofread-backend 'llm)
         (proofread-llm-provider
          [:proofread-test-provider :api-key "secret-token"])
-        (proofread-llm-provider-identity nil)
-        (proofread-prompt-version "prompt-a"))
+        (proofread-llm-provider-identity nil))
     (cl-letf (((symbol-function 'llm-name)
                (lambda (_provider)
                  "qwen3:1.7b")))
@@ -2105,7 +1972,7 @@
           (should (integerp (plist-get provider :session))))
         (should (eq (plist-get identity :response-strategy)
                     'prompt-json))
-        (should (equal (plist-get identity :prompt-version) "prompt-a"))
+        (should (= (plist-get identity :contract-version) 1))
         (should-not (string-match-p
                      "secret-token"
                      (prin1-to-string identity)))
@@ -2188,7 +2055,7 @@
                 ((symbol-function 'llm-capabilities)
                  #'proofread-test--llm-capabilities))
         (let ((handle
-               (proofread-backend-check
+               (proofread--backend-check
                 request
                 (lambda (backend-result)
                   (setq result backend-result))
@@ -2216,8 +2083,8 @@
                        :source)
                       'llm)))))))
 
-(ert-deftest proofread-test-llm-prompt-uses-character-ranges ()
-  "LLM prompts use character ranges without token locator hints."
+(ert-deftest proofread-test-llm-prompt-describes-character-ranges ()
+  "LLM prompts describe chunk-relative character ranges."
   (with-temp-buffer
     (org-mode)
     (insert "青晨六点。")
@@ -2235,17 +2102,14 @@
         (let* ((chunk (car (proofread--request-ready-chunks-for-ranges
                             (list (cons (point-min) (point-max))))))
                (request (proofread--make-backend-request chunk 'llm)))
-          (proofread-backend-check request #'ignore 'llm)
+          (proofread--backend-check request #'ignore 'llm)
           (let* ((interaction
                   (car (llm-chat-prompt-interactions captured-prompt)))
                  (prompt-text
                   (llm-chat-prompt-interaction-content interaction)))
             (should (string-match-p "Text:\n青晨六点。" prompt-text))
             (should (string-match-p "range end is exclusive"
-                                    prompt-text))
-            (should-not (string-match-p "Tokens:" prompt-text))
-            (should-not (string-match-p "token_index" prompt-text))
-            (should-not (string-match-p "token_range" prompt-text))))))))
+                                    prompt-text))))))))
 
 (ert-deftest proofread-test-llm-success-enters-overlay-pipeline ()
   "Fresh LLM diagnostics use the existing result, cache, and overlay path."
@@ -2253,12 +2117,10 @@
     (insert "helo")
     (proofread-mode 1)
     (let* ((proofread-llm-provider 'proofread-test-provider)
-           (chunk (car (proofread--request-ready-chunks-for-ranges
-                        (list (cons (point-min) (point-max))))))
-           (request (proofread--make-backend-request chunk 'llm))
            (content
             (proofread-test--response-content
              (list (proofread-test--response-diagnostic 0 4 "helo"))))
+           request
            result)
       (cl-letf (((symbol-function 'llm-chat-async)
                  (lambda (_provider _prompt success _error
@@ -2267,6 +2129,11 @@
                    'proofread-test-llm-handle))
                 ((symbol-function 'llm-capabilities)
                  #'proofread-test--llm-capabilities))
+        (setq request
+              (proofread--make-backend-request
+               (car (proofread--request-ready-chunks-for-ranges
+                     (list (cons (point-min) (point-max)))))
+               'llm))
         (should (proofread--dispatch-backend-request
                  request
                  (lambda (backend-result)
@@ -2277,7 +2144,7 @@
                  (lambda ()
                    proofread--diagnostics)))
         (should (eq (plist-get result :status) 'ok))
-        (should-not proofread--requests)
+        (should-not proofread--active-requests)
         (should (= (length proofread--diagnostics) 1))
         (should (= (length proofread--overlays) 1))
         (should (= (hash-table-count proofread--cache) 1))))))
@@ -2286,11 +2153,12 @@
   "LLM backend can collect additional diagnostics in later passes."
   (with-temp-buffer
     (insert "helo wrld")
+    (proofread-mode 1)
     (let* ((proofread-llm-provider 'proofread-test-provider)
            (proofread-llm-max-diagnostic-passes 2)
            (chunk (car (proofread--request-ready-chunks-for-ranges
                         (list (cons (point-min) (point-max))))))
-           (request (proofread--make-backend-request chunk 'llm))
+           request
            (first
             (proofread-test--response-content
              (list (proofread-test--response-diagnostic 0 4 "helo"))))
@@ -2312,7 +2180,9 @@
                    (intern (format "proofread-test-handle-%d" calls))))
                 ((symbol-function 'llm-capabilities)
                  #'proofread-test--llm-capabilities))
-        (let ((handle (proofread-backend-check
+        (setq request (proofread--make-backend-request chunk 'llm))
+        (should (> (plist-get request :generation) 0))
+        (let ((handle (proofread--backend-check
                        request
                        (lambda (backend-result)
                          (setq result backend-result))
@@ -2335,17 +2205,56 @@
                                  (plist-get result :diagnostics))
                          '("helo" "wrld"))))))))
 
+(ert-deftest proofread-test-managed-llm-request-stops-after-becoming-stale ()
+  "A managed low-level LLM request cannot continue after edit or disable."
+  (dolist (scenario '(edited disabled))
+    (with-temp-buffer
+      (insert "helo")
+      (proofread-mode 1)
+      (let ((proofread-llm-provider proofread-test--llm-provider)
+            (proofread-llm-provider-identity
+             proofread-test--llm-provider-identity)
+            (proofread-llm-max-diagnostic-passes 2)
+            (content
+             (proofread-test--response-content
+              (list (proofread-test--response-diagnostic 0 4 "helo"))))
+            callbacks
+            calls
+            result)
+        (proofread-test--with-llm-capabilities
+         (let* ((chunk (car (proofread--request-ready-chunks-for-ranges
+                             (list (cons (point-min) (point-max))))))
+                (request (proofread--make-backend-request chunk 'llm)))
+           (should (> (plist-get request :generation) 0))
+           (cl-letf (((symbol-function 'llm-chat-async)
+                      (lambda (_provider _prompt success _error
+                                         &optional _multi-output)
+                        (setq calls (1+ (or calls 0)))
+                        (push success callbacks)
+                        (intern (format "proofread-test-managed-%d" calls)))))
+             (proofread--backend-check
+              request
+              (lambda (backend-result)
+                (setq result backend-result))
+              'llm)
+             (should (= calls 1))
+             (pcase scenario
+               ('edited
+                (goto-char (point-min))
+                (delete-char 1))
+               ('disabled (proofread-mode -1)))
+             (funcall (car callbacks) content)
+             (should (proofread-test--wait-for (lambda () result)))
+             (should (= calls 1)))))))))
+
 (ert-deftest proofread-test-llm-error-preserves-buffer-and-clears-request ()
   "LLM error callbacks preserve text and clear active request state."
   (with-temp-buffer
     (insert "helo")
     (proofread-mode 1)
-    (let* ((proofread-llm-provider 'proofread-test-provider)
-           (before-text (buffer-string))
-           (chunk (car (proofread--request-ready-chunks-for-ranges
-                        (list (cons (point-min) (point-max))))))
-           (request (proofread--make-backend-request chunk 'llm))
-           result)
+    (let ((proofread-llm-provider 'proofread-test-provider)
+          (before-text (buffer-string))
+          result)
       (cl-letf (((symbol-function 'llm-chat-async)
                  (lambda (_provider _prompt _success error
                                     &optional _multi-output)
@@ -2353,28 +2262,28 @@
                    'proofread-test-llm-handle))
                 ((symbol-function 'llm-capabilities)
                  #'proofread-test--llm-capabilities))
-        (should (proofread--dispatch-backend-request
-                 request
-                 (lambda (backend-result)
-                   (setq result backend-result))
-                 'llm))
-        (should (proofread-test--wait-for (lambda () result)))
-        (should (eq (plist-get result :status) 'error))
-        (should (eq (plist-get result :error) 'llm-error))
-        (should (equal (buffer-string) before-text))
-        (should-not proofread--requests)
-        (should-not proofread--overlays)))))
+        (let* ((chunk (car (proofread--request-ready-chunks-for-ranges
+                            (list (cons (point-min) (point-max))))))
+               (request (proofread--make-backend-request chunk 'llm)))
+          (should (proofread--dispatch-backend-request
+                   request
+                   (lambda (backend-result)
+                     (setq result backend-result))
+                   'llm))
+          (should (proofread-test--wait-for (lambda () result)))
+          (should (eq (plist-get result :status) 'error))
+          (should (eq (plist-get result :error) 'llm-error))
+          (should (equal (buffer-string) before-text))
+          (should-not proofread--active-requests)
+          (should-not proofread--overlays))))))
 
 (ert-deftest proofread-test-llm-invalid-success-response-is-error ()
   "Unparsable LLM success responses create no overlays and become errors."
   (with-temp-buffer
     (insert "helo")
     (proofread-mode 1)
-    (let* ((proofread-llm-provider 'proofread-test-provider)
-           (chunk (car (proofread--request-ready-chunks-for-ranges
-                        (list (cons (point-min) (point-max))))))
-           (request (proofread--make-backend-request chunk 'llm))
-           result)
+    (let ((proofread-llm-provider 'proofread-test-provider)
+          result)
       (cl-letf (((symbol-function 'llm-chat-async)
                  (lambda (_provider _prompt success _error
                                     &optional _multi-output)
@@ -2382,21 +2291,24 @@
                    'proofread-test-llm-handle))
                 ((symbol-function 'llm-capabilities)
                  #'proofread-test--llm-capabilities))
-        (should (proofread--dispatch-backend-request
-                 request
-                 (lambda (backend-result)
-                   (setq result backend-result)
-                   (proofread--handle-backend-result backend-result))
-                 'llm))
-        (should (proofread-test--wait-for (lambda () result)))
-        (should (eq (plist-get result :status) 'error))
-        (should (eq (plist-get result :error) 'llm-invalid-response))
-        (should-not proofread--requests)
-        (should-not proofread--overlays)
-        (should (= (hash-table-count proofread--cache) 0))))))
+        (let* ((chunk (car (proofread--request-ready-chunks-for-ranges
+                            (list (cons (point-min) (point-max))))))
+               (request (proofread--make-backend-request chunk 'llm)))
+          (should (proofread--dispatch-backend-request
+                   request
+                   (lambda (backend-result)
+                     (setq result backend-result)
+                     (proofread--handle-backend-result backend-result))
+                   'llm))
+          (should (proofread-test--wait-for (lambda () result)))
+          (should (eq (plist-get result :status) 'error))
+          (should (eq (plist-get result :error) 'llm-invalid-response))
+          (should-not proofread--active-requests)
+          (should-not proofread--overlays)
+          (should (= (hash-table-count proofread--cache) 0)))))))
 
 (ert-deftest proofread-test-llm-stale-results-are-dropped ()
-  "LLM results are stale after buffer, mode, tick, or text changes."
+  "LLM results are cancelled or stale after their source becomes invalid."
   (dolist (scenario '(killed disabled modified text-mismatch))
     (let ((buffer (generate-new-buffer
                    (format " *proofread-llm-stale-%s*" scenario)))
@@ -2413,7 +2325,6 @@
                      (chunk (car (proofread--request-ready-chunks-for-ranges
                                   (list (cons (point-min)
                                               (point-max)))))))
-                (setq request (proofread--make-backend-request chunk 'llm))
                 (cl-letf (((symbol-function 'llm-chat-async)
                            (lambda (_provider _prompt callback _error
                                               &optional _multi-output)
@@ -2424,6 +2335,8 @@
                           ((symbol-function 'llm-cancel-request)
                            (lambda (_handle)
                              nil)))
+                  (setq request
+                        (proofread--make-backend-request chunk 'llm))
                   (should (proofread--dispatch-backend-request
                            request
                            (lambda (backend-result)
@@ -2444,16 +2357,18 @@
               ('text-mismatch
                (with-current-buffer buffer
                  (delete-region (point-min) (point-max))
-                 (insert "halo")
-                 (plist-put request
-                            :modified-tick
-                            (buffer-chars-modified-tick)))))
+                 (insert "halo"))))
             (funcall
              success
              (proofread-test--response-content
               (list (proofread-test--response-diagnostic 0 4 "helo"))))
-            (should (proofread-test--wait-for (lambda () result)))
-            (should (eq result 'stale))
+            (if (or (memq scenario '(killed disabled))
+                    (proofread--request-invalidated-p request))
+                (progn
+                  (accept-process-output nil 0.02)
+                  (should-not result))
+              (should (proofread-test--wait-for (lambda () result)))
+              (should (eq result 'stale)))
             (when (buffer-live-p buffer)
               (with-current-buffer buffer
                 (should-not proofread--diagnostics)
@@ -2482,38 +2397,19 @@
       (should (string-match-p "only for the Text section" prompt))
       (should (string-match-p "zero-based chunk-relative offsets" prompt))
       (should (string-match-p "range end is exclusive" prompt))
-      (dolist (field '("kind" "message" "text" "range"
-                       "suggestions" "confidence"))
+      (dolist (field '("kind" "message" "text" "range" "suggestions"))
         (should (string-match-p field prompt)))
       (should-not (string-match-p "source" prompt))
-      (should-not (string-match-p "token_index" prompt))
-      (should-not (string-match-p "token_range" prompt))
       (should (string-match-p "Language: \"en\"" prompt))
       (should (string-match-p "Major mode: text-mode" prompt))
       (should (string-match-p "Text:\nhelo" prompt))
       (should-not (string-match-p "absolute buffer" prompt)))))
-
-(ert-deftest proofread-test-structured-response-prompt-has-no-token-contract ()
-  "Structured response prompts do not expose token locator details."
-  (with-temp-buffer
-    (text-mode)
-    (insert "helo")
-    (let* ((chunk (car (proofread--request-ready-chunks-for-ranges
-                        (list (cons (point-min) (point-max))))))
-           (request (proofread--make-backend-request chunk 'llm))
-           (prompt (proofread--structured-response-prompt request)))
-      (should-not (string-match-p "Tokens:" prompt))
-      (should-not (string-match-p "When you can localize" prompt))
-      (should-not (string-match-p "token_index" prompt))
-      (should-not (string-match-p "token_range" prompt)))))
 
 (ert-deftest proofread-test-structured-response-schema-encodes-json-false ()
   "Structured response schema encodes false as a JSON boolean."
   (let ((schema (proofread--structured-response-schema-text)))
     (should (string-match-p "\"additionalProperties\":false" schema))
     (should-not (string-match-p "\"source\"" schema))
-    (should-not (string-match-p "\"token_index\"" schema))
-    (should-not (string-match-p "\"token_range\"" schema))
     (should-not
      (string-match-p "\"additionalProperties\":\"false\"" schema))))
 
@@ -2569,34 +2465,20 @@
        (proofread--diagnostics-from-structured-response
         request "Before {\"diagnostics\":[} after" 'llm)))))
 
-(ert-deftest proofread-test-structured-response-direct-payload ()
-  "Structured response payloads can be consumed directly."
+(ert-deftest proofread-test-structured-response-rejects-non-json-payload ()
+  "Structured responses reject non-JSON Lisp payloads."
   (with-temp-buffer
     (insert "helo")
     (let* ((chunk (car (proofread--request-ready-chunks-for-ranges
                         (list (cons (point-min) (point-max))))))
            (request (proofread--make-backend-request chunk 'llm))
-           (payload
-            '(:diagnostics
-              ((:kind "spelling"
-                      :message "Possible misspelling"
-                      :text "helo"
-                      :range (:beg 0 :end 4)
-                      :suggestions ["hello"]
-                      :confidence nil))))
-           (diagnostics
-            (proofread--diagnostics-from-structured-response
-             request payload 'llm)))
-      (should (= (length diagnostics) 1))
-      (should (equal (plist-get (car diagnostics) :text) "helo"))
-      (should (equal (plist-get (car diagnostics) :suggestions)
-                     '("hello")))
-      (should (eq (plist-get (car diagnostics) :source) 'llm))
-      (should (equal (plist-get (car diagnostics) :locator)
-                     '(:kind char-range :beg 1 :end 5))))))
+           (payload '(:diagnostics nil)))
+      (should-error
+       (proofread--diagnostics-from-structured-response
+        request payload 'llm)))))
 
-(ert-deftest proofread-test-structured-response-uses-char-range-locator ()
-  "Structured response diagnostics use internal character range locators."
+(ert-deftest proofread-test-structured-response-uses-absolute-buffer-range ()
+  "Structured response diagnostics use absolute buffer ranges."
   (with-temp-buffer
     (insert "青晨六点，小城。")
     (let* ((chunk (car (proofread--request-ready-chunks-for-ranges
@@ -2608,8 +2490,8 @@
            (diagnostic
             (car (proofread--diagnostics-from-structured-response
                   request content 'llm))))
-      (should (equal (plist-get diagnostic :locator)
-                     '(:kind char-range :beg 6 :end 8))))))
+      (should (equal (proofread--diagnostic-range diagnostic)
+                     '(6 . 8))))))
 
 (ert-deftest proofread-test-structured-response-preserves-multiple-diagnostics ()
   "Structured response keeps multiple diagnostics from one request."
@@ -2637,8 +2519,8 @@
                              diagnostics)
                      '((1 . 5) (6 . 10)))))))
 
-(ert-deftest proofread-test-structured-response-unmatched-text-is-dropped ()
-  "Structured response diagnostics whose text is outside the request are dropped."
+(ert-deftest proofread-test-structured-response-unmatched-text-is-error ()
+  "A diagnostic whose text is outside the request invalidates the response."
   (with-temp-buffer
     (insert "helo")
     (let* ((chunk (car (proofread--request-ready-chunks-for-ranges
@@ -2646,13 +2528,13 @@
            (request (proofread--make-backend-request chunk 'llm))
            (content
             (proofread-test--response-content
-             (list (proofread-test--response-diagnostic 0 99 "world"))))
-           (diagnostics
-            (proofread--diagnostics-from-structured-response request content 'llm)))
-      (should-not diagnostics))))
+             (list (proofread-test--response-diagnostic 0 99 "world")))))
+      (should-error
+       (proofread--diagnostics-from-structured-response
+        request content 'llm)))))
 
-(ert-deftest proofread-test-structured-response-repairs-mismatched-range ()
-  "Structured response diagnostics recover from wrong ranges using exact text."
+(ert-deftest proofread-test-structured-response-rejects-mismatched-range ()
+  "A response is invalid when reported range and text do not agree exactly."
   (with-temp-buffer
     (insert "青晨六点半，小城的街到刚刚醒来。")
     (let* ((chunk (car (proofread--request-ready-chunks-for-ranges
@@ -2662,22 +2544,13 @@
             (proofread-test--response-content
              (list
               (proofread-test--response-diagnostic 0 2 "青晨" '("清晨"))
-              (proofread-test--response-diagnostic 7 9 "街到" '("街道")))))
-           (diagnostics
-            (proofread--diagnostics-from-structured-response request content 'llm)))
-      (should (= (length diagnostics) 2))
-      (should (equal (mapcar (lambda (diagnostic)
-                               (plist-get diagnostic :text))
-                             diagnostics)
-                     '("青晨" "街到")))
-      (should (equal (mapcar (lambda (diagnostic)
-                               (cons (plist-get diagnostic :beg)
-                                     (plist-get diagnostic :end)))
-                             diagnostics)
-                     '((1 . 3) (10 . 12)))))))
+              (proofread-test--response-diagnostic 7 9 "街到" '("街道"))))))
+      (should-error
+       (proofread--diagnostics-from-structured-response
+        request content 'llm)))))
 
-(ert-deftest proofread-test-structured-response-text-mismatch-is-dropped ()
-  "Structured response diagnostics whose text does not match the range are dropped."
+(ert-deftest proofread-test-structured-response-text-mismatch-is-error ()
+  "A diagnostic whose text does not match invalidates the response."
   (with-temp-buffer
     (insert "helo")
     (let* ((chunk (car (proofread--request-ready-chunks-for-ranges
@@ -2685,13 +2558,13 @@
            (request (proofread--make-backend-request chunk 'llm))
            (content
             (proofread-test--response-content
-             (list (proofread-test--response-diagnostic 0 4 "hola"))))
-           (diagnostics
-            (proofread--diagnostics-from-structured-response request content 'llm)))
-      (should-not diagnostics))))
+             (list (proofread-test--response-diagnostic 0 4 "hola")))))
+      (should-error
+       (proofread--diagnostics-from-structured-response
+        request content 'llm)))))
 
-(ert-deftest proofread-test-structured-response-invalid-candidate-preserves-valid ()
-  "One invalid structured response diagnostic does not discard valid diagnostics."
+(ert-deftest proofread-test-structured-response-invalid-candidate-is-error ()
+  "One invalid candidate invalidates the whole structured response."
   (with-temp-buffer
     (insert "helo wrld")
     (let* ((chunk (car (proofread--request-ready-chunks-for-ranges
@@ -2703,14 +2576,13 @@
               (proofread-test--response-diagnostic 0 99 "hola")
               (proofread-test--response-diagnostic-with-fields
                0 4 "helo" '(("kind" . "typo")))
-              (proofread-test--response-diagnostic 5 9 "wrld" '("world")))))
-           (diagnostics
-            (proofread--diagnostics-from-structured-response request content 'llm)))
-      (should (= (length diagnostics) 1))
-      (should (equal (plist-get (car diagnostics) :text) "wrld")))))
+              (proofread-test--response-diagnostic 5 9 "wrld" '("world"))))))
+      (should-error
+       (proofread--diagnostics-from-structured-response
+        request content 'llm)))))
 
-(ert-deftest proofread-test-structured-response-suggestions-preserve-order ()
-  "Structured response suggestions keep string order and ignore non-strings."
+(ert-deftest proofread-test-structured-response-suggestions-must-be-strings ()
+  "A non-string suggestion invalidates the structured response."
   (with-temp-buffer
     (insert "helo")
     (let* ((chunk (car (proofread--request-ready-chunks-for-ranges
@@ -2722,51 +2594,210 @@
               ("text" . "helo")
               ("range" . (("beg" . 0)
                           ("end" . 4)))
-              ("suggestions" . ["hello" 42 "hullo" nil "help"])
-              ("confidence" . 0.9)))
+              ("suggestions" . ["hello" 42 "hullo"])))
            (content (proofread-test--response-content
-                     (list candidate)))
-           (diagnostic
-            (car (proofread--diagnostics-from-structured-response
-                  request content 'llm))))
-      (should (equal (plist-get diagnostic :suggestions)
-                     '("hello" "hullo" "help"))))))
+                     (list candidate))))
+      (should-error
+       (proofread--diagnostics-from-structured-response
+        request content 'llm)))))
 
-(ert-deftest proofread-test-structured-response-optional-fields-conservative ()
-  "Structured response optional confidence fields are validated."
+(ert-deftest proofread-test-structured-response-null-arrays-are-error ()
+  "JSON null cannot stand in for diagnostics or suggestions arrays."
   (with-temp-buffer
-    (insert "helo wrld")
+    (insert "helo")
+    (let* ((chunk (car (proofread--request-ready-chunks-for-ranges
+                        (list (cons (point-min) (point-max))))))
+           (request (proofread--make-backend-request chunk 'llm)))
+      (dolist
+          (content
+           '("{\"diagnostics\":null}"
+             "{\"diagnostics\":[{\"kind\":\"spelling\",\"message\":\"issue\",\"text\":\"helo\",\"range\":{\"beg\":0,\"end\":4},\"suggestions\":null}]}"))
+        (should-error
+         (proofread--diagnostics-from-structured-response
+          request content 'llm))))))
+
+(ert-deftest proofread-test-structured-response-unknown-fields-are-error ()
+  "Unknown root, candidate, and range fields invalidate the response."
+  (with-temp-buffer
+    (insert "helo")
     (let* ((chunk (car (proofread--request-ready-chunks-for-ranges
                         (list (cons (point-min) (point-max))))))
            (request (proofread--make-backend-request chunk 'llm))
-           (valid-optional
-            '(("kind" . "spelling")
-              ("message" . "Possible misspelling")
-              ("text" . "helo")
-              ("range" . (("beg" . 0)
-                          ("end" . 4)))
-              ("suggestions" . ["hello"])
-              ("confidence" . 0.75)
-              ("source" . "provider")))
-           (invalid-optional
-            '(("kind" . "spelling")
-              ("message" . "Possible misspelling")
-              ("text" . "wrld")
-              ("range" . (("beg" . 5)
-                          ("end" . 9)))
-              ("suggestions" . ["world"])
-              ("confidence" . 3)
-              ("source" . 42)))
-           (content
+           (candidate
+            (proofread-test--response-diagnostic 0 4 "helo"))
+           (candidate-extra
+            (append candidate '(("extra" . true))))
+           (range-extra
+            (proofread-test--response-diagnostic-with-fields
+             0 4 "helo"
+             '(("range" . (("beg" . 0)
+                           ("end" . 4)
+                           ("extra" . true)))))))
+      (dolist (content
+               (list
+                "{\"diagnostics\":[],\"extra\":true}"
+                (proofread-test--response-content (list candidate-extra))
+                (proofread-test--response-content (list range-extra))))
+        (should-error
+         (proofread--diagnostics-from-structured-response
+          request content 'llm))))))
+
+(ert-deftest proofread-test-structured-response-duplicate-fields-are-error ()
+  "Duplicate fields at every object level invalidate the response."
+  (let ((request '(:beg 1 :end 5 :text "helo")))
+    (dolist
+        (content
+         '("{\"diagnostics\":false,\"diagnostics\":[]}"
+           "{\"diagnostics\":[{\"kind\":\"spelling\",\"kind\":\"style\",\"message\":\"issue\",\"text\":\"helo\",\"range\":{\"beg\":0,\"end\":4},\"suggestions\":[]}]}"
+           "{\"diagnostics\":[{\"kind\":\"spelling\",\"message\":\"issue\",\"text\":\"helo\",\"range\":{\"beg\":0,\"beg\":1,\"end\":4},\"suggestions\":[]}]}"))
+      (should-error
+       (proofread--diagnostics-from-structured-response
+        request content 'llm)))))
+
+(ert-deftest proofread-test-structured-response-trailing-commas-are-error ()
+  "Trailing commas at every array and object level are parse errors."
+  (let ((request '(:beg 1 :end 5 :text "helo")))
+    (dolist
+        (content
+         '("{\"diagnostics\":[],}"
+           "{\"diagnostics\":[{\"kind\":\"spelling\",\"message\":\"issue\",\"text\":\"helo\",\"range\":{\"beg\":0,\"end\":4},\"suggestions\":[]},]}"
+           "{\"diagnostics\":[{\"kind\":\"spelling\",\"message\":\"issue\",\"text\":\"helo\",\"range\":{\"beg\":0,\"end\":4},\"suggestions\":[],}]}"
+           "{\"diagnostics\":[{\"kind\":\"spelling\",\"message\":\"issue\",\"text\":\"helo\",\"range\":{\"beg\":0,\"end\":4,},\"suggestions\":[]}]}"
+           "{\"diagnostics\":[{\"kind\":\"spelling\",\"message\":\"issue\",\"text\":\"helo\",\"range\":{\"beg\":0,\"end\":4},\"suggestions\":[\"hello\",]}]}"))
+      (should-error
+       (proofread--diagnostics-from-structured-response
+        request content 'llm)))))
+
+(ert-deftest proofread-test-structured-response-does-not-intern-unknown-keys ()
+  "Rejected JSON object keys do not enter the global symbol table."
+  (let ((key "proofread-test-unknown-key-7dc65efef5634c08")
+        (request '(:beg 1 :end 5 :text "helo")))
+    (should-not (intern-soft key))
+    (should-error
+     (proofread--diagnostics-from-structured-response
+      request (format "{\"diagnostics\":[],\"%s\":true}" key) 'llm))
+    (should-not (intern-soft key))))
+
+(ert-deftest proofread-test-structured-response-rejects-source-delimiters ()
+  "Comment and docstring delimiters are not valid proofreading targets."
+  (with-temp-buffer
+    (emacs-lisp-mode)
+    (insert ";; prose text\n")
+    (let* ((text (buffer-string))
+           (request (list :buffer (current-buffer)
+                          :beg (point-min)
+                          :end (point-max)
+                          :text text
+                          :target-kind 'comment))
+           (delimiter
             (proofread-test--response-content
-             (list valid-optional invalid-optional)))
-           (diagnostics
-            (proofread--diagnostics-from-structured-response request content 'llm)))
-      (should (= (length diagnostics) 2))
-      (should (= (plist-get (car diagnostics) :confidence) 0.75))
-      (should (eq (plist-get (car diagnostics) :source) 'llm))
-      (should-not (plist-get (cadr diagnostics) :confidence))
-      (should (eq (plist-get (cadr diagnostics) :source) 'llm)))))
+             (list (proofread-test--response-diagnostic 0 2 ";;"))))
+           (insertion-position
+            (+ (string-search "prose" text) (length "prose")))
+           (insertion
+            (proofread-test--response-content
+             (list (proofread-test--response-diagnostic
+                    insertion-position insertion-position "" '("."))))))
+      (should-error
+       (proofread--diagnostics-from-structured-response
+        request delimiter 'llm))
+      (let ((diagnostic
+             (car (proofread--diagnostics-from-structured-response
+                   request insertion 'llm))))
+        (should (= (plist-get diagnostic :beg)
+                   (+ (point-min) insertion-position)))
+        (should (= (plist-get diagnostic :beg)
+                   (plist-get diagnostic :end))))))
+  (with-temp-buffer
+    (c-mode)
+    (insert "/*helo*/")
+    (let* ((text (buffer-string))
+           (request (list :buffer (current-buffer)
+                          :beg (point-min)
+                          :end (point-max)
+                          :text text
+                          :target-kind 'comment))
+           (closing-delimiter
+            (proofread-test--response-content
+             (list (proofread-test--response-diagnostic 6 7 "*" '(""))))))
+      (should-error
+       (proofread--diagnostics-from-structured-response
+        request closing-delimiter 'llm))))
+  (with-temp-buffer
+    (html-mode)
+    (insert "<!--helo-->")
+    (syntax-propertize (point-max))
+    (let ((request (list :buffer (current-buffer)
+                         :beg (point-min)
+                         :end (point-max)
+                         :text (buffer-string)
+                         :target-kind 'comment)))
+      (dolist (candidate '((8 9 "-") (9 10 "-") (10 11 ">")))
+        (should-error
+         (proofread--diagnostics-from-structured-response
+          request
+          (proofread-test--response-content
+           (list (proofread-test--response-diagnostic
+                  (nth 0 candidate) (nth 1 candidate) (nth 2 candidate)
+                  '(""))))
+          'llm)))))
+  (with-temp-buffer
+    (emacs-lisp-mode)
+    (insert "\"prose text\"")
+    (let* ((text (buffer-string))
+           (request (list :buffer (current-buffer)
+                          :beg (point-min)
+                          :end (point-max)
+                          :text text
+                          :target-kind 'docstring))
+           (delimiter
+            (proofread-test--response-content
+             (list (proofread-test--response-diagnostic 0 1 "\"")))))
+      (should-error
+       (proofread--diagnostics-from-structured-response
+        request delimiter 'llm)))))
+
+(ert-deftest proofread-test-structured-response-allows-safe-target-interiors ()
+  "Target guards allow prose punctuation and incomplete source containers."
+  (dolist (spec '((c-mode "/*helo!*/" comment 6 7 "!")
+                  (c-mode "/*helo" comment 2 6 "helo")
+                  (emacs-lisp-mode "\"helo" docstring 1 5 "helo")))
+    (with-temp-buffer
+      (funcall (nth 0 spec))
+      (insert (nth 1 spec))
+      (syntax-propertize (point-max))
+      (let* ((request (list :buffer (current-buffer)
+                            :beg (point-min)
+                            :end (point-max)
+                            :text (buffer-string)
+                            :target-kind (nth 2 spec)))
+             (content
+              (proofread-test--response-content
+               (list (proofread-test--response-diagnostic
+                      (nth 3 spec) (nth 4 spec) (nth 5 spec) '("fixed"))))))
+        (should
+         (proofread--diagnostics-from-structured-response
+          request content 'llm))))))
+
+(ert-deftest proofread-test-structured-response-rejects-string-escapes ()
+  "Docstring diagnostics cannot alter escape introducers or quoted characters."
+  (with-temp-buffer
+    (emacs-lisp-mode)
+    (insert "\"Say \\\"helo\\\".\"")
+    (let ((request (list :buffer (current-buffer)
+                         :beg (point-min)
+                         :end (point-max)
+                         :text (buffer-string)
+                         :target-kind 'docstring)))
+      (dolist (candidate '((5 6 "\\") (6 7 "\"")))
+        (let ((content
+               (proofread-test--response-content
+                (list (proofread-test--response-diagnostic
+                       (nth 0 candidate) (nth 1 candidate) (nth 2 candidate)
+                       '(""))))))
+          (should-error
+           (proofread--diagnostics-from-structured-response
+            request content 'llm)))))))
 
 (ert-deftest proofread-test-structured-response-cross-boundary-range ()
   "Character ranges can describe diagnostics across word-like boundaries."
@@ -2782,9 +2813,7 @@
                 request content 'llm))))
     (should diagnostic)
     (should (= (plist-get diagnostic :beg) 4))
-    (should (= (plist-get diagnostic :end) 6))
-    (should (equal (plist-get diagnostic :locator)
-                   '(:kind char-range :beg 4 :end 6)))))
+    (should (= (plist-get diagnostic :end) 6))))
 
 (ert-deftest proofread-test-structured-response-without-range-and-text-is-rejected ()
   "Diagnostics without authoritative range and text are rejected."
@@ -2794,7 +2823,8 @@
            (list '(("kind" . "spelling")
                    ("message" . "Possible misspelling")
                    ("suggestions" . ["清晨"]))))))
-    (should-not (proofread--diagnostics-from-structured-response request content 'llm))))
+    (should-error
+     (proofread--diagnostics-from-structured-response request content 'llm))))
 
 (ert-deftest proofread-test-structured-response-parsed-results-still-stale-check ()
   "Parsed structured response diagnostics still require stale validation."
@@ -2818,27 +2848,6 @@
       (should-not proofread--diagnostics)
       (should-not proofread--overlays)
       (should (equal (buffer-string) "helo!")))))
-
-(ert-deftest proofread-test-structured-response-prompt-version-cache-miss ()
-  "Structured response cache entries miss when prompt version changes."
-  (with-temp-buffer
-    (insert "helo")
-    (proofread-mode 1)
-    (let* ((proofread-backend 'llm)
-           (proofread-llm-provider 'proofread-test-provider)
-           (proofread-llm-provider-identity "provider")
-           (proofread-prompt-version "schema-v1")
-           (chunk (car (proofread--request-ready-chunks-for-ranges
-                        (list (cons (point-min) (point-max))))))
-           (request (proofread--make-backend-request chunk))
-           (diagnostic
-            (proofread-test--diagnostic-for-range 1 5 "helo")))
-      (proofread--cache-write-request request (list diagnostic))
-      (should (proofread--cache-read-request
-               (proofread--make-backend-request chunk)))
-      (let ((proofread-prompt-version "schema-v2"))
-        (should-not (proofread--cache-read-request
-                     (proofread--make-backend-request chunk)))))))
 
 (ert-deftest proofread-test-structured-response-strategy-cache-miss ()
   "Structured response cache entries miss when LLM response strategy changes."
@@ -2929,8 +2938,7 @@
     (let ((proofread-language "en")
           (proofread-context-size 3))
       (insert "abcTARGETxyz")
-      (let* ((tick (buffer-chars-modified-tick))
-             (chunk (car (proofread--request-ready-chunks-for-ranges
+      (let* ((chunk (car (proofread--request-ready-chunks-for-ranges
                           '((4 . 10)))))
              (request (proofread--make-backend-request chunk)))
         (dolist (key proofread--backend-request-keys)
@@ -2943,8 +2951,7 @@
         (should (equal (plist-get request :context-before) "abc"))
         (should (equal (plist-get request :context-after) "xyz"))
         (should (equal (plist-get request :language) "en"))
-        (should (eq (plist-get request :major-mode) 'text-mode))
-        (should (= (plist-get request :modified-tick) tick))))))
+        (should (eq (plist-get request :major-mode) 'text-mode))))))
 
 (ert-deftest proofread-test-llm-backend-success-is-asynchronous ()
   "LLM backend success callbacks happen after dispatch returns."
@@ -2956,7 +2963,7 @@
                          (list (cons (point-min) (point-max))))))
             (request (proofread--make-backend-request chunk))
             result)
-       (should (proofread-backend-check
+       (should (proofread--backend-check
                 request
                 (lambda (backend-result)
                   (setq result backend-result))
@@ -2976,7 +2983,7 @@
                                                         (list (cons (point-min) (point-max))))))
                                            (request (proofread--make-backend-request chunk))
                                            result)
-                                      (should (proofread-backend-check
+                                      (should (proofread--backend-check
                                                request
                                                (lambda (backend-result)
                                                  (setq result backend-result))
@@ -2996,7 +3003,7 @@
                         (list (cons (point-min) (point-max))))))
            (request (proofread--make-backend-request chunk))
            result)
-      (should (proofread-backend-check
+      (should (proofread--backend-check
                request
                (lambda (backend-result)
                  (setq result backend-result))
@@ -3025,7 +3032,7 @@
                 (lambda (backend-result)
                   (setq result backend-result)
                   (with-current-buffer buffer
-                    (setq active-at-callback proofread--requests)))
+                    (setq active-at-callback proofread--active-requests)))
                 'llm))
        (should (proofread--active-request-p request))
        (should (proofread-test--wait-for (lambda () result)))
@@ -3051,7 +3058,7 @@
                                                (lambda (backend-result)
                                                  (setq result backend-result)
                                                  (with-current-buffer buffer
-                                                   (setq active-at-callback proofread--requests)))
+                                                   (setq active-at-callback proofread--active-requests)))
                                                'llm))
                                       (should (proofread--active-request-p request))
                                       (should (proofread-test--wait-for (lambda () result)))
@@ -3081,21 +3088,19 @@
                           (lambda (&optional _window) (point-min)))
                          ((symbol-function 'window-end)
                           (lambda (&optional _window _update) (point-max)))
-                         ((symbol-function 'proofread-backend-check)
+                         ((symbol-function 'proofread--backend-check)
                           (lambda (request callback &optional _backend)
                             (push request requests)
                             (push callback callbacks)
                             'proofread-test-handle)))
                  (proofread-check-visible-range)
                  (setq requests (nreverse requests))
-                 (should (equal proofread--pending-ranges
-                                (list (cons (point-min) (point-max)))))
                  (should (equal (mapcar (lambda (request)
                                           (plist-get request :text))
                                         requests)
                                 '("Alpha " " Beta")))
                  (should (= (length callbacks) 2))
-                 (should (= (length proofread--requests) 2))
+                 (should (= (length proofread--active-requests) 2))
                  (should-not proofread--diagnostics)
                  (should-not proofread--overlays)))))
         (kill-buffer buffer)))))
@@ -3124,7 +3129,7 @@
                           (lambda (&optional _window) (point-min)))
                          ((symbol-function 'window-end)
                           (lambda (&optional _window _update) (point-max)))
-                         ((symbol-function 'proofread-backend-check)
+                         ((symbol-function 'proofread--backend-check)
                           (lambda (request callback &optional _backend)
                             (push request requests)
                             (push callback callbacks)
@@ -3145,7 +3150,7 @@
                              (plist-get request :beg)
                              (plist-get request :end)))))
                  (should (= (length callbacks) 3))
-                 (should (= (length proofread--requests) 3))))))
+                 (should (= (length proofread--active-requests) 3))))))
         (kill-buffer buffer)))))
 
 (ert-deftest proofread-test-max-concurrent-requests-queues-extra-work ()
@@ -3172,14 +3177,20 @@
                           (lambda (&optional _window) (point-min)))
                          ((symbol-function 'window-end)
                           (lambda (&optional _window _update) (point-max)))
-                         ((symbol-function 'proofread-backend-check)
+                         ((symbol-function 'proofread--backend-check)
                           (plist-get recorder :function)))
                  (proofread-show-buffer-requests buffer)
                  (proofread-check-visible-range)
                  (should (= (length (funcall
                                      (plist-get recorder :requests)))
                             2))
-                 (should (= (length proofread--requests) 2))
+                 (should (= (length proofread--active-requests) 2))
+                 (should (= (length proofread--request-queue) 1))
+                 (proofread-check-visible-range)
+                 (should (= (length (funcall
+                                     (plist-get recorder :requests)))
+                            2))
+                 (should (= (length proofread--active-requests) 2))
                  (should (= (length proofread--request-queue) 1))
                  (with-current-buffer name
                    (let ((statuses (mapcar (lambda (entry)
@@ -3206,9 +3217,9 @@
                           (active-ids
                            (mapcar (lambda (request)
                                      (plist-get request :id))
-                                   proofread--requests)))
+                                   proofread--active-requests)))
                      (should (= (length all-requests) 3))
-                     (should (= (length proofread--requests) 2))
+                     (should (= (length proofread--active-requests) 2))
                      (should-not proofread--request-queue)
                      (with-current-buffer name
                        (let ((statuses
@@ -3242,7 +3253,7 @@
               (proofread-llm-provider-identity
                proofread-test--llm-provider-identity))
           (proofread-test--with-llm-capabilities
-           (cl-letf (((symbol-function 'proofread-backend-check)
+           (cl-letf (((symbol-function 'proofread--backend-check)
                       (lambda (_request _callback &optional _backend)
                         'proofread-test-handle)))
              (with-current-buffer first-buffer
@@ -3258,12 +3269,12 @@
                 (proofread--request-ready-chunks-for-ranges
                  (list (cons (point-min) (point-max))))))
              (with-current-buffer first-buffer
-               (should (= (length proofread--requests) 1))
-               (should (eq (plist-get (car proofread--requests) :buffer)
+               (should (= (length proofread--active-requests) 1))
+               (should (eq (plist-get (car proofread--active-requests) :buffer)
                            first-buffer)))
              (with-current-buffer second-buffer
-               (should (= (length proofread--requests) 1))
-               (should (eq (plist-get (car proofread--requests) :buffer)
+               (should (= (length proofread--active-requests) 1))
+               (should (eq (plist-get (car proofread--active-requests) :buffer)
                            second-buffer))))))
       (kill-buffer first-buffer)
       (kill-buffer second-buffer))))
@@ -3288,7 +3299,7 @@
                           (lambda (&optional _window) (point-min)))
                          ((symbol-function 'window-end)
                           (lambda (&optional _window _update) (point-max)))
-                         ((symbol-function 'proofread-backend-check)
+                         ((symbol-function 'proofread--backend-check)
                           (lambda (backend-request backend-callback
                                                    &optional _backend)
                             (setq request backend-request)
@@ -3308,6 +3319,28 @@
                    (should (overlay-buffer (car proofread--overlays)))
                    (should-not (proofread--active-request-p request)))))))
         (kill-buffer buffer)))))
+
+(ert-deftest proofread-test-live-range-does-not-mutate-backend-result ()
+  "Moving a live overlay leaves the backend result as an immutable snapshot."
+  (with-temp-buffer
+    (insert "helo")
+    (proofread-mode 1)
+    (let* ((chunk
+            (car (proofread--request-ready-chunks-for-ranges
+                  (list (cons (point-min) (point-max))))))
+           (request (proofread--make-backend-request chunk 'llm))
+           (diagnostic
+            (proofread-test--diagnostic-for-range 1 5 "helo"))
+           (result
+            (proofread--backend-success-result request (list diagnostic))))
+      (should (eq (proofread--handle-backend-result result) 'applied))
+      (let ((live (car proofread--diagnostics)))
+        (should-not (eq live diagnostic))
+        (goto-char (point-min))
+        (insert "x")
+        (should (equal (proofread--diagnostic-range live) '(2 . 6)))
+        (should (equal (proofread--diagnostic-range diagnostic) '(1 . 5)))
+        (should (eq (car (plist-get result :diagnostics)) diagnostic))))))
 
 (ert-deftest proofread-test-context-does-not-shift-diagnostic-overlays ()
   "Sentence-window context does not shift accepted diagnostic overlays."
@@ -3356,7 +3389,7 @@
                     (lambda (&optional _window) (point-min)))
                    ((symbol-function 'window-end)
                     (lambda (&optional _window _update) (point-max)))
-                   ((symbol-function 'proofread-backend-check)
+                   ((symbol-function 'proofread--backend-check)
                     (lambda (backend-request backend-callback
                                              &optional _backend)
                       (setq request backend-request)
@@ -3392,7 +3425,7 @@
                           (lambda (&optional _window) (point-min)))
                          ((symbol-function 'window-end)
                           (lambda (&optional _window _update) (point-max)))
-                         ((symbol-function 'proofread-backend-check)
+                         ((symbol-function 'proofread--backend-check)
                           (lambda (backend-request backend-callback
                                                    &optional _backend)
                             (setq request backend-request)
@@ -3409,11 +3442,11 @@
                              'stale))
                  (should-not proofread--diagnostics)
                  (should-not proofread--overlays)
-                 (should-not proofread--requests)))))
+                 (should-not proofread--active-requests)))))
         (kill-buffer buffer)))))
 
-(ert-deftest proofread-test-modified-tick-result-is-dropped ()
-  "Results are stale after any buffer modified tick change."
+(ert-deftest proofread-test-context-change-result-is-dropped ()
+  "Results are stale after their surrounding context changes."
   (save-window-excursion
     (let ((buffer (generate-new-buffer " *proofread-tick-result*")))
       (unwind-protect
@@ -3432,7 +3465,7 @@
                           (lambda (&optional _window) (point-min)))
                          ((symbol-function 'window-end)
                           (lambda (&optional _window _update) 5))
-                         ((symbol-function 'proofread-backend-check)
+                         ((symbol-function 'proofread--backend-check)
                           (lambda (backend-request backend-callback
                                                    &optional _backend)
                             (setq request backend-request)
@@ -3473,7 +3506,7 @@
                           (lambda (&optional _window) (point-min)))
                          ((symbol-function 'window-end)
                           (lambda (&optional _window _update) 5))
-                         ((symbol-function 'proofread-backend-check)
+                         ((symbol-function 'proofread--backend-check)
                           (lambda (backend-request backend-callback
                                                    &optional _backend)
                             (setq request backend-request)
@@ -3482,17 +3515,13 @@
                  (proofread-check-visible-range)
                  (delete-region 1 5)
                  (insert "hello")
-                 (let ((mismatched-request
-                        (plist-put (copy-sequence request)
-                                   :modified-tick
-                                   (buffer-chars-modified-tick))))
-                   (should (eq (funcall
-                                callback
-                                (proofread--backend-success-result
-                                 mismatched-request
-                                 (list (proofread-test--diagnostic-for-range
-                                        1 6 "hello"))))
-                               'stale)))
+                 (should (eq (funcall
+                              callback
+                              (proofread--backend-success-result
+                               request
+                               (list (proofread-test--diagnostic-for-range
+                                      1 6 "hello"))))
+                             'stale))
                  (should-not proofread--diagnostics)
                  (should-not proofread--overlays)
                  (should-not (proofread--active-request-p request))))))
@@ -3519,7 +3548,7 @@
                           (lambda (&optional _window) (point-min)))
                          ((symbol-function 'window-end)
                           (lambda (&optional _window _update) (point-max)))
-                         ((symbol-function 'proofread-backend-check)
+                         ((symbol-function 'proofread--backend-check)
                           (lambda (backend-request backend-callback
                                                    &optional _backend)
                             (setq request backend-request)
@@ -3541,6 +3570,7 @@
   "Navigation diagnostics are valid and sorted by start and end position."
   (with-temp-buffer
     (insert "abcdefghij")
+    (proofread-mode 1)
     (let* ((marker (copy-marker 2))
            (first (proofread-test--diagnostic-for-range marker 5 "bcd"))
            (same-start-short
@@ -3555,6 +3585,8 @@
       (setq proofread--diagnostics
             (list same-start-long invalid-beg last invalid-backward
                   same-start-short first))
+      (mapc #'proofread--create-overlay
+            (list same-start-long last same-start-short first))
       (should (equal (mapcar #'proofread--diagnostic-range
                              (proofread--navigation-diagnostics))
                      '((2 . 5) (4 . 6) (4 . 9) (8 . 10)))))))
@@ -3562,11 +3594,14 @@
 (ert-deftest proofread-test-navigation-target-selection-around-point ()
   "Next and previous target helpers select strict non-wrapping targets."
   (with-temp-buffer
+    (insert "abcdefghijkl")
+    (proofread-mode 1)
     (let* ((first (proofread-test--diagnostic-for-range 3 4 "c"))
            (second (proofread-test--diagnostic-for-range 6 7 "f"))
            (third (proofread-test--diagnostic-for-range 9 10 "i"))
            (invalid (proofread-test--diagnostic-for-range 12 11 "")))
       (setq proofread--diagnostics (list third invalid first second))
+      (mapc #'proofread--create-overlay (list third first second))
       (should (eq (proofread--next-diagnostic-after 1) first))
       (should (eq (proofread--next-diagnostic-after 3) second))
       (should (eq (proofread--next-diagnostic-after 6) third))
@@ -3738,7 +3773,6 @@
                :kind 'spelling
                :message "Possible misspelling"
                :suggestions '("hello")
-               :confidence 0.9
                :source 'test))
              (second
               (proofread--make-diagnostic
@@ -3831,19 +3865,45 @@
     (insert "helo")
     (should-error (proofread-show-buffer-diagnostics) :type 'user-error)))
 
+(ert-deftest proofread-test-diagnostics-list-refreshes-visible-contents ()
+  "An open diagnostics list redraws when source diagnostics change."
+  (save-window-excursion
+    (let ((source (generate-new-buffer " *proofread-diagnostics-refresh*")))
+      (unwind-protect
+          (progn
+            (switch-to-buffer source)
+            (insert "helo")
+            (proofread-mode 1)
+            (let* ((diagnostic
+                    (proofread-test--diagnostic-for-range 1 5 "helo"))
+                   (name (proofread--diagnostics-buffer-name)))
+              (proofread-test--install-diagnostics (list diagnostic))
+              (proofread-show-buffer-diagnostics)
+              (with-current-buffer name
+                (goto-char (point-min))
+                (should (search-forward "helo" nil t)))
+              (with-current-buffer source
+                (proofread-clear))
+              (with-current-buffer name
+                (should-not tabulated-list-entries)
+                (goto-char (point-min))
+                (should-not (search-forward "helo" nil t)))))
+        (when (buffer-live-p source)
+          (kill-buffer source))))))
+
 (ert-deftest proofread-test-diagnostic-at-point-finds-covering-diagnostic ()
   "Diagnostic lookup returns the proofread diagnostic covering point."
   (with-temp-buffer
     (insert "abcdefghij")
     (proofread-mode 1)
     (let ((diagnostic (proofread-test--diagnostic-for-range 3 6 "cde")))
-      (setq proofread--diagnostics (list diagnostic))
+      (proofread-test--install-diagnostics (list diagnostic))
       (goto-char 3)
-      (should (eq (proofread--diagnostic-at-point) diagnostic))
+      (should (eq (proofread-diagnostic-at-point) diagnostic))
       (goto-char 5)
-      (should (eq (proofread--diagnostic-at-point) diagnostic))
+      (should (eq (proofread-diagnostic-at-point) diagnostic))
       (goto-char 6)
-      (should-not (proofread--diagnostic-at-point)))))
+      (should-not (proofread-diagnostic-at-point)))))
 
 (ert-deftest proofread-test-diagnostic-at-point-uses-overlap-order ()
   "Overlapping diagnostic lookup uses navigation ordering."
@@ -3853,9 +3913,9 @@
     (let ((long (proofread-test--diagnostic-for-range 2 9 "bcdefgh"))
           (short (proofread-test--diagnostic-for-range 2 6 "bcde"))
           (later (proofread-test--diagnostic-for-range 4 5 "d")))
-      (setq proofread--diagnostics (list later long short))
+      (proofread-test--install-diagnostics (list later long short))
       (goto-char 4)
-      (should (eq (proofread--diagnostic-at-point) short)))))
+      (should (eq (proofread-diagnostic-at-point) short)))))
 
 (ert-deftest proofread-test-diagnostic-at-point-ignores-foreign-overlays ()
   "Diagnostic lookup ignores foreign overlays and invalid diagnostic ranges."
@@ -3870,7 +3930,7 @@
       (overlay-put foreign-overlay 'category 'foreign-overlay)
       (setq proofread--diagnostics (list invalid-backward invalid-beg))
       (goto-char 4)
-      (should-not (proofread--diagnostic-at-point)))))
+      (should-not (proofread-diagnostic-at-point)))))
 
 (ert-deftest proofread-test-public-diagnostic-range-validates-range ()
   "The public diagnostic range accessor returns only valid ranges."
@@ -3982,7 +4042,6 @@
            :kind 'spelling
            :message "Possible misspelling"
            :suggestions '("hello")
-           :confidence 0.92
            :source 'llm))
          (description
           (proofread--format-diagnostic-description diagnostic)))
@@ -3990,7 +4049,6 @@
     (should (string-match-p "Message: Possible misspelling" description))
     (should (string-match-p "Original text:\nhelo" description))
     (should (string-match-p "1\\. hello" description))
-    (should (string-match-p "Confidence: 0.92" description))
     (should (string-match-p "Source: llm" description))))
 
 (ert-deftest proofread-test-describe-displays-diagnostic-details ()
@@ -4007,7 +4065,6 @@
               :kind 'spelling
               :message "Possible misspelling"
               :suggestions '("hello")
-              :confidence 0.91
               :source 'llm)))
         (proofread-test--install-diagnostics (list diagnostic))
         (goto-char 2)
@@ -4019,7 +4076,6 @@
                                     description))
             (should (string-match-p "Original text:\nhelo" description))
             (should (string-match-p "1\\. hello" description))
-            (should (string-match-p "Confidence: 0.91" description))
             (should (string-match-p "Source: llm" description))))))))
 
 (ert-deftest proofread-test-describe-preserves-suggestion-order ()
@@ -4140,7 +4196,7 @@
       (overlay-put foreign-overlay 'category 'foreign-overlay)
       (overlay-put foreign-overlay 'proofread-diagnostic diagnostic)
       (goto-char 2)
-      (should (eq (proofread--diagnostic-at-point) diagnostic))
+      (should (eq (proofread-diagnostic-at-point) diagnostic))
       (should (eq (proofread--overlay-for-diagnostic diagnostic)
                   proofread-overlay))
       (delete-overlay proofread-overlay)
@@ -4275,11 +4331,7 @@
     (dolist (scope '(at-point region buffer visible-range))
       (should
        (commandp
-        (intern (format "proofread-%s-%s" operation scope))))))
-  (dolist (old-command '(proofread-check-point
-                         proofread-check-visible
-                         proofread-correct))
-    (should-not (fboundp old-command))))
+        (intern (format "proofread-%s-%s" operation scope)))))))
 
 (ert-deftest proofread-test-correct-region-applies-from-end-to-beginning ()
   "Region correction handles reversed bounds and changing text lengths."
@@ -4300,9 +4352,7 @@
       (should (eq (proofread-correct-region 14 1) 'applied))
       (should (equal (buffer-string) "hello and world; ouut."))
       (should (equal proofread--diagnostics (list outside)))
-      (should (equal (proofread-diagnostic-range outside) '(18 . 22)))
-      (should (equal (plist-get outside :locator)
-                     '(:kind char-range :beg 18 :end 22))))))
+      (should (equal (proofread-diagnostic-range outside) '(18 . 22))))))
 
 (ert-deftest proofread-test-correct-region-validates-interactive-bounds ()
   "Interactive region correction rejects inactive and foreign bounds."
@@ -4367,9 +4417,7 @@
         (should (eq (proofread-correct-visible-range) 'applied)))
       (should (equal (buffer-string) "hello and wrld and out"))
       (should (equal proofread--diagnostics (list hidden)))
-      (should (equal (proofread-diagnostic-range hidden) '(11 . 15)))
-      (should (equal (plist-get hidden :locator)
-                     '(:kind char-range :beg 11 :end 15))))))
+      (should (equal (proofread-diagnostic-range hidden) '(11 . 15))))))
 
 (ert-deftest proofread-test-correct-buffer-skips-unavailable-suggestions ()
   "Buffer correction skips diagnostics without suggestions."
@@ -4479,6 +4527,229 @@
       (should (equal (buffer-string) "helo wrld"))
       (should (equal proofread--diagnostics (list first second)))
       (should (= (length (proofread--current-buffer-overlays)) 2)))))
+
+(ert-deftest proofread-test-correct-buffer-revalidates-after-selection ()
+  "A user edit made while selecting a suggestion is never overwritten."
+  (with-temp-buffer
+    (insert "helo")
+    (proofread-mode 1)
+    (let ((diagnostic
+           (proofread-test--diagnostic-with-suggestions
+            1 5 "helo" '("hello" "hullo"))))
+      (proofread-test--install-diagnostics (list diagnostic))
+      (cl-letf (((symbol-function 'completing-read)
+                 (lambda (&rest _)
+                   (erase-buffer)
+                   (insert "user text")
+                   "hello")))
+        (should-error (proofread-correct-buffer) :type 'user-error))
+      (should (equal (buffer-string) "user text"))
+      (should-not proofread--diagnostics)
+      (should-not proofread--overlays))))
+
+(ert-deftest proofread-test-correction-rejects-source-delimiter-suggestions ()
+  "Corrections cannot introduce comment or string delimiters."
+  (dolist (spec '((c-mode "/*helo*/" comment 2 6 "helo" "*/")
+                  (emacs-lisp-mode "\"helo\"" docstring 1 5 "helo" "\"")
+                  (emacs-lisp-mode "\"helo\"" docstring 1 5 "helo" "\\")))
+    (with-temp-buffer
+      (funcall (nth 0 spec))
+      (insert (nth 1 spec))
+      (syntax-propertize (point-max))
+      (proofread-mode 1)
+      (let* ((before (buffer-string))
+             (request (list :buffer (current-buffer)
+                            :beg (point-min)
+                            :end (point-max)
+                            :text before
+                            :target-kind (nth 2 spec)))
+             (content
+              (proofread-test--response-content
+               (list (proofread-test--response-diagnostic
+                      (nth 3 spec) (nth 4 spec) (nth 5 spec)
+                      (list (nth 6 spec))))))
+             (diagnostic
+              (car (proofread--diagnostics-from-structured-response
+                    request content 'llm)))
+             (overlay
+              (car (proofread-test--install-diagnostics
+                    (list diagnostic)))))
+        (goto-char (plist-get diagnostic :beg))
+        (should-error (proofread-correct-at-point) :type 'user-error)
+        (should (equal (buffer-string) before))
+        (should (equal proofread--diagnostics (list diagnostic)))
+        (should (overlay-buffer overlay))))))
+
+(ert-deftest proofread-test-correction-allows-safe-comment-text ()
+  "A source-aware correction still accepts ordinary comment prose."
+  (with-temp-buffer
+    (c-mode)
+    (insert "/*helo*/")
+    (syntax-propertize (point-max))
+    (proofread-mode 1)
+    (let* ((request (list :buffer (current-buffer)
+                          :beg (point-min)
+                          :end (point-max)
+                          :text (buffer-string)
+                          :target-kind 'comment))
+           (content
+            (proofread-test--response-content
+             (list (proofread-test--response-diagnostic
+                    2 6 "helo" '("hello!")))))
+           (diagnostic
+            (car (proofread--diagnostics-from-structured-response
+                  request content 'llm))))
+      (proofread-test--install-diagnostics (list diagnostic))
+      (goto-char (plist-get diagnostic :beg))
+      (should (eq (proofread-correct-at-point) 'applied))
+      (should (equal (buffer-string) "/*hello!*/")))))
+
+(ert-deftest proofread-test-narrowed-correction-uses-full-source-container ()
+  "Narrowing cannot hide source delimiters from correction validation."
+  (dolist (spec '(("hello" . applied)
+                  ("hello\\" . rejected)))
+    (with-temp-buffer
+      (emacs-lisp-mode)
+      (insert "\"helo\"")
+      (syntax-propertize (point-max))
+      (proofread-mode 1)
+      (let* ((before (buffer-string))
+             (diagnostic
+              (proofread--make-diagnostic
+               :beg 2 :end 6 :text "helo" :kind 'spelling
+               :message "Possible misspelling"
+               :suggestions (list (car spec)) :source 'test
+               :target-kind 'docstring)))
+        (proofread-test--install-diagnostics (list diagnostic))
+        (narrow-to-region 2 6)
+        (goto-char (point-min))
+        (if (eq (cdr spec) 'applied)
+            (should (eq (proofread-correct-at-point) 'applied))
+          (should-error (proofread-correct-at-point) :type 'user-error))
+        (widen)
+        (should (equal (buffer-string)
+                       (if (eq (cdr spec) 'applied)
+                           "\"hello\""
+                         before)))))))
+
+(ert-deftest proofread-test-correction-invalidates-nested-same-buffer-edit ()
+  "A correction hook cannot leave a remotely edited diagnostic stale."
+  (with-temp-buffer
+    (insert "helo tail")
+    (proofread-mode 1)
+    (let ((first
+           (proofread-test--diagnostic-with-suggestions
+            1 5 "helo" '("hello")))
+          (second
+           (proofread-test--diagnostic-with-suggestions
+            6 10 "tail" '("tall")))
+          nested-edit)
+      (proofread-test--install-diagnostics (list first second))
+      (add-hook
+       'after-change-functions
+       (lambda (&rest _)
+         (unless nested-edit
+           (setq nested-edit t)
+           (save-excursion
+             (goto-char (point-min))
+             (when (search-forward "tail" nil t)
+               (replace-match "fail" t t)))))
+       nil t)
+      (goto-char (point-min))
+      (should (eq (proofread-correct-at-point) 'applied))
+      (should (equal (buffer-string) "hello fail"))
+      (should-not proofread--diagnostics)
+      (should-not proofread--overlays))))
+
+(ert-deftest proofread-test-correction-does-not-inhibit-other-buffer-edits ()
+  "Correction-time invalidation inhibition belongs only to its source buffer."
+  (let ((source (generate-new-buffer " *proofread-correction-source*"))
+        (other (generate-new-buffer " *proofread-correction-other*")))
+    (unwind-protect
+        (progn
+          (with-current-buffer other
+            (insert "helo")
+            (proofread-mode 1)
+            (proofread-test--install-diagnostics
+             (list (proofread-test--diagnostic-with-suggestions
+                    1 5 "helo" '("hello")))))
+          (with-current-buffer source
+            (insert "wrng")
+            (proofread-mode 1)
+            (proofread-test--install-diagnostics
+             (list (proofread-test--diagnostic-with-suggestions
+                    1 5 "wrng" '("wrong"))))
+            (let (nested-edit)
+              (add-hook
+               'after-change-functions
+               (lambda (&rest _)
+                 (unless nested-edit
+                   (setq nested-edit t)
+                   (with-current-buffer other
+                     (goto-char 2)
+                     (delete-char 1)
+                     (insert "x"))))
+               nil t)
+              (goto-char (point-min))
+              (should (eq (proofread-correct-at-point) 'applied))
+              (should (equal (buffer-string) "wrong"))))
+          (with-current-buffer other
+            (should (equal (buffer-string) "hxlo"))
+            (should-not proofread--diagnostics)
+            (should-not proofread--overlays)))
+      (when (buffer-live-p source)
+        (kill-buffer source))
+      (when (buffer-live-p other)
+        (kill-buffer other)))))
+
+(ert-deftest proofread-test-failed-correction-repairs-other-buffer-edits ()
+  "A rolled-back correction still repairs nested edits in another buffer."
+  (let ((source (generate-new-buffer " *proofread-failed-source*"))
+        (other (generate-new-buffer " *proofread-failed-other*")))
+    (unwind-protect
+        (progn
+          (with-current-buffer other
+            (insert "helo")
+            (proofread-mode 1)
+            (proofread-test--install-diagnostics
+             (list (proofread-test--diagnostic-with-suggestions
+                    1 5 "helo" '("hello")))))
+          (with-current-buffer source
+            (emacs-lisp-mode)
+            (insert "\"helo\"")
+            (syntax-propertize (point-max))
+            (proofread-mode 1)
+            (let ((diagnostic
+                   (proofread--make-diagnostic
+                    :beg 2 :end 6 :text "helo" :kind 'spelling
+                    :message "Possible misspelling"
+                    :suggestions '("hello\\") :source 'test
+                    :target-kind 'docstring))
+                  nested-edit)
+              (proofread-test--install-diagnostics (list diagnostic))
+              (add-hook
+               'after-change-functions
+               (lambda (&rest _)
+                 (unless nested-edit
+                   (setq nested-edit t)
+                   (with-current-buffer other
+                     (goto-char 2)
+                     (delete-char 1)
+                     (insert "x"))))
+               nil t)
+              (goto-char 2)
+              (should-error (proofread-correct-at-point) :type 'user-error)
+              (should (equal (buffer-string) "\"helo\""))
+              (should (equal proofread--diagnostics (list diagnostic)))
+              (should (= (length proofread--overlays) 1))))
+          (with-current-buffer other
+            (should (equal (buffer-string) "hxlo"))
+            (should-not proofread--diagnostics)
+            (should-not proofread--overlays)))
+      (when (buffer-live-p source)
+        (kill-buffer source))
+      (when (buffer-live-p other)
+        (kill-buffer other)))))
 
 (ert-deftest proofread-test-correct-buffer-notifies-diagnostics-once ()
   "Buffer correction emits one final diagnostics notification."
@@ -4649,9 +4920,10 @@
         (should (equal (buffer-string) text))))))
 
 (ert-deftest proofread-test-ignore-key-exact-text-and-kind ()
-  "Ignore keys match exact diagnostic text and kind only."
+  "Ignore keys include language and diagnostic meaning, not location."
   (let ((proofread--ignored-diagnostics (make-hash-table :test #'equal)))
-    (let ((diagnostic
+    (let ((proofread-language "en")
+          (diagnostic
            (proofread-test--diagnostic-with-kind
             1 5 "helo" 'spelling))
           (same
@@ -4662,13 +4934,20 @@
             10 14 "helo" 'grammar))
           (different-text
            (proofread-test--diagnostic-with-kind
-            10 14 "wrld" 'spelling)))
+            10 14 "wrld" 'spelling))
+          (different-message
+           (proofread--make-diagnostic
+            :beg 10 :end 14 :text "helo" :kind 'spelling
+            :message "Different issue" :suggestions '("hello")
+            :source 'test)))
       (should (equal (proofread--diagnostic-ignore-key diagnostic)
-                     '(:text "helo" :kind spelling)))
+                     '(:language "en" :text "helo" :kind spelling
+                                 :message "Possible issue" :source test)))
       (proofread--record-ignored-diagnostic diagnostic)
       (should (proofread--diagnostic-ignored-p same))
       (should-not (proofread--diagnostic-ignored-p different-kind))
-      (should-not (proofread--diagnostic-ignored-p different-text)))))
+      (should-not (proofread--diagnostic-ignored-p different-text))
+      (should-not (proofread--diagnostic-ignored-p different-message)))))
 
 (ert-deftest proofread-test-ignore-command-removes-matching-overlays ()
   "`proofread-ignore' records a key and removes matching proofread overlays."
@@ -4786,12 +5065,10 @@
     (proofread-mode 1)
     (let* ((proofread-llm-provider 'proofread-test-provider)
            (proofread-llm-max-diagnostic-passes 1)
-           (chunk (car (proofread--request-ready-chunks-for-ranges
-                        (list (cons (point-min) (point-max))))))
-           (request (proofread--make-backend-request chunk 'llm))
            (content
             (proofread-test--response-content
              (list (proofread-test--response-diagnostic 0 4 "helo"))))
+           request
            events
            status)
       (cl-letf (((symbol-function 'llm-chat-async)
@@ -4801,6 +5078,11 @@
                    'proofread-test-llm-handle))
                 ((symbol-function 'llm-capabilities)
                  #'proofread-test--llm-capabilities))
+        (setq request
+              (proofread--make-backend-request
+               (car (proofread--request-ready-chunks-for-ranges
+                     (list (cons (point-min) (point-max)))))
+               'llm))
         (let ((proofread-request-log-hook
                (list (lambda (event)
                        (push event events)))))
@@ -4839,6 +5121,24 @@
             (should (eq (plist-get final-result :status)
                         'applied))))))))
 
+(ert-deftest proofread-test-negative-request-log-limit-is-safe ()
+  "A negative direct request-log limit is clamped instead of looping."
+  (with-temp-buffer
+    (proofread-mode 1)
+    (setq proofread--request-log-enabled t)
+    (let ((proofread-request-log-max-records -1))
+      (proofread--request-log-record-event
+       (list :type 'chunk-request
+             :time (current-time)
+             :log-id 1
+             :request-id 1
+             :buffer (current-buffer)
+             :beg 1
+             :end 1
+             :request (list :log-id 1 :id 1 :buffer (current-buffer))))
+      (should-not proofread--request-log-order)
+      (should (= (hash-table-count proofread--request-log-records) 0)))))
+
 (ert-deftest proofread-test-request-log-buffer-lists-recorded-requests ()
   "`proofread-show-buffer-requests' lists request ranges for a buffer."
   (save-window-excursion
@@ -4855,9 +5155,7 @@
                           :beg 4
                           :end 8
                           :text "helo"
-                          :backend 'llm
-                          :modified-tick
-                          (buffer-chars-modified-tick)))
+                          :backend 'llm))
                    (name (proofread--request-log-list-buffer-name source)))
               (unwind-protect
                   (progn
@@ -4881,7 +5179,7 @@
                       (let* ((entry (car tabulated-list-entries))
                              (id (car entry))
                              (columns (cadr entry)))
-                        (should (= (plist-get id :request-id) 7))
+                        (should (= (plist-get id :key) 9001))
                         (should (equal (aref columns 0) "7"))
                         (should (equal (aref columns 1) "ready"))
                         (should (equal (aref columns 3) "1"))
@@ -4919,7 +5217,7 @@
                              ((symbol-function 'window-end)
                               (lambda (&optional _window _update)
                                 (point-max)))
-                             ((symbol-function 'proofread-backend-check)
+                             ((symbol-function 'proofread--backend-check)
                               (plist-get recorder :function)))
                      (proofread-show-buffer-requests source)
                      (proofread-check-visible-range)
@@ -4954,6 +5252,72 @@
         (when (buffer-live-p source)
           (kill-buffer source))))))
 
+(ert-deftest proofread-test-source-kill-closes-associated-list-buffers ()
+  "Killing a source closes its lists and releases request-log hooks."
+  (save-window-excursion
+    (let ((source (generate-new-buffer " *proofread-list-source-kill*"))
+          diagnostics-name
+          requests-name)
+      (unwind-protect
+          (progn
+            (switch-to-buffer source)
+            (insert "helo")
+            (proofread-mode 1)
+            (setq diagnostics-name (proofread--diagnostics-buffer-name))
+            (setq requests-name
+                  (proofread--request-log-list-buffer-name source))
+            (proofread-show-buffer-diagnostics)
+            (proofread-show-buffer-requests source)
+            (should (get-buffer diagnostics-name))
+            (should (get-buffer requests-name))
+            (should (memq #'proofread--request-log-record-event
+                          proofread-request-log-hook))
+            (kill-buffer source)
+            (should-not (get-buffer diagnostics-name))
+            (should-not (get-buffer requests-name))
+            (should-not (memq #'proofread--request-log-record-event
+                              proofread-request-log-hook)))
+        (when (buffer-live-p source)
+          (kill-buffer source))
+        (dolist (name (list diagnostics-name requests-name))
+          (when-let* ((buffer (and name (get-buffer name))))
+            (kill-buffer buffer)))))))
+
+(ert-deftest proofread-test-list-major-mode-change-releases-source-hooks ()
+  "Changing an auxiliary list's major mode unregisters its source state."
+  (save-window-excursion
+    (let ((source (generate-new-buffer " *proofread-list-mode-change*"))
+          diagnostics-buffer
+          requests-buffer)
+      (unwind-protect
+          (progn
+            (switch-to-buffer source)
+            (insert "helo")
+            (proofread-mode 1)
+            (proofread-show-buffer-diagnostics)
+            (setq diagnostics-buffer
+                  (get-buffer (proofread--diagnostics-buffer-name)))
+            (proofread-show-buffer-requests source)
+            (setq requests-buffer
+                  (get-buffer
+                   (proofread--request-log-list-buffer-name source)))
+            (with-current-buffer requests-buffer
+              (fundamental-mode))
+            (with-current-buffer source
+              (should-not proofread--request-log-enabled))
+            (should-not (memq #'proofread--request-log-record-event
+                              proofread-request-log-hook))
+            (with-current-buffer diagnostics-buffer
+              (fundamental-mode))
+            (with-current-buffer source
+              (should-not proofread--diagnostics-list-buffers)
+              (should-not
+               (memq #'proofread--refresh-diagnostics-list-buffers
+                     proofread-diagnostics-changed-hook))))
+        (dolist (buffer (list diagnostics-buffer requests-buffer source))
+          (when (buffer-live-p buffer)
+            (kill-buffer buffer)))))))
+
 (ert-deftest proofread-test-request-log-request-buffer-shows-lisp-data ()
   "Detailed proofread request buffers are read-only Lisp data buffers."
   (save-window-excursion
@@ -4970,9 +5334,7 @@
                           :beg 1
                           :end 5
                           :text "helo"
-                          :backend 'llm
-                          :modified-tick
-                          (buffer-chars-modified-tick)))
+                          :backend 'llm))
                    (result
                     (proofread--backend-success-result
                      request
@@ -5010,10 +5372,7 @@
                     (proofread--request-log-show-record record)
                     (with-current-buffer detail-name
                       (should buffer-read-only)
-                      (should (eq major-mode
-                                  (if (fboundp 'lisp-data-mode)
-                                      'lisp-data-mode
-                                    'emacs-lisp-mode)))
+                      (should (eq major-mode 'lisp-data-mode))
                       (goto-char (point-min))
                       (dolist (heading '(";;; Summary"
                                          ";;; Chunk request"
@@ -5197,7 +5556,6 @@
     (goto-char (point-min))
     (search-forward "code-token")
     (should-error (proofread-check-at-point) :type 'user-error)
-    (should-not proofread--pending-ranges)
     (goto-char (point-min))
     (search-forward "point prose")
     (let ((proofread-backend 'llm)
@@ -5207,7 +5565,7 @@
           (proofread-context-size 0)
           (recorder (proofread-test--make-backend-recorder)))
       (proofread-test--with-llm-capabilities
-       (cl-letf (((symbol-function 'proofread-backend-check)
+       (cl-letf (((symbol-function 'proofread--backend-check)
                   (plist-get recorder :function)))
          (proofread-check-at-point)
          (let* ((requests (funcall (plist-get recorder :requests)))
@@ -5325,6 +5683,29 @@
           (should-not (overlay-buffer invalid-overlay))
           (should (overlay-buffer outside-overlay)))))))
 
+(ert-deftest proofread-test-target-pruning-keeps-zero-width-domain-end ()
+  "A zero-width diagnostic at a target's end remains inside that target."
+  (with-temp-buffer
+    (insert "Hello")
+    (proofread-mode 1)
+    (let* ((position (point-max))
+           (diagnostic
+            (proofread--make-diagnostic
+             :beg position :end position :text "" :kind 'grammar
+             :message "Missing punctuation" :suggestions '(".")
+             :source 'test :target-kind 'text))
+           (overlay
+            (car (proofread-test--install-diagnostics
+                  (list diagnostic)))))
+      (proofread--prune-diagnostics-outside-targets
+       (list (cons (point-min) (point-max)))
+       (list (list :kind 'text
+                   :target-policy 'all
+                   :domain-beg (point-min)
+                   :domain-end (point-max))))
+      (should (equal proofread--diagnostics (list diagnostic)))
+      (should (overlay-buffer overlay)))))
+
 (ert-deftest proofread-test-consecutive-line-comments-share-context-domain ()
   "Indented adjacent line comments share context until a blank line."
   (with-temp-buffer
@@ -5376,28 +5757,8 @@
                          "Later target sentence"
                          (plist-get isolated-chunk :context-before)))))))))
 
-(ert-deftest proofread-test-unchanged-buffer-tick-skips-target-rescan ()
-  "Fresh requests avoid semantic target rescanning when the tick is unchanged."
-  (with-temp-buffer
-    (emacs-lisp-mode)
-    (insert ";; Stable comment prose.\n")
-    (setq-local proofread-auto-check nil)
-    (setq-local proofread-targets 'comments)
-    (proofread-mode 1)
-    (let* ((chunk
-            (car (proofread--request-ready-chunks-for-ranges
-                  (list (cons (point-min) (point-max))))))
-           (request (proofread--make-backend-request chunk 'llm)))
-      (should (= (plist-get request :buffer-tick)
-                 (buffer-modified-tick)))
-      (cl-letf (((symbol-function
-                  'proofread--request-target-domain-matches-p)
-                 (lambda (&rest _args)
-                   (error "Semantic target rescan was called"))))
-        (should (proofread--fresh-request-p request))))))
-
 (ert-deftest proofread-test-ignore-changes-make-request-stale ()
-  "New ignored text or changed ignore options make old requests stale."
+  "Only ignore-setting changes that affect request text make it stale."
   (with-temp-buffer
     (insert "Alpha prose.")
     (setq-local proofread-auto-check nil)
@@ -5423,7 +5784,7 @@
                   (list (cons (point-min) (point-max))))))
            (request (proofread--make-backend-request chunk 'llm)))
       (setq-local proofread-ignored-properties '(proofread-test-ignore))
-      (should-not (proofread--fresh-request-p request)))))
+      (should (proofread--fresh-request-p request)))))
 
 (ert-deftest proofread-test-python-docstring-predicate-receives-full-triple-string ()
   "Custom predicates receive a complete Python triple-quoted string."
@@ -5445,15 +5806,1222 @@
          (list (lambda (beg end)
                  (push (cons beg end) calls)
                  t)))
-        (let ((domains
-               (proofread--docstring-domains-for-ranges
-                (list (cons (point-min) (point-max))))))
-          (should (equal domains
-                         (list (cons expected-beg expected-end))))
-          (should calls)
-          (dolist (range calls)
-            (should (equal range
-                           (cons expected-beg expected-end)))))))))
+        (cl-letf (((symbol-function 'proofread--font-lock-docstring-domain)
+                   (lambda (_range) nil)))
+          (let ((domains
+                 (proofread--docstring-domains-for-ranges
+                  (list (cons (point-min) (point-max))))))
+            (should (equal domains
+                           (list (cons expected-beg expected-end))))
+            (should calls)
+            (dolist (range calls)
+              (should (equal range
+                             (cons expected-beg expected-end))))))))))
+
+(ert-deftest proofread-test-disable-reenable-rejects-old-generation-callback ()
+  "An old callback cannot clear or populate a re-enabled mode generation."
+  (with-temp-buffer
+    (insert "helo")
+    (proofread-mode 1)
+    (let ((proofread-backend 'llm)
+          (proofread-llm-provider proofread-test--llm-provider)
+          (proofread-llm-provider-identity
+           proofread-test--llm-provider-identity)
+          (recorder (proofread-test--make-backend-recorder)))
+      (proofread-test--with-llm-capabilities
+       (cl-letf (((symbol-function 'proofread--backend-check)
+                  (plist-get recorder :function)))
+         (let* ((old-request
+                 (car (proofread--dispatch-request-ready-chunks
+                       (proofread--request-ready-chunks-for-ranges
+                        (list (cons (point-min) (point-max))))
+                       'llm)))
+                (old-callback
+                 (car (funcall (plist-get recorder :callbacks))))
+                (old-generation (plist-get old-request :generation)))
+           (proofread-mode -1)
+           (proofread-mode 1)
+           (let* ((new-request
+                   (car (proofread--dispatch-request-ready-chunks
+                         (proofread--request-ready-chunks-for-ranges
+                          (list (cons (point-min) (point-max))))
+                         'llm)))
+                  (new-log-id (plist-get new-request :log-id)))
+             (should-not (= old-generation
+                            (plist-get new-request :generation)))
+             (should (eq
+                      (funcall
+                       old-callback
+                       (proofread--backend-success-result
+                        old-request
+                        (list (proofread-test--diagnostic-for-range
+                               1 5 "helo"))))
+                      'stale))
+             (should (= (length proofread--active-requests) 1))
+             (should (= (plist-get (car proofread--active-requests) :log-id)
+                        new-log-id))
+             (should-not proofread--diagnostics))))))))
+
+(ert-deftest proofread-test-backend-callback-is-at-most-once ()
+  "A backend invoking its callback twice completes the request only once."
+  (with-temp-buffer
+    (insert "Alpha")
+    (proofread-mode 1)
+    (let* ((chunk (car (proofread--request-ready-chunks-for-ranges
+                        (list (cons (point-min) (point-max))))))
+           (request (proofread--make-backend-request chunk 'llm))
+           captured-callback
+           (calls 0))
+      (cl-letf (((symbol-function 'proofread--backend-check)
+                 (lambda (_request callback &optional _backend)
+                   (setq captured-callback callback)
+                   'proofread-test-handle)))
+        (proofread--dispatch-backend-request
+         request
+         (lambda (_result)
+           (setq calls (1+ calls)))
+         'llm)
+        (let ((result (proofread--backend-success-result request nil)))
+          (funcall captured-callback result)
+          (funcall captured-callback result))
+        (should (= calls 1))
+        (should-not proofread--active-requests)))))
+
+(ert-deftest proofread-test-repeated-mode-enable-resets-owned-state ()
+  "Explicitly enabling an enabled mode starts a clean generation."
+  (with-temp-buffer
+    (insert "helo")
+    (proofread-mode 1)
+    (let* ((generation proofread--generation)
+           (diagnostic (proofread-test--diagnostic-for-range 1 5 "helo"))
+           (overlay (car (proofread-test--install-diagnostics
+                          (list diagnostic)))))
+      (proofread--cache-write 'old-cache 'old-value)
+      (proofread-mode 1)
+      (should proofread-mode)
+      (should-not (= proofread--generation generation))
+      (should-not (overlay-buffer overlay))
+      (should-not proofread--diagnostics)
+      (should-not proofread--active-requests)
+      (should-not proofread--request-queue)
+      (should (= (hash-table-count proofread--cache) 0)))))
+
+(ert-deftest proofread-test-major-mode-change-tears-down-proofread-mode ()
+  "Changing major mode removes Proofread hooks, state, and overlays."
+  (with-temp-buffer
+    (insert "helo")
+    (proofread-mode 1)
+    (let* ((diagnostic (proofread-test--diagnostic-for-range 1 5 "helo"))
+           (overlay (car (proofread-test--install-diagnostics
+                          (list diagnostic)))))
+      (text-mode)
+      (should-not proofread-mode)
+      (should-not (overlay-buffer overlay))
+      (should-not (memq (current-buffer) proofread--mode-buffers))
+      (should-not (memq #'proofread--before-change
+                        before-change-functions)))))
+
+(ert-deftest proofread-test-zero-width-diagnostic-invalidated-by-insertion ()
+  "Insertion at a zero-width diagnostic removes all of its owned state."
+  (with-temp-buffer
+    (insert "ab")
+    (proofread-mode 1)
+    (let* ((diagnostic
+            (proofread--make-diagnostic
+             :beg 2 :end 2 :text "" :kind 'grammar
+             :message "Missing punctuation" :suggestions '(",")
+             :source 'test))
+           (overlay (car (proofread-test--install-diagnostics
+                          (list diagnostic)))))
+      (goto-char 2)
+      (insert ",")
+      (should-not (overlay-buffer overlay))
+      (should-not proofread--diagnostics)
+      (should-not proofread--overlays))))
+
+(ert-deftest proofread-test-edit-before-request-invalidates-shifted-duplicate ()
+  "An edit before a request is stale even when old coordinates still match."
+  (with-temp-buffer
+    (insert "helo helo")
+    (proofread-mode 1)
+    (let* ((chunk (car (proofread--request-ready-chunks-for-ranges
+                        '((6 . 10)))))
+           (request (proofread--make-backend-request chunk 'llm)))
+      (goto-char (point-min))
+      (insert "helo ")
+      (should (equal
+               (buffer-substring-no-properties
+                (plist-get request :beg) (plist-get request :end))
+               (plist-get request :text)))
+      (should-not (proofread--fresh-request-p request)))))
+
+(ert-deftest proofread-test-request-cache-key-is-frozen-at-construction ()
+  "A request keeps its cache key when live provider settings later change."
+  (with-temp-buffer
+    (insert "Alpha")
+    (proofread-mode 1)
+    (let* ((proofread-backend 'llm)
+           (proofread-llm-provider proofread-test--llm-provider)
+           (proofread-llm-provider-identity "provider-a")
+           (chunk (car (proofread--request-ready-chunks-for-ranges
+                        (list (cons (point-min) (point-max))))))
+           (request (proofread--make-backend-request chunk 'llm))
+           (key (plist-get request :cache-key))
+           (diagnostic
+            (proofread-test--diagnostic-for-range 1 6 "Alpha")))
+      (let ((proofread-llm-provider-identity "provider-b"))
+        (proofread--cache-write-request request (list diagnostic))
+        (should (equal (plist-get request :cache-key) key))
+        (should (gethash key proofread--cache))))))
+
+(ert-deftest proofread-test-provider-identity-is-snapshotted ()
+  "Destructive identity changes cannot mutate pending request keys."
+  (with-temp-buffer
+    (insert "Alpha")
+    (proofread-mode 1)
+    (let* ((name (copy-sequence "alpha"))
+           (proofread-backend 'llm)
+           (proofread-llm-provider proofread-test--llm-provider)
+           (proofread-llm-provider-identity (list :provider name))
+           (chunk
+            (car (proofread--request-ready-chunks-for-ranges
+                  (list (cons (point-min) (point-max))))))
+           (request (proofread--make-backend-request chunk 'llm))
+           (work-key-text
+            (prin1-to-string (proofread--request-work-key request))))
+      (proofread--queue-request request 'llm)
+      (aset name 0 ?o)
+      (should
+       (equal (plist-get (plist-get request :backend-identity) :provider)
+              '(:provider "alpha")))
+      (should (equal (prin1-to-string (proofread--request-work-key request))
+                     work-key-text))
+      (should (proofread--request-work-pending-p request))
+      (should-not (proofread--fresh-request-p request)))))
+
+(ert-deftest proofread-test-provider-switch-makes-request-stale ()
+  "Changing the configured provider identity invalidates an old request."
+  (with-temp-buffer
+    (insert "Alpha")
+    (proofread-mode 1)
+    (let* ((proofread-backend 'llm)
+           (proofread-llm-provider proofread-test--llm-provider)
+           (proofread-llm-provider-identity "provider-a")
+           (chunk (car (proofread--request-ready-chunks-for-ranges
+                        (list (cons (point-min) (point-max))))))
+           (request (proofread--make-backend-request chunk 'llm)))
+      (let ((proofread-llm-provider-identity "provider-b"))
+        (should-not (proofread--fresh-request-p request))))))
+
+(ert-deftest proofread-test-context-edit-makes-request-stale ()
+  "Editing request context invalidates a still-unchanged target."
+  (with-temp-buffer
+    (insert "Before. Target. After.")
+    (proofread-mode 1)
+    (goto-char (point-min))
+    (search-forward "Target.")
+    (let* ((beg (match-beginning 0))
+           (end (match-end 0))
+           (chunk (car (proofread--request-ready-chunks-for-ranges
+                        (list (cons beg end)))))
+           (request (proofread--make-backend-request chunk 'llm)))
+      (goto-char (point-min))
+      (delete-char 1)
+      (insert "X")
+      (should (equal
+               (buffer-substring-no-properties
+                (plist-get request :beg) (plist-get request :end))
+               (plist-get request :text)))
+      (should-not (proofread--fresh-request-p request)))))
+
+(ert-deftest proofread-test-newer-overlapping-result-wins-out-of-order ()
+  "A superseded result cannot overwrite a newer overlapping result."
+  (with-temp-buffer
+    (insert "helo")
+    (proofread-mode 1)
+    (let* ((chunk (car (proofread--request-ready-chunks-for-ranges
+                        (list (cons (point-min) (point-max))))))
+           (older (proofread--make-backend-request chunk 'llm))
+           (newer (proofread--make-backend-request chunk 'llm))
+           (old-diagnostic
+            (proofread-test--diagnostic-with-suggestions
+             1 5 "helo" '("hullo")))
+           (new-diagnostic
+            (proofread-test--diagnostic-with-suggestions
+             1 5 "helo" '("hello"))))
+      (proofread--register-active-request older)
+      (proofread--finish-superseded-requests
+       (proofread--supersede-conflicting-requests (list newer)))
+      (should (eq (proofread--handle-backend-result
+                   (proofread--backend-success-result
+                    newer (list new-diagnostic)))
+                  'applied))
+      (should (eq (proofread--handle-backend-result
+                   (proofread--backend-success-result
+                    older (list old-diagnostic)))
+                  'stale))
+      (should (equal proofread--diagnostics (list new-diagnostic))))))
+
+(ert-deftest proofread-test-cache-evicts-least-recently-used-entry ()
+  "The buffer-local cache honors its least-recently-used size limit."
+  (with-temp-buffer
+    (proofread-mode 1)
+    (let ((proofread-cache-max-entries 2))
+      (proofread--cache-write 'a 1)
+      (proofread--cache-write 'b 2)
+      (should (= (proofread--cache-read 'a) 1))
+      (proofread--cache-write 'c 3)
+      (should (= (proofread--cache-read 'a) 1))
+      (should-not (proofread--cache-read 'b))
+      (should (= (proofread--cache-read 'c) 3))
+      (should (= (hash-table-count proofread--cache) 2)))))
+
+(ert-deftest proofread-test-zero-concurrency-prunes-stale-queue-heads ()
+  "A blocked queue prunes stale heads and resumes when capacity increases."
+  (with-temp-buffer
+    (insert "One. Two. Three.")
+    (proofread-mode 1)
+    (let* ((chunks (proofread--request-ready-chunks-for-ranges
+                    (list (cons (point-min) (point-max)))))
+           (requests
+            (mapcar (lambda (chunk)
+                      (proofread--make-backend-request chunk 'llm))
+                    chunks))
+           (invalidated (nth 0 requests))
+           (superseded (nth 1 requests))
+           (ready (nth 2 requests))
+           dispatched)
+      (should (= (length requests) 3))
+      (dolist (request requests)
+        (proofread--queue-request request 'llm))
+      (proofread--invalidate-request invalidated)
+      (proofread--set-request-state-flag superseded :superseded)
+      (let ((proofread-max-concurrent-requests 0))
+        (should-not (proofread--dispatch-queued-requests))
+        (should (= (length proofread--request-queue) 1))
+        (should (eq (plist-get (car proofread--request-queue) :request)
+                    ready))
+        (should-not (proofread--request-work-pending-p invalidated))
+        (should-not (proofread--request-work-pending-p superseded))
+        (should (proofread--request-work-pending-p ready)))
+      (let ((proofread-max-concurrent-requests 1))
+        (cl-letf (((symbol-function 'proofread--backend-check)
+                   (lambda (request _callback &optional _backend)
+                     (setq dispatched request)
+                     'proofread-test-handle)))
+          (should (equal (proofread--dispatch-queued-requests)
+                         (list ready)))))
+      (should (eq dispatched ready))
+      (should-not proofread--request-queue)
+      (should-not proofread--request-queue-tail)
+      (should (proofread--active-request-p ready)))))
+
+(ert-deftest proofread-test-reentrant-queue-dispatch-submits-once ()
+  "A freshness predicate cannot submit the queue head twice."
+  (with-temp-buffer
+    (insert "Alpha")
+    (let ((proofread-auto-check nil)
+          reentered
+          submitted-log-ids
+          callback)
+      (proofread-mode 1)
+      (let* ((chunk (proofread--make-request-ready-chunk 1 6))
+             (request (proofread--make-backend-request chunk 'llm))
+             (log-id (plist-get request :log-id)))
+        (proofread--queue-request request 'llm)
+        (cl-letf (((symbol-function 'proofread--fresh-request-p)
+                   (lambda (_request)
+                     (unless reentered
+                       (setq reentered t)
+                       (proofread--dispatch-queued-requests))
+                     t))
+                  ((symbol-function 'proofread--backend-check)
+                   (lambda (backend-request backend-callback
+                                            &optional _backend)
+                     (push (plist-get backend-request :log-id)
+                           submitted-log-ids)
+                     (setq callback backend-callback)
+                     (list :backend 'test :log-id log-id))))
+          (should (equal (proofread--dispatch-queued-requests)
+                         (list request)))
+          (should (equal submitted-log-ids (list log-id)))
+          (should-not proofread--request-queue)
+          (should-not proofread--claimed-requests)
+          (should (= (length proofread--active-requests) 1))
+          (should (equal
+                   (gethash (proofread--request-work-key request)
+                            proofread--pending-request-keys)
+                   log-id))
+          (funcall callback (proofread--backend-success-result request nil))
+          (should (equal submitted-log-ids (list log-id)))
+          (should-not proofread--active-requests)
+          (should (= (hash-table-count proofread--pending-request-keys)
+                     0)))))))
+
+(ert-deftest proofread-test-reentrant-freshness-preserves-conflicting-new-work ()
+  "Conflicting work enqueued during freshness replaces the claimed request."
+  (with-temp-buffer
+    (insert "abcdef")
+    (let ((proofread-auto-check nil)
+          (proofread-context-size 0)
+          reentered
+          submitted
+          callback)
+      (proofread-mode 1)
+      (let* ((old-chunk (proofread--make-request-ready-chunk 1 5))
+             (new-chunk (proofread--make-request-ready-chunk 2 6))
+             (old (proofread--make-backend-request old-chunk 'llm)))
+        (proofread--queue-request old 'llm)
+        (cl-letf (((symbol-function 'proofread--fresh-request-p)
+                   (lambda (_request)
+                     (unless reentered
+                       (setq reentered t)
+                       (proofread--dispatch-request-ready-chunks
+                        (list new-chunk) 'llm))
+                     t))
+                  ((symbol-function 'proofread--backend-check)
+                   (lambda (request backend-callback &optional _backend)
+                     (push request submitted)
+                     (setq callback backend-callback)
+                     (list :backend 'test
+                           :log-id (plist-get request :log-id)))))
+          (let ((dispatched (proofread--dispatch-queued-requests)))
+            (should (= (length dispatched) 1))
+            (should (eq (car dispatched) (car submitted))))
+          (let* ((new (car submitted))
+                 (new-log-id (plist-get new :log-id)))
+            (should-not (equal new-log-id (plist-get old :log-id)))
+            (should (proofread--request-state-flag-p old :superseded))
+            (should (proofread--request-state-flag-p old :cancelled))
+            (should (= (length submitted) 1))
+            (should-not proofread--request-queue)
+            (should-not proofread--claimed-requests)
+            (should (equal
+                     (mapcar (lambda (request)
+                               (plist-get request :log-id))
+                             proofread--active-requests)
+                     (list new-log-id)))
+            (should (= (hash-table-count proofread--pending-request-keys)
+                       1))
+            (should (equal
+                     (gethash (proofread--request-work-key new)
+                              proofread--pending-request-keys)
+                     new-log-id))
+            (funcall callback
+                     (proofread--backend-success-result new nil))
+            (should-not proofread--active-requests)
+            (should (= (hash-table-count proofread--pending-request-keys)
+                       0))))))))
+
+(ert-deftest proofread-test-cancel-hook-reentrant-dispatch-does-not-duplicate ()
+  "Cancellation hooks cannot submit a retained queue entry twice."
+  (with-temp-buffer
+    (insert "abc def")
+    (let ((proofread-auto-check nil)
+          (proofread-context-size 0)
+          (proofread-max-concurrent-requests 1)
+          nested
+          submitted-log-ids
+          callbacks)
+      (proofread-mode 1)
+      (let* ((victim-chunk (proofread--make-request-ready-chunk 1 4))
+             (new-chunk (proofread--make-request-ready-chunk 2 5))
+             (unrelated-chunk (proofread--make-request-ready-chunk 5 8))
+             (victim (proofread--make-backend-request victim-chunk 'llm))
+             (unrelated
+              (proofread--make-backend-request unrelated-chunk 'llm))
+             (victim-log-id (plist-get victim :log-id))
+             (unrelated-log-id (plist-get unrelated :log-id))
+             (proofread-request-log-hook
+              (list
+               (lambda (event)
+                 (when (and (not nested)
+                            (eq (plist-get event :type) 'cancelled)
+                            (equal (plist-get event :log-id) victim-log-id))
+                   (setq nested t)
+                   (proofread--dispatch-queued-requests))))))
+        (setq victim (plist-put victim :handle 'victim-handle))
+        (proofread--register-active-request victim)
+        (proofread--queue-request unrelated 'llm)
+        (cl-letf (((symbol-function 'proofread--fresh-request-p)
+                   (lambda (_request) t))
+                  ((symbol-function 'proofread--backend-check)
+                   (lambda (request callback &optional _backend)
+                     (let ((log-id (plist-get request :log-id)))
+                       (push log-id submitted-log-ids)
+                       (push (cons log-id callback) callbacks)
+                       (list :backend 'test :log-id log-id)))))
+          (proofread--dispatch-request-ready-chunks (list new-chunk) 'llm)
+          (should (equal submitted-log-ids (list unrelated-log-id)))
+          (should (proofread--request-state-flag-p victim :superseded))
+          (should (proofread--request-state-flag-p victim :cancelled))
+          (should-not proofread--claimed-requests)
+          (should (= (length proofread--request-queue) 1))
+          (let* ((new
+                  (plist-get (car proofread--request-queue) :request))
+                 (new-log-id (plist-get new :log-id)))
+            (funcall (cdr (assq unrelated-log-id callbacks))
+                     (proofread--backend-success-result unrelated nil))
+            (should (= (cl-count unrelated-log-id submitted-log-ids)
+                       1))
+            (should (= (cl-count new-log-id submitted-log-ids) 1))
+            (should-not proofread--request-queue)
+            (should-not proofread--claimed-requests)
+            (funcall (cdr (assq new-log-id callbacks))
+                     (proofread--backend-success-result new nil))
+            (should-not proofread--active-requests)
+            (should (= (hash-table-count proofread--pending-request-keys)
+                       0))))))))
+
+(ert-deftest proofread-test-edit-during-claimed-freshness-prevents-submit ()
+  "An edit during freshness invalidates a claimed request before submission."
+  (with-temp-buffer
+    (insert "Alpha")
+    (let ((proofread-auto-check nil)
+          edited
+          backend-calls)
+      (proofread-mode 1)
+      (let* ((chunk (proofread--make-request-ready-chunk 1 6))
+             (request (proofread--make-backend-request chunk 'llm)))
+        (proofread--queue-request request 'llm)
+        (cl-letf (((symbol-function 'proofread--fresh-request-p)
+                   (lambda (_request)
+                     (unless edited
+                       (setq edited t)
+                       (goto-char (point-min))
+                       (delete-char 1)
+                       (insert "X"))
+                     t))
+                  ((symbol-function 'proofread--backend-check)
+                   (lambda (&rest _)
+                     (setq backend-calls (1+ (or backend-calls 0)))
+                     'unexpected-handle)))
+          (should-not (proofread--dispatch-queued-requests)))
+        (should (equal (buffer-string) "Xlpha"))
+        (should-not backend-calls)
+        (should (proofread--request-invalidated-p request))
+        (should (proofread--request-state-flag-p request :cancelled))
+        (should-not proofread--active-requests)
+        (should-not proofread--claimed-requests)
+        (should-not proofread--request-queue)
+        (should (= (hash-table-count proofread--pending-request-keys) 0))))))
+
+(ert-deftest proofread-test-active-event-edit-prevents-backend-submit ()
+  "An edit from the active-request event runs before backend submission."
+  (with-temp-buffer
+    (insert "Alpha")
+    (let ((proofread-auto-check nil)
+          edited
+          backend-calls)
+      (proofread-mode 1)
+      (let* ((chunk (proofread--make-request-ready-chunk 1 6))
+             (request (proofread--make-backend-request chunk 'llm))
+             (log-id (plist-get request :log-id))
+             (proofread-request-log-hook
+              (list
+               (lambda (event)
+                 (when (and (not edited)
+                            (eq (plist-get event :type) 'active-request)
+                            (equal (plist-get event :log-id) log-id))
+                   (setq edited t)
+                   (goto-char (point-min))
+                   (delete-char 1)
+                   (insert "X"))))))
+        (proofread--queue-request request 'llm)
+        (cl-letf (((symbol-function 'proofread--fresh-request-p)
+                   (lambda (_request) t))
+                  ((symbol-function 'proofread--backend-check)
+                   (lambda (&rest _)
+                     (setq backend-calls (1+ (or backend-calls 0)))
+                     'unexpected-handle)))
+          (should-not (proofread--dispatch-queued-requests)))
+        (should (equal (buffer-string) "Xlpha"))
+        (should-not backend-calls)
+        (should (proofread--request-invalidated-p request))
+        (should (proofread--request-state-flag-p request :cancelled))
+        (should-not proofread--active-requests)
+        (should-not proofread--claimed-requests)
+        (should-not proofread--request-queue)
+        (should (= (hash-table-count proofread--pending-request-keys) 0))))))
+
+(ert-deftest proofread-test-invalidated-active-releases-slot-for-queued-work ()
+  "Editing active work frees its request slot for unrelated queued work."
+  (with-temp-buffer
+    (insert "aaa bbb")
+    (let ((proofread-auto-check nil)
+          (proofread-max-concurrent-requests 1)
+          submitted-log-ids
+          cancelled-handles
+          callback)
+      (proofread-mode 1)
+      (let* ((waiting-chunk (proofread--make-request-ready-chunk 1 4))
+             (active-chunk (proofread--make-request-ready-chunk 5 8))
+             (waiting (proofread--make-backend-request waiting-chunk 'llm))
+             (active (proofread--make-backend-request active-chunk 'llm))
+             (waiting-log-id (plist-get waiting :log-id)))
+        (setq active (plist-put active :handle 'old-handle))
+        (proofread--register-active-request active)
+        (proofread--queue-request waiting 'llm)
+        (cl-letf (((symbol-function 'proofread--fresh-request-p)
+                   (lambda (_request) t))
+                  ((symbol-function 'proofread--backend-check)
+                   (lambda (request backend-callback &optional _backend)
+                     (push (plist-get request :log-id) submitted-log-ids)
+                     (setq callback backend-callback)
+                     (list :backend 'test
+                           :log-id (plist-get request :log-id))))
+                  ((symbol-function 'proofread--cancel-request-handle)
+                   (lambda (handle)
+                     (push handle cancelled-handles))))
+          (goto-char 6)
+          (delete-char 1)
+          (insert "b")
+          (should
+           (proofread-test--wait-for (lambda () submitted-log-ids)))
+          (should (equal submitted-log-ids (list waiting-log-id)))
+          (should (equal cancelled-handles (list 'old-handle)))
+          (should (proofread--request-invalidated-p active))
+          (should (proofread--request-state-flag-p active :cancelled))
+          (should-not (proofread--active-request-p active))
+          (should (proofread--active-request-p waiting))
+          (should-not proofread--request-queue)
+          (should-not proofread--claimed-requests)
+          (should (= (hash-table-count proofread--pending-request-keys) 1))
+          (should (equal
+                   (gethash (proofread--request-work-key waiting)
+                            proofread--pending-request-keys)
+                   waiting-log-id))
+          (funcall callback
+                   (proofread--backend-success-result waiting nil))
+          (should-not proofread--active-requests)
+          (should (= (hash-table-count proofread--pending-request-keys)
+                     0)))))))
+
+(ert-deftest proofread-test-stale-active-request-does-not-block-queue ()
+  "Configuration-stale active work cannot hold a request slot forever."
+  (with-temp-buffer
+    (insert "aaa bbb")
+    (let ((proofread-auto-check nil)
+          (proofread-backend 'llm)
+          (proofread-llm-provider proofread-test--llm-provider)
+          (proofread-llm-provider-identity "provider-a")
+          (proofread-context-size 0)
+          (proofread-max-concurrent-requests 1)
+          submitted-log-ids
+          cancelled-handles)
+      (proofread-mode 1)
+      (proofread-test--with-llm-capabilities
+       (let* ((chunks
+               (proofread--request-ready-chunks-for-ranges
+                '((1 . 4) (5 . 8))))
+              (active
+               (proofread--make-backend-request
+                (nth 1 chunks) 'llm)))
+         (setq active (plist-put active :handle 'old-handle))
+         (proofread--register-active-request active)
+         (setq proofread-llm-provider-identity "provider-b")
+         (let* ((waiting
+                 (proofread--make-backend-request
+                  (car chunks) 'llm))
+                (waiting-log-id (plist-get waiting :log-id)))
+           (proofread--queue-request waiting 'llm)
+           (cl-letf (((symbol-function 'proofread--backend-check)
+                      (lambda (request _callback &optional _backend)
+                        (push (plist-get request :log-id)
+                              submitted-log-ids)
+                        (list :backend 'test
+                              :log-id (plist-get request :log-id))))
+                     ((symbol-function 'proofread--cancel-request-handle)
+                      (lambda (handle)
+                        (push handle cancelled-handles))))
+             (should (equal (proofread--dispatch-queued-requests)
+                            (list waiting))))
+           (should (equal submitted-log-ids (list waiting-log-id)))
+           (should (equal cancelled-handles (list 'old-handle)))
+           (should (proofread--request-invalidated-p active))
+           (should (proofread--request-state-flag-p active :cancelled))
+           (should-not (proofread--active-request-p active))
+           (should (proofread--active-request-p waiting))
+           (should-not proofread--request-queue)
+           (should-not proofread--claimed-requests)))))))
+
+(ert-deftest proofread-test-context-stale-active-resumes-queued-work ()
+  "An edit to saved context cannot leave unrelated queued work blocked."
+  (with-temp-buffer
+    (insert "Aaa. Bbb. Ccc.")
+    (let ((proofread-auto-check nil)
+          (proofread-backend 'llm)
+          (proofread-llm-provider proofread-test--llm-provider)
+          (proofread-llm-provider-identity
+           proofread-test--llm-provider-identity)
+          (proofread-context-sentences-before 0)
+          (proofread-context-sentences-after 1)
+          (proofread-context-size 200)
+          (proofread-max-concurrent-requests 1)
+          submitted-log-ids
+          cancelled-handles)
+      (proofread-mode 1)
+      (proofread-test--with-llm-capabilities
+       (let* ((waiting-chunk
+               (car (proofread--request-ready-chunks-for-ranges
+                     '((1 . 5)))))
+              (active-chunk
+               (car (proofread--request-ready-chunks-for-ranges
+                     '((6 . 10)))))
+              (waiting
+               (proofread--make-backend-request waiting-chunk 'llm))
+              (active
+               (proofread--make-backend-request active-chunk 'llm))
+              (waiting-log-id (plist-get waiting :log-id)))
+         (setq active (plist-put active :handle 'old-handle))
+         (proofread--register-active-request active)
+         (proofread--queue-request waiting 'llm)
+         (cl-letf (((symbol-function 'proofread--backend-check)
+                    (lambda (request _callback &optional _backend)
+                      (push (plist-get request :log-id)
+                            submitted-log-ids)
+                      (list :backend 'test
+                            :log-id (plist-get request :log-id))))
+                   ((symbol-function 'proofread--cancel-request-handle)
+                    (lambda (handle)
+                      (push handle cancelled-handles))))
+           (goto-char 11)
+           (delete-char 1)
+           (insert "X")
+           (should-not (proofread--request-invalidated-p active))
+           (should (timerp proofread--queue-dispatch-timer))
+           (should
+            (proofread-test--wait-for (lambda () submitted-log-ids)))
+           (should (equal submitted-log-ids (list waiting-log-id)))
+           (should (equal cancelled-handles (list 'old-handle)))
+           (should (proofread--request-invalidated-p active))
+           (should (proofread--request-state-flag-p active :cancelled))
+           (should-not (proofread--active-request-p active))
+           (should (proofread--active-request-p waiting))
+           (should-not proofread--request-queue)
+           (should-not proofread--claimed-requests)))))))
+
+(ert-deftest proofread-test-queue-inhibition-is-buffer-specific ()
+  "A lifecycle transaction in one buffer cannot block another buffer's queue."
+  (let ((source (generate-new-buffer " *proofread-queue-source*"))
+        (other (generate-new-buffer " *proofread-queue-other*")))
+    (unwind-protect
+        (progn
+          (with-current-buffer source
+            (proofread-mode 1))
+          (with-current-buffer other
+            (insert "Alpha")
+            (proofread-mode 1))
+          (let ((proofread--inhibit-queue-dispatch source)
+                submitted-log-ids)
+            (with-current-buffer other
+              (let* ((chunk (proofread--make-request-ready-chunk 1 6))
+                     (request (proofread--make-backend-request chunk 'llm))
+                     (log-id (plist-get request :log-id)))
+                (proofread--queue-request request 'llm)
+                (cl-letf (((symbol-function 'proofread--fresh-request-p)
+                           (lambda (_request) t))
+                          ((symbol-function 'proofread--backend-check)
+                           (lambda (backend-request _callback
+                                                    &optional _backend)
+                             (push (plist-get backend-request :log-id)
+                                   submitted-log-ids)
+                             (list :backend 'test :log-id log-id))))
+                  (should (equal (proofread--dispatch-queued-requests)
+                                 (list request))))
+                (should (equal submitted-log-ids (list log-id)))
+                (should-not proofread--request-queue)
+                (should-not proofread--claimed-requests)))))
+      (when (buffer-live-p source)
+        (kill-buffer source))
+      (when (buffer-live-p other)
+        (kill-buffer other)))))
+
+(ert-deftest proofread-test-submit-error-does-not-strand-claimed-work ()
+  "An unexpected submission error leaves no claimed or pending request."
+  (with-temp-buffer
+    (insert "Alpha")
+    (let ((proofread-auto-check nil))
+      (proofread-mode 1)
+      (let* ((chunk (proofread--make-request-ready-chunk 1 6))
+             (request (proofread--make-backend-request chunk 'llm)))
+        (proofread--queue-request request 'llm)
+        (cl-letf (((symbol-function 'proofread--submit-request)
+                   (lambda (&rest _)
+                     (error "Simulated submission failure"))))
+          (should-error (proofread--dispatch-queued-requests)))
+        (should (proofread--request-state-flag-p request :cancelled))
+        (should-not proofread--queue-dispatch-active-p)
+        (should-not proofread--active-requests)
+        (should-not proofread--claimed-requests)
+        (should-not proofread--request-queue)
+        (should (= (hash-table-count proofread--pending-request-keys) 0))))))
+
+(ert-deftest proofread-test-clear-rejects-work-enqueued-by-cancel-hook ()
+  "A cancellation hook cannot leave newly queued work orphaned during clear."
+  (with-temp-buffer
+    (insert "abcdef")
+    (let ((proofread-auto-check nil)
+          triggered
+          new-request
+          events)
+      (proofread-mode 1)
+      (let* ((old-chunk (proofread--make-request-ready-chunk 1 5))
+             (new-chunk (proofread--make-request-ready-chunk 2 6))
+             (old (proofread--make-backend-request old-chunk 'llm))
+             (old-log-id (plist-get old :log-id)))
+        (proofread--queue-request old 'llm)
+        (let ((proofread-request-log-hook
+               (list
+                (lambda (event)
+                  (push event events)
+                  (cond
+                   ((and (not triggered)
+                         (eq (plist-get event :type) 'cancelled)
+                         (equal (plist-get event :log-id) old-log-id))
+                    (setq triggered t)
+                    (proofread--dispatch-request-ready-chunks
+                     (list new-chunk) 'llm))
+                   ((eq (plist-get event :reason) 'cleared)
+                    (setq new-request (plist-get event :request))))))))
+          (proofread--clear-scheduled-work))
+        (should triggered)
+        (should new-request)
+        (should (proofread--request-invalidated-p new-request))
+        (should (proofread--request-state-flag-p new-request :cancelled))
+        (should-not
+         (cl-find-if
+          (lambda (event)
+            (and (equal (plist-get event :log-id)
+                        (plist-get new-request :log-id))
+                 (eq (plist-get event :type) 'queued-request)))
+          events))
+        (should-not proofread--active-requests)
+        (should-not proofread--claimed-requests)
+        (should-not proofread--request-queue)
+        (should-not proofread--request-queue-tail)
+        (should-not proofread--queue-dispatch-timer)
+        (should (= (hash-table-count proofread--pending-request-keys) 0))))))
+
+(ert-deftest proofread-test-request-cleanup-rejects-active-cancel-hook-work ()
+  "Active-request cancellation hooks cannot enqueue work during cleanup."
+  (with-temp-buffer
+    (insert "abcdef")
+    (let ((proofread-auto-check nil)
+          triggered
+          rejected)
+      (proofread-mode 1)
+      (let* ((old-chunk (proofread--make-request-ready-chunk 1 5))
+             (new-chunk (proofread--make-request-ready-chunk 2 6))
+             (old (proofread--make-backend-request old-chunk 'llm))
+             (old-log-id (plist-get old :log-id)))
+        (setq old (plist-put old :handle 'old-handle))
+        (proofread--register-active-request old)
+        (let ((proofread-request-log-hook
+               (list
+                (lambda (event)
+                  (cond
+                   ((and (not triggered)
+                         (eq (plist-get event :type) 'cancelled)
+                         (equal (plist-get event :log-id) old-log-id))
+                    (setq triggered t)
+                    (proofread--dispatch-request-ready-chunks
+                     (list new-chunk) 'llm))
+                   ((eq (plist-get event :reason) 'cleared)
+                    (setq rejected (plist-get event :request))))))))
+          (proofread--clear-request-work))
+        (should triggered)
+        (should rejected)
+        (should (proofread--request-invalidated-p rejected))
+        (should (proofread--request-state-flag-p rejected :cancelled))
+        (should-not proofread--active-requests)
+        (should-not proofread--claimed-requests)
+        (should-not proofread--request-queue)
+        (should (= (hash-table-count proofread--pending-request-keys) 0))))))
+
+(ert-deftest proofread-test-restored-edit-does-not-block-same-work-request ()
+  "Restored text can submit work that an invalidated request once owned."
+  (with-temp-buffer
+    (insert "helo")
+    (let ((proofread-auto-check nil)
+          (proofread-backend 'llm)
+          (proofread-llm-provider proofread-test--llm-provider)
+          (proofread-llm-provider-identity
+           proofread-test--llm-provider-identity)
+          (proofread-context-size 0)
+          backend-requests)
+      (proofread-mode 1)
+      (proofread-test--with-llm-capabilities
+       (cl-letf (((symbol-function 'proofread--backend-check)
+                  (lambda (request _callback &optional _backend)
+                    (setq backend-requests
+                          (append backend-requests (list request)))
+                    (list :backend 'test
+                          :request-id (plist-get request :id)))))
+         (let* ((old-chunks
+                 (proofread--request-ready-chunks-for-ranges
+                  (list (cons (point-min) (point-max)))))
+                (old
+                 (car (proofread--dispatch-request-ready-chunks
+                       old-chunks 'llm))))
+           (should old)
+           (goto-char 2)
+           (insert "x")
+           (delete-region 2 3)
+           (should (equal (buffer-string) "helo"))
+           (should (proofread--request-invalidated-p old))
+           (should-not (proofread--request-work-pending-p old))
+           (let* ((new-chunks
+                   (proofread--request-ready-chunks-for-ranges
+                    (list (cons (point-min) (point-max)))))
+                  (new
+                   (car (proofread--dispatch-request-ready-chunks
+                         new-chunks 'llm))))
+             (should new)
+             (should (equal (proofread--request-work-key old)
+                            (proofread--request-work-key new)))
+             (should (= (length backend-requests) 2))
+             (should-not (proofread--active-request-p old))
+             (should (proofread--active-request-p new))
+             (should (proofread--request-work-pending-p new)))))))))
+
+(ert-deftest proofread-test-request-work-key-distinguishes-restrictions ()
+  "Request identity and freshness include the accessible buffer restriction."
+  (with-temp-buffer
+    (insert "abcdef")
+    (proofread-mode 1)
+    (let* ((full-chunk
+            (car (proofread--request-ready-chunks-for-ranges
+                  (list (cons (point-min) (point-max))))))
+           (full-request
+            (proofread--make-backend-request full-chunk 'llm))
+           narrowed-request)
+      (narrow-to-region 2 6)
+      (setq narrowed-request
+            (proofread--make-backend-request
+             (car (proofread--request-ready-chunks-for-ranges
+                   (list (cons (point-min) (point-max)))))
+             'llm))
+      (should-not (equal (proofread--request-work-key full-request)
+                         (proofread--request-work-key narrowed-request)))
+      (should-not (proofread--fresh-request-p full-request))
+      (should (proofread--fresh-request-p narrowed-request))
+      (widen)
+      (should (proofread--fresh-request-p full-request))
+      (should-not (proofread--fresh-request-p narrowed-request)))))
+
+(ert-deftest proofread-test-cache-hit-edit-invalidates-prepared-batch ()
+  "An edit from a synchronous cache-hit hook invalidates later batch work."
+  (with-temp-buffer
+    (insert "aaa aaa")
+    (let ((proofread-auto-check nil)
+          (proofread-backend 'llm)
+          (proofread-llm-provider proofread-test--llm-provider)
+          (proofread-llm-provider-identity
+           proofread-test--llm-provider-identity)
+          (proofread-context-size 0)
+          calls)
+      (proofread-mode 1)
+      (proofread-test--with-llm-capabilities
+       (let* ((first
+               (car (proofread--request-ready-chunks-for-ranges
+                     '((1 . 4)))))
+              (second
+               (car (proofread--request-ready-chunks-for-ranges
+                     '((5 . 8)))))
+              (preview (proofread--make-backend-request first 'llm)))
+         (should (equal (plist-get first :text) "aaa"))
+         (should (equal (plist-get second :text) "aaa"))
+         (proofread--cache-write-request preview nil)
+         (add-hook
+          'proofread-diagnostics-changed-hook
+          (lambda ()
+            (setq calls (1+ (or calls 0)))
+            (when (= calls 1)
+              (goto-char (point-min))
+              (insert "aaa ")))
+          nil t)
+         (should-not
+          (proofread--dispatch-request-ready-chunks
+           (list first second) 'llm))
+         (should (= calls 1))
+         (should (equal (buffer-string) "aaa aaa aaa"))
+         (should-not proofread--request-queue)
+         (should (= (hash-table-count proofread--pending-request-keys) 0)))))))
+
+(ert-deftest proofread-test-full-queue-does-not-starve-later-cache-hit ()
+  "Cached queued work runs even when earlier backend work is full."
+  (with-temp-buffer
+    (insert "aa bb cc")
+    (let ((proofread-auto-check nil)
+          (proofread-backend 'llm)
+          (proofread-llm-provider proofread-test--llm-provider)
+          (proofread-llm-provider-identity
+           proofread-test--llm-provider-identity)
+          (proofread-context-size 0)
+          (proofread-max-concurrent-requests 1)
+          calls)
+      (proofread-mode 1)
+      (proofread-test--with-llm-capabilities
+       (let* ((active
+               (proofread--make-backend-request
+                (car (proofread--request-ready-chunks-for-ranges
+                      '((1 . 3))))
+                'llm))
+              (waiting
+               (proofread--make-backend-request
+                (car (proofread--request-ready-chunks-for-ranges
+                      '((4 . 6))))
+                'llm))
+              (cached
+               (proofread--make-backend-request
+                (car (proofread--request-ready-chunks-for-ranges
+                      '((7 . 9))))
+                'llm)))
+         (proofread--register-active-request active)
+         (proofread--queue-request waiting 'llm)
+         (proofread--cache-write-request cached nil)
+         (proofread--queue-request cached 'llm)
+         (add-hook 'proofread-diagnostics-changed-hook
+                   (lambda ()
+                     (setq calls (1+ (or calls 0)))
+                     (when (= calls 1)
+                       (goto-char (point-min))
+                       (insert "x")
+                       (delete-char -1)))
+                   nil t)
+         (should-not (proofread--dispatch-queued-requests t))
+         (should (= calls 1))
+         (should-not proofread--request-queue)
+         (should (proofread--request-invalidated-p waiting))
+         (should-not (proofread--request-work-pending-p waiting))
+         (should-not (proofread--request-work-pending-p cached)))))))
+
+(ert-deftest proofread-test-conflicting-request-replaces-active-at-limit ()
+  "A conflicting request cancels active work before applying the limit."
+  (with-temp-buffer
+    (insert "abcdef")
+    (let ((proofread-auto-check nil)
+          (proofread-backend 'llm)
+          (proofread-llm-provider proofread-test--llm-provider)
+          (proofread-llm-provider-identity
+           proofread-test--llm-provider-identity)
+          (proofread-context-size 0)
+          (proofread-max-concurrent-requests 1)
+          backend-requests
+          cancelled-handles)
+      (proofread-mode 1)
+      (proofread-test--with-llm-capabilities
+       (cl-letf (((symbol-function 'proofread--backend-check)
+                  (lambda (request _callback &optional _backend)
+                    (setq backend-requests
+                          (append backend-requests (list request)))
+                    (list :backend 'test
+                          :request-id (plist-get request :id))))
+                 ((symbol-function 'proofread--cancel-request-handle)
+                  (lambda (handle)
+                    (push handle cancelled-handles))))
+         (let* ((older-chunk
+                 (car (proofread--request-ready-chunks-for-ranges
+                       '((1 . 7)))))
+                (newer-chunk
+                 (car (proofread--request-ready-chunks-for-ranges
+                       '((2 . 6)))))
+                (older
+                 (car (proofread--dispatch-request-ready-chunks
+                       (list older-chunk) 'llm)))
+                (newer
+                 (car (proofread--dispatch-request-ready-chunks
+                       (list newer-chunk) 'llm))))
+           (should older)
+           (should newer)
+           (should (= (length backend-requests) 2))
+           (should (= (length cancelled-handles) 1))
+           (should (proofread--request-state-flag-p older :superseded))
+           (should-not (proofread--active-request-p older))
+           (should (proofread--active-request-p newer))
+           (should (equal (mapcar (lambda (request)
+                                    (plist-get request :text))
+                                  proofread--active-requests)
+                          '("bcde")))
+           (should-not proofread--request-queue)
+           (should-not proofread--request-queue-tail)))))))
+
+(ert-deftest proofread-test-superseding-cache-hit-drains-unrelated-queue ()
+  "A cache hit after superseding active work still drains unrelated work."
+  (with-temp-buffer
+    (insert "abc def")
+    (let ((proofread-auto-check nil)
+          (proofread-backend 'llm)
+          (proofread-llm-provider proofread-test--llm-provider)
+          (proofread-llm-provider-identity
+           proofread-test--llm-provider-identity)
+          (proofread-context-size 0)
+          (proofread-max-concurrent-requests 1)
+          backend-requests
+          cancelled-handles)
+      (proofread-mode 1)
+      (proofread-test--with-llm-capabilities
+       (cl-letf (((symbol-function 'proofread--backend-check)
+                  (lambda (request _callback &optional _backend)
+                    (setq backend-requests
+                          (append backend-requests (list request)))
+                    (list :backend 'test
+                          :request-id (plist-get request :id))))
+                 ((symbol-function 'proofread--cancel-request-handle)
+                  (lambda (handle)
+                    (push handle cancelled-handles))))
+         (let* ((older-chunk
+                 (car (proofread--request-ready-chunks-for-ranges
+                       '((1 . 4)))))
+                (cached-chunk
+                 (car (proofread--request-ready-chunks-for-ranges
+                       '((1 . 5)))))
+                (unrelated-chunk
+                 (car (proofread--request-ready-chunks-for-ranges
+                       '((5 . 8)))))
+                (cached-preview
+                 (proofread--make-backend-request cached-chunk 'llm))
+                (unrelated
+                 (proofread--make-backend-request unrelated-chunk 'llm)))
+           (proofread--cache-write-request cached-preview nil)
+           (let ((older
+                  (car (proofread--dispatch-request-ready-chunks
+                        (list older-chunk) 'llm))))
+             (should older)
+             (proofread--queue-request unrelated 'llm)
+             (should (= (length proofread--request-queue) 1))
+             (should
+              (equal
+               (proofread--dispatch-request-ready-chunks
+                (list cached-chunk) 'llm)
+               (list unrelated)))
+             (should (proofread--request-state-flag-p
+                      older :superseded))
+             (should (= (length cancelled-handles) 1))
+             (should (equal (mapcar (lambda (request)
+                                      (plist-get request :text))
+                                    backend-requests)
+                            '("abc" "def")))
+             (should-not (proofread--active-request-p older))
+             (should (proofread--active-request-p unrelated))
+             (should-not proofread--request-queue)
+             (should-not proofread--request-queue-tail))))))))
+
+(ert-deftest proofread-test-synchronous-queued-callback-drains-once ()
+  "Synchronous queued callbacks drain the queue without duplicate submits."
+  (with-temp-buffer
+    (insert "One. Two. Three.")
+    (let ((proofread-auto-check nil)
+          (proofread-context-size 0)
+          (proofread-max-concurrent-requests 1)
+          submitted-log-ids)
+      (proofread-mode 1)
+      (let* ((chunks
+              (proofread--request-ready-chunks-for-ranges
+               (list (cons (point-min) (point-max)))))
+             (requests
+              (mapcar (lambda (chunk)
+                        (proofread--make-backend-request chunk 'llm))
+                      chunks))
+             (expected-log-ids
+              (mapcar (lambda (request)
+                        (plist-get request :log-id))
+                      requests)))
+        (should (= (length requests) 3))
+        (dolist (request requests)
+          (proofread--queue-request request 'llm))
+        (cl-letf (((symbol-function 'proofread--backend-check)
+                   (lambda (request callback &optional _backend)
+                     (push (plist-get request :log-id) submitted-log-ids)
+                     (funcall callback
+                              (proofread--backend-success-result
+                               request nil))
+                     (list :backend 'test
+                           :request-id (plist-get request :id)))))
+          (proofread--dispatch-queued-requests))
+        (setq submitted-log-ids (nreverse submitted-log-ids))
+        (should (equal submitted-log-ids expected-log-ids))
+        (should (= (length (delete-dups (copy-sequence submitted-log-ids)))
+                   (length requests)))
+        (should-not proofread--active-requests)
+        (should-not proofread--request-queue)
+        (should-not proofread--request-queue-tail)
+        (should (= (hash-table-count proofread--pending-request-keys) 0))))))
+
+(ert-deftest proofread-test-adjacent-zero-width-diagnostic-keeps-owner ()
+  "Adjacent request results preserve a boundary diagnostic until owner clean."
+  (dolist (producer '(left right))
+    (dolist (callback-order '((left right) (right left)))
+      (with-temp-buffer
+        (insert "abcdef")
+        (let ((proofread-auto-check nil)
+              (proofread-backend 'llm)
+              (proofread-llm-provider proofread-test--llm-provider)
+              (proofread-llm-provider-identity
+               proofread-test--llm-provider-identity)
+              (proofread-context-size 0)
+              (proofread-cache-max-entries 0))
+          (proofread-mode 1)
+          (let* ((left-chunk
+                  (car (proofread--request-ready-chunks-for-ranges
+                        '((1 . 4)))))
+                 (right-chunk
+                  (car (proofread--request-ready-chunks-for-ranges
+                        '((4 . 7)))))
+                 (left-request
+                  (proofread--make-backend-request left-chunk 'llm))
+                 (right-request
+                  (proofread--make-backend-request right-chunk 'llm))
+                 (producer-request
+                  (if (eq producer 'left)
+                      left-request
+                    right-request))
+                 (boundary-diagnostic
+                  (proofread--make-diagnostic
+                   :beg 4 :end 4 :text "" :kind 'grammar
+                   :message "Missing boundary punctuation"
+                   :suggestions '(".") :source 'test))
+                 (neighbor-diagnostic
+                  (if (eq producer 'left)
+                      (proofread-test--diagnostic-for-range 5 6 "e")
+                    (proofread-test--diagnostic-for-range 2 3 "b"))))
+            (dolist (side callback-order)
+              (let ((request (if (eq side 'left)
+                                 left-request
+                               right-request))
+                    (diagnostics
+                     (if (eq side producer)
+                         (list boundary-diagnostic)
+                       (list neighbor-diagnostic))))
+                (should
+                 (eq (proofread--handle-backend-result
+                      (proofread--backend-success-result
+                       request diagnostics))
+                     'applied))))
+            (should (= (length proofread--diagnostics) 2))
+            (let ((live-boundary
+                   (cl-find boundary-diagnostic proofread--diagnostics
+                            :test #'equal))
+                  (live-neighbor
+                   (cl-find neighbor-diagnostic proofread--diagnostics
+                            :test #'equal)))
+              (should live-boundary)
+              (should live-neighbor)
+              (should (proofread--overlay-for-diagnostic live-boundary))
+              (should (proofread--overlay-for-diagnostic live-neighbor))
+              (should
+               (eq (proofread--handle-backend-result
+                    (proofread--backend-success-result
+                     producer-request nil))
+                   'applied))
+              (should-not (memq live-boundary proofread--diagnostics))
+              (should-not (proofread--overlay-for-diagnostic
+                           live-boundary))
+              (should (equal proofread--diagnostics
+                             (list neighbor-diagnostic)))
+              (should (proofread--overlay-for-diagnostic
+                       live-neighbor)))))))))
 
 (provide 'proofread-tests)
 
