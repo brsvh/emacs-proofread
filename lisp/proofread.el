@@ -60,6 +60,15 @@ configuration."
                  string)
   :group 'proofread)
 
+(defcustom proofread-auto-check t
+  "Non-nil means schedule automatic checks in `proofread-mode'.
+When nil, buffer changes and window activity do not schedule proofreading;
+use commands such as `proofread-check-visible' to start checks manually.
+This option becomes buffer-local when set."
+  :type 'boolean
+  :local t
+  :group 'proofread)
+
 (defcustom proofread-idle-delay 1.0
   "Seconds of idle time before scheduled proofreading work may run."
   :type 'number
@@ -1995,14 +2004,12 @@ When BACKEND is nil, use `proofread-backend'.  Return dispatched requests."
   (when (buffer-live-p buffer)
     (with-current-buffer buffer
       (when proofread-mode
-        (if proofread--pending-work
-            (progn
-              (setq proofread--pending-work nil)
-              (setq proofread--idle-timer nil)
-              (proofread-check-visible)
-              'ran)
+        (let ((run-p (and proofread-auto-check proofread--pending-work)))
+          (setq proofread--pending-work nil)
           (setq proofread--idle-timer nil)
-          nil)))))
+          (when run-p
+            (proofread-check-visible)
+            'ran))))))
 
 (defun proofread--schedule-idle-timer ()
   "Schedule an idle timer for pending proofreading work if needed."
@@ -2016,7 +2023,7 @@ When BACKEND is nil, use `proofread-backend'.  Return dispatched requests."
 
 (defun proofread--mark-pending-work ()
   "Mark the current buffer as needing scheduled visible proofreading."
-  (when proofread-mode
+  (when (and proofread-mode proofread-auto-check)
     (setq proofread--request-queue nil)
     (setq proofread--pending-work t)
     (proofread--schedule-idle-timer)))
@@ -3422,9 +3429,10 @@ When RESET is non-nil, move from the beginning of the buffer."
 (define-minor-mode proofread-mode
   "Toggle context-aware proofreading in the current buffer.
 
-When enabled, proofread schedules visible-buffer checks after editing and
-window activity, then dispatches request-ready visible chunks through the
-configured backend."
+When enabled and `proofread-auto-check' is non-nil, proofread schedules
+visible-buffer checks after editing and window activity, then dispatches
+request-ready visible chunks through the configured backend.  When automatic
+checking is disabled, use `proofread-check-visible' to start a check manually."
   :lighter " Proofread"
   :group 'proofread
   (if proofread-mode
@@ -3432,27 +3440,35 @@ configured backend."
     (proofread--disable-buffer)))
 
 ;;;###autoload
-(defun proofread-check-visible ()
-  "Check visible text in the current buffer for proofreading diagnostics."
-  (interactive)
-  (setq proofread--pending-ranges (proofread--visible-ranges))
-  (if (proofread-backend-available-p)
-      (let* ((chunks (proofread--request-ready-visible-chunks))
-             (requests (proofread--dispatch-request-ready-chunks chunks))
-             (queued (length proofread--request-queue)))
-        (proofread--progress-message
-         "proofread: dispatched %d request%s%s from %d visible range%s"
-         (length requests)
-         (if (= (length requests) 1) "" "s")
-         (if (> queued 0)
-             (format "; queued %d" queued)
-           "")
-         (length proofread--pending-ranges)
-         (if (= (length proofread--pending-ranges) 1) "" "s")))
-    (proofread--progress-message
-     "proofread: collected %d visible range%s; no available backend"
-     (length proofread--pending-ranges)
-     (if (= (length proofread--pending-ranges) 1) "" "s"))))
+(defun proofread-check-visible (&optional force-feedback)
+  "Check visible text in the current buffer for proofreading diagnostics.
+When FORCE-FEEDBACK is non-nil, report command feedback even when routine
+progress messages are inhibited."
+  (interactive (list t))
+  (let ((progress-message
+         (if force-feedback
+             #'message
+           #'proofread--progress-message)))
+    (setq proofread--pending-ranges (proofread--visible-ranges))
+    (if (proofread-backend-available-p)
+        (let* ((chunks (proofread--request-ready-visible-chunks))
+               (requests (proofread--dispatch-request-ready-chunks chunks))
+               (queued (length proofread--request-queue)))
+          (funcall
+           progress-message
+           "proofread: dispatched %d request%s%s from %d visible range%s"
+           (length requests)
+           (if (= (length requests) 1) "" "s")
+           (if (> queued 0)
+               (format "; queued %d" queued)
+             "")
+           (length proofread--pending-ranges)
+           (if (= (length proofread--pending-ranges) 1) "" "s")))
+      (funcall
+       progress-message
+       "proofread: collected %d visible range%s; no available backend"
+       (length proofread--pending-ranges)
+       (if (= (length proofread--pending-ranges) 1) "" "s")))))
 
 ;;;###autoload
 (defun proofread-check-buffer ()

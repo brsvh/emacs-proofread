@@ -394,6 +394,169 @@
       (proofread--progress-message "proofread: %s" "checking")
       (should (equal messages '("proofread: checking"))))))
 
+(ert-deftest proofread-test-check-visible-background-progress-is-inhibited ()
+  "`proofread-check-visible' is quiet when called noninteractively."
+  (save-window-excursion
+    (let ((buffer (generate-new-buffer " *proofread-background-message*")))
+      (unwind-protect
+          (progn
+            (switch-to-buffer buffer)
+            (insert "hello")
+            (proofread-mode 1)
+            (let (messages)
+              (cl-letf (((symbol-function 'message)
+                         (lambda (format-string &rest args)
+                           (push (apply #'format format-string args)
+                                 messages)))
+                        ((symbol-function 'window-start)
+                         (lambda (&optional _window)
+                           (point-min)))
+                        ((symbol-function 'window-end)
+                         (lambda (&optional _window _update)
+                           (point-max))))
+                (proofread-check-visible)
+                (should-not messages))))
+        (kill-buffer buffer)))))
+
+(ert-deftest proofread-test-check-visible-interactive-progress-is-shown ()
+  "`proofread-check-visible' reports feedback when called interactively."
+  (save-window-excursion
+    (let ((buffer (generate-new-buffer " *proofread-interactive-message*")))
+      (unwind-protect
+          (progn
+            (switch-to-buffer buffer)
+            (insert "hello")
+            (proofread-mode 1)
+            (let (messages)
+              (cl-letf (((symbol-function 'message)
+                         (lambda (format-string &rest args)
+                           (push (apply #'format format-string args)
+                                 messages)))
+                        ((symbol-function 'window-start)
+                         (lambda (&optional _window)
+                           (point-min)))
+                        ((symbol-function 'window-end)
+                         (lambda (&optional _window _update)
+                           (point-max))))
+                (call-interactively #'proofread-check-visible)
+                (should
+                 (equal messages
+                        '("proofread: collected 1 visible range; no available backend"))))))
+        (kill-buffer buffer)))))
+
+(ert-deftest proofread-test-auto-check-defaults-enabled-and-is-buffer-local ()
+  "`proofread-auto-check' defaults to enabled and localizes when set."
+  (should (custom-variable-p 'proofread-auto-check))
+  (should (default-value 'proofread-auto-check))
+  (should (local-variable-if-set-p 'proofread-auto-check))
+  (with-temp-buffer
+    (setq proofread-auto-check nil)
+    (should (local-variable-p 'proofread-auto-check))
+    (should-not proofread-auto-check)
+    (with-temp-buffer
+      (should proofread-auto-check))))
+
+(ert-deftest proofread-test-auto-check-disabled-does-not-schedule-edit-work ()
+  "Editing does not schedule work when automatic checking is disabled."
+  (with-temp-buffer
+    (insert "Alpha")
+    (setq-local proofread-auto-check nil)
+    (proofread-mode 1)
+    (let ((proofread--request-queue '(manual-request))
+          timer-count)
+      (cl-letf (((symbol-function 'run-with-idle-timer)
+                 (lambda (_seconds _repeat _function &rest _args)
+                   (setq timer-count (1+ (or timer-count 0)))
+                   'proofread-test-timer)))
+        (insert "!")
+        (should-not timer-count)
+        (should-not proofread--pending-work)
+        (should-not proofread--idle-timer)
+        (should (equal proofread--request-queue '(manual-request)))))))
+
+(ert-deftest proofread-test-auto-check-disabled-does-not-schedule-window-work ()
+  "Window activity does not schedule work when automatic checking is disabled."
+  (save-window-excursion
+    (let ((buffer (generate-new-buffer " *proofread-auto-check-window*")))
+      (unwind-protect
+          (progn
+            (switch-to-buffer buffer)
+            (insert "Alpha")
+            (setq-local proofread-auto-check nil)
+            (proofread-mode 1)
+            (let ((proofread--request-queue '(manual-request))
+                  timer-count)
+              (cl-letf (((symbol-function 'run-with-idle-timer)
+                         (lambda (_seconds _repeat _function &rest _args)
+                           (setq timer-count (1+ (or timer-count 0)))
+                           'proofread-test-timer)))
+                (proofread--window-scroll (selected-window) (point-min))
+                (proofread--window-configuration-change)
+                (should-not timer-count)
+                (should-not proofread--pending-work)
+                (should-not proofread--idle-timer)
+                (should (equal proofread--request-queue
+                               '(manual-request))))))
+        (kill-buffer buffer)))))
+
+(ert-deftest proofread-test-auto-check-disabled-allows-manual-visible-check ()
+  "Manual visible checking works when automatic checking is disabled."
+  (save-window-excursion
+    (let ((buffer (generate-new-buffer " *proofread-manual-check*")))
+      (unwind-protect
+          (progn
+            (switch-to-buffer buffer)
+            (insert "Alpha")
+            (setq-local proofread-auto-check nil)
+            (proofread-mode 1)
+            (let (dispatched)
+              (cl-letf (((symbol-function 'window-start)
+                         (lambda (&optional _window) (point-min)))
+                        ((symbol-function 'window-end)
+                         (lambda (&optional _window _update) (point-max)))
+                        ((symbol-function 'proofread-backend-available-p)
+                         (lambda () t))
+                        ((symbol-function
+                          'proofread--request-ready-visible-chunks)
+                         (lambda () '((:text "Alpha"))))
+                        ((symbol-function
+                          'proofread--dispatch-request-ready-chunks)
+                         (lambda (chunks)
+                           (setq dispatched chunks)
+                           '(proofread-test-request))))
+                (proofread-check-visible)
+                (should (equal proofread--pending-ranges
+                               (list (cons (point-min) (point-max)))))
+                (should (equal dispatched '((:text "Alpha")))))))
+        (kill-buffer buffer)))))
+
+(ert-deftest proofread-test-disabled-auto-check-stale-timer-does-not-check ()
+  "A stale timer does not check after automatic checking is disabled."
+  (with-temp-buffer
+    (insert "Alpha")
+    (proofread-mode 1)
+    (let ((buffer (current-buffer))
+          timer-count
+          visible-checks)
+      (cl-letf (((symbol-function 'run-with-idle-timer)
+                 (lambda (_seconds _repeat _function &rest _args)
+                   (setq timer-count (1+ (or timer-count 0)))
+                   (intern (format "proofread-test-timer-%d" timer-count))))
+                ((symbol-function 'proofread-check-visible)
+                 (lambda ()
+                   (setq visible-checks (1+ (or visible-checks 0))))))
+        (insert "!")
+        (should (= timer-count 1))
+        (setq proofread-auto-check nil)
+        (should-not (proofread--idle-timer-run buffer))
+        (should-not visible-checks)
+        (should-not proofread--pending-work)
+        (should-not proofread--idle-timer)
+        (setq proofread-auto-check t)
+        (insert "?")
+        (should (= timer-count 2))
+        (should proofread--pending-work)))))
+
 (ert-deftest proofread-test-edit-schedules-idle-work ()
   "Editing in `proofread-mode' marks pending work and schedules a timer."
   (with-temp-buffer
