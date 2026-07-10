@@ -130,6 +130,15 @@
           (lambda ()
             (reverse callbacks)))))
 
+(defun proofread-test--window-state (buffer window)
+  "Return point and window state for BUFFER and WINDOW."
+  (list :selected-window (selected-window)
+        :window-list (window-list)
+        :selected-window-point (window-point (selected-window))
+        :buffer-point (with-current-buffer buffer (point))
+        :window-point (window-point window)
+        :window-start (window-start window)))
+
 (defconst proofread-test--llm-provider 'proofread-test-provider
   "Provider object used for local LLM backend tests.")
 
@@ -440,6 +449,46 @@
              (should (eq mark-active before-mark-active))
              (should (= (point-min) before-min))
              (should (= (point-max) before-max)))))))))
+
+(ert-deftest proofread-test-programming-checks-preserve-window-state ()
+  "Programming checks preserve point and the displayed window position."
+  (dolist (command '(proofread-check-visible-range proofread-check-buffer))
+    (save-window-excursion
+      (let ((buffer
+             (generate-new-buffer
+              (format " *proofread-programming-%s*" command))))
+        (unwind-protect
+            (progn
+              (switch-to-buffer buffer)
+              (emacs-lisp-mode)
+              (insert ";; First prose sentence.\n"
+                      "(setq cursor_should_stay_here 1)\n"
+                      ";; Last prose sentence.\n")
+              (setq-local proofread-auto-check nil)
+              (setq-local proofread-targets 'comments)
+              (proofread-mode 1)
+              (goto-char (point-min))
+              (search-forward "cursor_should")
+              (let* ((proofread-backend 'llm)
+                     (proofread-llm-provider
+                      proofread-test--llm-provider)
+                     (proofread-llm-provider-identity
+                      proofread-test--llm-provider-identity)
+                     (proofread-context-size 0)
+                     (proofread-max-concurrent-requests 10)
+                     (recorder (proofread-test--make-backend-recorder))
+                     (window (selected-window))
+                     (before (proofread-test--window-state buffer window)))
+                (proofread-test--with-llm-capabilities
+                 (cl-letf (((symbol-function 'proofread--backend-check)
+                            (plist-get recorder :function)))
+                   (funcall command)
+                   (redisplay t)
+                   (should (funcall (plist-get recorder :requests)))
+                   (should (equal
+                            (proofread-test--window-state buffer window)
+                            before))))))
+          (kill-buffer buffer))))))
 
 (ert-deftest proofread-test-check-region-normalizes-and-filters-selection ()
   "`proofread-check-region' normalizes bounds and filters ignored text."
@@ -895,6 +944,68 @@
         (should (= timer-count 2))
         (should (= visible-checks 1))
         (should proofread--pending-work)))))
+
+(ert-deftest proofread-test-programming-idle-check-preserves-window-state ()
+  "A background programming check preserves user and target window state."
+  (save-window-excursion
+    (let ((user-buffer (generate-new-buffer " *proofread-idle-user*"))
+          (target-buffer (generate-new-buffer " *proofread-idle-target*")))
+      (unwind-protect
+          (let* ((user-window (selected-window))
+                 (target-window (split-window-right))
+                 (recorder (proofread-test--make-backend-recorder)))
+            (set-window-buffer user-window user-buffer)
+            (with-current-buffer user-buffer
+              (insert "User point must stay here.")
+              (goto-char 8))
+            (set-window-point user-window 8)
+            (with-current-buffer target-buffer
+              (emacs-lisp-mode)
+              (insert ";; First prose sentence.\n"
+                      "(setq target_cursor_stays_here 1)\n"
+                      ";; Last prose sentence.\n")
+              (setq-local proofread-targets 'comments)
+              (proofread-mode 1)
+              (goto-char (point-min))
+              (search-forward "target_cursor")
+              (setq proofread--pending-work t))
+            (set-window-buffer target-window target-buffer)
+            (set-window-point
+             target-window (with-current-buffer target-buffer (point)))
+            (set-window-start target-window 1)
+            (select-window user-window)
+            (let ((proofread-backend 'llm)
+                  (proofread-llm-provider proofread-test--llm-provider)
+                  (proofread-llm-provider-identity
+                   proofread-test--llm-provider-identity)
+                  (proofread-context-size 0)
+                  (proofread-max-concurrent-requests 10)
+                  (warning-display-at-bottom t)
+                  (before
+                   (proofread-test--window-state
+                    target-buffer target-window)))
+              (proofread-test--with-llm-capabilities
+               (cl-letf (((symbol-function 'proofread--backend-check)
+                          (plist-get recorder :function)))
+                 (should (eq (proofread--idle-timer-run target-buffer) 'ran))
+                 (redisplay t)
+                 (let ((requests (funcall (plist-get recorder :requests)))
+                       (callbacks (funcall (plist-get recorder :callbacks))))
+                   (should requests)
+                   (cl-mapc
+                    (lambda (request callback)
+                      (funcall
+                       callback
+                       (proofread--backend-error-result
+                        request 'test-error "Simulated background failure")))
+                    requests callbacks))
+                 (redisplay t)
+                 (should (equal
+                          (proofread-test--window-state
+                           target-buffer target-window)
+                          before))))))
+        (kill-buffer user-buffer)
+        (kill-buffer target-buffer)))))
 
 (ert-deftest proofread-test-window-activity-marks-proofread-buffer ()
   "Window activity marks only live buffers with `proofread-mode' enabled."
@@ -3855,6 +3966,7 @@
           (proofread-llm-provider-identity
            proofread-test--llm-provider-identity)
           (proofread-max-concurrent-requests 10)
+          warning-levels
           warnings)
       (proofread-mode 1)
       (proofread-test--with-llm-capabilities
@@ -3867,7 +3979,10 @@
                 ranges))
               (recorder (proofread-test--make-backend-recorder)))
          (cl-letf (((symbol-function 'display-warning)
-                    (lambda (&rest args) (push args warnings)))
+                    (lambda (&rest args)
+                      (push warning-minimum-level warning-levels)
+                      (push args warnings)))
+                   ((symbol-function 'message) #'ignore)
                    ((symbol-function 'proofread--backend-check)
                     (plist-get recorder :function)))
            (should (= (length (proofread--dispatch-request-ready-chunks
@@ -3915,7 +4030,8 @@
                    (proofread--backend-error-result
                     direct 'llm-failure "Direct failure"))
                   'error))
-             (should (= (length warnings) 3)))))))))
+             (should (= (length warnings) 3))
+             (should (equal warning-levels '(:error :error :error))))))))))
 
 (ert-deftest proofread-test-navigation-sorts-and-filters-diagnostics ()
   "Navigation diagnostics are valid and sorted by start and end position."
@@ -6002,6 +6118,31 @@
       (should-not proofread--diagnostics)
       (should-not proofread--overlays))))
 
+(ert-deftest proofread-test-programming-request-freshness-preserves-point ()
+  "Asynchronous comment freshness checks preserve point and mark."
+  (with-temp-buffer
+    (emacs-lisp-mode)
+    (insert ";; Checked prose sentence.\n"
+            "(setq cursor_and_mark_stay_here 1)\n")
+    (setq-local proofread-auto-check nil)
+    (setq-local proofread-targets 'comments)
+    (proofread-mode 1)
+    (let* ((proofread-context-size 0)
+           (chunk
+            (car (proofread--request-ready-chunks-for-ranges
+                  (list (cons (point-min) (point-max))))))
+           (request (proofread--make-backend-request chunk 'llm)))
+      (goto-char (point-min))
+      (search-forward "cursor_and_mark")
+      (push-mark (line-end-position) t t)
+      (let ((before-point (point))
+            (before-mark (mark t))
+            (before-mark-active mark-active))
+        (should (proofread--fresh-request-p request))
+        (should (= (point) before-point))
+        (should (= (mark t) before-mark))
+        (should (eq mark-active before-mark-active))))))
+
 (ert-deftest proofread-test-backend-nil-prunes-checked-out-of-target-diagnostics ()
   "A backend-less check prunes invalid checked diagnostics only."
   (with-temp-buffer
@@ -6118,6 +6259,114 @@
             (should-not (string-match-p
                          "Later target sentence"
                          (plist-get isolated-chunk :context-before)))))))))
+
+(ert-deftest proofread-test-consecutive-comments-use-language-sentences ()
+  "Comment source lines do not replace natural-language sentence boundaries."
+  (with-temp-buffer
+    (emacs-lisp-mode)
+    (insert ";; This sentence begins here and\n"
+            ";; ends on this line. A second sentence starts\n"
+            ";; and ends here.\n")
+    (setq-local proofread-auto-check nil)
+    (setq-local proofread-targets 'comments)
+    (proofread-mode 1)
+    (let ((proofread-backend 'llm)
+          (proofread-llm-provider proofread-test--llm-provider)
+          (proofread-llm-provider-identity
+           proofread-test--llm-provider-identity)
+          (proofread-context-size 0)
+          (proofread-max-concurrent-requests 10)
+          (recorder (proofread-test--make-backend-recorder)))
+      (proofread-test--with-llm-capabilities
+       (cl-letf (((symbol-function 'proofread--backend-check)
+                  (plist-get recorder :function)))
+         (proofread-check-buffer)
+         (let ((requests (funcall (plist-get recorder :requests))))
+           (should (= (length requests) 2))
+           (should (string-match-p
+                    "This sentence begins"
+                    (plist-get (nth 0 requests) :text)))
+           (should (string-match-p
+                    "ends on this line\\."
+                    (plist-get (nth 0 requests) :text)))
+           (should (string-match-p
+                    "A second sentence starts"
+                    (plist-get (nth 1 requests) :text)))
+           (should (string-match-p
+                    "and ends here\\."
+                    (plist-get (nth 1 requests) :text)))
+           (dolist (request requests)
+             (should (eq (plist-get request :target-kind) 'comment))
+             (should (equal
+                      (plist-get request :text)
+                      (buffer-substring-no-properties
+                       (plist-get request :beg)
+                       (plist-get request :end)))))))))))
+
+(ert-deftest proofread-test-comment-delimiters-follow-major-mode-syntax ()
+  "Mode-specific comment delimiters do not split hard-wrapped prose."
+  (dolist
+      (case
+       (list
+        (list
+         'emacs-lisp-mode
+         (concat
+          ";; This file is free software: you can redistribute it and/or modify\n"
+          ";; it under the terms of the GNU General Public License as published\n"
+          ";; by the Free Software Foundation, either version 3 of the License,\n"
+          ";; or (at your option) any later version.\n")
+         "This file is free software" "any later version")
+        (list
+         'c-mode
+         "// First C line continues\n// through the next source line.\n"
+         "First C line" "next source line")
+        (list
+         'c-mode
+         "/* First block line continues\n * through the next source line. */\n"
+         "First block line" "next source line")
+        (list
+         'html-mode
+         "<!-- First HTML line continues\nthrough the next source line. -->\n"
+         "First HTML line" "next source line")))
+    (with-temp-buffer
+      (funcall (nth 0 case))
+      (setq-local proofread-targets 'comments)
+      (insert (nth 1 case))
+      (let* ((chunks
+              (proofread--request-ready-chunks-for-ranges
+               (list (cons (point-min) (point-max)))))
+             (chunk (car chunks)))
+        (should (= (length chunks) 1))
+        (should (string-match-p (regexp-quote (nth 2 case))
+                                (plist-get chunk :text)))
+        (should (string-match-p (regexp-quote (nth 3 case))
+                                (plist-get chunk :text)))
+        (should (eq (plist-get chunk :target-kind) 'comment))
+        (should (equal
+                 (plist-get chunk :text)
+                 (buffer-substring-no-properties
+                  (plist-get chunk :beg)
+                  (plist-get chunk :end))))))))
+
+(ert-deftest proofread-test-hard-wrapped-comment-sentence-stays-in-context ()
+  "Comment context keeps a logical sentence spanning source lines."
+  (with-temp-buffer
+    (emacs-lisp-mode)
+    (insert ";; First hard-wrapped part of one\n"
+            ";; sentence ends here.\n"
+            ";; Target sentence.\n")
+    (setq-local proofread-targets 'comments)
+    (goto-char (point-min))
+    (search-forward "Target sentence.")
+    (let* ((proofread-context-size 300)
+           (proofread-context-sentences-before 1)
+           (proofread-context-sentences-after 0)
+           (chunk
+            (car (proofread--request-ready-chunks-for-ranges
+                  (list (cons (match-beginning 0) (match-end 0))))))
+           (context (plist-get chunk :context-before)))
+      (should (string-match-p "First hard-wrapped part" context))
+      (should (string-match-p "sentence ends here\\." context)))))
 
 (ert-deftest proofread-test-ignore-changes-make-request-stale ()
   "Only ignore-setting changes that affect request text make it stale."

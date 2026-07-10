@@ -481,6 +481,12 @@ interrupting proofreading.")
       (format "Proofreading backend error: %S"
               (plist-get result :error))))
 
+(defun proofread--report-warning-without-window (message)
+  "Log proofread warning MESSAGE without displaying a warning window."
+  (let ((warning-minimum-level :error))
+    (display-warning 'proofread message :warning))
+  (message "proofread: %s" message))
+
 (defun proofread--request-batch-error-counts (errors)
   "Return an alist counting backend error message strings in ERRORS."
   (let (counts)
@@ -508,8 +514,7 @@ interrupting proofreading.")
                           (car entry) 160 nil nil "...")
                          (cdr entry)))
                shown ", ")))
-        (display-warning
-         'proofread
+        (proofread--report-warning-without-window
          (format
           (concat "Proofreading failed for %d request%s in one check (%s%s).  "
                   "Run M-x proofread-show-buffer-requests before retrying "
@@ -520,8 +525,7 @@ interrupting proofreading.")
           (if (> remaining 0)
               (format ", and %d more error kind%s"
                       remaining (if (= remaining 1) "" "s"))
-            ""))
-         :warning)))))
+            "")))))))
 
 (defun proofread--settle-request-batch (request &optional result status)
   "Settle REQUEST in its shared batch using RESULT and final STATUS."
@@ -1168,10 +1172,35 @@ Paragraphs are nonblank runs of lines separated by blank or structural lines."
           "\\(?:\\b\\(?:Mr\\|Mrs\\|Ms\\|Dr\\|Prof\\|Sr\\|Jr\\|St\\|vs\\|etc\\)\\|\\be\\.g\\|\\bi\\.e\\|\\ba\\.m\\|\\bp\\.m\\)\\.$"
           text))))
 
+(defun proofread--comment-start-delimiter-position-p (position)
+  "Return non-nil when POSITION is inside a comment start delimiter.
+Recognize the delimiter from the current mode's `comment-start-skip' and
+confirm it against the buffer's syntax state."
+  (when (and (eq proofread--active-target-kind 'comment)
+             comment-start-skip)
+    (save-match-data
+      (save-excursion
+        (goto-char position)
+        (let ((limit (line-end-position))
+              found)
+          (goto-char (line-beginning-position))
+          (while (and (not found)
+                      (re-search-forward comment-start-skip limit t)
+                      (<= (match-beginning 0) position))
+            (let ((delimiter-beg (match-beginning 0))
+                  (delimiter-end (match-end 0)))
+              (when (and (< position delimiter-end)
+                         (let ((state (syntax-ppss delimiter-end)))
+                           (and (nth 4 state)
+                                (= (nth 8 state) delimiter-beg))))
+                (setq found t))))
+          found)))))
+
 (defun proofread--sentence-boundary-at-point-p ()
   "Return non-nil when point is at an internal sentence boundary."
   (let ((character (char-after)))
     (and (proofread--sentence-ending-character-p character)
+         (not (proofread--comment-start-delimiter-position-p (point)))
          (not (proofread--period-between-ascii-alnum-p (point)))
          (not (proofread--english-abbreviation-period-p (point))))))
 
@@ -1617,22 +1646,25 @@ too large for `proofread-context-size'."
   (let ((accessible-beg (and (buffer-narrowed-p) (point-min)))
         (accessible-end (and (buffer-narrowed-p) (point-max)))
         request-chunks)
-    (dolist (island islands)
-      (let ((proofread--active-target-kind (plist-get island :kind)))
-        (save-restriction
-          (narrow-to-region (plist-get island :domain-beg)
-                            (plist-get island :domain-end))
-          (dolist (chunk
-                   (proofread--request-ready-chunks-for-spans
-                    (proofread--chunk-spans-for-ranges
-                     (list (cons (plist-get island :beg)
-                                 (plist-get island :end))))))
-            (when (proofread--chunk-has-target-prose-p chunk island)
-              (let ((chunk (proofread--chunk-with-target-metadata
-                            chunk island)))
-                (setq chunk (plist-put chunk :accessible-beg accessible-beg))
-                (setq chunk (plist-put chunk :accessible-end accessible-end))
-                (push chunk request-chunks)))))))
+    (save-mark-and-excursion
+      (dolist (island islands)
+        (let ((proofread--active-target-kind (plist-get island :kind)))
+          (save-restriction
+            (narrow-to-region (plist-get island :domain-beg)
+                              (plist-get island :domain-end))
+            (dolist (chunk
+                     (proofread--request-ready-chunks-for-spans
+                      (proofread--chunk-spans-for-ranges
+                       (list (cons (plist-get island :beg)
+                                   (plist-get island :end))))))
+              (when (proofread--chunk-has-target-prose-p chunk island)
+                (let ((chunk (proofread--chunk-with-target-metadata
+                              chunk island)))
+                  (setq chunk
+                        (plist-put chunk :accessible-beg accessible-beg))
+                  (setq chunk
+                        (plist-put chunk :accessible-end accessible-end))
+                  (push chunk request-chunks))))))))
     (nreverse request-chunks)))
 
 (defun proofread--request-ready-chunks-for-ranges (ranges)
@@ -3285,14 +3317,15 @@ by `proofread--drain-request-queue'."
         (domain-beg (plist-get domain :domain-beg))
         (domain-end (plist-get domain :domain-end)))
     (and beg end domain-beg domain-end
-         (save-restriction
-           (narrow-to-region domain-beg domain-end)
-           (let ((proofread--active-target-kind
-                  (plist-get request :target-kind)))
-             (and (equal (plist-get request :context-before)
-                         (proofread--request-ready-context-before beg))
-                  (equal (plist-get request :context-after)
-                         (proofread--request-ready-context-after end))))))))
+         (save-mark-and-excursion
+           (save-restriction
+             (narrow-to-region domain-beg domain-end)
+             (let ((proofread--active-target-kind
+                    (plist-get request :target-kind)))
+               (and (equal (plist-get request :context-before)
+                           (proofread--request-ready-context-before beg))
+                    (equal (plist-get request :context-after)
+                           (proofread--request-ready-context-after end)))))))))
 
 (defun proofread--fresh-request-p (request)
   "Return non-nil if REQUEST still matches its originating buffer."
@@ -3635,10 +3668,8 @@ When REQUEST-RANGE is non-nil, record it as their owning request range."
 
 (defun proofread--report-backend-error (result)
   "Report the backend error described by RESULT."
-  (display-warning
-   'proofread
-   (proofread--backend-error-message result)
-   :warning))
+  (proofread--report-warning-without-window
+   (proofread--backend-error-message result)))
 
 (defun proofread--handle-backend-result (result)
   "Handle backend RESULT and return an internal status symbol."
