@@ -362,6 +362,9 @@ interrupting proofreading.")
 (defvar proofread--window-hooks-installed nil
   "Non-nil when proofread global window activity hooks are installed.")
 
+(defvar proofread--inhibit-overlay-invalidation nil
+  "Non-nil means text changes must not invalidate proofread overlays.")
+
 (defvar proofread--request-log-sequence 0
   "Session-local sequence for request log identifiers.")
 
@@ -2579,6 +2582,8 @@ When BACKEND is nil, use `proofread-backend'.  Return dispatched requests."
 
 (defun proofread--after-change (_beg _end _length)
   "Mark proofreading work pending after a buffer change."
+  (unless proofread--inhibit-overlay-invalidation
+    (proofread--synchronize-live-diagnostic-ranges))
   (proofread--mark-pending-work))
 
 (defun proofread--mark-window-buffer-pending (window)
@@ -2684,7 +2689,7 @@ When BACKEND is nil, use `proofread-backend'.  Return dispatched requests."
 (defun proofread--overlay-modified (overlay after _beg _end &optional _length)
   "Delete proofread-owned OVERLAY when its text is modified.
 AFTER is non-nil for the after-change notification."
-  (unless after
+  (unless (or after proofread--inhibit-overlay-invalidation)
     (proofread--delete-overlay overlay)
     (proofread--run-diagnostics-changed-hook)))
 
@@ -2740,7 +2745,9 @@ AFTER is non-nil for the after-change notification."
     (and range
          point-position
          (<= (car range) point-position)
-         (< point-position (cdr range)))))
+         (or (< point-position (cdr range))
+             (and (= (car range) (cdr range))
+                  (= point-position (car range)))))))
 
 (defun proofread--diagnostic-at-point (&optional position)
   "Return the proofread diagnostic covering POSITION or point.
@@ -3649,6 +3656,26 @@ When RESET is non-nil, move from the beginning of the buffer."
   (and (< beg other-end)
        (< other-beg end)))
 
+(defun proofread--ranges-conflict-p (beg end other-beg other-end)
+  "Return non-nil if changes to BEG through END can affect the other range.
+The other range extends from OTHER-BEG through OTHER-END.  Zero-width ranges
+conflict with ranges whose closed boundaries contain their position."
+  (or (proofread--ranges-intersect-p beg end other-beg other-end)
+      (and (= beg end)
+           (<= other-beg beg)
+           (<= beg other-end))
+      (and (= other-beg other-end)
+           (<= beg other-beg)
+           (<= other-beg end))))
+
+(defun proofread--range-conflicts-any-p (range ranges)
+  "Return non-nil when RANGE conflicts with one of RANGES."
+  (cl-some
+   (lambda (candidate)
+     (proofread--ranges-conflict-p
+      (car range) (cdr range) (car candidate) (cdr candidate)))
+   ranges))
+
 (defun proofread--overlays-intersecting-range (beg end)
   "Return proofread-owned overlays intersecting BEG to END."
   (let (overlays)
@@ -3658,7 +3685,7 @@ When RESET is non-nil, move from the beginning of the buffer."
             (overlay-end (overlay-end overlay)))
         (when (and overlay-beg
                    overlay-end
-                   (proofread--ranges-intersect-p
+                   (proofread--ranges-conflict-p
                     beg end overlay-beg overlay-end))
           (push overlay overlays))))
     (nreverse overlays)))
@@ -3667,7 +3694,7 @@ When RESET is non-nil, move from the beginning of the buffer."
   "Return non-nil if DIAGNOSTIC intersects BEG to END."
   (let ((range (proofread--diagnostic-range diagnostic)))
     (and range
-         (proofread--ranges-intersect-p
+         (proofread--ranges-conflict-p
           beg end (car range) (cdr range)))))
 
 (defun proofread--diagnostics-intersecting-range (beg end)
@@ -3701,6 +3728,25 @@ When INHIBIT-NOTIFICATION is non-nil, defer the diagnostics change hook."
   (unless inhibit-notification
     (proofread--run-diagnostics-changed-hook)))
 
+(defun proofread--synchronize-live-diagnostic-ranges ()
+  "Synchronize stored diagnostic ranges with their live overlays."
+  (let (overlays)
+    (dolist (overlay proofread--overlays)
+      (when (proofread--current-buffer-overlay-p overlay)
+        (push overlay overlays)
+        (let ((diagnostic (overlay-get overlay 'proofread-diagnostic))
+              (beg (overlay-start overlay))
+              (end (overlay-end overlay)))
+          (when (and (memq diagnostic proofread--diagnostics) beg end)
+            (setf (plist-get diagnostic :beg) beg)
+            (setf (plist-get diagnostic :end) end)
+            (let ((locator (plist-get diagnostic :locator)))
+              (when (and (listp locator)
+                         (eq (plist-get locator :kind) 'char-range))
+                (setf (plist-get locator :beg) beg)
+                (setf (plist-get locator :end) end)))))))
+    (setq proofread--overlays (nreverse overlays))))
+
 (defun proofread--apply-suggestion-to-diagnostic (diagnostic suggestion)
   "Replace DIAGNOSTIC's range with SUGGESTION and invalidate stale state."
   (let* ((range (proofread--validate-suggestion-application diagnostic))
@@ -3710,14 +3756,99 @@ When INHIBIT-NOTIFICATION is non-nil, defer the diagnostics change hook."
          (affected-diagnostics
           (proofread--diagnostics-intersecting-range beg end)))
     (undo-boundary)
-    (delete-region beg end)
-    (goto-char beg)
-    (insert suggestion)
+    (let ((proofread--inhibit-overlay-invalidation t))
+      (atomic-change-group
+        (delete-region beg end)
+        (goto-char beg)
+        (insert suggestion)))
     (proofread--invalidate-affected-diagnostics
-     affected-overlays affected-diagnostics)
+     affected-overlays affected-diagnostics t)
+    (proofread--synchronize-live-diagnostic-ranges)
+    (proofread--run-diagnostics-changed-hook)
     (undo-boundary)
     (message "proofread: applied suggestion")
     'applied))
+
+(defun proofread--prepare-diagnostic-corrections (diagnostics)
+  "Return selected nonoverlapping corrections for DIAGNOSTICS.
+Each returned element is a cons cell of the form (DIAGNOSTIC . SUGGESTION).
+DIAGNOSTICS must be in navigation order.  An earlier diagnostic takes
+precedence over any later diagnostic whose range overlaps it."
+  (let (corrections ranges)
+    (dolist (diagnostic diagnostics)
+      (let ((range (proofread--validate-suggestion-application diagnostic)))
+        (unless (proofread--range-conflicts-any-p range ranges)
+          (let ((suggestion
+                 (proofread--select-diagnostic-suggestion diagnostic)))
+            (push range ranges)
+            (push (cons diagnostic suggestion) corrections)))))
+    (nreverse corrections)))
+
+(defun proofread--corrections-affected-state (corrections)
+  "Return overlays and diagnostics affected by CORRECTIONS.
+The return value is a cons cell whose car contains overlays and whose cdr
+contains diagnostics."
+  (let (overlays diagnostics)
+    (dolist (correction corrections)
+      (let* ((range (proofread--diagnostic-range (car correction)))
+             (beg (car range))
+             (end (cdr range)))
+        (dolist (overlay (proofread--overlays-intersecting-range beg end))
+          (cl-pushnew overlay overlays))
+        (dolist (diagnostic
+                 (proofread--diagnostics-intersecting-range beg end))
+          (cl-pushnew diagnostic diagnostics :test #'equal))))
+    (cons overlays diagnostics)))
+
+(defun proofread--apply-diagnostic-corrections (corrections)
+  "Apply prepared CORRECTIONS atomically from end to beginning."
+  (let* ((affected-state
+          (proofread--corrections-affected-state corrections))
+         (affected-overlays (car affected-state))
+         (affected-diagnostics (cdr affected-state)))
+    (save-mark-and-excursion
+      (undo-boundary)
+      (let ((proofread--inhibit-overlay-invalidation t))
+        (atomic-change-group
+          (dolist (correction (reverse corrections))
+            (let* ((diagnostic (car correction))
+                   (suggestion (cdr correction))
+                   (range (proofread--diagnostic-range diagnostic))
+                   (beg (car range))
+                   (end (cdr range)))
+              (goto-char beg)
+              (delete-region beg end)
+              (insert suggestion)))))
+      (proofread--invalidate-affected-diagnostics
+       affected-overlays affected-diagnostics t)
+      (proofread--synchronize-live-diagnostic-ranges)
+      (undo-boundary))
+    (proofread--run-diagnostics-changed-hook)))
+
+(defun proofread--correct-diagnostics (diagnostics)
+  "Apply selected suggestions to DIAGNOSTICS as one command.
+DIAGNOSTICS must be in navigation order.  Return `applied'."
+  (let (actionable)
+    (dolist (diagnostic diagnostics)
+      (when (proofread--diagnostic-suggestions diagnostic)
+        (push diagnostic actionable)))
+    (setq actionable (nreverse actionable))
+    (unless actionable
+      (user-error "No proofread suggestions available"))
+    (let* ((corrections
+            (proofread--prepare-diagnostic-corrections actionable))
+           (count (length corrections))
+           (skipped (- (length diagnostics) count)))
+      (proofread--apply-diagnostic-corrections corrections)
+      (message "proofread: applied %d suggestion%s%s"
+               count
+               (if (= count 1) "" "s")
+               (if (zerop skipped)
+                   ""
+                 (format "; skipped %d diagnostic%s"
+                         skipped
+                         (if (= skipped 1) "" "s"))))
+      'applied)))
 
 (defun proofread--format-diagnostic-description (diagnostic)
   "Return a stable plain-text description for DIAGNOSTIC."
@@ -3787,7 +3918,7 @@ When INHIBIT-NOTIFICATION is non-nil, defer the diagnostics change hook."
                  (<= beg end))
       (error "Invalid proofread diagnostic range: %S" diagnostic))
     (proofread--prune-overlays)
-    (let ((overlay (make-overlay beg end)))
+    (let ((overlay (make-overlay beg end nil t nil)))
       (overlay-put overlay 'category proofread--overlay-category)
       (overlay-put overlay 'face 'proofread-face)
       (overlay-put overlay 'proofread-diagnostic diagnostic)
@@ -3855,6 +3986,14 @@ When INHIBIT-NOTIFICATION is non-nil, defer the diagnostics change hook."
    (lambda (candidate)
      (proofread--ranges-intersect-p
       (car range) (cdr range) (car candidate) (cdr candidate)))
+   ranges))
+
+(defun proofread--range-contained-in-any-p (range ranges)
+  "Return non-nil when one of RANGES completely contains RANGE."
+  (cl-some
+   (lambda (candidate)
+     (and (<= (car candidate) (car range))
+          (<= (cdr range) (cdr candidate))))
    ranges))
 
 (defun proofread--sorted-target-domains (domains)
@@ -4061,7 +4200,9 @@ visible-buffer checks after editing and window activity, then dispatches
 request-ready visible chunks through the configured backend.  The option
 `proofread-targets' controls which kinds of text are selected.  When automatic
 checking is disabled, use `proofread-check-visible', `proofread-check-buffer',
-`proofread-check-region', or `proofread-check-point' manually."
+`proofread-check-region', or `proofread-check-point' manually.  Apply available
+suggestions with `proofread-correct-at-point', `proofread-correct-region',
+`proofread-correct-buffer', or `proofread-correct-visible-range'."
   :lighter " Proofread"
   :group 'proofread
   (if proofread-mode
@@ -4225,6 +4366,7 @@ This function does not move point in the source buffer."
 
 (defun proofread--correct-at-point ()
   "Apply a selected proofreading suggestion at point."
+  (proofread--synchronize-live-diagnostic-ranges)
   (let ((diagnostic (proofread--diagnostic-at-point)))
     (unless diagnostic
       (user-error "No proofread diagnostic at point"))
@@ -4233,13 +4375,68 @@ This function does not move point in the source buffer."
      (proofread--select-diagnostic-suggestion diagnostic))))
 
 ;;;###autoload
-(defun proofread-correct ()
+(defun proofread-correct-at-point ()
   "Correct the proofreading diagnostic at point.
 When the diagnostic has multiple suggestions, choose one using
 `completing-read'.  Completion UIs such as Vertico and Consult can provide the
 selection interface."
   (interactive)
   (proofread--correct-at-point))
+
+(defun proofread--diagnostics-in-ranges (ranges)
+  "Return diagnostics contained in accessible RANGES in navigation order."
+  (let ((ranges (proofread--normalize-accessible-ranges ranges))
+        diagnostics)
+    (dolist (diagnostic (proofread--navigation-diagnostics))
+      (when-let* ((range (proofread--diagnostic-live-range diagnostic)))
+        (when (proofread--range-contained-in-any-p range ranges)
+          (push diagnostic diagnostics))))
+    (nreverse diagnostics)))
+
+(defun proofread--correct-ranges (ranges scope)
+  "Correct diagnostics contained in RANGES described by SCOPE."
+  (proofread--require-mode)
+  (proofread--synchronize-live-diagnostic-ranges)
+  (let ((diagnostics (proofread--diagnostics-in-ranges ranges)))
+    (unless diagnostics
+      (user-error "No proofread diagnostics in %s" scope))
+    (proofread--correct-diagnostics diagnostics)))
+
+;;;###autoload
+(defun proofread-correct-region (beg end)
+  "Correct proofreading diagnostics contained between BEG and END.
+Interactively, correct the active region.  BEG and END may be supplied in
+either order."
+  (interactive
+   (if (use-region-p)
+       (list (region-beginning) (region-end))
+     (list nil nil)))
+  (unless (and beg end)
+    (user-error "No active region"))
+  (unless (and (proofread--current-buffer-position-p beg)
+               (proofread--current-buffer-position-p end))
+    (user-error "Region boundaries are not in the current buffer"))
+  (let ((beg (proofread--position-integer beg))
+        (end (proofread--position-integer end)))
+    (when (= beg end)
+      (user-error "The region is empty"))
+    (proofread--correct-ranges
+     (list (cons beg end)) "the selected region")))
+
+;;;###autoload
+(defun proofread-correct-buffer ()
+  "Correct proofreading diagnostics in the accessible current buffer."
+  (interactive)
+  (proofread--correct-ranges
+   (list (cons (point-min) (point-max))) "the accessible buffer"))
+
+;;;###autoload
+(defun proofread-correct-visible-range ()
+  "Correct diagnostics in visible ranges of the current buffer.
+Visible ranges come from all live windows displaying the current buffer."
+  (interactive)
+  (proofread--correct-ranges
+   (proofread--visible-ranges) "the visible range"))
 
 ;;;###autoload
 (defun proofread-ignore ()

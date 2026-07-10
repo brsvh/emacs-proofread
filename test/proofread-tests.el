@@ -60,6 +60,20 @@
    :confidence 0.9
    :source 'test))
 
+(defun proofread-test--diagnostic-with-suggestions
+    (beg end text suggestions)
+  "Return a diagnostic for BEG, END, TEXT, and SUGGESTIONS."
+  (proofread--make-diagnostic
+   :beg beg
+   :end end
+   :text text
+   :kind 'spelling
+   :message "Possible misspelling"
+   :suggestions suggestions
+   :confidence 0.9
+   :source 'test
+   :locator (proofread--char-range-locator beg end)))
+
 (defun proofread-test--install-diagnostics (diagnostics)
   "Install DIAGNOSTICS and return their proofread overlays."
   (setq proofread--diagnostics diagnostics)
@@ -3931,7 +3945,7 @@
                   (error "Simulated frontend failure"))
                 nil t)
       (goto-char 2)
-      (should (eq (proofread-correct) 'applied))
+      (should (eq (proofread-correct-at-point) 'applied))
       (should (equal (buffer-string) "hello"))
       (should-not proofread--diagnostics)
       (should-not proofread--overlays))))
@@ -4144,8 +4158,8 @@
     (should (equal (proofread--diagnostic-suggestions diagnostic)
                    '("hello" "hullo" "42")))))
 
-(ert-deftest proofread-test-correct-single-suggestion-replaces-range ()
-  "`proofread-correct' applies one suggestion without prompting."
+(ert-deftest proofread-test-correct-at-point-single-suggestion ()
+  "`proofread-correct-at-point' applies one suggestion without prompting."
   (with-temp-buffer
     (insert "aa helo zz")
     (proofread-mode 1)
@@ -4162,11 +4176,11 @@
       (cl-letf (((symbol-function 'completing-read)
                  (lambda (&rest _args)
                    (error "Unexpected completion prompt"))))
-        (should (eq (proofread-correct) 'applied)))
+        (should (eq (proofread-correct-at-point) 'applied)))
       (should (equal (buffer-string) "aa hello zz")))))
 
-(ert-deftest proofread-test-correct-multiple-suggestions-uses-completion ()
-  "`proofread-correct' preserves candidate order for completion."
+(ert-deftest proofread-test-correct-at-point-multiple-suggestions ()
+  "`proofread-correct-at-point' preserves candidate order for completion."
   (with-temp-buffer
     (insert "aa helo zz")
     (proofread-mode 1)
@@ -4185,12 +4199,12 @@
                  (lambda (_prompt candidates &rest _args)
                    (setq candidates-seen candidates)
                    "hullo")))
-        (should (eq (proofread-correct) 'applied)))
+        (should (eq (proofread-correct-at-point) 'applied)))
       (should (equal candidates-seen '("hello" "hullo" "hallo")))
       (should (equal (buffer-string) "aa hullo zz")))))
 
-(ert-deftest proofread-test-correct-uses-native-completion ()
-  "`proofread-correct' uses `completing-read' for multiple suggestions."
+(ert-deftest proofread-test-correct-at-point-uses-native-completion ()
+  "`proofread-correct-at-point' uses completion for multiple suggestions."
   (let ((description-buffer (get-buffer proofread--description-buffer-name)))
     (when description-buffer
       (kill-buffer description-buffer)))
@@ -4217,12 +4231,271 @@
                    (setq candidates-seen candidates)
                    (setq require-match-seen require-match)
                    "hallo")))
-        (should (eq (proofread-correct) 'applied)))
+        (should (eq (proofread-correct-at-point) 'applied)))
       (should (equal prompt-seen "Apply suggestion: "))
       (should (equal candidates-seen '("hello" "hullo" "hallo")))
       (should require-match-seen)
       (should (equal (buffer-string) "aa hallo zz"))
       (should-not (get-buffer proofread--description-buffer-name)))))
+
+(ert-deftest proofread-test-correct-at-point-follows-preceding-edit ()
+  "Point correction follows a live diagnostic after preceding text changes."
+  (with-temp-buffer
+    (insert "helo")
+    (proofread-mode 1)
+    (let ((diagnostic
+           (proofread-test--diagnostic-with-suggestions
+            1 5 "helo" '("hello"))))
+      (proofread-test--install-diagnostics (list diagnostic))
+      (goto-char (point-min))
+      (insert "xx ")
+      (should (equal (proofread-diagnostic-range diagnostic) '(4 . 8)))
+      (goto-char 5)
+      (proofread-correct-at-point)
+      (should (equal (buffer-string) "xx hello")))))
+
+(ert-deftest proofread-test-correct-at-point-inserts-zero-width-suggestion ()
+  "Point correction applies and removes a zero-width diagnostic."
+  (with-temp-buffer
+    (insert "ab")
+    (proofread-mode 1)
+    (let ((diagnostic
+           (proofread-test--diagnostic-with-suggestions
+            2 2 "" '("X"))))
+      (proofread-test--install-diagnostics (list diagnostic))
+      (goto-char 2)
+      (should (eq (proofread-diagnostic-at-point) diagnostic))
+      (proofread-correct-at-point)
+      (should (equal (buffer-string) "aXb"))
+      (should-not proofread--diagnostics))))
+
+(ert-deftest proofread-test-correct-public-command-scopes ()
+  "Correction commands expose point, region, buffer, and visible scopes."
+  (dolist (command '(proofread-correct-at-point
+                     proofread-correct-region
+                     proofread-correct-buffer
+                     proofread-correct-visible-range))
+    (should (commandp command)))
+  (should-not (fboundp 'proofread-correct)))
+
+(ert-deftest proofread-test-correct-region-applies-from-end-to-beginning ()
+  "Region correction handles reversed bounds and changing text lengths."
+  (with-temp-buffer
+    (insert "helo and wrld; ouut.")
+    (proofread-mode 1)
+    (let ((first
+           (proofread-test--diagnostic-with-suggestions
+            1 5 "helo" '("hello")))
+          (second
+           (proofread-test--diagnostic-with-suggestions
+            10 14 "wrld" '("world")))
+          (outside
+           (proofread-test--diagnostic-with-suggestions
+            16 20 "ouut" '("out"))))
+      (proofread-test--install-diagnostics
+       (list first second outside))
+      (should (eq (proofread-correct-region 14 1) 'applied))
+      (should (equal (buffer-string) "hello and world; ouut."))
+      (should (equal proofread--diagnostics (list outside)))
+      (should (equal (proofread-diagnostic-range outside) '(18 . 22)))
+      (should (equal (plist-get outside :locator)
+                     '(:kind char-range :beg 18 :end 22))))))
+
+(ert-deftest proofread-test-correct-region-validates-interactive-bounds ()
+  "Interactive region correction rejects inactive and foreign bounds."
+  (with-temp-buffer
+    (insert "helo")
+    (proofread-mode 1)
+    (let ((transient-mark-mode t))
+      (goto-char (point-max))
+      (set-mark (point-min))
+      (setq mark-active nil)
+      (should-error (call-interactively #'proofread-correct-region)
+                    :type 'user-error))
+    (let ((other (generate-new-buffer " *proofread-correct-marker*")))
+      (unwind-protect
+          (let ((foreign
+                 (with-current-buffer other
+                   (insert "wrld")
+                   (copy-marker (point-min)))))
+            (should-error
+             (proofread-correct-region foreign (point-max))
+             :type 'user-error))
+        (kill-buffer other)))))
+
+(ert-deftest proofread-test-correct-buffer-respects-narrowing ()
+  "Buffer correction changes diagnostics only in the accessible portion."
+  (with-temp-buffer
+    (insert "helo middle wrld")
+    (proofread-mode 1)
+    (let ((outside
+           (proofread-test--diagnostic-with-suggestions
+            1 5 "helo" '("hello")))
+          (inside
+           (proofread-test--diagnostic-with-suggestions
+            13 17 "wrld" '("world"))))
+      (proofread-test--install-diagnostics (list outside inside))
+      (narrow-to-region 13 17)
+      (should (eq (proofread-correct-buffer) 'applied))
+      (should (= (point-min) 13))
+      (should (= (point-max) 18))
+      (widen)
+      (should (equal (buffer-string) "helo middle world"))
+      (should (equal proofread--diagnostics (list outside)))
+      (should (equal (proofread-diagnostic-range outside) '(1 . 5))))))
+
+(ert-deftest proofread-test-correct-visible-range-uses-all-ranges ()
+  "Visible-range correction changes only diagnostics in visible ranges."
+  (with-temp-buffer
+    (insert "helo and wrld and ouut")
+    (proofread-mode 1)
+    (let ((first
+           (proofread-test--diagnostic-with-suggestions
+            1 5 "helo" '("hello")))
+          (hidden
+           (proofread-test--diagnostic-with-suggestions
+            10 14 "wrld" '("world")))
+          (last
+           (proofread-test--diagnostic-with-suggestions
+            19 23 "ouut" '("out"))))
+      (proofread-test--install-diagnostics (list first hidden last))
+      (cl-letf (((symbol-function 'proofread--visible-ranges)
+                 (lambda () '((1 . 5) (19 . 23)))))
+        (should (eq (proofread-correct-visible-range) 'applied)))
+      (should (equal (buffer-string) "hello and wrld and out"))
+      (should (equal proofread--diagnostics (list hidden)))
+      (should (equal (proofread-diagnostic-range hidden) '(11 . 15)))
+      (should (equal (plist-get hidden :locator)
+                     '(:kind char-range :beg 11 :end 15))))))
+
+(ert-deftest proofread-test-correct-buffer-skips-unavailable-suggestions ()
+  "Buffer correction skips diagnostics without suggestions."
+  (with-temp-buffer
+    (insert "note helo")
+    (proofread-mode 1)
+    (let ((unavailable
+           (proofread-test--diagnostic-with-suggestions
+            1 5 "note" nil))
+          (available
+           (proofread-test--diagnostic-with-suggestions
+            6 10 "helo" '("hello"))))
+      (proofread-test--install-diagnostics (list unavailable available))
+      (should (eq (proofread-correct-buffer) 'applied))
+      (should (equal (buffer-string) "note hello"))
+      (should (equal proofread--diagnostics (list unavailable))))))
+
+(ert-deftest proofread-test-correct-buffer-keeps-adjacent-diagnostic-range ()
+  "A correction preserves an adjacent diagnostic's exact range."
+  (with-temp-buffer
+    (insert "helowrld")
+    (proofread-mode 1)
+    (let ((available
+           (proofread-test--diagnostic-with-suggestions
+            1 5 "helo" '("hello")))
+          (adjacent
+           (proofread-test--diagnostic-with-suggestions
+            5 9 "wrld" nil)))
+      (proofread-test--install-diagnostics (list available adjacent))
+      (proofread-correct-buffer)
+      (should (equal (buffer-string) "hellowrld"))
+      (should (equal proofread--diagnostics (list adjacent)))
+      (should (equal (proofread-diagnostic-range adjacent) '(6 . 10)))
+      (should (equal (buffer-substring-no-properties 6 10) "wrld")))))
+
+(ert-deftest proofread-test-correct-buffer-prefers-navigation-order ()
+  "Buffer correction skips overlapping diagnostics after the first one."
+  (with-temp-buffer
+    (insert "abcdef")
+    (proofread-mode 1)
+    (let ((long
+           (proofread-test--diagnostic-with-suggestions
+            1 5 "abcd" '("long")))
+          (short
+           (proofread-test--diagnostic-with-suggestions
+            1 3 "ab" '("XY"))))
+      (proofread-test--install-diagnostics (list long short))
+      (should (eq (proofread-correct-buffer) 'applied))
+      (should (equal (buffer-string) "XYcdef"))
+      (should-not proofread--diagnostics))))
+
+(ert-deftest proofread-test-correct-buffer-deduplicates-zero-width-position ()
+  "Buffer correction applies one diagnostic at a shared insertion point."
+  (with-temp-buffer
+    (insert "ab")
+    (proofread-mode 1)
+    (let ((first
+           (proofread-test--diagnostic-with-suggestions
+            2 2 "" '("X")))
+          (second
+           (proofread-test--diagnostic-with-suggestions
+            2 2 "" '("Y"))))
+      (proofread-test--install-diagnostics (list first second))
+      (proofread-correct-buffer)
+      (should (equal (buffer-string) "aXb"))
+      (should-not proofread--diagnostics))))
+
+(ert-deftest proofread-test-correct-buffer-is-one-undo-step ()
+  "One undo restores every replacement made by buffer correction."
+  (with-temp-buffer
+    (insert "helo wrld tail")
+    (buffer-enable-undo)
+    (proofread-mode 1)
+    (let ((first
+           (proofread-test--diagnostic-with-suggestions
+            1 5 "helo" '("hello")))
+          (second
+           (proofread-test--diagnostic-with-suggestions
+            6 10 "wrld" '("world")))
+          (survivor
+           (proofread-test--diagnostic-with-suggestions
+            11 15 "tail" nil)))
+      (proofread-test--install-diagnostics (list first second survivor))
+      (setq buffer-undo-list nil)
+      (proofread-correct-buffer)
+      (should (equal (buffer-string) "hello world tail"))
+      (should (equal (proofread-diagnostic-range survivor) '(13 . 17)))
+      (undo)
+      (should (equal (buffer-string) "helo wrld tail"))
+      (should (equal (proofread-diagnostic-range survivor) '(11 . 15)))
+      (should (equal (buffer-substring-no-properties 11 15) "tail")))))
+
+(ert-deftest proofread-test-correct-buffer-rolls-back-on-edit-error ()
+  "Buffer correction leaves text and diagnostics intact after an edit error."
+  (with-temp-buffer
+    (insert "helo wrld")
+    (add-text-properties 1 5 '(read-only t))
+    (proofread-mode 1)
+    (let ((first
+           (proofread-test--diagnostic-with-suggestions
+            1 5 "helo" '("hello")))
+          (second
+           (proofread-test--diagnostic-with-suggestions
+            6 10 "wrld" '("world"))))
+      (proofread-test--install-diagnostics (list first second))
+      (should-error (proofread-correct-buffer))
+      (should (equal (buffer-string) "helo wrld"))
+      (should (equal proofread--diagnostics (list first second)))
+      (should (= (length (proofread--current-buffer-overlays)) 2)))))
+
+(ert-deftest proofread-test-correct-buffer-notifies-diagnostics-once ()
+  "Buffer correction emits one final diagnostics notification."
+  (with-temp-buffer
+    (insert "helo wrld")
+    (proofread-mode 1)
+    (let ((calls 0)
+          (first
+           (proofread-test--diagnostic-with-suggestions
+            1 5 "helo" '("hello")))
+          (second
+           (proofread-test--diagnostic-with-suggestions
+            6 10 "wrld" '("world"))))
+      (proofread-test--install-diagnostics (list first second))
+      (add-hook 'proofread-diagnostics-changed-hook
+                (lambda ()
+                  (setq calls (1+ calls)))
+                nil t)
+      (proofread-correct-buffer)
+      (should (= calls 1)))))
 
 (ert-deftest proofread-test-apply-no-suggestion-reports-unavailable ()
   "Suggestion application reports no available suggestion without editing."
@@ -4238,7 +4511,7 @@
             :message "Possible misspelling")))
       (proofread-test--install-diagnostics (list diagnostic))
       (goto-char 2)
-      (should-error (proofread-correct) :type 'user-error)
+      (should-error (proofread-correct-at-point) :type 'user-error)
       (should (equal (buffer-string) "helo")))))
 
 (ert-deftest proofread-test-apply-invalid-range-rejected ()
@@ -4255,7 +4528,7 @@
             :suggestions '("hello"))))
       (setq proofread--diagnostics (list diagnostic))
       (goto-char 2)
-      (should-error (proofread-correct) :type 'user-error)
+      (should-error (proofread-correct-at-point) :type 'user-error)
       (should (equal (buffer-string) "helo")))))
 
 (ert-deftest proofread-test-apply-stale-overlay-rejected ()
@@ -4275,7 +4548,7 @@
                   (list diagnostic)))))
       (delete-overlay overlay)
       (goto-char 2)
-      (should-error (proofread-correct) :type 'user-error)
+      (should-error (proofread-correct-at-point) :type 'user-error)
       (should (equal (buffer-string) "helo")))))
 
 (ert-deftest proofread-test-apply-text-mismatch-rejected ()
@@ -4292,11 +4565,11 @@
             :suggestions '("hello"))))
       (proofread-test--install-diagnostics (list diagnostic))
       (goto-char 2)
-      (should-error (proofread-correct) :type 'user-error)
+      (should-error (proofread-correct-at-point) :type 'user-error)
       (should (equal (buffer-string) "hell")))))
 
 (ert-deftest proofread-test-apply-undo-restores-original-text ()
-  "Undo restores text replaced by `proofread-correct'."
+  "Undo restores text replaced by `proofread-correct-at-point'."
   (with-temp-buffer
     (insert "aa helo zz")
     (buffer-enable-undo)
@@ -4311,7 +4584,7 @@
             :suggestions '("hello"))))
       (proofread-test--install-diagnostics (list diagnostic))
       (goto-char 5)
-      (proofread-correct)
+      (proofread-correct-at-point)
       (should (equal (buffer-string) "aa hello zz"))
       (undo)
       (should (equal (buffer-string) "aa helo zz")))))
@@ -4342,7 +4615,7 @@
       (overlay-put foreign-overlay 'category 'foreign-overlay)
       (proofread--mark-current-diagnostic target)
       (goto-char 5)
-      (proofread-correct)
+      (proofread-correct-at-point)
       (should-not (overlay-buffer target-overlay))
       (should-not (overlay-buffer overlap-overlay))
       (should (overlay-buffer outside-overlay))

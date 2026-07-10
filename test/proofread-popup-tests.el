@@ -322,8 +322,8 @@
          (when (buffer-live-p buffer)
            (kill-buffer buffer)))))))
 
-(ert-deftest proofread-popup-test-correct-hides-frame-immediately ()
-  "`proofread-correct' immediately hides the corrected diagnostic's frame."
+(ert-deftest proofread-popup-test-correct-at-point-hides-frame ()
+  "Point correction immediately hides the corrected diagnostic's frame."
   (proofread-popup-test--with-posframe-recorder
    (save-window-excursion
      (with-temp-buffer
@@ -337,7 +337,7 @@
          (goto-char 5)
          (proofread-popup--update)
          (should proofread-popup--diagnostic)
-         (proofread-correct)
+         (proofread-correct-at-point)
          (should proofread-popup-test--hides)
          (should-not proofread-popup--diagnostic)
          (should (equal (buffer-string) "aa hello zz")))))))
