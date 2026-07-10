@@ -65,6 +65,13 @@ configuration."
   :type 'number
   :group 'proofread)
 
+(defcustom proofread-inhibit-progress-messages t
+  "Non-nil means suppress routine proofread echo-area progress messages.
+This affects background check and request-dispatch progress messages.  It does
+not suppress errors or explicit command feedback."
+  :type 'boolean
+  :group 'proofread)
+
 (defcustom proofread-max-chunk-size 2000
   "Maximum number of characters in a proofreading chunk."
   :type 'natnum
@@ -362,6 +369,11 @@ read-only and must not signal errors that interrupt proofreading.")
                    (error-message-string err))))
        nil)
      event)))
+
+(defun proofread--progress-message (format-string &rest args)
+  "Display a routine progress message using FORMAT-STRING and ARGS."
+  (unless proofread-inhibit-progress-messages
+    (apply #'message format-string args)))
 
 (defun proofread--record-request-event (request type &rest properties)
   "Record a lifecycle event of TYPE for REQUEST with PROPERTIES."
@@ -3428,17 +3440,19 @@ configured backend."
       (let* ((chunks (proofread--request-ready-visible-chunks))
              (requests (proofread--dispatch-request-ready-chunks chunks))
              (queued (length proofread--request-queue)))
-        (message "proofread: dispatched %d request%s%s from %d visible range%s"
-                 (length requests)
-                 (if (= (length requests) 1) "" "s")
-                 (if (> queued 0)
-                     (format "; queued %d" queued)
-                   "")
-                 (length proofread--pending-ranges)
-                 (if (= (length proofread--pending-ranges) 1) "" "s")))
-    (message "proofread: collected %d visible range%s; no available backend"
-             (length proofread--pending-ranges)
-             (if (= (length proofread--pending-ranges) 1) "" "s"))))
+        (proofread--progress-message
+         "proofread: dispatched %d request%s%s from %d visible range%s"
+         (length requests)
+         (if (= (length requests) 1) "" "s")
+         (if (> queued 0)
+             (format "; queued %d" queued)
+           "")
+         (length proofread--pending-ranges)
+         (if (= (length proofread--pending-ranges) 1) "" "s")))
+    (proofread--progress-message
+     "proofread: collected %d visible range%s; no available backend"
+     (length proofread--pending-ranges)
+     (if (= (length proofread--pending-ranges) 1) "" "s"))))
 
 ;;;###autoload
 (defun proofread-check-buffer ()

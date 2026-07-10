@@ -374,6 +374,26 @@
     (proofread-check-visible)
     (should-not proofread--pending-ranges)))
 
+(ert-deftest proofread-test-progress-messages-inhibited-by-default ()
+  "Routine progress messages are quiet by default."
+  (let (messages)
+    (cl-letf (((symbol-function 'message)
+               (lambda (format-string &rest args)
+                 (push (apply #'format format-string args) messages))))
+      (should proofread-inhibit-progress-messages)
+      (proofread--progress-message "proofread: %s" "checking")
+      (should-not messages))))
+
+(ert-deftest proofread-test-progress-messages-can-be-enabled ()
+  "Routine progress messages can be enabled explicitly."
+  (let ((proofread-inhibit-progress-messages nil)
+        messages)
+    (cl-letf (((symbol-function 'message)
+               (lambda (format-string &rest args)
+                 (push (apply #'format format-string args) messages))))
+      (proofread--progress-message "proofread: %s" "checking")
+      (should (equal messages '("proofread: checking"))))))
+
 (ert-deftest proofread-test-edit-schedules-idle-work ()
   "Editing in `proofread-mode' marks pending work and schedules a timer."
   (with-temp-buffer
