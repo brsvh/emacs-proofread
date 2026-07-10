@@ -161,28 +161,6 @@
                 #'proofread-test--llm-capabilities))
        ,@body)))
 
-(defmacro proofread-test--with-popup-recorder (&rest body)
-  "Run BODY while recording proofread child frame calls."
-  (declare (indent 0) (debug (body)))
-  `(let (proofread-test--popup-shows
-         proofread-test--popup-hides
-         proofread-test--popup-deletes)
-     (cl-letf (((symbol-function 'posframe-workable-p)
-                (lambda ()
-                  t))
-               ((symbol-function 'posframe-show)
-                (lambda (buffer-or-name &rest args)
-                  (push (cons buffer-or-name args)
-                        proofread-test--popup-shows)
-                  'proofread-test-posframe))
-               ((symbol-function 'posframe-hide)
-                (lambda (buffer-or-name)
-                  (push buffer-or-name proofread-test--popup-hides)))
-               ((symbol-function 'posframe-delete)
-                (lambda (buffer-or-name)
-                  (push buffer-or-name proofread-test--popup-deletes))))
-       ,@body)))
-
 (defun proofread-test--response-content (diagnostics)
   "Return structured response text containing DIAGNOSTICS."
   (json-encode `(("diagnostics" . ,(vconcat diagnostics)))))
@@ -218,8 +196,7 @@
 
 (ert-deftest proofread-test-face-defaults-avoid-fixed-colors ()
   "Proofread faces are defined without fixed color attributes."
-  (dolist (face '(proofread-face proofread-current-face
-                                 proofread-popup-face))
+  (dolist (face '(proofread-face proofread-current-face))
     (should (facep face))
     (let ((spec (face-default-spec face)))
       (should-not (proofread-test--tree-member-p :foreground spec))
@@ -235,15 +212,6 @@
   (let ((spec (face-default-spec 'proofread-face)))
     (should (proofread-test--tree-member-p 'warning spec))
     (should (proofread-test--tree-member-p :underline spec))))
-
-(ert-deftest proofread-test-popup-faces-use-own-defaults ()
-  "Proofread popup faces do not depend on external face definitions."
-  (let ((spec (face-default-spec 'proofread-popup-face)))
-    (should-not (proofread-test--tree-member-p 'eldoc-box-body spec))
-    (should-not (proofread-test--tree-member-p 'eldoc-box-border spec)))
-  (should (equal (face-default-spec 'proofread-popup-border-face)
-                 '((((background dark)) :background "white")
-                   (((background light)) :background "black")))))
 
 (ert-deftest proofread-test-overlay-stores-diagnostic ()
   "Created proofread overlays store ownership and diagnostic metadata."
@@ -3890,176 +3858,105 @@
       (goto-char 4)
       (should-not (proofread--diagnostic-at-point)))))
 
-(ert-deftest proofread-test-popup-shows-message-above-diagnostic-start ()
-  "The proofread child frame uses the diagnostic message and range start."
-  (proofread-test--with-popup-recorder
-   (save-window-excursion
-     (with-temp-buffer
-       (switch-to-buffer (current-buffer))
-       (insert "aa helo zz")
-       (proofread-mode 1)
-       (let ((diagnostic
-              (proofread--make-diagnostic
-               :beg 4
-               :end 8
-               :text "helo"
-               :kind 'spelling
-               :message "Possible misspelling"
-               :suggestions '("hello"))))
-         (proofread-test--install-diagnostics (list diagnostic))
-         (goto-char 5)
-         (proofread--popup-update)
-         (should (= (length proofread-test--popup-shows) 1))
-         (let* ((call (car proofread-test--popup-shows))
-                (args (cdr call))
-                (string (plist-get args :string)))
-           (should (string-prefix-p proofread--popup-buffer-prefix
-                                    (car call)))
-           (should (equal (substring-no-properties string)
-                          "Possible misspelling"))
-           (should (eq (get-text-property 0 'face string)
-                       'proofread-popup-face))
-           (should (= (plist-get args :position) 4))
-           (should (eq (plist-get args :poshandler)
-                       #'posframe-poshandler-point-bottom-left-corner-upward))
-           (should (= (plist-get args :internal-border-width) 1))
-           (should (= (plist-get args :left-fringe) 3))
-           (should (= (plist-get args :right-fringe) 3))
-           (should (eq (plist-get args :accept-focus) nil))
-           (should (member '(no-accept-focus . t)
-                           (plist-get args :override-parameters)))
-           (should (member '(no-focus-on-map . t)
-                           (plist-get args :override-parameters)))))))))
+(ert-deftest proofread-test-public-diagnostic-range-validates-range ()
+  "The public diagnostic range accessor returns only valid ranges."
+  (should (equal
+           (proofread-diagnostic-range
+            (proofread-test--diagnostic-for-range 3 6 "cde"))
+           '(3 . 6)))
+  (should-not (proofread-diagnostic-range '(:beg 7 :end 6)))
+  (should-not (proofread-diagnostic-range '(:beg invalid :end 6))))
 
-(ert-deftest proofread-test-popup-uses-themed-face-colors ()
-  "The proofread child frame forwards colors from the active face."
-  (proofread-test--with-popup-recorder
-   (save-window-excursion
-     (with-temp-buffer
-       (switch-to-buffer (current-buffer))
-       (insert "helo")
-       (proofread-mode 1)
-       (let ((diagnostic
-              (proofread--make-diagnostic
-               :beg 1
-               :end 5
-               :text "helo"
-               :message "Possible misspelling")))
-         (proofread-test--install-diagnostics (list diagnostic))
-         (goto-char 2)
-         (cl-letf (((symbol-function 'face-attribute)
-                    (lambda (face attribute &rest _args)
-                      (pcase (list face attribute)
-                        (`(proofread-popup-face :foreground)
-                         "theme-foreground")
-                        (`(proofread-popup-face :background)
-                         "theme-background")
-                        (`(proofread-popup-border-face :background)
-                         "theme-border")))))
-           (proofread--popup-update))
-         (let* ((call (car proofread-test--popup-shows))
-                (args (cdr call)))
-           (should (equal (plist-get args :foreground-color)
-                          "theme-foreground"))
-           (should (equal (plist-get args :background-color)
-                          "theme-background"))
-           (should (equal (plist-get args :internal-border-color)
-                          "theme-border"))))))))
+(ert-deftest proofread-test-public-diagnostic-at-point-requires-overlay ()
+  "The public diagnostic lookup returns only live displayed diagnostics."
+  (with-temp-buffer
+    (insert "abcdefghij")
+    (proofread-mode 1)
+    (let* ((diagnostic
+            (proofread-test--diagnostic-for-range 3 6 "cde"))
+           overlay)
+      (setq proofread--diagnostics (list diagnostic))
+      (should-not (proofread-diagnostic-at-point 4))
+      (setq overlay (proofread--create-overlay diagnostic))
+      (should (eq (proofread-diagnostic-at-point 4) diagnostic))
+      (delete-overlay overlay)
+      (should-not (proofread-diagnostic-at-point 4)))))
 
-(ert-deftest proofread-test-popup-does-not-refresh-same-diagnostic ()
-  "Moving inside one diagnostic does not repeatedly redraw the child frame."
-  (proofread-test--with-popup-recorder
-   (save-window-excursion
-     (with-temp-buffer
-       (switch-to-buffer (current-buffer))
-       (insert "aa helo zz")
-       (proofread-mode 1)
-       (let ((diagnostic
-              (proofread-test--diagnostic-for-range 4 8 "helo")))
-         (proofread-test--install-diagnostics (list diagnostic))
-         (goto-char 5)
-         (proofread--popup-update)
-         (goto-char 7)
-         (proofread--popup-update)
-         (should (= (length proofread-test--popup-shows) 1)))))))
+(ert-deftest proofread-test-public-diagnostic-at-point-skips-stale-overlap ()
+  "The public lookup skips an earlier stale overlapping diagnostic."
+  (with-temp-buffer
+    (insert "abcdefghij")
+    (proofread-mode 1)
+    (let ((stale
+           (proofread-test--diagnostic-for-range 2 8 "bcdefg"))
+          (live
+           (proofread-test--diagnostic-for-range 3 6 "cde")))
+      (setq proofread--diagnostics (list stale live))
+      (proofread--create-overlay live)
+      (should (eq (proofread-diagnostic-at-point 4) live)))))
 
-(ert-deftest proofread-test-popup-hides-away-from-diagnostic ()
-  "The proofread child frame hides when point leaves diagnostics."
-  (proofread-test--with-popup-recorder
-   (save-window-excursion
-     (with-temp-buffer
-       (switch-to-buffer (current-buffer))
-       (insert "aa helo zz")
-       (proofread-mode 1)
-       (let ((diagnostic
-              (proofread-test--diagnostic-for-range 4 8 "helo")))
-         (proofread-test--install-diagnostics (list diagnostic))
-         (goto-char 5)
-         (proofread--popup-update)
-         (goto-char 10)
-         (proofread--popup-update)
-         (should proofread-test--popup-hides)
-         (should-not proofread--popup-diagnostic))))))
+(ert-deftest proofread-test-diagnostics-changed-hook-runs-after-clear ()
+  "Clearing displayed diagnostics notifies optional frontends immediately."
+  (with-temp-buffer
+    (insert "abcdefghij")
+    (proofread-mode 1)
+    (let ((calls 0)
+          (diagnostic
+           (proofread-test--diagnostic-for-range 3 6 "cde")))
+      (add-hook 'proofread-diagnostics-changed-hook
+                (lambda ()
+                  (setq calls (1+ calls)))
+                nil t)
+      (proofread-test--install-diagnostics (list diagnostic))
+      (proofread-clear)
+      (should (= calls 1))
+      (should-not (proofread-diagnostic-at-point 4)))))
 
-(ert-deftest proofread-test-popup-disabled-does-not-show ()
-  "Disabling proofread popup display prevents child frame creation."
-  (proofread-test--with-popup-recorder
-   (save-window-excursion
-     (with-temp-buffer
-       (switch-to-buffer (current-buffer))
-       (insert "helo")
-       (proofread-mode 1)
-       (let ((proofread-popup-enabled nil)
-             (diagnostic
-              (proofread-test--diagnostic-for-range 1 5 "helo")))
-         (proofread-test--install-diagnostics (list diagnostic))
-         (goto-char 2)
-         (proofread--popup-update)
-         (should-not proofread-test--popup-shows))))))
+(ert-deftest proofread-test-diagnostics-hook-error-does-not-break-correction ()
+  "An optional frontend error does not interrupt applying a correction."
+  (with-temp-buffer
+    (insert "helo")
+    (proofread-mode 1)
+    (let ((diagnostic
+           (proofread--make-diagnostic
+            :beg 1
+            :end 5
+            :text "helo"
+            :kind 'spelling
+            :message "Possible misspelling"
+            :suggestions '("hello"))))
+      (proofread-test--install-diagnostics (list diagnostic))
+      (add-hook 'proofread-diagnostics-changed-hook
+                (lambda ()
+                  (error "Simulated frontend failure"))
+                nil t)
+      (goto-char 2)
+      (should (eq (proofread-correct) 'applied))
+      (should (equal (buffer-string) "hello"))
+      (should-not proofread--diagnostics)
+      (should-not proofread--overlays))))
 
-(ert-deftest proofread-test-popup-disable-mode-hides-frame ()
-  "Disabling `proofread-mode' hides any proofread child frame."
-  (proofread-test--with-popup-recorder
-   (save-window-excursion
-     (with-temp-buffer
-       (switch-to-buffer (current-buffer))
-       (insert "helo")
-       (proofread-mode 1)
-       (let ((diagnostic
-              (proofread-test--diagnostic-for-range 1 5 "helo")))
-         (proofread-test--install-diagnostics (list diagnostic))
-         (goto-char 2)
-         (proofread--popup-update)
-         (proofread-mode -1)
-         (should proofread-test--popup-hides)
-         (should proofread-test--popup-deletes)
-         (should-not (memq #'proofread--popup-update
-                           post-command-hook))
-         (should-not proofread--popup-diagnostic))))))
-
-(ert-deftest proofread-test-popup-correct-hides-frame ()
-  "`proofread-correct' hides the child frame for the corrected diagnostic."
-  (proofread-test--with-popup-recorder
-   (save-window-excursion
-     (with-temp-buffer
-       (switch-to-buffer (current-buffer))
-       (insert "aa helo zz")
-       (proofread-mode 1)
-       (let ((diagnostic
-              (proofread--make-diagnostic
-               :beg 4
-               :end 8
-               :text "helo"
-               :kind 'spelling
-               :message "Possible misspelling"
-               :suggestions '("hello"))))
-         (proofread-test--install-diagnostics (list diagnostic))
-         (goto-char 5)
-         (proofread--popup-update)
-         (proofread-correct)
-         (should proofread-test--popup-hides)
-         (should-not proofread--popup-diagnostic)
-         (should (equal (buffer-string) "aa hello zz")))))))
+(ert-deftest proofread-test-backend-replace-notifies-diagnostics-once ()
+  "One backend replacement emits one final diagnostics notification."
+  (with-temp-buffer
+    (insert "helo")
+    (proofread-mode 1)
+    (let ((calls 0)
+          (old
+           (proofread-test--diagnostic-for-range 1 5 "helo"))
+          (new
+           (proofread-test--diagnostic-with-kind
+            1 5 "helo" 'grammar)))
+      (proofread-test--install-diagnostics (list old))
+      (add-hook 'proofread-diagnostics-changed-hook
+                (lambda ()
+                  (setq calls (1+ calls)))
+                nil t)
+      (proofread--replace-backend-diagnostics
+       (list :beg 1 :end 5)
+       (list new))
+      (should (= calls 1))
+      (should (equal proofread--diagnostics (list new))))))
 
 (ert-deftest proofread-test-format-diagnostic-description-details ()
   "Diagnostic description includes stable package-level fields."

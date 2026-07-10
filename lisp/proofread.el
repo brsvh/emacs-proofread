@@ -4,7 +4,7 @@
 
 ;; Author: Bingshan Chang <chang@bingshan.org>
 ;; Keywords: convenience, wp
-;; Package-Requires: ((emacs "30.1") (llm "0.31.1") (posframe "1.5.2"))
+;; Package-Requires: ((emacs "30.1") (llm "0.31.1"))
 ;; Version: 0.1.0
 
 ;; This file is not part of GNU Emacs.
@@ -35,7 +35,6 @@
 (require 'json)
 (require 'lisp-mode)
 (require 'llm)
-(require 'posframe)
 (require 'pp)
 (require 'pulse)
 (require 'subr-x)
@@ -206,16 +205,6 @@ property has a non-nil value is not included in request-ready chunks."
   :type '(repeat symbol)
   :group 'proofread)
 
-(defcustom proofread-popup-enabled t
-  "Non-nil means show a child frame message for the diagnostic at point."
-  :type 'boolean
-  :group 'proofread)
-
-(defcustom proofread-popup-max-width 80
-  "Maximum width of the proofread child frame message."
-  :type 'natnum
-  :group 'proofread)
-
 (defface proofread-face
   '((t :inherit warning :underline (:style wave)))
   "Face for proofreading diagnostics."
@@ -224,17 +213,6 @@ property has a non-nil value is not included in request-ready chunks."
 (defface proofread-current-face
   '((t :inherit proofread-face :weight bold))
   "Face for the current proofreading diagnostic."
-  :group 'proofread)
-
-(defface proofread-popup-face
-  '((t :inherit default))
-  "Face for proofreading child frame messages."
-  :group 'proofread)
-
-(defface proofread-popup-border-face
-  '((((background dark)) :background "white")
-    (((background light)) :background "black"))
-  "Face for proofreading child frame borders."
   :group 'proofread)
 
 (defconst proofread--diagnostic-keys
@@ -321,9 +299,6 @@ property has a non-nil value is not included in request-ready chunks."
 (defconst proofread--description-buffer-name "*Proofread Diagnostic*"
   "Buffer name used to display proofread diagnostic descriptions.")
 
-(defconst proofread--popup-buffer-prefix " *Proofread Popup*"
-  "Prefix for hidden buffers used by proofread child frames.")
-
 (defvar proofread--ignored-diagnostics (make-hash-table :test #'equal)
   "Session-local table of ignored proofread diagnostic keys.")
 
@@ -341,24 +316,6 @@ property has a non-nil value is not included in request-ready chunks."
 
 (defvar-local proofread--diagnostics-buffer-source nil
   "Source buffer for a proofread diagnostics listing buffer.")
-
-(defvar-local proofread--popup-buffer-name nil
-  "Hidden posframe buffer name for the current proofread buffer.")
-
-(defvar-local proofread--popup-diagnostic nil
-  "Diagnostic currently displayed in the proofread child frame.")
-
-(defvar-local proofread--popup-position nil
-  "Buffer position currently used for the proofread child frame.")
-
-(defvar-local proofread--popup-window nil
-  "Window where the proofread child frame was last positioned.")
-
-(defvar-local proofread--popup-window-start nil
-  "Window start used for the current proofread child frame position.")
-
-(defvar-local proofread--popup-visible-p nil
-  "Non-nil when the current proofread child frame should be visible.")
 
 (defvar-local proofread--pending-ranges nil
   "Pending proofread ranges for the current buffer.")
@@ -394,6 +351,11 @@ property has a non-nil value is not included in request-ready chunks."
 Each function receives one plist argument.  Consumers should treat the event as
 read-only and must not signal errors that interrupt proofreading.")
 
+(defvar-local proofread-diagnostics-changed-hook nil
+  "Hook run after displayed diagnostics change in the current buffer.
+Functions are called without arguments.  Errors are reported without
+interrupting proofreading.")
+
 (defvar proofread--mode-buffers nil
   "Live buffers where `proofread-mode' has installed local hooks.")
 
@@ -421,6 +383,19 @@ read-only and must not signal errors that interrupt proofreading.")
   "Display a routine progress message using FORMAT-STRING and ARGS."
   (unless proofread-inhibit-progress-messages
     (apply #'message format-string args)))
+
+(defun proofread--run-diagnostics-changed-hook ()
+  "Run `proofread-diagnostics-changed-hook' without breaking proofreading."
+  (when proofread-diagnostics-changed-hook
+    (run-hook-wrapped
+     'proofread-diagnostics-changed-hook
+     (lambda (function)
+       (condition-case err
+           (funcall function)
+         (error
+          (message "proofread diagnostics hook error: %s"
+                   (error-message-string err))))
+       nil))))
 
 (defun proofread--record-request-event (request type &rest properties)
   "Record a lifecycle event of TYPE for REQUEST with PROPERTIES."
@@ -2474,11 +2449,14 @@ When BACKEND is nil, use the selected `proofread-backend'."
        :result result)
       (proofread--handle-backend-result result))))
 
-(defun proofread--clear-diagnostics-in-range (beg end)
-  "Remove current proofread diagnostics intersecting BEG to END."
+(defun proofread--clear-diagnostics-in-range
+    (beg end &optional inhibit-notification)
+  "Remove current proofread diagnostics intersecting BEG to END.
+When INHIBIT-NOTIFICATION is non-nil, defer the diagnostics change hook."
   (proofread--invalidate-affected-diagnostics
    (proofread--overlays-intersecting-range beg end)
-   (proofread--diagnostics-intersecting-range beg end)))
+   (proofread--diagnostics-intersecting-range beg end)
+   inhibit-notification))
 
 (defun proofread--apply-backend-diagnostics (diagnostics)
   "Record DIAGNOSTICS and create proofread-owned overlays for them."
@@ -2487,14 +2465,14 @@ When BACKEND is nil, use the selected `proofread-backend'."
           (append proofread--diagnostics diagnostics))
     (dolist (diagnostic diagnostics)
       (proofread--create-overlay diagnostic))
-    (proofread--popup-update)))
+    (proofread--run-diagnostics-changed-hook)))
 
 (defun proofread--replace-backend-diagnostics (request diagnostics)
   "Replace current diagnostics for REQUEST with DIAGNOSTICS."
   (let ((beg (proofread--position-integer (plist-get request :beg)))
         (end (proofread--position-integer (plist-get request :end))))
     (when (and beg end)
-      (proofread--clear-diagnostics-in-range beg end)))
+      (proofread--clear-diagnostics-in-range beg end t)))
   (proofread--apply-backend-diagnostics diagnostics))
 
 (defun proofread--handle-backend-result (result)
@@ -2667,7 +2645,6 @@ When BACKEND is nil, use `proofread-backend'.  Return dispatched requests."
 
 (defun proofread--kill-buffer ()
   "Clean up proofread scheduling state before killing the current buffer."
-  (proofread--popup-delete)
   (proofread--clear-scheduled-work)
   (proofread--cancel-active-requests)
   (proofread--unregister-mode-buffer))
@@ -2702,16 +2679,14 @@ When BACKEND is nil, use `proofread-backend'.  Return dispatched requests."
 (defun proofread--delete-overlay (overlay)
   "Delete proofread-owned OVERLAY when it is live."
   (when (proofread--overlay-p overlay)
-    (when (equal (overlay-get overlay 'proofread-diagnostic)
-                 proofread--popup-diagnostic)
-      (proofread--popup-hide))
     (delete-overlay overlay)))
 
 (defun proofread--overlay-modified (overlay after _beg _end &optional _length)
   "Delete proofread-owned OVERLAY when its text is modified.
 AFTER is non-nil for the after-change notification."
   (unless after
-    (proofread--delete-overlay overlay)))
+    (proofread--delete-overlay overlay)
+    (proofread--run-diagnostics-changed-hook)))
 
 (defun proofread--diagnostic-range (diagnostic)
   "Return DIAGNOSTIC's valid range as a cons cell, or nil."
@@ -2721,6 +2696,10 @@ AFTER is non-nil for the after-change notification."
               (plist-get diagnostic :end))))
     (when (and beg end (<= beg end))
       (cons beg end))))
+
+(defun proofread-diagnostic-range (diagnostic)
+  "Return DIAGNOSTIC's valid buffer range, or nil."
+  (proofread--diagnostic-range diagnostic))
 
 (defun proofread--navigation-entry< (a b)
   "Return non-nil when navigation entry A should sort before B."
@@ -2841,6 +2820,7 @@ navigation order."
                (proofread--diagnostic-matches-ignore-key-p
                 proofread--current-diagnostic key))
       (setq proofread--current-diagnostic nil))
+    (proofread--run-diagnostics-changed-hook)
     diagnostics))
 
 (defun proofread--next-diagnostic-after (position)
@@ -2879,6 +2859,18 @@ navigation order."
                         diagnostic))
         (setq found overlay)))
     found))
+
+(defun proofread-diagnostic-at-point (&optional position)
+  "Return the live proofreading diagnostic at POSITION or point.
+A diagnostic is live only while its proofread-owned overlay exists in the
+current buffer."
+  (let ((point-position (or position (point))))
+    (catch 'found
+      (dolist (diagnostic (proofread--navigation-diagnostics))
+        (when (and (proofread--diagnostic-covers-position-p
+                    diagnostic point-position)
+                   (proofread--overlay-for-diagnostic diagnostic))
+          (throw 'found diagnostic))))))
 
 (defun proofread--mark-current-diagnostic (diagnostic)
   "Mark DIAGNOSTIC as current and update proofread-owned overlay faces."
@@ -3601,141 +3593,6 @@ When RESET is non-nil, move from the beginning of the buffer."
   "Fit proofread diagnostics WINDOW to its buffer."
   (fit-window-to-buffer window 15 8))
 
-(defun proofread--popup-buffer ()
-  "Return the hidden buffer name used for the current proofread child frame."
-  (or proofread--popup-buffer-name
-      (setq proofread--popup-buffer-name
-            (generate-new-buffer-name proofread--popup-buffer-prefix))))
-
-(defun proofread--popup-available-p ()
-  "Return non-nil when proofread can show a child frame."
-  (and proofread-popup-enabled
-       (posframe-workable-p)))
-
-(defun proofread--popup-selected-buffer-p ()
-  "Return non-nil when the selected window displays the current buffer."
-  (eq (window-buffer (selected-window))
-      (current-buffer)))
-
-(defun proofread--popup-window-start-position ()
-  "Return the selected window start as an integer position."
-  (proofread--position-integer
-   (window-start (selected-window))))
-
-(defun proofread--popup-message (diagnostic)
-  "Return the child frame message for DIAGNOSTIC."
-  (let ((message (plist-get diagnostic :message)))
-    (cond
-     ((and (stringp message)
-           (not (string-empty-p (string-trim message))))
-      (string-trim message))
-     (message
-      (proofread--format-diagnostic-field message))
-     ((plist-get diagnostic :text)
-      (format "Proofread: %s"
-              (proofread--format-diagnostic-field
-               (plist-get diagnostic :text))))
-     (t "Proofread diagnostic"))))
-
-(defun proofread--face-color (face attribute)
-  "Return FACE color ATTRIBUTE, or nil if unspecified."
-  (let ((value (face-attribute face attribute nil t)))
-    (unless (eq value 'unspecified)
-      value)))
-
-(defun proofread--popup-diagnostic-at-point ()
-  "Return the visible proofread diagnostic at point, or nil."
-  (let ((diagnostic (proofread--diagnostic-at-point)))
-    (when (and diagnostic
-               (proofread--overlay-for-diagnostic diagnostic))
-      diagnostic)))
-
-(defun proofread--popup-needs-refresh-p (diagnostic position)
-  "Return non-nil when the child frame needs DIAGNOSTIC at POSITION."
-  (not (and (eq diagnostic proofread--popup-diagnostic)
-            (equal position proofread--popup-position)
-            (eq (selected-window) proofread--popup-window)
-            (equal (proofread--popup-window-start-position)
-                   proofread--popup-window-start))))
-
-(defun proofread--popup-hide ()
-  "Hide the current proofread child frame."
-  (when (and proofread--popup-buffer-name
-             proofread--popup-visible-p)
-    (posframe-hide proofread--popup-buffer-name))
-  (setq proofread--popup-diagnostic nil)
-  (setq proofread--popup-position nil)
-  (setq proofread--popup-window nil)
-  (setq proofread--popup-window-start nil)
-  (setq proofread--popup-visible-p nil))
-
-(defun proofread--popup-delete ()
-  "Delete the current proofread child frame and hidden buffer."
-  (when proofread--popup-buffer-name
-    (posframe-delete proofread--popup-buffer-name))
-  (setq proofread--popup-buffer-name nil)
-  (setq proofread--popup-diagnostic nil)
-  (setq proofread--popup-position nil)
-  (setq proofread--popup-window nil)
-  (setq proofread--popup-window-start nil)
-  (setq proofread--popup-visible-p nil))
-
-(defun proofread--popup-show (diagnostic)
-  "Show DIAGNOSTIC's message in a child frame."
-  (let ((range (proofread--diagnostic-range diagnostic)))
-    (if (and range
-             (proofread--popup-selected-buffer-p)
-             (proofread--popup-available-p))
-        (let ((position (car range))
-              (message (proofread--popup-message diagnostic)))
-          (posframe-show
-           (proofread--popup-buffer)
-           :string (propertize message 'face 'proofread-popup-face)
-           :position position
-           :poshandler
-           #'posframe-poshandler-point-bottom-left-corner-upward
-           :foreground-color
-           (proofread--face-color 'proofread-popup-face :foreground)
-           :background-color
-           (proofread--face-color 'proofread-popup-face :background)
-           :max-width (max 1 proofread-popup-max-width)
-           :min-width 1
-           :internal-border-width 1
-           :internal-border-color
-           (proofread--face-color 'proofread-popup-border-face :background)
-           :left-fringe 3
-           :right-fringe 3
-           :accept-focus nil
-           :override-parameters
-           '((no-accept-focus . t)
-             (no-focus-on-map . t)
-             (cursor-type . nil)
-             (no-special-glyphs . t)
-             (desktop-dont-save . t))
-           :hidehandler #'posframe-hidehandler-when-buffer-switch)
-          (setq proofread--popup-diagnostic diagnostic)
-          (setq proofread--popup-position position)
-          (setq proofread--popup-window (selected-window))
-          (setq proofread--popup-window-start
-                (proofread--popup-window-start-position))
-          (setq proofread--popup-visible-p t))
-      (proofread--popup-hide))))
-
-(defun proofread--popup-update ()
-  "Update the proofread child frame for the diagnostic at point."
-  (if (and proofread-mode
-           proofread-popup-enabled
-           (proofread--popup-selected-buffer-p))
-      (let* ((diagnostic (proofread--popup-diagnostic-at-point))
-             (range (and diagnostic
-                         (proofread--diagnostic-range diagnostic)))
-             (position (car-safe range)))
-        (if (and diagnostic position)
-            (when (proofread--popup-needs-refresh-p diagnostic position)
-              (proofread--popup-show diagnostic))
-          (proofread--popup-hide)))
-    (proofread--popup-hide)))
-
 (defun proofread--format-diagnostic-field (value)
   "Return VALUE formatted for a diagnostic description."
   (cond
@@ -3830,15 +3687,19 @@ When RESET is non-nil, move from the beginning of the buffer."
                           diagnostic))
                       proofread--diagnostics))))
 
-(defun proofread--invalidate-affected-diagnostics (overlays diagnostics)
-  "Invalidate proofread-owned OVERLAYS and DIAGNOSTICS after text changes."
+(defun proofread--invalidate-affected-diagnostics
+    (overlays diagnostics &optional inhibit-notification)
+  "Invalidate proofread-owned OVERLAYS and DIAGNOSTICS after text changes.
+When INHIBIT-NOTIFICATION is non-nil, defer the diagnostics change hook."
   (dolist (overlay overlays)
     (proofread--delete-overlay overlay))
   (proofread--remove-diagnostics diagnostics)
   (when (and proofread--current-diagnostic
              (member proofread--current-diagnostic diagnostics))
     (setq proofread--current-diagnostic nil))
-  (proofread--prune-overlays))
+  (proofread--prune-overlays)
+  (unless inhibit-notification
+    (proofread--run-diagnostics-changed-hook)))
 
 (defun proofread--apply-suggestion-to-diagnostic (diagnostic suggestion)
   "Replace DIAGNOSTIC's range with SUGGESTION and invalidate stale state."
@@ -3937,24 +3798,18 @@ When RESET is non-nil, move from the beginning of the buffer."
 
 (defun proofread--clear-overlays ()
   "Delete proofread-owned overlays in the current buffer."
-  (proofread--popup-hide)
   (dolist (overlay (proofread--current-buffer-overlays))
     (delete-overlay overlay))
   (setq proofread--overlays nil)
   (setq proofread--current-diagnostic nil)
-  (force-window-update (current-buffer)))
+  (force-window-update (current-buffer))
+  (proofread--run-diagnostics-changed-hook))
 
 (defun proofread--initialize-buffer-state ()
   "Initialize proofread-owned state for the current buffer."
   (setq-local proofread--diagnostics nil)
   (setq-local proofread--overlays nil)
   (setq-local proofread--current-diagnostic nil)
-  (setq-local proofread--popup-buffer-name nil)
-  (setq-local proofread--popup-diagnostic nil)
-  (setq-local proofread--popup-position nil)
-  (setq-local proofread--popup-window nil)
-  (setq-local proofread--popup-window-start nil)
-  (setq-local proofread--popup-visible-p nil)
   (setq-local proofread--pending-ranges nil)
   (setq-local proofread--requests nil)
   (setq-local proofread--request-queue nil)
@@ -3968,7 +3823,6 @@ When RESET is non-nil, move from the beginning of the buffer."
   (proofread--clear-scheduled-work)
   (proofread--cancel-active-requests)
   (proofread--clear-overlays)
-  (proofread--popup-delete)
   (setq proofread--diagnostics nil)
   (setq proofread--current-diagnostic nil)
   (setq proofread--pending-ranges nil)
@@ -3980,14 +3834,12 @@ When RESET is non-nil, move from the beginning of the buffer."
   "Enable proofread buffer-local hooks and state in the current buffer."
   (proofread--initialize-buffer-state)
   (add-hook 'after-change-functions #'proofread--after-change nil t)
-  (add-hook 'post-command-hook #'proofread--popup-update nil t)
   (add-hook 'kill-buffer-hook #'proofread--kill-buffer nil t)
   (proofread--register-mode-buffer))
 
 (defun proofread--disable-buffer ()
   "Disable proofread buffer-local hooks and state in the current buffer."
   (remove-hook 'after-change-functions #'proofread--after-change t)
-  (remove-hook 'post-command-hook #'proofread--popup-update t)
   (remove-hook 'kill-buffer-hook #'proofread--kill-buffer t)
   (proofread--clear-buffer-state)
   (proofread--unregister-mode-buffer))

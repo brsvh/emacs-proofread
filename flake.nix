@@ -57,12 +57,11 @@
                   emacsPackagesFor
                   ;
 
-                package =
+                emacs-proofread =
                   {
                     lib,
                     llm,
                     melpaBuild,
-                    posframe,
                     projectRoot,
                     ...
                   }:
@@ -75,27 +74,69 @@
                   melpaBuild {
                     packageRequires = [
                       llm
-                      posframe
                     ];
 
                     meta = {
                       description = "Context-aware LLM proofreading for GNU Emacs";
-                      homepage = "https://codeberg.org/bingshan/emacs-proofread";
+                      homepage = "https://github.com/brsvh/emacs-proofread";
                       license = licenses.gpl3Plus;
                       maintainers = with maintainers; [ brsvh ];
                     };
 
                     pname = "proofread";
-                    src = projectRoot + /lisp;
+                    src = projectRoot + /lisp/proofread.el;
                     version = "0.1.0";
                   };
 
-                scope = finalAttrs: prevAttrs: {
-                  proofread = finalAttrs.callPackage package {
-                    inherit
-                      projectRoot
+                emacs-proofread-popup =
+                  {
+                    lib,
+                    melpaBuild,
+                    posframe,
+                    projectRoot,
+                    proofread,
+                    ...
+                  }:
+                  let
+                    inherit (lib)
+                      licenses
+                      maintainers
                       ;
+                  in
+                  melpaBuild {
+                    packageRequires = [
+                      proofread
+                      posframe
+                    ];
+
+                    meta = {
+                      description = "Popup diagnostics for proofread";
+                      homepage = "https://github.com/brsvh/emacs-proofread";
+                      license = licenses.gpl3Plus;
+                      maintainers = with maintainers; [ brsvh ];
+                    };
+
+                    pname = "proofread-popup";
+                    src = projectRoot + /lisp/proofread-popup.el;
+                    version = "0.1.0";
                   };
+
+                scope = finalAttrs: _: {
+                  proofread =
+                    finalAttrs.callPackage emacs-proofread
+                      {
+                        inherit
+                          projectRoot
+                          ;
+                      };
+
+                  proofread-popup =
+                    finalAttrs.callPackage emacs-proofread-popup
+                      {
+                        inherit
+                          projectRoot
+                          ;
+                      };
                 };
               in
               {
@@ -161,21 +202,24 @@
                   acc: base:
                   let
                     inherit (pkgs)
+                      coreutils
                       emacsPackagesFor
                       writeShellApplication
                       ;
 
                     version = "${versions.major base.version}";
 
-                    emacs =
+                    emacs-with-proofread =
                       (emacsPackagesFor base).emacsWithPackages
-                        (
-                          epkgs: with epkgs; [
-                            llm
-                            posframe
-                            proofread
-                          ]
-                        );
+                        (epkgs: [
+                          epkgs.proofread
+                        ]);
+
+                    emacs-with-proofread-popup =
+                      (emacsPackagesFor base).emacsWithPackages
+                        (epkgs: [
+                          epkgs.proofread-popup
+                        ]);
                   in
                   acc
                   // {
@@ -185,7 +229,8 @@
                           name = "emacs${version}-with-proofread";
 
                           runtimeInputs = [
-                            emacs
+                            coreutils
+                            emacs-with-proofread-popup
                           ];
 
                           text = ''
@@ -199,16 +244,24 @@
                           name = "emacs${version}-run-proofread-tests";
 
                           runtimeInputs = [
-                            emacs
+                            coreutils
                           ];
 
                           text = ''
-                            initdir="$(mktemp --tmpdir -d emacs-proofread-test-XXXXXX)"
-                            trap 'rm -rf "$initdir"' EXIT
+                            coreInitdir="$(mktemp --tmpdir -d emacs-proofread-test-XXXXXX)"
+                            popupInitdir="$(mktemp --tmpdir -d emacs-proofread-popup-test-XXXXXX)"
+                            trap 'rm -rf "$coreInitdir" "$popupInitdir"' EXIT
 
-                            emacs --batch \
-                              --init-directory "$initdir" \
+                            "${emacs-with-proofread}/bin/emacs" --batch \
+                              --init-directory "$coreInitdir" \
                               -l "${projectRoot + /test/proofread-tests.el}" \
+                              -f ert-run-tests-batch-and-exit
+
+                            "${emacs-with-proofread-popup}/bin/emacs" --batch \
+                              --init-directory "$popupInitdir" \
+                              -l "${
+                                projectRoot + /test/proofread-popup-tests.el
+                              }" \
                               -f ert-run-tests-batch-and-exit
                           '';
                         };
@@ -219,7 +272,7 @@
                           name = "emacs${version}-byte-compile-proofread";
 
                           runtimeInputs = [
-                            emacs
+                            coreutils
                           ];
 
                           text = ''
@@ -227,13 +280,26 @@
                             workdir="$(mktemp --tmpdir -d emacs-proofread-byte-compile-src-XXXXXX)"
                             trap 'rm -rf "$initdir" "$workdir"' EXIT
 
-                            cp lisp/proofread.el "$workdir/proofread.el"
+                            cp "${
+                              projectRoot + /lisp/proofread.el
+                            }" "$workdir/proofread.el"
+                            cp "${
+                              projectRoot + /lisp/proofread-popup.el
+                            }" "$workdir/proofread-popup.el"
 
-                            emacs --batch \
+                            "${emacs-with-proofread}/bin/emacs" --batch \
                               --init-directory "$initdir" \
+                              -L "$workdir" \
                               --eval '(setq byte-compile-error-on-warn t)' \
                               -f batch-byte-compile \
                               "$workdir/proofread.el"
+
+                            "${emacs-with-proofread-popup}/bin/emacs" --batch \
+                              --init-directory "$initdir" \
+                              -L "$workdir" \
+                              --eval '(setq byte-compile-error-on-warn t)' \
+                              -f batch-byte-compile \
+                              "$workdir/proofread-popup.el"
                           '';
                         };
                   }
