@@ -71,6 +71,13 @@
             (plist-get chunk :text))
           chunks))
 
+(defun proofread-test--combined-chunk-text (chunks)
+  "Return the text payloads from CHUNKS joined by newlines."
+  (mapconcat (lambda (chunk)
+               (plist-get chunk :text))
+             chunks
+             "\n"))
+
 (defun proofread-test--chunk-ranges (chunks)
   "Return the buffer ranges from CHUNKS."
   (mapcar (lambda (chunk)
@@ -774,8 +781,8 @@
                         ((symbol-function 'proofread-backend-available-p)
                          (lambda () t))
                         ((symbol-function
-                          'proofread--request-ready-visible-chunks)
-                         (lambda () '((:text "Alpha"))))
+                          'proofread--request-ready-chunks-for-islands)
+                         (lambda (_islands) '((:text "Alpha"))))
                         ((symbol-function
                           'proofread--dispatch-request-ready-chunks)
                          (lambda (chunks)
@@ -1782,13 +1789,10 @@
   (with-temp-buffer
     (insert "helo wrld")
     (proofread-mode 1)
-    (let* ((request
-            (list :buffer (current-buffer)
-                  :beg (point-min)
-                  :end (point-max)
-                  :text (buffer-string)
-                  :modified-tick (buffer-chars-modified-tick)
-                  :backend 'llm))
+    (let* ((chunk
+            (car (proofread--request-ready-chunks-for-ranges
+                  (list (cons (point-min) (point-max))))))
+           (request (proofread--make-backend-request chunk 'llm))
            (diagnostic
             (proofread-test--diagnostic-for-range 1 5 "helo")))
       (should (eq (proofread--handle-backend-result
@@ -4581,13 +4585,10 @@
     (with-temp-buffer
       (insert "helo")
       (proofread-mode 1)
-      (let* ((request
-              (list :buffer (current-buffer)
-                    :beg 1
-                    :end 5
-                    :text "helo"
-                    :modified-tick (buffer-chars-modified-tick)
-                    :backend 'llm))
+      (let* ((chunk
+              (car (proofread--request-ready-chunks-for-ranges
+                    (list (cons (point-min) (point-max))))))
+             (request (proofread--make-backend-request chunk 'llm))
              (diagnostic
               (proofread-test--diagnostic-with-kind
                1 5 "helo" 'spelling))
@@ -4853,6 +4854,433 @@
                   (kill-buffer buffer)))))
         (when (buffer-live-p source)
           (kill-buffer source))))))
+
+(ert-deftest proofread-test-targets-default-auto-and-buffer-local ()
+  "`proofread-targets' defaults to automatic buffer-local selection."
+  (should (custom-variable-p 'proofread-targets))
+  (should (eq (default-value 'proofread-targets) 'auto))
+  (should (local-variable-if-set-p 'proofread-targets))
+  (with-temp-buffer
+    (setq proofread-targets 'comments)
+    (should (local-variable-p 'proofread-targets))
+    (should (eq proofread-targets 'comments))
+    (with-temp-buffer
+      (should (eq proofread-targets 'auto)))))
+
+(ert-deftest proofread-test-targets-auto-prog-selects-prose-containers ()
+  "Automatic programming targets include comments and docstrings only."
+  (with-temp-buffer
+    (emacs-lisp-mode)
+    (insert "(setq code-token 1)\n"
+            ";; Comment prose token.\n"
+            "(setq ordinary \"Ordinary string token.\")\n"
+            "(defun sample ()\n"
+            "  \"Docstring prose token.\"\n"
+            "  code-token)\n")
+    (let* ((chunks
+            (proofread--request-ready-chunks-for-ranges
+             (list (cons (point-min) (point-max)))))
+           (text (proofread-test--combined-chunk-text chunks)))
+      (should (eq proofread-targets 'auto))
+      (should (string-match-p "Comment prose token" text))
+      (should (string-match-p "Docstring prose token" text))
+      (should-not (string-match-p "Ordinary string token" text))
+      (should-not (string-match-p "setq code-token" text))
+      (should (equal (delete-dups
+                      (mapcar (lambda (chunk)
+                                (plist-get chunk :target-kind))
+                              chunks))
+                     '(comment docstring))))))
+
+(ert-deftest proofread-test-targets-auto-text-mode-selects-all-text ()
+  "Automatic non-programming targets include the accessible text."
+  (with-temp-buffer
+    (text-mode)
+    (insert "Plain prose sentence. Another sentence.")
+    (let ((chunks
+           (proofread--request-ready-chunks-for-ranges
+            (list (cons (point-min) (point-max))))))
+      (should (string-match-p
+               "Plain prose sentence"
+               (proofread-test--combined-chunk-text chunks)))
+      (dolist (chunk chunks)
+        (should (eq (plist-get chunk :target-policy) 'all))
+        (should (eq (plist-get chunk :target-kind) 'text))
+        (should (= (plist-get chunk :domain-beg) (point-min)))
+        (should (= (plist-get chunk :domain-end) (point-max)))))))
+
+(ert-deftest proofread-test-targets-explicit-programming-policies ()
+  "Explicit target policies select their requested programming text."
+  (with-temp-buffer
+    (emacs-lisp-mode)
+    (insert "(setq code-token 1)\n"
+            ";; Comment prose token.\n"
+            "(setq ordinary \"Ordinary string token.\")\n"
+            "(defun sample ()\n"
+            "  \"Docstring prose token.\"\n"
+            "  code-token)\n")
+    (dolist (case '((all t t t)
+                    (comments t nil nil)
+                    (docstrings nil t nil)
+                    (comments-and-docstrings t t nil)))
+      (setq-local proofread-targets (car case))
+      (let* ((chunks
+              (proofread--request-ready-chunks-for-ranges
+               (list (cons (point-min) (point-max)))))
+             (text (proofread-test--combined-chunk-text chunks)))
+        (should (eq (not (null (string-match-p
+                                "Comment prose token" text)))
+                    (nth 1 case)))
+        (should (eq (not (null (string-match-p
+                                "Docstring prose token" text)))
+                    (nth 2 case)))
+        (should (eq (not (null (string-match-p
+                                "setq code-token" text)))
+                    (nth 3 case)))))))
+
+(ert-deftest proofread-test-targets-auto-c-mode-selects-comments ()
+  "Automatic C targets include line and block comments, but not strings."
+  (with-temp-buffer
+    (c-mode)
+    (insert "int code_token = 1;\n"
+            "// C line comment prose.\n"
+            "char *ordinary = \"not // comment prose\";\n"
+            "/* C block comment prose. */\n")
+    (let* ((chunks
+            (proofread--request-ready-chunks-for-ranges
+             (list (cons (point-min) (point-max)))))
+           (text (proofread-test--combined-chunk-text chunks)))
+      (should (string-match-p "C line comment prose" text))
+      (should (string-match-p "C block comment prose" text))
+      (should-not (string-match-p "code_token" text))
+      (should-not (string-match-p "not // comment prose" text))
+      (dolist (chunk chunks)
+        (should (eq (plist-get chunk :target-kind) 'comment))))))
+
+(ert-deftest proofread-test-targets-auto-python-selects-docstrings ()
+  "Automatic Python targets include docstrings, but not ordinary strings."
+  (with-temp-buffer
+    (insert "value = \"ordinary prose string\"\n\n"
+            "def sample():\n"
+            "    \"\"\"Python docstring prose.\"\"\"\n"
+            "    return value\n")
+    (python-mode)
+    (let* ((chunks
+            (proofread--request-ready-chunks-for-ranges
+             (list (cons (point-min) (point-max)))))
+           (text (proofread-test--combined-chunk-text chunks)))
+      (should (string-match-p "Python docstring prose" text))
+      (should-not (string-match-p "ordinary prose string" text))
+      (should-not (string-match-p "return value" text))
+      (dolist (chunk chunks)
+        (should (eq (plist-get chunk :target-kind) 'docstring))))))
+
+(ert-deftest proofread-test-target-region-and-narrowing-boundaries ()
+  "Target selection clips regions and context to the current restriction."
+  (with-temp-buffer
+    (emacs-lisp-mode)
+    (insert ";; Outside prefix. Before context sentence. "
+            "Selected target sentence. After context sentence. "
+            "Outside suffix.\n"
+            "(setq code-token 1)\n")
+    (goto-char (point-min))
+    (search-forward "Before")
+    (let ((narrow-beg (match-beginning 0)))
+      (search-forward "Selected")
+      (let ((selected-beg (match-beginning 0)))
+        (search-forward "sentence.")
+        (let ((selected-end (point)))
+          (search-forward "Outside suffix")
+          (let ((narrow-end (match-beginning 0)))
+            (narrow-to-region narrow-beg narrow-end)
+            (let* ((chunks
+                    (proofread--request-ready-chunks-for-ranges
+                     (list (cons selected-beg selected-end))))
+                   (chunk (car chunks))
+                   (payload
+                    (concat (plist-get chunk :context-before)
+                            (plist-get chunk :text)
+                            (plist-get chunk :context-after))))
+              (should (= (length chunks) 1))
+              (should (= (plist-get chunk :beg) selected-beg))
+              (should (= (plist-get chunk :end) selected-end))
+              (should (= (plist-get chunk :domain-beg) (point-min)))
+              (should (= (plist-get chunk :domain-end) (point-max)))
+              (should (equal (plist-get chunk :text)
+                             "Selected target sentence."))
+              (should (string-match-p "Before context sentence" payload))
+              (should (string-match-p "After context sentence" payload))
+              (should-not (string-match-p "Outside prefix" payload))
+              (should-not (string-match-p "Outside suffix" payload))
+              (should-not (string-match-p "code-token" payload)))))))))
+
+(ert-deftest proofread-test-check-point-programming-targets ()
+  "Point checking rejects code and dispatches the containing comment."
+  (with-temp-buffer
+    (emacs-lisp-mode)
+    (insert "(setq code-token 1)\n;; Comment point prose.\n")
+    (setq-local proofread-auto-check nil)
+    (proofread-mode 1)
+    (goto-char (point-min))
+    (search-forward "code-token")
+    (should-error (proofread-check-point) :type 'user-error)
+    (should-not proofread--pending-ranges)
+    (goto-char (point-min))
+    (search-forward "point prose")
+    (let ((proofread-backend 'llm)
+          (proofread-llm-provider proofread-test--llm-provider)
+          (proofread-llm-provider-identity
+           proofread-test--llm-provider-identity)
+          (proofread-context-size 0)
+          (recorder (proofread-test--make-backend-recorder)))
+      (proofread-test--with-llm-capabilities
+       (cl-letf (((symbol-function 'proofread-backend-check)
+                  (plist-get recorder :function)))
+         (proofread-check-point)
+         (let* ((requests (funcall (plist-get recorder :requests)))
+                (request (car requests)))
+           (should (= (length requests) 1))
+           (should (eq (plist-get request :target-kind) 'comment))
+           (should (string-match-p "Comment point prose"
+                                   (plist-get request :text)))))))))
+
+(ert-deftest proofread-test-target-metadata-is-part-of-request-and-cache-key ()
+  "Target policy and kind propagate to requests and distinguish cache keys."
+  (with-temp-buffer
+    (emacs-lisp-mode)
+    (insert ";; Comment metadata prose.\n"
+            "(defun sample ()\n  \"Docstring metadata prose.\")\n")
+    (setq-local proofread-targets 'comments-and-docstrings)
+    (let* ((chunks
+            (proofread--request-ready-chunks-for-ranges
+             (list (cons (point-min) (point-max)))))
+           (comment
+            (cl-find 'comment chunks
+                     :key (lambda (chunk)
+                            (plist-get chunk :target-kind))))
+           (docstring
+            (cl-find 'docstring chunks
+                     :key (lambda (chunk)
+                            (plist-get chunk :target-kind))))
+           (request (proofread--make-backend-request comment 'llm))
+           (key (proofread--cache-key comment 'llm)))
+      (should comment)
+      (should docstring)
+      (should (eq (plist-get request :target-policy)
+                  'comments-and-docstrings))
+      (should (eq (plist-get request :target-kind) 'comment))
+      (should (= (plist-get request :domain-beg)
+                 (plist-get comment :domain-beg)))
+      (should (= (plist-get request :domain-end)
+                 (plist-get comment :domain-end)))
+      (should (eq (plist-get key :target-policy)
+                  'comments-and-docstrings))
+      (should (eq (plist-get key :target-kind) 'comment))
+      (let ((changed-kind (copy-sequence comment))
+            (changed-policy (copy-sequence comment)))
+        (setq changed-kind
+              (plist-put changed-kind :target-kind 'docstring))
+        (setq changed-policy
+              (plist-put changed-policy :target-policy 'all))
+        (should-not (equal key (proofread--cache-key changed-kind 'llm)))
+        (should-not (equal key (proofread--cache-key changed-policy 'llm)))))))
+
+(ert-deftest proofread-test-target-option-change-makes-request-stale ()
+  "Changing target policy rejects an otherwise unchanged backend result."
+  (with-temp-buffer
+    (emacs-lisp-mode)
+    (insert ";; Comment stale prose.\n")
+    (setq-local proofread-targets 'comments)
+    (proofread-mode 1)
+    (let* ((chunk
+            (car (proofread--request-ready-chunks-for-ranges
+                  (list (cons (point-min) (point-max))))))
+           (request (proofread--make-backend-request chunk 'llm))
+           (beg (plist-get request :beg))
+           (diagnostic
+            (proofread-test--diagnostic-for-range
+             beg (+ beg 7)
+             (buffer-substring-no-properties beg (+ beg 7)))))
+      (setq-local proofread-targets 'all)
+      (should (eq (proofread--handle-backend-result
+                   (proofread--backend-success-result
+                    request (list diagnostic)))
+                  'stale))
+      (should-not proofread--diagnostics)
+      (should-not proofread--overlays))))
+
+(ert-deftest proofread-test-backend-nil-prunes-checked-out-of-target-diagnostics ()
+  "A backend-less check prunes invalid checked diagnostics only."
+  (with-temp-buffer
+    (emacs-lisp-mode)
+    (insert ";; Valid comment prose.\n"
+            "(setq invalid-code 1)\n"
+            "(setq outside-code 2)\n")
+    (setq-local proofread-auto-check nil)
+    (setq-local proofread-targets 'comments)
+    (proofread-mode 1)
+    (goto-char (point-min))
+    (search-forward "Valid")
+    (let* ((valid-beg (match-beginning 0))
+           (valid-end (match-end 0))
+           (valid
+            (proofread-test--diagnostic-for-range
+             valid-beg valid-end "Valid")))
+      (search-forward "invalid-code")
+      (let* ((invalid-beg (match-beginning 0))
+             (invalid-end (match-end 0))
+             (check-end (line-end-position))
+             (invalid
+              (proofread-test--diagnostic-for-range
+               invalid-beg invalid-end "invalid-code")))
+        (search-forward "outside-code")
+        (let* ((outside-beg (match-beginning 0))
+               (outside-end (match-end 0))
+               (outside
+                (proofread-test--diagnostic-for-range
+                 outside-beg outside-end "outside-code"))
+               (overlays
+                (proofread-test--install-diagnostics
+                 (list valid invalid outside)))
+               (valid-overlay (nth 0 overlays))
+               (invalid-overlay (nth 1 overlays))
+               (outside-overlay (nth 2 overlays))
+               (proofread-backend nil))
+          (proofread-check-region (point-min) check-end)
+          (should (equal proofread--diagnostics (list valid outside)))
+          (should (overlay-buffer valid-overlay))
+          (should-not (overlay-buffer invalid-overlay))
+          (should (overlay-buffer outside-overlay)))))))
+
+(ert-deftest proofread-test-consecutive-line-comments-share-context-domain ()
+  "Indented adjacent line comments share context until a blank line."
+  (with-temp-buffer
+    (emacs-lisp-mode)
+    (insert "    ;; First context sentence.\n"
+            "    ;; Later target sentence.\n"
+            "\n"
+            "    ;; Isolated comment sentence.\n")
+    (setq-local proofread-targets 'comments)
+    (goto-char (point-min))
+    (search-forward "Later")
+    (let ((later-beg (match-beginning 0)))
+      (search-forward "sentence.")
+      (let ((later-end (point)))
+        (search-forward "Isolated")
+        (let ((isolated-beg (match-beginning 0)))
+          (search-forward "sentence.")
+          (let* ((isolated-end (point))
+                 (domains
+                  (proofread--comment-domains-for-ranges
+                   (list (cons (point-min) (point-max)))))
+                 (first-domain (nth 0 domains))
+                 (isolated-domain (nth 1 domains))
+                 (proofread-context-size 300)
+                 (proofread-context-sentences-before 1)
+                 (proofread-context-sentences-after 1)
+                 (later-chunk
+                  (car (proofread--request-ready-chunks-for-ranges
+                        (list (cons later-beg later-end)))))
+                 (isolated-chunk
+                  (car (proofread--request-ready-chunks-for-ranges
+                        (list (cons isolated-beg isolated-end))))))
+            (should (= (length domains) 2))
+            (should (< (car first-domain) later-beg))
+            (should (<= later-end (cdr first-domain)))
+            (should (< (cdr first-domain) (car isolated-domain)))
+            (should (= (plist-get later-chunk :domain-beg)
+                       (car first-domain)))
+            (should (= (plist-get later-chunk :domain-end)
+                       (cdr first-domain)))
+            (should (string-match-p
+                     "First context sentence"
+                     (plist-get later-chunk :context-before)))
+            (should (= (plist-get isolated-chunk :domain-beg)
+                       (car isolated-domain)))
+            (should (= (plist-get isolated-chunk :domain-end)
+                       (cdr isolated-domain)))
+            (should-not (string-match-p
+                         "Later target sentence"
+                         (plist-get isolated-chunk :context-before)))))))))
+
+(ert-deftest proofread-test-unchanged-buffer-tick-skips-target-rescan ()
+  "Fresh requests avoid semantic target rescanning when the tick is unchanged."
+  (with-temp-buffer
+    (emacs-lisp-mode)
+    (insert ";; Stable comment prose.\n")
+    (setq-local proofread-auto-check nil)
+    (setq-local proofread-targets 'comments)
+    (proofread-mode 1)
+    (let* ((chunk
+            (car (proofread--request-ready-chunks-for-ranges
+                  (list (cons (point-min) (point-max))))))
+           (request (proofread--make-backend-request chunk 'llm)))
+      (should (= (plist-get request :buffer-tick)
+                 (buffer-modified-tick)))
+      (cl-letf (((symbol-function
+                  'proofread--request-target-domain-matches-p)
+                 (lambda (&rest _args)
+                   (error "Semantic target rescan was called"))))
+        (should (proofread--fresh-request-p request))))))
+
+(ert-deftest proofread-test-ignore-changes-make-request-stale ()
+  "New ignored text or changed ignore options make old requests stale."
+  (with-temp-buffer
+    (insert "Alpha prose.")
+    (setq-local proofread-auto-check nil)
+    (setq-local proofread-ignored-properties '(proofread-test-ignore))
+    (proofread-mode 1)
+    (let* ((chunk
+            (car (proofread--request-ready-chunks-for-ranges
+                  (list (cons (point-min) (point-max))))))
+           (request (proofread--make-backend-request chunk 'llm))
+           (chars-tick (buffer-chars-modified-tick)))
+      (add-text-properties
+       (plist-get request :beg)
+       (1+ (plist-get request :beg))
+       '(proofread-test-ignore t))
+      (should (= chars-tick (buffer-chars-modified-tick)))
+      (should-not (proofread--fresh-request-p request))))
+  (with-temp-buffer
+    (insert "Beta prose.")
+    (setq-local proofread-auto-check nil)
+    (proofread-mode 1)
+    (let* ((chunk
+            (car (proofread--request-ready-chunks-for-ranges
+                  (list (cons (point-min) (point-max))))))
+           (request (proofread--make-backend-request chunk 'llm)))
+      (setq-local proofread-ignored-properties '(proofread-test-ignore))
+      (should-not (proofread--fresh-request-p request)))))
+
+(ert-deftest proofread-test-python-docstring-predicate-receives-full-triple-string ()
+  "Custom predicates receive a complete Python triple-quoted string."
+  (with-temp-buffer
+    (insert "def sample():\n"
+            "    \"\"\"Python docstring prose.\n"
+            "    Continued prose.\"\"\"\n"
+            "    return 1\n")
+    (python-mode)
+    (goto-char (point-min))
+    (search-forward "\"\"\"")
+    (let ((expected-beg (match-beginning 0)))
+      (search-forward "\"\"\"")
+      (let ((expected-end (match-end 0))
+            calls)
+        (setq-local proofread-targets 'docstrings)
+        (setq-local
+         proofread-docstring-predicate-functions
+         (list (lambda (beg end)
+                 (push (cons beg end) calls)
+                 t)))
+        (let ((domains
+               (proofread--docstring-domains-for-ranges
+                (list (cons (point-min) (point-max))))))
+          (should (equal domains
+                         (list (cons expected-beg expected-end))))
+          (should calls)
+          (dolist (range calls)
+            (should (equal range
+                           (cons expected-beg expected-end)))))))))
 
 (provide 'proofread-tests)
 

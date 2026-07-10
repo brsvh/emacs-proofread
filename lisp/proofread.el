@@ -69,6 +69,36 @@ This option becomes buffer-local when set."
   :local t
   :group 'proofread)
 
+(defcustom proofread-targets 'auto
+  "Kinds of text selected for proofreading in the current buffer.
+The value `auto' selects comments and docstrings in modes derived from
+`prog-mode', and all text in other modes.  The value `all' selects all text;
+`comments' and `docstrings' select only the corresponding syntactic text; and
+`comments-and-docstrings' selects both.
+
+Comment and docstring delimiters remain part of the selected text so backend
+offsets continue to map exactly to buffer positions.  Backends are instructed
+to report only natural-language prose inside those targets.  This option
+becomes buffer-local when set."
+  :type '(choice (const :tag "Automatic" auto)
+                 (const :tag "All text" all)
+                 (const :tag "Comments only" comments)
+                 (const :tag "Docstrings only" docstrings)
+                 (const :tag "Comments and docstrings"
+                        comments-and-docstrings))
+  :local t
+  :group 'proofread)
+
+(defcustom proofread-docstring-predicate-functions nil
+  "Functions used to recognize syntactic strings as docstrings.
+Each function is called with the beginning and end positions of a complete
+syntactic string and should return non-nil when that string is a docstring.
+The generic `font-lock-doc-face' detector is always used as a fallback.  This
+option becomes buffer-local when set."
+  :type '(repeat function)
+  :local t
+  :group 'proofread)
+
 (defcustom proofread-idle-delay 1.0
   "Seconds of idle time before scheduled proofreading work may run."
   :type 'number
@@ -151,7 +181,7 @@ uses a single LLM call."
   :type 'natnum
   :group 'proofread)
 
-(defcustom proofread-prompt-version "8"
+(defcustom proofread-prompt-version "9"
   "Prompt contract version used to invalidate diagnostic cache entries."
   :type 'string
   :group 'proofread)
@@ -221,7 +251,9 @@ property has a non-nil value is not included in request-ready chunks."
 
 (defconst proofread--backend-request-keys
   '( :id :buffer :beg :end :text :context-before :context-after
-     :language :major-mode :modified-tick :backend)
+     :language :major-mode :modified-tick :buffer-tick :target-policy
+     :target-kind :target-predicates :ignored-faces :ignored-properties
+     :domain-beg :domain-end :backend)
   "Required keys for proofread backend request plists.")
 
 (defconst proofread--structured-response-instructions
@@ -242,6 +274,9 @@ property has a non-nil value is not included in request-ready chunks."
    "Report diagnostics only for the Text section.  Use context before and "
    "context after only to understand the Text; never return ranges or text "
    "from context.\n"
+   "When Target kind is comment or docstring, check only natural-language "
+   "prose.  Never report comment delimiters, string quotes, indentation, "
+   "program code, or markup as proofreading problems.\n"
    "Use zero-based chunk-relative offsets; range end is exclusive.\n"
    "The text field must exactly equal the substring selected by range.\n"
    "Use kind values spelling, grammar, style, or other.\n"
@@ -347,6 +382,9 @@ property has a non-nil value is not included in request-ready chunks."
   "Idle timer scheduled for pending proofreading work in this buffer.")
 
 (defvar proofread-mode)
+
+(defvar proofread--active-target-kind nil
+  "Target kind dynamically bound while constructing request chunks.")
 
 (defvar warning-minimum-level)
 (defvar warning-minimum-log-level)
@@ -458,6 +496,405 @@ are discarded.  Overlapping or adjacent ranges are merged."
                     clipped))))))
     (proofread--normalize-ranges clipped)))
 
+(defun proofread--effective-target-policy ()
+  "Return the effective proofreading target policy for this buffer."
+  (pcase proofread-targets
+    ('auto
+     (if (derived-mode-p 'prog-mode)
+         'comments-and-docstrings
+       'all))
+    ((or 'all 'comments 'docstrings 'comments-and-docstrings)
+     proofread-targets)
+    (_ (error "Invalid proofread target policy: %S" proofread-targets))))
+
+(defun proofread--target-policy-includes-p (policy kind)
+  "Return non-nil when target POLICY includes KIND."
+  (pcase kind
+    ('comment (memq policy '(comments comments-and-docstrings)))
+    ('docstring (memq policy '(docstrings comments-and-docstrings)))
+    ('text (eq policy 'all))))
+
+(defun proofread--syntax-container-state-p (state kind)
+  "Return non-nil when parse STATE is inside syntactic container KIND."
+  (pcase kind
+    ('comment (nth 4 state))
+    ('string (nth 3 state))
+    (_ (error "Unsupported syntax container kind: %S" kind))))
+
+(defun proofread--syntax-container-overlaps-range-p (container range)
+  "Return non-nil when CONTAINER and RANGE overlap."
+  (and (< (car container) (cdr range))
+       (< (car range) (cdr container))))
+
+(defun proofread--normalize-overlapping-ranges (ranges)
+  "Return sorted RANGES with duplicates and overlaps merged.
+Unlike `proofread--normalize-ranges', keep adjacent ranges separate."
+  (let (normalized)
+    (dolist (range
+             (sort (mapcar #'copy-tree ranges)
+                   (lambda (left right)
+                     (< (car left) (car right)))))
+      (if (and normalized (< (car range) (cdar normalized)))
+          (setcdr (car normalized) (max (cdar normalized) (cdr range)))
+        (push range normalized)))
+    (nreverse normalized)))
+
+(defun proofread--advance-to-syntax-container-end
+    (position state buffer-end kind)
+  "Advance POSITION and parse STATE to the end of container KIND.
+BUFFER-END is the end of the widened buffer.  Return a cons containing the
+new position and parse state."
+  (while (and (< position buffer-end)
+              (proofread--syntax-container-state-p state kind))
+    (goto-char position)
+    (let ((old-position position))
+      (setq state
+            (parse-partial-sexp
+             position buffer-end nil nil state 'syntax-table)
+            position (point))
+      (when (= position old-position)
+        (error "Syntax parser made no progress at %d" position))))
+  (cons position state))
+
+(defun proofread--syntax-containers-for-range (range buffer-end kind)
+  "Return full syntactic containers of KIND overlapping RANGE.
+BUFFER-END is the end of the widened buffer."
+  (let* ((beg (car range))
+         (end (cdr range))
+         ;; Include enough lookahead for a delimiter that crosses END.
+         (scan-end (min buffer-end (+ end 2)))
+         (position beg)
+         (state (syntax-ppss beg))
+         containers)
+    (when (proofread--syntax-container-state-p state kind)
+      (let* ((container-beg (nth 8 state))
+             (advanced
+              (proofread--advance-to-syntax-container-end
+               position state buffer-end kind))
+             (container (cons container-beg (car advanced))))
+        (when (proofread--syntax-container-overlaps-range-p container range)
+          (push container containers))
+        (setq position (car advanced)
+              state (cdr advanced))))
+    (while (< position scan-end)
+      (goto-char position)
+      (let ((old-position position))
+        (setq state
+              (parse-partial-sexp
+               position scan-end nil nil state 'syntax-table)
+              position (point))
+        (when (= position old-position)
+          (error "Syntax parser made no progress at %d" position)))
+      (when (proofread--syntax-container-state-p state kind)
+        (let* ((container-beg (nth 8 state))
+               (advanced
+                (proofread--advance-to-syntax-container-end
+                 position state buffer-end kind))
+               (container (cons container-beg (car advanced))))
+          (when (proofread--syntax-container-overlaps-range-p container range)
+            (push container containers))
+          (setq position (car advanced)
+                state (cdr advanced)))))
+    (nreverse containers)))
+
+(defun proofread--syntax-containers-for-ranges (ranges kind)
+  "Return full syntactic containers of KIND overlapping RANGES.
+KIND is either `comment' or `string'.  Selection is limited to the current
+restriction, but returned containers may extend beyond it."
+  (let ((ranges (proofread--normalize-accessible-ranges ranges))
+        (was-narrowed (buffer-narrowed-p))
+        containers)
+    (save-excursion
+      (save-restriction
+        (widen)
+        ;; A PPSS cache populated while narrowed can have an invalid base
+        ;; state, so rebuild it against the widened buffer.
+        (when was-narrowed
+          (syntax-ppss-flush-cache (point-min)))
+        (when syntax-propertize-function
+          (syntax-propertize (point-max)))
+        (when was-narrowed
+          (syntax-ppss-flush-cache (point-min)))
+        (with-syntax-table (or syntax-ppss-table (syntax-table))
+          (dolist (range ranges)
+            (setq containers
+                  (nconc
+                   (proofread--syntax-containers-for-range
+                    range (point-max) kind)
+                   containers))))))
+    (proofread--normalize-overlapping-ranges containers)))
+
+(defun proofread--horizontally-adjacent-ranges-p (left right)
+  "Return non-nil when LEFT and RIGHT are separated by horizontal space."
+  (save-excursion
+    (goto-char (cdr left))
+    (skip-chars-forward " \t" (car right))
+    (= (point) (car right))))
+
+(defun proofread--merge-adjacent-comment-ranges (ranges)
+  "Merge sorted comment RANGES separated only by indentation."
+  (let (merged)
+    (dolist (range ranges)
+      (if (and merged
+               (proofread--horizontally-adjacent-ranges-p
+                (car merged) range))
+          (setcdr (car merged) (cdr range))
+        (push (copy-tree range) merged)))
+    (nreverse merged)))
+
+(defun proofread--comment-domain-expansion-size ()
+  "Return the character radius used to extend selected comment domains."
+  (+ (* 2 (max 1 proofread-max-chunk-size))
+     (max 0 proofread-context-size)))
+
+(defun proofread--expand-adjacent-comment-domain (range minimum maximum)
+  "Expand comment RANGE over adjacent comments from MINIMUM to MAXIMUM."
+  (let ((beg (car range))
+        (end (cdr range))
+        expanded)
+    (while (not expanded)
+      (goto-char end)
+      (skip-chars-forward " \t")
+      (let ((next-beg (point)))
+        (if (and (< next-beg maximum)
+                 (not (memq (char-after next-beg) '(?\n ?\r)))
+                 (forward-comment 1))
+            (setq end (point))
+          (setq expanded t))))
+    (setq expanded nil)
+    (while (not expanded)
+      (goto-char beg)
+      (skip-chars-backward " \t")
+      (let ((previous-end (point)))
+        (if (and (> previous-end minimum)
+                 (nth 4 (syntax-ppss (1- previous-end)))
+                 (progn
+                   (goto-char beg)
+                   (forward-comment -1)))
+            (setq beg (point))
+          (setq expanded t))))
+    (cons beg end)))
+
+(defun proofread--comment-domains-for-ranges (ranges)
+  "Return logical comment domains overlapping RANGES.
+Consecutive line comments separated only by indentation are treated as one
+domain so sentence context can cross their source lines."
+  (let ((comments
+         (proofread--syntax-containers-for-ranges ranges 'comment))
+        (expansion-size (proofread--comment-domain-expansion-size))
+        domains)
+    (when comments
+      (save-excursion
+        (save-restriction
+          (widen)
+          (with-syntax-table (or syntax-ppss-table (syntax-table))
+            (dolist (comment
+                     (proofread--merge-adjacent-comment-ranges comments))
+              (push (proofread--expand-adjacent-comment-domain
+                     comment
+                     (max (point-min) (- (car comment) expansion-size))
+                     (min (point-max) (+ (cdr comment) expansion-size)))
+                    domains))))))
+    (proofread--normalize-overlapping-ranges domains)))
+
+(defun proofread--face-value-contains-p (value face)
+  "Return non-nil when face VALUE recursively contains FACE."
+  (cond
+   ((eq value face) t)
+   ((consp value)
+    (or (proofread--face-value-contains-p (car value) face)
+        (proofread--face-value-contains-p (cdr value) face)))
+   ((vectorp value)
+    (cl-some
+     (lambda (item)
+       (proofread--face-value-contains-p item face))
+     value))))
+
+(defun proofread--doc-face-at-p (position)
+  "Return non-nil when font lock marks POSITION as doc text."
+  (or (proofread--face-value-contains-p
+       (get-text-property position 'face) 'font-lock-doc-face)
+      (proofread--face-value-contains-p
+       (get-text-property position 'font-lock-face) 'font-lock-doc-face)))
+
+(defun proofread--next-face-property-change (position limit)
+  "Return the next face-related property change after POSITION up to LIMIT."
+  (min (or (next-single-property-change position 'face nil limit)
+           limit)
+       (or (next-single-property-change
+            position 'font-lock-face nil limit)
+           limit)))
+
+(defun proofread--previous-face-property-change (position limit)
+  "Return the previous face-related property change before POSITION to LIMIT."
+  (max (or (previous-single-property-change position 'face nil limit)
+           limit)
+       (or (previous-single-property-change
+            position 'font-lock-face nil limit)
+           limit)))
+
+(defun proofread--range-has-doc-face-p (beg end)
+  "Return non-nil when some character from BEG to END has doc face."
+  (let ((position beg)
+        found)
+    (while (and (< position end) (not found))
+      (setq found (proofread--doc-face-at-p position))
+      (unless found
+        (setq position
+              (proofread--next-face-property-change position end))))
+    found))
+
+(defun proofread--docstring-predicate-matches-p (beg end)
+  "Return non-nil when a configured predicate accepts BEG through END."
+  (catch 'matches
+    (dolist (predicate proofread-docstring-predicate-functions)
+      (when (and (functionp predicate)
+                 (condition-case nil
+                     (funcall predicate beg end)
+                   (error nil)))
+        (throw 'matches t)))
+    nil))
+
+(defun proofread--expand-range-over-doc-face (range)
+  "Expand RANGE over adjacent text marked with a doc face."
+  (let ((beg (car range))
+        (end (cdr range)))
+    (while (and (> beg (point-min))
+                (proofread--doc-face-at-p (1- beg)))
+      (setq beg
+            (proofread--previous-face-property-change
+             beg (point-min))))
+    (while (and (< end (point-max))
+                (proofread--doc-face-at-p end))
+      (setq end
+            (proofread--next-face-property-change
+             end (point-max))))
+    (cons beg end)))
+
+(defconst proofread--docstring-font-lock-sample-size 256
+  "Maximum opening characters fontified to classify a docstring.")
+
+(defun proofread--font-lock-docstring-domain (string-range)
+  "Return the font-lock docstring domain for STRING-RANGE, or nil."
+  (let ((beg (car string-range))
+        (end (cdr string-range))
+        face-match)
+    (setq face-match
+          (condition-case nil
+              (save-match-data
+                ;; Fontifying the opening sample is enough for conventional
+                ;; docstring rules and avoids traversing a huge literal.
+                (font-lock-ensure
+                 beg
+                 (min end (+ beg proofread--docstring-font-lock-sample-size)))
+                (proofread--range-has-doc-face-p beg end))
+            (error nil)))
+    (when face-match
+      (proofread--expand-range-over-doc-face string-range))))
+
+(defun proofread--docstring-domains-for-ranges (ranges)
+  "Return full docstring domains overlapping RANGES."
+  (let ((strings
+         (proofread--syntax-containers-for-ranges ranges 'string))
+        face-domains
+        unmatched-strings
+        domains)
+    (save-excursion
+      (save-restriction
+        (widen)
+        (dolist (string strings)
+          (if-let* ((domain
+                     (proofread--font-lock-docstring-domain string)))
+              (push domain face-domains)
+            (push string unmatched-strings)))
+        ;; Python triple-quoted strings can appear as several syntactic
+        ;; strings.  Normalize face-expanded domains before calling custom
+        ;; predicates so predicates see the complete source literal once.
+        (setq face-domains (proofread--normalize-ranges face-domains))
+        (dolist (domain face-domains)
+          (proofread--docstring-predicate-matches-p
+           (car domain) (cdr domain))
+          (push domain domains))
+        (dolist (domain
+                 (proofread--normalize-ranges unmatched-strings))
+          (unless (cl-some
+                   (lambda (face-domain)
+                     (and (<= (car face-domain) (car domain))
+                          (<= (cdr domain) (cdr face-domain))))
+                   face-domains)
+            (when (proofread--docstring-predicate-matches-p
+                   (car domain) (cdr domain))
+              (push domain domains))))))
+    (proofread--normalize-ranges domains)))
+
+(defun proofread--make-target-domain (range kind policy minimum maximum)
+  "Return a target domain plist for RANGE and KIND under POLICY.
+MINIMUM and MAXIMUM are the accessible buffer bounds."
+  (let ((beg (max minimum (car range)))
+        (end (min maximum (cdr range))))
+    (when (< beg end)
+      (list :kind kind
+            :target-policy policy
+            :domain-beg beg
+            :domain-end end))))
+
+(defun proofread--target-domains-for-kind
+    (ranges kind policy minimum maximum)
+  "Return target domains of KIND overlapping RANGES under POLICY.
+MINIMUM and MAXIMUM are the accessible buffer bounds."
+  (let ((target-ranges
+         (pcase kind
+           ('text (and ranges (list (cons minimum maximum))))
+           ('comment
+            (proofread--comment-domains-for-ranges ranges))
+           ('docstring (proofread--docstring-domains-for-ranges ranges))
+           (_ (error "Unsupported proofread target kind: %S" kind))))
+        domains)
+    (dolist (range target-ranges)
+      (when-let* ((domain
+                   (proofread--make-target-domain
+                    range kind policy minimum maximum)))
+        (push domain domains)))
+    (nreverse domains)))
+
+(defun proofread--target-domains-for-ranges (ranges)
+  "Return complete proofreading target domains overlapping RANGES."
+  (let* ((minimum (point-min))
+         (maximum (point-max))
+         (ranges (proofread--normalize-accessible-ranges ranges))
+         (policy (proofread--effective-target-policy))
+         domains)
+    (dolist (kind '(text comment docstring))
+      (when (proofread--target-policy-includes-p policy kind)
+        (setq domains
+              (nconc domains
+                     (proofread--target-domains-for-kind
+                      ranges kind policy minimum maximum)))))
+    (sort domains
+          (lambda (left right)
+            (< (plist-get left :domain-beg)
+               (plist-get right :domain-beg))))))
+
+(defun proofread--target-islands-for-ranges (ranges)
+  "Return selected target islands for accessible RANGES.
+Each island records its selected bounds and its complete target domain."
+  (let ((ranges (proofread--normalize-accessible-ranges ranges))
+        islands)
+    (dolist (domain (proofread--target-domains-for-ranges ranges))
+      (let ((domain-beg (plist-get domain :domain-beg))
+            (domain-end (plist-get domain :domain-end)))
+        (dolist (range ranges)
+          (let ((beg (max (car range) domain-beg))
+                (end (min (cdr range) domain-end)))
+            (when (< beg end)
+              (push (append (list :beg beg :end end)
+                            domain)
+                    islands))))))
+    (sort islands
+          (lambda (left right)
+            (< (plist-get left :beg)
+               (plist-get right :beg))))))
+
 (defun proofread--visible-window-ranges ()
   "Return raw visible ranges for live windows showing the current buffer."
   (let ((buffer (current-buffer))
@@ -480,6 +917,12 @@ are discarded.  Overlapping or adjacent ranges are merged."
   (save-excursion
     (goto-char beg)
     (re-search-forward "\\S-" end t)))
+
+(defun proofread--range-has-alphanumeric-p (beg end)
+  "Return non-nil if text between BEG and END contains an alphanumeric."
+  (save-excursion
+    (goto-char beg)
+    (re-search-forward "[[:alnum:]]" end t)))
 
 (defun proofread--chunk-context-before (beg)
   "Return bounded context before BEG without text properties."
@@ -832,36 +1275,50 @@ the preceding text ends with sentence punctuation."
 (defun proofread--context-search-beg (beg)
   "Return the nearest structural context boundary before BEG."
   (save-excursion
-    (let ((boundary nil))
+    (let ((boundary nil)
+          (limit
+           (max (point-min)
+                (- beg (max 0 proofread-context-size)))))
       (goto-char (max (point-min) (min beg (point-max))))
       (beginning-of-line)
       (if (proofread--context-stop-line-at-point-p)
           (setq boundary (point))
-        (while (and (not boundary) (> (point) (point-min)))
+        (while (and (not boundary) (> (point) limit))
           (forward-line -1)
           (when (proofread--context-stop-line-at-point-p)
             (setq boundary (proofread--line-end-after-newline)))))
-      (min beg (or boundary (point-min))))))
+      (max limit (min beg (or boundary limit))))))
 
 (defun proofread--context-search-end (end)
   "Return the nearest structural context boundary after END."
   (save-excursion
-    (let ((boundary nil))
+    (let ((boundary nil)
+          (limit
+           (min (point-max)
+                (+ end (max 0 proofread-context-size)))))
       (goto-char (max (point-min) (min end (point-max))))
       (beginning-of-line)
       (if (proofread--context-stop-line-at-point-p)
           (setq boundary end)
-        (while (and (not boundary) (< (line-end-position) (point-max)))
+        (while (and (not boundary) (< (line-end-position) limit))
           (forward-line 1)
           (when (proofread--context-stop-line-at-point-p)
             (setq boundary (line-beginning-position)))))
-      (max end (or boundary (point-max))))))
+      (min limit (max end (or boundary limit))))))
 
 (defun proofread--context-sentence-spans (beg end)
   "Return logical context sentence spans between BEG and END."
   (when (and (< beg end)
              (proofread--range-nonblank-p beg end))
-    (proofread--sentence-spans-in-paragraph (cons beg end))))
+    (let ((spans
+           (proofread--sentence-spans-in-paragraph (cons beg end))))
+      (if (memq proofread--active-target-kind '(comment docstring))
+          (cl-remove-if-not
+           (lambda (span)
+             (proofread--range-has-alphanumeric-p
+              (car span) (cdr span)))
+           spans)
+        spans))))
 
 (defun proofread--take-spans (count spans)
   "Return the first COUNT items from SPANS."
@@ -949,7 +1406,8 @@ too large for `proofread-context-size'."
           :language proofread-language
           :context-before (proofread--request-ready-context-before beg)
           :context-after (proofread--request-ready-context-after end)
-          :modified-tick (buffer-chars-modified-tick))))
+          :modified-tick (buffer-chars-modified-tick)
+          :buffer-tick (buffer-modified-tick))))
 
 (defun proofread--request-ready-chunks-from-chunk (chunk)
   "Return request-ready chunks split from paragraph CHUNK."
@@ -972,12 +1430,48 @@ too large for `proofread-context-size'."
         (push request-chunk request-chunks)))
     (nreverse request-chunks)))
 
+(defun proofread--chunk-with-target-metadata (chunk island)
+  "Return CHUNK annotated with target metadata from ISLAND."
+  (append chunk
+          (list :target-policy (plist-get island :target-policy)
+                :target-kind (plist-get island :kind)
+                :target-predicates
+                (copy-sequence proofread-docstring-predicate-functions)
+                :ignored-faces (copy-sequence proofread-ignored-faces)
+                :ignored-properties
+                (copy-sequence proofread-ignored-properties)
+                :domain-beg (plist-get island :domain-beg)
+                :domain-end (plist-get island :domain-end))))
+
+(defun proofread--chunk-has-target-prose-p (chunk island)
+  "Return non-nil when CHUNK has useful prose for target ISLAND."
+  (or (eq (plist-get island :kind) 'text)
+      (string-match-p "[[:alnum:]]" (plist-get chunk :text))))
+
+(defun proofread--request-ready-chunks-for-islands (islands)
+  "Return request-ready chunks for target ISLANDS."
+  (let (request-chunks)
+    (dolist (island islands)
+      (let ((proofread--active-target-kind (plist-get island :kind)))
+        (save-restriction
+          (narrow-to-region (plist-get island :domain-beg)
+                            (plist-get island :domain-end))
+          (dolist (chunk
+                   (proofread--request-ready-chunks-from-chunks
+                    (proofread--chunks-for-ranges
+                     (list (cons (plist-get island :beg)
+                                 (plist-get island :end))))))
+            (when (proofread--chunk-has-target-prose-p chunk island)
+              (push (proofread--chunk-with-target-metadata chunk island)
+                    request-chunks))))))
+    (nreverse request-chunks)))
+
 (defun proofread--request-ready-chunks-for-ranges (ranges)
-  "Return request-ready chunks for visible RANGES.
+  "Return request-ready chunks for selected target text in RANGES.
 This is the internal boundary future cache lookup and backend dispatch should
 consume."
-  (proofread--request-ready-chunks-from-chunks
-   (proofread--chunks-for-ranges ranges)))
+  (proofread--request-ready-chunks-for-islands
+   (proofread--target-islands-for-ranges ranges)))
 
 (defun proofread--request-ready-visible-chunks ()
   "Return request-ready chunks for `proofread--pending-ranges'."
@@ -1148,7 +1642,8 @@ When BACKEND is nil, check the selected `proofread-backend'."
            "%s"
            "%s"
            "Language: %S\n"
-           "Major mode: %S\n\n"
+           "Major mode: %S\n"
+           "Target kind: %S\n\n"
            "Context before:\n%s\n\n"
            "Text:\n%s\n\n"
            "Context after:\n%s\n")
@@ -1161,6 +1656,7 @@ When BACKEND is nil, check the selected `proofread-backend'."
      "")
    (plist-get request :language)
    (plist-get request :major-mode)
+   (plist-get request :target-kind)
    (or (plist-get request :context-before) "")
    (or (plist-get request :text) "")
    (or (plist-get request :context-after) "")))
@@ -1730,6 +2226,55 @@ Return requests that were sent to the backend."
          (equal (buffer-substring-no-properties beg end)
                 (plist-get request :text)))))
 
+(defun proofread--request-currently-included-p (request)
+  "Return non-nil when current ignore settings still include REQUEST."
+  (let ((beg (proofread--position-integer (plist-get request :beg)))
+        (end (proofread--position-integer (plist-get request :end))))
+    (and beg end
+         (equal proofread-ignored-faces
+                (plist-get request :ignored-faces))
+         (equal proofread-ignored-properties
+                (plist-get request :ignored-properties))
+         (null (proofread--ignored-ranges-in-region beg end)))))
+
+(defun proofread--request-target-domain-matches-p
+    (kind policy request-beg request-end)
+  "Return non-nil when REQUEST-BEG through REQUEST-END remains a target.
+KIND and POLICY describe the saved target classification."
+  (cl-find-if
+   (lambda (domain)
+     (and (eq kind (plist-get domain :kind))
+          (<= (plist-get domain :domain-beg) request-beg)
+          (<= request-end (plist-get domain :domain-end))))
+   (proofread--target-domains-for-kind
+    (list (cons request-beg request-end))
+    kind policy (point-min) (point-max))))
+
+(defun proofread--request-target-fresh-p (request)
+  "Return non-nil when REQUEST still belongs to its target domain."
+  (let ((beg (proofread--position-integer (plist-get request :beg)))
+        (end (proofread--position-integer (plist-get request :end)))
+        (domain-beg
+         (proofread--position-integer (plist-get request :domain-beg)))
+        (domain-end
+         (proofread--position-integer (plist-get request :domain-end)))
+        (kind (plist-get request :target-kind))
+        (policy (plist-get request :target-policy))
+        (buffer-tick (plist-get request :buffer-tick)))
+    (and beg end domain-beg domain-end kind policy
+         (integerp buffer-tick)
+         (eq major-mode (plist-get request :major-mode))
+         (equal proofread-language (plist-get request :language))
+         (equal proofread-docstring-predicate-functions
+                (plist-get request :target-predicates))
+         (eq policy (proofread--effective-target-policy))
+         (<= domain-beg beg)
+         (<= end domain-end)
+         (proofread--request-currently-included-p request)
+         (or (= buffer-tick (buffer-modified-tick))
+             (proofread--request-target-domain-matches-p
+              kind policy beg end)))))
+
 (defun proofread--fresh-request-p (request)
   "Return non-nil if REQUEST still matches its originating buffer."
   (let ((buffer (plist-get request :buffer)))
@@ -1739,7 +2284,8 @@ Return requests that were sent to the backend."
                 (equal (buffer-chars-modified-tick)
                        (plist-get request :modified-tick))
                 (proofread--request-range-valid-p request)
-                (proofread--request-text-matches-p request))))))
+                (proofread--request-text-matches-p request)
+                (proofread--request-target-fresh-p request))))))
 
 (defun proofread--backend-identity-p (value)
   "Return non-nil when VALUE is a structured proofread backend identity."
@@ -1814,6 +2360,8 @@ When BACKEND is nil, use the selected `proofread-backend'."
                    (proofread--chunk-text-hash (plist-get chunk :text))
                    :language (plist-get chunk :language)
                    :major-mode (plist-get chunk :major-mode)
+                   :target-policy (plist-get chunk :target-policy)
+                   :target-kind (plist-get chunk :target-kind)
                    :backend (proofread--backend-identity
                              (or (plist-get chunk :backend) backend))
                    :prompt-version proofread-prompt-version
@@ -3449,6 +3997,61 @@ When RESET is non-nil, move from the beginning of the buffer."
   (unless proofread-mode
     (user-error "Proofread mode is not enabled in the current buffer")))
 
+(defun proofread--range-intersects-any-p (range ranges)
+  "Return non-nil when RANGE intersects one of RANGES."
+  (cl-some
+   (lambda (candidate)
+     (proofread--ranges-intersect-p
+      (car range) (cdr range) (car candidate) (cdr candidate)))
+   ranges))
+
+(defun proofread--sorted-target-domains (domains)
+  "Return a copy of DOMAINS sorted by beginning position."
+  (sort (copy-sequence domains)
+        (lambda (left right)
+          (< (plist-get left :domain-beg)
+             (plist-get right :domain-beg)))))
+
+(defun proofread--checked-diagnostic-entries (ranges)
+  "Return diagnostics intersecting RANGES with positions sorted."
+  (let (entries)
+    (dolist (diagnostic proofread--diagnostics)
+      (when-let* ((range (proofread--diagnostic-range diagnostic)))
+        (when (proofread--range-intersects-any-p range ranges)
+          (push (cons diagnostic range) entries))))
+    (sort entries
+          (lambda (left right)
+            (< (cadr left) (cadr right))))))
+
+(defun proofread--prune-diagnostics-outside-targets (ranges domains)
+  "Remove checked diagnostics in RANGES that are invalid in DOMAINS."
+  (let ((remaining-domains (proofread--sorted-target-domains domains))
+        diagnostics)
+    (dolist (entry (proofread--checked-diagnostic-entries ranges))
+      (let* ((diagnostic (car entry))
+             (range (cdr entry))
+             (beg (car range))
+             (end (cdr range)))
+        (while (and remaining-domains
+                    (<= (plist-get (car remaining-domains) :domain-end)
+                        beg))
+          (setq remaining-domains (cdr remaining-domains)))
+        (unless (and remaining-domains
+                     (<= (plist-get (car remaining-domains) :domain-beg)
+                         beg)
+                     (<= end
+                         (plist-get (car remaining-domains) :domain-end))
+                     (null (proofread--ignored-ranges-in-region beg end)))
+          (push diagnostic diagnostics))))
+    (when diagnostics
+      (proofread--invalidate-affected-diagnostics
+       (cl-remove-if-not
+        (lambda (overlay)
+          (member (overlay-get overlay 'proofread-diagnostic)
+                  diagnostics))
+        (proofread--current-buffer-overlays))
+       diagnostics))))
+
 (defun proofread--check-ranges (ranges scope &optional force-feedback)
   "Check RANGES and describe them as SCOPE in progress feedback.
 When FORCE-FEEDBACK is non-nil, report feedback even when routine progress
@@ -3460,27 +4063,43 @@ messages are inhibited."
            #'proofread--progress-message)))
     (setq proofread--pending-ranges
           (proofread--normalize-accessible-ranges ranges))
-    (if (proofread-backend-available-p)
-        (let* ((chunks (proofread--request-ready-visible-chunks))
-               (requests (proofread--dispatch-request-ready-chunks chunks))
-               (queued (length proofread--request-queue)))
-          (funcall
-           progress-message
-           "proofread: dispatched %d request%s%s from %d %s range%s"
-           (length requests)
-           (if (= (length requests) 1) "" "s")
-           (if (> queued 0)
-               (format "; queued %d" queued)
-             "")
-           (length proofread--pending-ranges)
-           scope
-           (if (= (length proofread--pending-ranges) 1) "" "s")))
-      (funcall
-       progress-message
-       "proofread: collected %d %s range%s; no available backend"
-       (length proofread--pending-ranges)
-       scope
-       (if (= (length proofread--pending-ranges) 1) "" "s")))))
+    (let* ((islands
+            (proofread--target-islands-for-ranges
+             proofread--pending-ranges))
+           (domains
+            (cl-delete-duplicates
+             (mapcar
+              (lambda (island)
+                (list :kind (plist-get island :kind)
+                      :domain-beg (plist-get island :domain-beg)
+                      :domain-end (plist-get island :domain-end)))
+              islands)
+             :test #'equal)))
+      (proofread--prune-diagnostics-outside-targets
+       proofread--pending-ranges domains)
+      (if (proofread-backend-available-p)
+          (let* ((chunks
+                  (proofread--request-ready-chunks-for-islands islands))
+                 (requests
+                  (proofread--dispatch-request-ready-chunks chunks))
+                 (queued (length proofread--request-queue)))
+            (funcall
+             progress-message
+             "proofread: dispatched %d request%s%s from %d %s range%s"
+             (length requests)
+             (if (= (length requests) 1) "" "s")
+             (if (> queued 0)
+                 (format "; queued %d" queued)
+               "")
+             (length proofread--pending-ranges)
+             scope
+             (if (= (length proofread--pending-ranges) 1) "" "s")))
+        (funcall
+         progress-message
+         "proofread: collected %d %s range%s; no available backend"
+         (length proofread--pending-ranges)
+         scope
+         (if (= (length proofread--pending-ranges) 1) "" "s"))))))
 
 (defun proofread--span-at-position (spans position)
   "Return the most useful member of sorted SPANS for POSITION.
@@ -3500,21 +4119,86 @@ ends exactly at POSITION."
                       (= (cdr span) position))
                     spans))))
 
+(defun proofread--point-probe-ranges ()
+  "Return nonempty character ranges immediately around point."
+  (let ((position (point))
+        ranges)
+    (when (< position (point-max))
+      (push (cons position (1+ position)) ranges))
+    (when (> position (point-min))
+      (push (cons (1- position) position) ranges))
+    (nreverse ranges)))
+
+(defun proofread--point-island-for-domain (domain position)
+  "Return a bounded island in target DOMAIN around POSITION."
+  (let* ((domain-beg (plist-get domain :domain-beg))
+         (domain-end (plist-get domain :domain-end))
+         (size (max 1 proofread-max-chunk-size))
+         (index (/ (max 0 (- position domain-beg)) size))
+         (beg (if (<= (- domain-end domain-beg) (* 4 size))
+                  domain-beg
+                (+ domain-beg (* (max 0 (1- index)) size))))
+         (end (if (= beg domain-beg)
+                  (min domain-end (+ beg (* 4 size)))
+                (min domain-end (+ beg (* 3 size))))))
+    (append (list :beg beg :end end) domain)))
+
+(defun proofread--request-ready-chunks-at-point ()
+  "Return request-ready chunks in the target domain at point."
+  (let* ((position (point))
+         (ranges (proofread--point-probe-ranges))
+         (policy (proofread--effective-target-policy))
+         (minimum (point-min))
+         (maximum (point-max))
+         (domains
+          (cond
+           ((eq policy 'all)
+            (proofread--target-domains-for-kind
+             ranges 'text policy minimum maximum))
+           ((proofread--target-policy-includes-p policy 'comment)
+            (or (proofread--target-domains-for-kind
+                 ranges 'comment policy minimum maximum)
+                (when (proofread--target-policy-includes-p
+                       policy 'docstring)
+                  (proofread--target-domains-for-kind
+                   ranges 'docstring policy minimum maximum))))
+           (t
+            (proofread--target-domains-for-kind
+             ranges 'docstring policy minimum maximum)))))
+    (proofread--request-ready-chunks-for-islands
+     (mapcar
+      (lambda (domain)
+        (proofread--point-island-for-domain domain position))
+      domains))))
+
 (defun proofread--request-ready-range-at-point ()
   "Return the request-ready chunk range selected by point, or nil."
   (let* ((position (point))
-         (span
-          (proofread--span-at-position
-           (proofread--chunk-spans-for-ranges
-            (list (cons (point-min) (point-max))))
-           position)))
-    (when span
-      (proofread--span-at-position
-       (mapcar (lambda (chunk)
-                 (cons (plist-get chunk :beg)
-                       (plist-get chunk :end)))
-               (proofread--request-ready-chunks-for-ranges (list span)))
-       position))))
+         (chunks (proofread--request-ready-chunks-at-point))
+         (spans
+          (mapcar (lambda (chunk)
+                    (cons (plist-get chunk :beg)
+                          (plist-get chunk :end)))
+                  chunks)))
+    (or (proofread--span-at-position spans position)
+        ;; A comment delimiter can form a punctuation-only chunk that is
+        ;; intentionally filtered.  Select the following prose in that same
+        ;; target domain when point is on the delimiter.
+        (when (cl-some
+               (lambda (chunk)
+                 (memq (plist-get chunk :target-kind)
+                       '(comment docstring)))
+               chunks)
+          (when-let* ((span
+                       (cl-find-if
+                        (lambda (candidate)
+                          (<= position (car candidate)))
+                        spans)))
+            (when (and (not (proofread--range-has-alphanumeric-p
+                             position (car span)))
+                       (null (proofread--ignored-ranges-in-region
+                              position (car span))))
+              span))))))
 
 ;;;###autoload
 (define-minor-mode proofread-mode
@@ -3522,7 +4206,8 @@ ends exactly at POSITION."
 
 When enabled and `proofread-auto-check' is non-nil, proofread schedules
 visible-buffer checks after editing and window activity, then dispatches
-request-ready visible chunks through the configured backend.  When automatic
+request-ready visible chunks through the configured backend.  The option
+`proofread-targets' controls which kinds of text are selected.  When automatic
 checking is disabled, use `proofread-check-visible', `proofread-check-buffer',
 `proofread-check-region', or `proofread-check-point' manually."
   :lighter " Proofread"
