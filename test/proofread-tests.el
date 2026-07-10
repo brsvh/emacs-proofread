@@ -374,6 +374,263 @@
     (proofread-check-visible)
     (should-not proofread--pending-ranges)))
 
+(ert-deftest proofread-test-check-commands-require-mode ()
+  "Proofread check commands require `proofread-mode'."
+  (with-temp-buffer
+    (insert "Alpha")
+    (should-error (proofread-check-visible) :type 'user-error)
+    (should-error (proofread-check-buffer) :type 'user-error)
+    (should-error (proofread-check-region (point-min) (point-max))
+                  :type 'user-error)
+    (goto-char (point-min))
+    (should-error (proofread-check-point) :type 'user-error)
+    (should-not proofread--pending-ranges)))
+
+(ert-deftest proofread-test-check-buffer-dispatches-accessible-buffer ()
+  "`proofread-check-buffer' checks only accessible text with current options."
+  (with-temp-buffer
+    (insert "Outside. Alpha beta. Gamma. Outside.")
+    (goto-char (point-min))
+    (search-forward "Alpha")
+    (let ((beg (match-beginning 0)))
+      (search-forward "Gamma.")
+      (let ((end (match-end 0)))
+        (narrow-to-region beg end)
+        (goto-char (+ (point-min) 2))
+        (set-mark (+ (point-min) 4))
+        (setq mark-active t)
+        (setq-local proofread-auto-check nil)
+        (proofread-mode 1)
+        (let ((proofread-backend 'llm)
+              (proofread-llm-provider proofread-test--llm-provider)
+              (proofread-llm-provider-identity
+               proofread-test--llm-provider-identity)
+              (proofread-language "en")
+              (proofread-context-size 0)
+              (proofread-max-chunk-size 7)
+              (proofread-max-concurrent-requests 10)
+              (recorder (proofread-test--make-backend-recorder))
+              (source (current-buffer))
+              (before-text (buffer-string))
+              (before-tick (buffer-chars-modified-tick))
+              (before-point (point))
+              (before-mark (mark))
+              (before-mark-active mark-active)
+              (before-min (point-min))
+              (before-max (point-max)))
+          (proofread-test--with-llm-capabilities
+           (cl-letf (((symbol-function 'proofread-backend-check)
+                      (plist-get recorder :function)))
+             (proofread-check-buffer)
+             (let ((requests (funcall (plist-get recorder :requests))))
+               (should (equal
+                        (mapcar (lambda (request)
+                                  (plist-get request :text))
+                                requests)
+                        '("Alpha b" "eta." "Gamma.")))
+               (dolist (request requests)
+                 (should (equal (plist-get request :language) "en"))))
+             (should (equal proofread--pending-ranges
+                            (list (cons before-min before-max))))
+             (should-not proofread-auto-check)
+             (should (eq (current-buffer) source))
+             (should (equal (buffer-string) before-text))
+             (should (= (buffer-chars-modified-tick) before-tick))
+             (should (= (point) before-point))
+             (should (= (mark) before-mark))
+             (should (eq mark-active before-mark-active))
+             (should (= (point-min) before-min))
+             (should (= (point-max) before-max)))))))))
+
+(ert-deftest proofread-test-check-region-normalizes-and-filters-selection ()
+  "`proofread-check-region' normalizes bounds and filters ignored text."
+  (with-temp-buffer
+    (insert "Before. Alpha SECRET beta. After.")
+    (goto-char (point-min))
+    (search-forward "Alpha")
+    (let ((beg (match-beginning 0)))
+      (search-forward "SECRET")
+      (add-text-properties (match-beginning 0) (match-end 0)
+                           '(proofread-test-ignore t))
+      (search-forward "beta.")
+      (let ((end (match-end 0)))
+        (setq-local proofread-auto-check nil)
+        (proofread-mode 1)
+        (let ((proofread-backend 'llm)
+              (proofread-llm-provider proofread-test--llm-provider)
+              (proofread-llm-provider-identity
+               proofread-test--llm-provider-identity)
+              (proofread-context-size 0)
+              (proofread-ignored-properties '(proofread-test-ignore))
+              (recorder (proofread-test--make-backend-recorder)))
+          (proofread-test--with-llm-capabilities
+           (cl-letf (((symbol-function 'proofread-backend-check)
+                      (plist-get recorder :function)))
+             (proofread-check-region end beg)
+             (should (equal proofread--pending-ranges
+                            (list (cons beg end))))
+             (should
+              (equal
+               (mapcar (lambda (request)
+                         (plist-get request :text))
+                       (funcall (plist-get recorder :requests)))
+               '("Alpha " " beta."))))))))))
+
+(ert-deftest proofread-test-check-region-interactively-requires-active-region ()
+  "`proofread-check-region' rejects an inactive region."
+  (with-temp-buffer
+    (insert "Alpha")
+    (setq-local proofread-auto-check nil)
+    (proofread-mode 1)
+    (let ((transient-mark-mode t))
+      (goto-char (point-max))
+      (set-mark (point-min))
+      (setq mark-active nil)
+      (should-error (call-interactively #'proofread-check-region)
+                    :type 'user-error)
+      (should-not proofread--pending-ranges)
+      (should-not proofread--requests))))
+
+(ert-deftest proofread-test-check-region-rejects-foreign-markers ()
+  "`proofread-check-region' rejects markers from another buffer."
+  (with-temp-buffer
+    (insert "Alpha")
+    (setq-local proofread-auto-check nil)
+    (proofread-mode 1)
+    (let ((other (generate-new-buffer " *proofread-region-marker*")))
+      (unwind-protect
+          (let ((foreign
+                 (with-current-buffer other
+                   (insert "Beta")
+                   (copy-marker (point-min)))))
+            (should-error
+             (proofread-check-region foreign (point-max))
+             :type 'user-error)
+            (should-not proofread--pending-ranges)
+            (should-not proofread--requests))
+        (kill-buffer other)))))
+
+(ert-deftest proofread-test-check-region-interactive-feedback-is-shown ()
+  "Interactive region checking reports feedback with messages inhibited."
+  (with-temp-buffer
+    (insert "Alpha")
+    (setq-local proofread-auto-check nil)
+    (proofread-mode 1)
+    (let ((transient-mark-mode t)
+          messages)
+      (goto-char (point-max))
+      (set-mark (point-min))
+      (setq mark-active t)
+      (cl-letf (((symbol-function 'message)
+                 (lambda (format-string &rest args)
+                   (push (apply #'format format-string args) messages))))
+        (call-interactively #'proofread-check-region)
+        (should
+         (equal messages
+                (list (concat "proofread: collected 1 selected range; "
+                              "no available backend"))))))))
+
+(ert-deftest proofread-test-check-point-dispatches-containing-chunk ()
+  "`proofread-check-point' checks one chunk and sends surrounding context."
+  (with-temp-buffer
+    (insert "First.  Second sentence. Third.")
+    (goto-char (point-min))
+    (search-forward "Second sentence.")
+    (let ((beg (match-beginning 0))
+          (end (match-end 0)))
+      (goto-char (+ beg 3))
+      (setq-local proofread-auto-check nil)
+      (proofread-mode 1)
+      (let ((proofread-backend 'llm)
+            (proofread-llm-provider proofread-test--llm-provider)
+            (proofread-llm-provider-identity
+             proofread-test--llm-provider-identity)
+            (proofread-language "en")
+            (proofread-context-size 100)
+            (proofread-context-sentences-before 1)
+            (proofread-context-sentences-after 1)
+            (recorder (proofread-test--make-backend-recorder))
+            (before-point (point)))
+        (proofread-test--with-llm-capabilities
+         (cl-letf (((symbol-function 'proofread-backend-check)
+                    (plist-get recorder :function)))
+           (proofread-check-point)
+           (let* ((requests (funcall (plist-get recorder :requests)))
+                  (request (car requests)))
+             (should (= (length requests) 1))
+             (should (equal (plist-get request :text)
+                            "Second sentence."))
+             (should (equal (plist-get request :language) "en"))
+             (should (string-match-p
+                      "First" (plist-get request :context-before)))
+             (should (string-match-p
+                      "Third" (plist-get request :context-after))))
+           (should (equal proofread--pending-ranges
+                          (list (cons beg end))))
+           (should (= (point) before-point))))))))
+
+(ert-deftest proofread-test-check-point-range-boundaries ()
+  "Point range selection handles sentence, whitespace, and buffer boundaries."
+  (with-temp-buffer
+    (insert "First.  Second.")
+    (setq-local proofread-auto-check nil)
+    (proofread-mode 1)
+    (goto-char (point-min))
+    (search-forward "First.")
+    (let ((first-beg (match-beginning 0))
+          (first-end (match-end 0)))
+      (search-forward "Second.")
+      (let ((second-beg (match-beginning 0))
+            (second-end (match-end 0)))
+        (goto-char second-beg)
+        (should (equal (proofread--request-ready-range-at-point)
+                       (cons second-beg second-end)))
+        (goto-char first-end)
+        (should (equal (proofread--request-ready-range-at-point)
+                       (cons first-beg first-end)))
+        (goto-char (1+ first-end))
+        (should-not (proofread--request-ready-range-at-point))
+        (goto-char (point-max))
+        (should (equal (proofread--request-ready-range-at-point)
+                       (cons second-beg second-end))))))
+  (with-temp-buffer
+    (insert "abcdef")
+    (setq-local proofread-auto-check nil)
+    (proofread-mode 1)
+    (let ((proofread-max-chunk-size 3))
+      (goto-char 4)
+      (should (equal (proofread--request-ready-range-at-point)
+                     '(4 . 7)))))
+  (with-temp-buffer
+    (insert "First.\n\n")
+    (setq-local proofread-auto-check nil)
+    (proofread-mode 1)
+    (goto-char (point-max))
+    (should-not (proofread--request-ready-range-at-point)))
+  (with-temp-buffer
+    (insert "Alpha http://example.com")
+    (setq-local proofread-auto-check nil)
+    (proofread-mode 1)
+    (goto-char (point-max))
+    (should-not (proofread--request-ready-range-at-point))))
+
+(ert-deftest proofread-test-check-point-rejects-ignored-text ()
+  "`proofread-check-point' rejects text excluded by ignored properties."
+  (with-temp-buffer
+    (insert "Alpha SECRET beta.")
+    (goto-char (point-min))
+    (search-forward "SECRET")
+    (let ((beg (match-beginning 0))
+          (end (match-end 0)))
+      (add-text-properties beg end '(proofread-test-ignore t))
+      (goto-char beg)
+      (setq-local proofread-auto-check nil)
+      (proofread-mode 1)
+      (let ((proofread-ignored-properties '(proofread-test-ignore)))
+        (should-error (proofread-check-point) :type 'user-error)
+        (should-not proofread--pending-ranges)
+        (should-not proofread--requests)))))
+
 (ert-deftest proofread-test-progress-messages-inhibited-by-default ()
   "Routine progress messages are quiet by default."
   (let (messages)

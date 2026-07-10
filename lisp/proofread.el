@@ -412,6 +412,12 @@ The returned plist contains the keys in `proofread--diagnostic-keys'."
    ((integerp position) position)
    ((markerp position) (marker-position position))))
 
+(defun proofread--current-buffer-position-p (position)
+  "Return non-nil when POSITION denotes a position in the current buffer."
+  (or (integerp position)
+      (and (markerp position)
+           (eq (marker-buffer position) (current-buffer)))))
+
 (defun proofread--normalize-ranges (ranges)
   "Return sorted, deduplicated RANGES.
 Each range is a cons cell of the form (BEG . END).  Empty or invalid ranges
@@ -434,6 +440,23 @@ are discarded.  Overlapping or adjacent ranges are merged."
           (setcdr (car normalized) (max (cdar normalized) (cdr range)))
         (push range normalized)))
     (nreverse normalized)))
+
+(defun proofread--normalize-accessible-ranges (ranges)
+  "Return normalized RANGES clipped to the accessible buffer portion."
+  (let ((minimum (point-min))
+        (maximum (point-max))
+        clipped)
+    (dolist (range ranges)
+      (when (consp range)
+        (let ((beg (proofread--position-integer (car range)))
+              (end (proofread--position-integer (cdr range))))
+          (when (and beg end)
+            (let ((lower (min beg end))
+                  (upper (max beg end)))
+              (push (cons (min maximum (max minimum lower))
+                          (min maximum (max minimum upper)))
+                    clipped))))))
+    (proofread--normalize-ranges clipped)))
 
 (defun proofread--visible-window-ranges ()
   "Return raw visible ranges for live windows showing the current buffer."
@@ -3421,9 +3444,77 @@ When RESET is non-nil, move from the beginning of the buffer."
   (proofread--clear-buffer-state)
   (proofread--unregister-mode-buffer))
 
-(defun proofread--command-placeholder (command)
-  "Report that COMMAND has not been implemented yet."
-  (message "proofread: `%s' is not implemented yet" command))
+(defun proofread--require-mode ()
+  "Require `proofread-mode' in the current buffer."
+  (unless proofread-mode
+    (user-error "Proofread mode is not enabled in the current buffer")))
+
+(defun proofread--check-ranges (ranges scope &optional force-feedback)
+  "Check RANGES and describe them as SCOPE in progress feedback.
+When FORCE-FEEDBACK is non-nil, report feedback even when routine progress
+messages are inhibited."
+  (proofread--require-mode)
+  (let ((progress-message
+         (if force-feedback
+             #'message
+           #'proofread--progress-message)))
+    (setq proofread--pending-ranges
+          (proofread--normalize-accessible-ranges ranges))
+    (if (proofread-backend-available-p)
+        (let* ((chunks (proofread--request-ready-visible-chunks))
+               (requests (proofread--dispatch-request-ready-chunks chunks))
+               (queued (length proofread--request-queue)))
+          (funcall
+           progress-message
+           "proofread: dispatched %d request%s%s from %d %s range%s"
+           (length requests)
+           (if (= (length requests) 1) "" "s")
+           (if (> queued 0)
+               (format "; queued %d" queued)
+             "")
+           (length proofread--pending-ranges)
+           scope
+           (if (= (length proofread--pending-ranges) 1) "" "s")))
+      (funcall
+       progress-message
+       "proofread: collected %d %s range%s; no available backend"
+       (length proofread--pending-ranges)
+       scope
+       (if (= (length proofread--pending-ranges) 1) "" "s")))))
+
+(defun proofread--span-at-position (spans position)
+  "Return the most useful member of sorted SPANS for POSITION.
+Spans are half-open ranges.  At the end of the accessible buffer or the first
+sentence-ending separator whitespace, return the preceding span only when it
+ends exactly at POSITION."
+  (or (cl-find-if (lambda (span)
+                    (and (<= (car span) position)
+                         (< position (cdr span))))
+                  spans)
+      (when (or (= position (point-max))
+                (and (< position (point-max))
+                     (memq (char-after position) '(?\s ?\t ?\n ?\r))
+                     (not (proofread--ignored-ranges-in-region
+                           position (1+ position)))))
+        (cl-find-if (lambda (span)
+                      (= (cdr span) position))
+                    spans))))
+
+(defun proofread--request-ready-range-at-point ()
+  "Return the request-ready chunk range selected by point, or nil."
+  (let* ((position (point))
+         (span
+          (proofread--span-at-position
+           (proofread--chunk-spans-for-ranges
+            (list (cons (point-min) (point-max))))
+           position)))
+    (when span
+      (proofread--span-at-position
+       (mapcar (lambda (chunk)
+                 (cons (plist-get chunk :beg)
+                       (plist-get chunk :end)))
+               (proofread--request-ready-chunks-for-ranges (list span)))
+       position))))
 
 ;;;###autoload
 (define-minor-mode proofread-mode
@@ -3432,7 +3523,8 @@ When RESET is non-nil, move from the beginning of the buffer."
 When enabled and `proofread-auto-check' is non-nil, proofread schedules
 visible-buffer checks after editing and window activity, then dispatches
 request-ready visible chunks through the configured backend.  When automatic
-checking is disabled, use `proofread-check-visible' to start a check manually."
+checking is disabled, use `proofread-check-visible', `proofread-check-buffer',
+`proofread-check-region', or `proofread-check-point' manually."
   :lighter " Proofread"
   :group 'proofread
   (if proofread-mode
@@ -3445,36 +3537,53 @@ checking is disabled, use `proofread-check-visible' to start a check manually."
 When FORCE-FEEDBACK is non-nil, report command feedback even when routine
 progress messages are inhibited."
   (interactive (list t))
-  (let ((progress-message
-         (if force-feedback
-             #'message
-           #'proofread--progress-message)))
-    (setq proofread--pending-ranges (proofread--visible-ranges))
-    (if (proofread-backend-available-p)
-        (let* ((chunks (proofread--request-ready-visible-chunks))
-               (requests (proofread--dispatch-request-ready-chunks chunks))
-               (queued (length proofread--request-queue)))
-          (funcall
-           progress-message
-           "proofread: dispatched %d request%s%s from %d visible range%s"
-           (length requests)
-           (if (= (length requests) 1) "" "s")
-           (if (> queued 0)
-               (format "; queued %d" queued)
-             "")
-           (length proofread--pending-ranges)
-           (if (= (length proofread--pending-ranges) 1) "" "s")))
-      (funcall
-       progress-message
-       "proofread: collected %d visible range%s; no available backend"
-       (length proofread--pending-ranges)
-       (if (= (length proofread--pending-ranges) 1) "" "s")))))
+  (proofread--check-ranges
+   (proofread--visible-ranges) "visible" force-feedback))
 
 ;;;###autoload
-(defun proofread-check-buffer ()
-  "Check the current buffer for proofreading diagnostics."
-  (interactive)
-  (proofread--command-placeholder 'proofread-check-buffer))
+(defun proofread-check-buffer (&optional force-feedback)
+  "Check accessible text in the current buffer for proofreading diagnostics.
+When FORCE-FEEDBACK is non-nil, report command feedback even when routine
+progress messages are inhibited."
+  (interactive (list t))
+  (proofread--check-ranges
+   (list (cons (point-min) (point-max))) "buffer" force-feedback))
+
+;;;###autoload
+(defun proofread-check-region (beg end &optional force-feedback)
+  "Check text between BEG and END for proofreading diagnostics.
+Interactively, check the active region.  BEG and END may be supplied in either
+order.  When FORCE-FEEDBACK is non-nil, report command feedback even when
+routine progress messages are inhibited."
+  (interactive
+   (if (use-region-p)
+       (list (region-beginning) (region-end) t)
+     (list nil nil t)))
+  (unless (and beg end)
+    (user-error "No active region"))
+  (unless (and (proofread--current-buffer-position-p beg)
+               (proofread--current-buffer-position-p end))
+    (user-error "Region boundaries are not in the current buffer"))
+  (let ((beg (proofread--position-integer beg))
+        (end (proofread--position-integer end)))
+    (when (= beg end)
+      (user-error "The region is empty"))
+    (proofread--check-ranges
+     (list (cons beg end))
+     "selected"
+     force-feedback)))
+
+;;;###autoload
+(defun proofread-check-point (&optional force-feedback)
+  "Check the request-ready proofreading chunk at point.
+When FORCE-FEEDBACK is non-nil, report command feedback even when routine
+progress messages are inhibited."
+  (interactive (list t))
+  (proofread--require-mode)
+  (let ((range (proofread--request-ready-range-at-point)))
+    (unless range
+      (user-error "No text to proofread at point"))
+    (proofread--check-ranges (list range) "point" force-feedback)))
 
 ;;;###autoload
 (defun proofread-show-buffer-diagnostics (&optional diagnostic)
