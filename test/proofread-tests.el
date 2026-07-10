@@ -4049,6 +4049,194 @@
         (should-not proofread--diagnostics)
         (should-not proofread--overlays)))))
 
+(ert-deftest proofread-test-request-log-hook-observes-llm-lifecycle ()
+  "Request events expose LLM request, response, parsed result, and final status."
+  (with-temp-buffer
+    (insert "helo")
+    (proofread-mode 1)
+    (let* ((proofread-llm-provider 'proofread-test-provider)
+           (proofread-llm-max-diagnostic-passes 1)
+           (chunk (car (proofread--request-ready-chunks-for-ranges
+                        (list (cons (point-min) (point-max))))))
+           (request (proofread--make-backend-request chunk 'llm))
+           (content
+            (proofread-test--response-content
+             (list (proofread-test--response-diagnostic 0 4 "helo"))))
+           events
+           status)
+      (cl-letf (((symbol-function 'llm-chat-async)
+                 (lambda (_provider _prompt success _error
+                                    &optional _multi-output)
+                   (run-at-time 0 nil (lambda () (funcall success content)))
+                   'proofread-test-llm-handle))
+                ((symbol-function 'llm-capabilities)
+                 #'proofread-test--llm-capabilities))
+        (let ((proofread-request-log-hook
+               (list (lambda (event)
+                       (push event events)))))
+          (should (proofread--dispatch-backend-request
+                   request
+                   (lambda (backend-result)
+                     (setq status
+                           (proofread--handle-backend-result
+                            backend-result)))
+                   'llm))
+          (should (proofread-test--wait-for (lambda () status)))
+          (setq events (nreverse events))
+          (let ((types (mapcar (lambda (event)
+                                 (plist-get event :type))
+                               events)))
+            (should (memq 'backend-request types))
+            (should (memq 'backend-response types))
+            (should (memq 'backend-result types))
+            (should (memq 'final-result types)))
+          (let ((backend-request
+                 (cl-find-if (lambda (event)
+                               (eq (plist-get event :type)
+                                   'backend-request))
+                             events))
+                (backend-response
+                 (cl-find-if (lambda (event)
+                               (eq (plist-get event :type)
+                                   'backend-response))
+                             events))
+                (final-result
+                 (car (last events))))
+            (should (plist-get backend-request :schema))
+            (should (plist-get backend-request :prompt))
+            (should (equal (plist-get backend-response :response)
+                           content))
+            (should (eq (plist-get final-result :status)
+                        'applied))))))))
+
+(ert-deftest proofread-test-request-log-buffer-lists-recorded-requests ()
+  "`proofread-show-buffer-requests' lists request ranges for a buffer."
+  (save-window-excursion
+    (let ((source (generate-new-buffer " *proofread-request-list-source*")))
+      (unwind-protect
+          (progn
+            (switch-to-buffer source)
+            (insert "aa helo\nbb")
+            (proofread-mode 1)
+            (let* ((request
+                    (list :log-id 9001
+                          :id 7
+                          :buffer source
+                          :beg 4
+                          :end 8
+                          :text "helo"
+                          :backend 'llm
+                          :modified-tick
+                          (buffer-chars-modified-tick)))
+                   (name (proofread--request-log-list-buffer-name source)))
+              (unwind-protect
+                  (progn
+                    (proofread-show-buffer-requests source)
+                    (proofread--request-log-record-event
+                     (list :type 'chunk-request
+                           :time (current-time)
+                           :log-id 9001
+                           :request-id 7
+                           :buffer source
+                           :beg 4
+                           :end 8
+                           :request request
+                           :chunk request))
+                    (with-current-buffer name
+                      (should (eq major-mode
+                                  'proofread-requests-buffer-mode))
+                      (should (eq proofread--request-log-list-source
+                                  source))
+                      (should (= (length tabulated-list-entries) 1))
+                      (let* ((entry (car tabulated-list-entries))
+                             (id (car entry))
+                             (columns (cadr entry)))
+                        (should (= (plist-get id :request-id) 7))
+                        (should (equal (aref columns 0) "7"))
+                        (should (equal (aref columns 1) "queued"))
+                        (should (equal (aref columns 3) "1"))
+                        (should (equal (aref columns 4) "3"))
+                        (should (equal (aref columns 5) "4-8"))
+                        (should (equal (aref columns 6) "llm"))
+                        (should (equal (aref columns 7) "helo")))))
+                (when-let* ((buffer (get-buffer name)))
+                  (kill-buffer buffer)))))
+        (when (buffer-live-p source)
+          (kill-buffer source))))))
+
+(ert-deftest proofread-test-request-log-request-buffer-shows-lisp-data ()
+  "Detailed proofread request buffers are read-only Lisp data buffers."
+  (save-window-excursion
+    (let ((source (generate-new-buffer " *proofread-request-detail-source*")))
+      (unwind-protect
+          (progn
+            (switch-to-buffer source)
+            (insert "helo")
+            (proofread-mode 1)
+            (let* ((request
+                    (list :log-id 9002
+                          :id 8
+                          :buffer source
+                          :beg 1
+                          :end 5
+                          :text "helo"
+                          :backend 'llm
+                          :modified-tick
+                          (buffer-chars-modified-tick)))
+                   (result
+                    (proofread--backend-success-result
+                     request
+                     (list (proofread-test--diagnostic-for-range
+                            1 5 "helo"))))
+                   (record
+                    (list :key 9002
+                          :log-id 9002
+                          :request-id 8
+                          :source-buffer source
+                          :buffer source
+                          :beg 1
+                          :end 5
+                          :status 'applied
+                          :chunk request
+                          :request request
+                          :backend-requests
+                          (list (list :backend 'llm
+                                      :pass 1
+                                      :schema
+                                      proofread--structured-response-schema
+                                      :prompt nil))
+                          :backend-responses
+                          (list (list :backend 'llm
+                                      :pass 1
+                                      :response
+                                      '(:diagnostics nil)))
+                          :backend-results (list result)
+                          :final-status 'applied
+                          :final-result result))
+                   (detail-name
+                    (proofread--request-log-request-buffer-name record)))
+              (unwind-protect
+                  (progn
+                    (proofread--request-log-show-record record)
+                    (with-current-buffer detail-name
+                      (should buffer-read-only)
+                      (should (eq major-mode
+                                  (if (fboundp 'lisp-data-mode)
+                                      'lisp-data-mode
+                                    'emacs-lisp-mode)))
+                      (goto-char (point-min))
+                      (dolist (heading '(";;; Summary"
+                                         ";;; Chunk request"
+                                         ";;; Backend requests"
+                                         ";;; Backend responses"
+                                         ";;; Parsed backend results"
+                                         ";;; Final result"))
+                        (should (search-forward heading nil t)))))
+                (when-let* ((buffer (get-buffer detail-name)))
+                  (kill-buffer buffer)))))
+        (when (buffer-live-p source)
+          (kill-buffer source))))))
+
 (provide 'proofread-tests)
 
 ;;; proofread-tests.el ends here

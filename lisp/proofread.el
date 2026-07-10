@@ -33,11 +33,16 @@
 (require 'cl-lib)
 (require 'button)
 (require 'json)
+(require 'lisp-mode)
 (require 'llm)
 (require 'posframe)
+(require 'pp)
 (require 'pulse)
 (require 'subr-x)
 (require 'tabulated-list)
+
+(declare-function llm-chat-prompt-interactions "llm" (prompt))
+(declare-function llm-chat-prompt-interaction-content "llm" (interaction))
 
 (declare-function previous-error-this-buffer-no-select "simple"
                   (&optional n reset))
@@ -325,11 +330,48 @@ property has a non-nil value is not included in request-ready chunks."
 (defvar warning-minimum-level)
 (defvar warning-minimum-log-level)
 
+(defvar proofread-request-log-hook nil
+  "Abnormal hook run with proofread request lifecycle events.
+Each function receives one plist argument.  Consumers should treat the event as
+read-only and must not signal errors that interrupt proofreading.")
+
 (defvar proofread--mode-buffers nil
   "Live buffers where `proofread-mode' has installed local hooks.")
 
 (defvar proofread--window-hooks-installed nil
   "Non-nil when proofread global window activity hooks are installed.")
+
+(defvar proofread--request-log-sequence 0
+  "Session-local sequence for request log identifiers.")
+
+(defun proofread--run-request-log-hook (event)
+  "Run `proofread-request-log-hook' for EVENT without breaking proofreading."
+  (when proofread-request-log-hook
+    (run-hook-wrapped
+     'proofread-request-log-hook
+     (lambda (function event)
+       (condition-case err
+           (funcall function event)
+         (error
+          (message "proofread request log hook error: %s"
+                   (error-message-string err))))
+       nil)
+     event)))
+
+(defun proofread--record-request-event (request type &rest properties)
+  "Record a lifecycle event of TYPE for REQUEST with PROPERTIES."
+  (let ((event (append
+                (list :type type
+                      :time (current-time)
+                      :log-id (plist-get request :log-id)
+                      :request-id (plist-get request :id)
+                      :buffer (plist-get request :buffer)
+                      :beg (plist-get request :beg)
+                      :end (plist-get request :end)
+                      :request request)
+                properties)))
+    (proofread--run-request-log-hook event)
+    event))
 
 (defun proofread--make-diagnostic (&rest properties)
   "Return a proofread diagnostic plist from PROPERTIES.
@@ -899,15 +941,18 @@ consume."
 (defun proofread--make-backend-request (chunk &optional backend)
   "Return a backend request plist for request-ready CHUNK.
 When BACKEND is non-nil, store its canonical identity in the request."
-  (mapcan
-   (lambda (key)
-     (list key
-           (pcase key
-             (:id (proofread--next-request-id))
-             (:buffer (current-buffer))
-             (:backend (proofread--backend-identity backend))
-             (_ (plist-get chunk key)))))
-   proofread--backend-request-keys))
+  (plist-put
+   (mapcan
+    (lambda (key)
+      (list key
+            (pcase key
+              (:id (proofread--next-request-id))
+              (:buffer (current-buffer))
+              (:backend (proofread--backend-identity backend))
+              (_ (plist-get chunk key)))))
+    proofread--backend-request-keys)
+   :log-id
+   (cl-incf proofread--request-log-sequence)))
 
 (defun proofread--backend-success-result (request diagnostics)
   "Return a successful backend result for REQUEST and DIAGNOSTICS."
@@ -1242,25 +1287,50 @@ DEFAULT-SOURCE is stored as each diagnostic's internal source."
     (plist-get response :text))
    (t (error "Invalid llm structured response"))))
 
-(defun proofread--llm-success-result (request response)
+(defun proofread--llm-success-result (request response &optional pass)
   "Return backend success or parse error result for LLM RESPONSE."
-  (condition-case err
-      (proofread--backend-success-result
-       request
-       (proofread--diagnostics-from-structured-response
-        request (proofread--llm-response-content response) 'llm))
-    (error
-     (proofread--backend-error-result
-      request 'llm-invalid-response (error-message-string err)))))
+  (proofread--record-request-event
+   request 'backend-response
+   :backend 'llm
+   :pass pass
+   :response response)
+  (let ((result
+         (condition-case err
+             (proofread--backend-success-result
+              request
+              (proofread--diagnostics-from-structured-response
+               request (proofread--llm-response-content response) 'llm))
+           (error
+            (proofread--backend-error-result
+             request 'llm-invalid-response (error-message-string err))))))
+    (proofread--record-request-event
+     request 'backend-result
+     :backend 'llm
+     :pass pass
+     :result result)
+    result))
 
-(defun proofread--llm-error-result (request error &optional message)
+(defun proofread--llm-error-result (request error &optional message pass)
   "Return backend error result for LLM ERROR and MESSAGE."
-  (proofread--backend-error-result
-   request
-   (or error 'llm-error)
-   (if message
-       (format "%s" message)
-     (format "%S" error))))
+  (proofread--record-request-event
+   request 'backend-response
+   :backend 'llm
+   :pass pass
+   :error error
+   :message message)
+  (let ((result
+         (proofread--backend-error-result
+          request
+          (or error 'llm-error)
+          (if message
+              (format "%s" message)
+            (format "%S" error)))))
+    (proofread--record-request-event
+     request 'backend-result
+     :backend 'llm
+     :pass pass
+     :result result)
+    result))
 
 (defun proofread--llm-provider-json-response-p (provider)
   "Return non-nil when PROVIDER advertises JSON response support."
@@ -1345,29 +1415,47 @@ MAX-PASSES is the request-local diagnostic pass limit."
            (pass diagnostics)
            (let ((prompt (proofread--llm-prompt request strategy diagnostics)))
              (condition-case err
-                 (let ((request-handle
-                        (llm-chat-async
-                         provider prompt
-                         (lambda (response)
-                           (proofread--llm-finish-or-continue
-                            request callback #'submit max-passes pass diagnostics
-                            (proofread--llm-success-result request response)))
-                         (lambda (error &optional message &rest _)
-                           (proofread--llm-finish-or-continue
-                            request callback #'submit max-passes pass diagnostics
-                            (proofread--llm-error-result
-                             request error message))))))
-                   (plist-put handle
-                              :requests
-                              (cons request-handle
-                                    (plist-get handle :requests))))
+                 (progn
+                   (proofread--record-request-event
+                    request 'backend-request
+                    :backend 'llm
+                    :pass pass
+                    :max-passes max-passes
+                    :strategy strategy
+                    :prompt prompt
+                    :schema (llm-chat-prompt-response-format prompt)
+                    :reported-diagnostics diagnostics)
+                   (let ((request-handle
+                          (llm-chat-async
+                           provider prompt
+                           (lambda (response)
+                             (proofread--llm-finish-or-continue
+                              request callback #'submit max-passes pass diagnostics
+                              (proofread--llm-success-result
+                               request response pass)))
+                           (lambda (error &optional message &rest _)
+                             (proofread--llm-finish-or-continue
+                              request callback #'submit max-passes pass diagnostics
+                              (proofread--llm-error-result
+                               request error message pass))))))
+                     (plist-put handle
+                                :requests
+                                (cons request-handle
+                                      (plist-get handle :requests)))))
                (error
-                (proofread--llm-defer-callback
-                 callback
-                 (if diagnostics
-                     (proofread--backend-success-result request diagnostics)
-                   (proofread--backend-error-result
-                    request 'llm-submit-error (error-message-string err)))))))))
+                (let ((result
+                       (if diagnostics
+                           (proofread--backend-success-result
+                            request diagnostics)
+                         (proofread--backend-error-result
+                          request 'llm-submit-error
+                          (error-message-string err)))))
+                  (proofread--record-request-event
+                   request 'backend-result
+                   :backend 'llm
+                   :pass pass
+                   :result result)
+                  (proofread--llm-defer-callback callback result)))))))
       (submit 1 nil)))
   handle)
 
@@ -1441,7 +1529,11 @@ handle."
                   nil))))
           (when handle
             (with-current-buffer buffer
-              (proofread--record-active-request-handle request handle)))
+              (proofread--record-active-request-handle request handle))
+            (proofread--record-request-event
+             request 'backend-dispatched
+             :backend (or backend proofread-backend)
+             :handle handle))
           handle)))))
 
 (defun proofread--request-range-valid-p (request)
@@ -1638,14 +1730,24 @@ When BACKEND is nil, use the selected `proofread-backend'."
   "Apply cached diagnostics from ENTRY for REQUEST when still valid."
   (when (equal (plist-get entry :text)
                (plist-get request :text))
-    (proofread--handle-backend-result
-     (list :status 'ok
-           :source 'cache
-           :request request
-           :diagnostics
-           (proofread--diagnostics-to-absolute
-            (plist-get entry :diagnostics)
-            request)))))
+    (proofread--record-request-event
+     request 'cache-hit
+     :entry entry)
+    (let ((result
+           (list :status 'ok
+                 :source 'cache
+                 :request request
+                 :diagnostics
+                 (proofread--diagnostics-to-absolute
+                  (plist-get entry :diagnostics)
+                  request))))
+      (proofread--record-request-event
+       request 'backend-result
+       :backend (plist-get request :backend)
+       :source 'cache
+       :entry entry
+       :result result)
+      (proofread--handle-backend-result result))))
 
 (defun proofread--clear-diagnostics-in-range (beg end)
   "Remove current proofread diagnostics intersecting BEG to END."
@@ -1673,19 +1775,26 @@ When BACKEND is nil, use the selected `proofread-backend'."
 (defun proofread--handle-backend-result (result)
   "Handle backend RESULT and return an internal status symbol."
   (let* ((request (plist-get result :request))
-         (buffer (plist-get request :buffer)))
-    (pcase (plist-get result :status)
-      ('ok
-       (if (proofread--fresh-request-p request)
-           (with-current-buffer buffer
-             (let ((diagnostics (plist-get result :diagnostics)))
-               (proofread--replace-backend-diagnostics request diagnostics)
-               (unless (eq (plist-get result :source) 'cache)
-                 (proofread--cache-write-request request diagnostics)))
-             'applied)
-         'stale))
-      ('error 'error)
-      (_ 'error))))
+         (buffer (plist-get request :buffer))
+         (status
+          (pcase (plist-get result :status)
+            ('ok
+             (if (proofread--fresh-request-p request)
+                 (with-current-buffer buffer
+                   (let ((diagnostics (plist-get result :diagnostics)))
+                     (proofread--replace-backend-diagnostics
+                      request diagnostics)
+                     (unless (eq (plist-get result :source) 'cache)
+                       (proofread--cache-write-request request diagnostics)))
+                   'applied)
+               'stale))
+            ('error 'error)
+            (_ 'error))))
+    (proofread--record-request-event
+     request 'final-result
+     :result result
+     :status status)
+    status))
 
 (defun proofread--dispatch-request-ready-chunks (chunks &optional backend)
   "Dispatch request-ready CHUNKS through BACKEND.
@@ -1696,6 +1805,9 @@ When BACKEND is nil, use `proofread-backend'.  Return dispatched requests."
       (dolist (chunk chunks)
         (let ((request (proofread--make-backend-request chunk backend)))
           (setq request (plist-put request :backend backend-identity))
+          (proofread--record-request-event
+           request 'chunk-request
+           :chunk chunk)
           (let ((entry (proofread--cache-read-request request)))
             (if entry
                 (proofread--apply-cache-entry request entry)
@@ -2053,6 +2165,511 @@ navigation order."
     (when overlay
       (overlay-put overlay 'face 'proofread-current-face)))
   diagnostic)
+
+;;; Per-buffer request listings
+
+(defvar-local proofread--request-log-enabled nil
+  "Non-nil when the current buffer records proofread request events.")
+
+(defvar-local proofread--request-log-records nil
+  "Hash table of proofread request records for the current buffer.")
+
+(defvar-local proofread--request-log-list-source nil
+  "Source buffer monitored by the current proofread requests buffer.")
+
+(defvar proofread-requests-buffer-mode-map
+  (let ((map (make-sparse-keymap)))
+    (define-key map (kbd "RET") #'proofread-show-request)
+    (define-key map (kbd "C-m") #'proofread-show-request)
+    map)
+  "Keymap for `proofread-requests-buffer-mode'.")
+
+(defconst proofread--request-log-list-format
+  `[("Id" 6 nil :right-align t)
+    ("Status" 10 t)
+    ("Time" 8 t)
+    ("Line" 4 ,(lambda (a b)
+                 (< (plist-get (car a) :line)
+                    (plist-get (car b) :line)))
+     :right-align t)
+    ("Col" 4 nil :right-align t)
+    ("Range" 15 t)
+    ("Backend" 10 t)
+    ("Text" 0 t)]
+  "Tabulated list format for proofread request buffers.")
+
+(defun proofread--request-log-ensure-records ()
+  "Return the current buffer's proofread request record table."
+  (unless (hash-table-p proofread--request-log-records)
+    (setq proofread--request-log-records (make-hash-table :test #'equal)))
+  proofread--request-log-records)
+
+(defun proofread--request-log-hash-values (hash-table)
+  "Return values from HASH-TABLE."
+  (let (values)
+    (maphash (lambda (_key value)
+               (push value values))
+             hash-table)
+    (nreverse values)))
+
+(defun proofread--request-log-event-request (event)
+  "Return the proofread request stored in EVENT."
+  (or (plist-get event :request)
+      (plist-get (plist-get event :result) :request)))
+
+(defun proofread--request-log-event-key (event)
+  "Return the request record key for EVENT."
+  (let ((request (proofread--request-log-event-request event)))
+    (or (plist-get event :log-id)
+        (plist-get request :log-id)
+        (plist-get event :request-id)
+        (plist-get request :id))))
+
+(defun proofread--request-log-plist-append (plist property value)
+  "Return PLIST with VALUE appended to list PROPERTY."
+  (plist-put plist property
+             (append (plist-get plist property) (list value))))
+
+(defun proofread--request-log-record-status (type event)
+  "Return the request status implied by event TYPE and EVENT."
+  (pcase type
+    ('chunk-request 'queued)
+    ('active-request 'active)
+    ('backend-dispatched 'pending)
+    ('backend-request 'sent)
+    ('backend-response 'received)
+    ('backend-result
+     (if (eq (plist-get (plist-get event :result) :status) 'error)
+         'error
+       'parsed))
+    ('cache-hit 'cache)
+    ('final-result (plist-get event :status))
+    (_ nil)))
+
+(defun proofread--request-log-record-request-fields (record request event)
+  "Update RECORD with REQUEST and range data from EVENT."
+  (let ((request (or request (plist-get record :request))))
+    (when request
+      (setq record (plist-put record :request request)))
+    (dolist (property '(:log-id :request-id :buffer :beg :end))
+      (when (plist-member event property)
+        (setq record
+              (plist-put record property (plist-get event property)))))
+    record))
+
+(defun proofread--request-log-apply-event (record event)
+  "Return RECORD updated with request lifecycle EVENT."
+  (let* ((type (plist-get event :type))
+         (time (plist-get event :time))
+         (request (proofread--request-log-event-request event))
+         (status (proofread--request-log-record-status type event)))
+    (setq record (proofread--request-log-record-request-fields
+                  record request event))
+    (unless (plist-get record :created-at)
+      (setq record (plist-put record :created-at time)))
+    (setq record (plist-put record :updated-at time))
+    (setq record (proofread--request-log-plist-append record :events event))
+    (when status
+      (setq record (plist-put record :status status)))
+    (pcase type
+      ('chunk-request
+       (setq record (plist-put record :chunk (plist-get event :chunk))))
+      ('backend-dispatched
+       (setq record (plist-put record :handle (plist-get event :handle))))
+      ('backend-request
+       (setq record
+             (proofread--request-log-plist-append
+              record :backend-requests event)))
+      ('backend-response
+       (setq record
+             (proofread--request-log-plist-append
+              record :backend-responses event)))
+      ('backend-result
+       (setq record
+             (proofread--request-log-plist-append
+              record :backend-results (plist-get event :result))))
+      ('cache-hit
+       (setq record (plist-put record :cache-entry
+                               (plist-get event :entry))))
+      ('final-result
+       (setq record (plist-put record :final-status
+                               (plist-get event :status)))
+       (setq record (plist-put record :final-result
+                               (plist-get event :result)))))
+    record))
+
+(defun proofread--request-log-source-enabled-p (source)
+  "Return non-nil when SOURCE records proofread request events."
+  (and (buffer-live-p source)
+       (with-current-buffer source
+         proofread--request-log-enabled)))
+
+(defun proofread--request-log-record-event (event)
+  "Record a proofread request EVENT when its buffer is monitored."
+  (let ((source (plist-get event :buffer))
+        (key (proofread--request-log-event-key event)))
+    (when (and key (proofread--request-log-source-enabled-p source))
+      (with-current-buffer source
+        (let* ((records (proofread--request-log-ensure-records))
+               (record (or (gethash key records)
+                           (list :key key
+                                 :source-buffer source))))
+          (setq record (proofread--request-log-apply-event record event))
+          (puthash key record records)))
+      (proofread--request-log-refresh-open-buffers source))))
+
+(defun proofread--request-log-record-list (&optional source)
+  "Return proofread request records for SOURCE or the current buffer."
+  (with-current-buffer (or source (current-buffer))
+    (sort
+     (proofread--request-log-hash-values (proofread--request-log-ensure-records))
+     (lambda (a b)
+       (< (or (plist-get a :log-id)
+              (plist-get a :request-id)
+              0)
+          (or (plist-get b :log-id)
+              (plist-get b :request-id)
+              0))))))
+
+(defun proofread--request-log-lookup-record (source key)
+  "Return request record KEY from SOURCE."
+  (when (buffer-live-p source)
+    (with-current-buffer source
+      (and (hash-table-p proofread--request-log-records)
+           (gethash key proofread--request-log-records)))))
+
+(defun proofread--request-log-position (position)
+  "Return POSITION as an integer buffer position, or nil."
+  (cond
+   ((integerp position) position)
+   ((markerp position) (marker-position position))))
+
+(defun proofread--request-log-source-range-valid-p (source beg end)
+  "Return non-nil when BEG to END is valid in SOURCE."
+  (and (buffer-live-p source)
+       (with-current-buffer source
+         (and (integerp beg)
+              (integerp end)
+              (<= (point-min) beg)
+              (<= beg end)
+              (<= end (point-max))))))
+
+(defun proofread--request-log-record-range (record)
+  "Return RECORD's source range as a cons cell, or nil."
+  (let ((beg (proofread--request-log-position (plist-get record :beg)))
+        (end (proofread--request-log-position (plist-get record :end))))
+    (when (and beg end)
+      (cons beg end))))
+
+(defun proofread--request-log-record-line-column (record)
+  "Return RECORD's source line and column as a cons cell."
+  (let* ((source (plist-get record :source-buffer))
+         (range (proofread--request-log-record-range record))
+         (beg (car-safe range))
+         (end (cdr-safe range)))
+    (when (proofread--request-log-source-range-valid-p source beg end)
+      (with-current-buffer source
+        (save-excursion
+          (goto-char beg)
+          (cons (line-number-at-pos)
+                (- (point) (line-beginning-position))))))))
+
+(defun proofread--request-log-record-current-text (record)
+  "Return RECORD's current source text, or nil when stale."
+  (let* ((source (plist-get record :source-buffer))
+         (range (proofread--request-log-record-range record))
+         (beg (car-safe range))
+         (end (cdr-safe range)))
+    (when (proofread--request-log-source-range-valid-p source beg end)
+      (with-current-buffer source
+        (buffer-substring-no-properties beg end)))))
+
+(defun proofread--request-log-format-time (time)
+  "Return TIME formatted for request lists."
+  (if time
+      (format-time-string "%T" time)
+    "-"))
+
+(defun proofread--request-log-format-field (value &optional width)
+  "Return VALUE as a one-line string, optionally limited to WIDTH."
+  (let* ((text (cond
+                ((null value) "-")
+                ((stringp value) value)
+                ((symbolp value) (symbol-name value))
+                (t (format "%S" value))))
+         (single-line (string-trim
+                       (replace-regexp-in-string "[[:space:]\n\r]+"
+                                                 " "
+                                                 text))))
+    (if (and width (> (string-width single-line) width))
+        (truncate-string-to-width single-line width nil nil "...")
+      single-line)))
+
+(defun proofread--request-log-backend-label (record)
+  "Return a short backend label for RECORD."
+  (let* ((request (plist-get record :request))
+         (backend (plist-get request :backend)))
+    (cond
+     ((and (listp backend) (plist-get backend :backend))
+      (proofread--request-log-format-field (plist-get backend :backend)))
+     (backend
+      (proofread--request-log-format-field backend 10))
+     (t "-"))))
+
+(defun proofread--request-log-record-entry (record)
+  "Return a tabulated list entry for request RECORD."
+  (let* ((line-column (proofread--request-log-record-line-column record))
+         (raw-line (car-safe line-column))
+         (raw-column (cdr-safe line-column))
+         (line (or raw-line 0))
+         (column (or raw-column 0))
+         (range (proofread--request-log-record-range record))
+         (entry-id (copy-sequence record)))
+    (setq entry-id (plist-put entry-id :line line))
+    (setq entry-id (plist-put entry-id :column column))
+    (list
+     entry-id
+     (vector
+      (proofread--request-log-format-field
+       (or (plist-get record :request-id)
+           (plist-get record :log-id)))
+      (proofread--request-log-format-field (plist-get record :status))
+      (proofread--request-log-format-time (plist-get record :updated-at))
+      (if raw-line (number-to-string raw-line) "-")
+      (if raw-column (number-to-string raw-column) "-")
+      (if range
+          (format "%d-%d" (car range) (cdr range))
+        "-")
+      (proofread--request-log-backend-label record)
+      (proofread--request-log-format-field
+       (or (plist-get (plist-get record :request) :text)
+           (proofread--request-log-record-current-text record))
+       90)))))
+
+(defun proofread--request-log-list-refresh ()
+  "Refresh the current proofread requests buffer."
+  (setq tabulated-list-format proofread--request-log-list-format)
+  (setq tabulated-list-entries
+        (and (buffer-live-p proofread--request-log-list-source)
+             (mapcar #'proofread--request-log-record-entry
+                     (proofread--request-log-record-list
+                      proofread--request-log-list-source))))
+  (tabulated-list-init-header)
+  (tabulated-list-print t))
+
+(defun proofread--request-log-list-setup ()
+  "Set up the current proofread requests buffer."
+  (setq-local revert-buffer-function
+              (lambda (&rest _)
+                (proofread--request-log-list-refresh)))
+  (setq tabulated-list-sort-key (cons "Id" nil)))
+
+(define-derived-mode proofread-requests-buffer-mode tabulated-list-mode
+  "Proofread requests"
+  "A mode for listing Proofread backend requests."
+  :interactive nil
+  (proofread--request-log-list-setup))
+
+(defun proofread--request-log-list-buffer-name (source)
+  "Return the request list buffer name for SOURCE."
+  (format "*Proofread requests for `%s'*" (buffer-name source)))
+
+(defun proofread--request-log-request-buffer-name (record)
+  "Return the request detail buffer name for RECORD."
+  (let ((source (plist-get record :source-buffer)))
+    (format "*Proofread request %s for `%s'*"
+            (or (plist-get record :request-id)
+                (plist-get record :log-id)
+                "?")
+            (if (buffer-live-p source)
+                (buffer-name source)
+              "dead buffer"))))
+
+(defun proofread--request-log-fit-list-window (window)
+  "Fit proofread request list WINDOW to its buffer."
+  (fit-window-to-buffer window 15 8))
+
+(defun proofread--request-log-source-buffer (buffer)
+  "Return BUFFER as a live buffer, or signal `user-error'."
+  (let ((source (if (bufferp buffer)
+                    buffer
+                  (get-buffer buffer))))
+    (unless (buffer-live-p source)
+      (user-error "No such live buffer: %S" buffer))
+    source))
+
+(defun proofread--request-log-ensure-hook ()
+  "Install the proofread request log hook."
+  (add-hook 'proofread-request-log-hook
+            #'proofread--request-log-record-event))
+
+(defun proofread--request-log-seed-active-requests (source)
+  "Record active requests already present in SOURCE."
+  (with-current-buffer source
+    (dolist (request proofread--requests)
+      (proofread--request-log-record-event
+       (list :type 'active-request
+             :time (current-time)
+             :log-id (plist-get request :log-id)
+             :request-id (plist-get request :id)
+             :buffer source
+             :beg (plist-get request :beg)
+             :end (plist-get request :end)
+             :request request)))))
+
+(defun proofread--request-log-enable-source (source)
+  "Enable proofread request recording for SOURCE."
+  (with-current-buffer source
+    (setq proofread--request-log-enabled t)
+    (proofread--request-log-ensure-records))
+  (proofread--request-log-ensure-hook)
+  (proofread--request-log-seed-active-requests source))
+
+(defun proofread--request-log-refresh-open-buffers (source)
+  "Refresh open proofread request list buffers for SOURCE."
+  (dolist (buffer (buffer-list))
+    (when (buffer-live-p buffer)
+      (with-current-buffer buffer
+        (when (and (eq major-mode 'proofread-requests-buffer-mode)
+                   (eq proofread--request-log-list-source source))
+          (proofread--request-log-list-refresh))))))
+
+(defun proofread--request-log-prompt-text (prompt)
+  "Return a plain prompt text summary from PROMPT, or nil."
+  (condition-case nil
+      (mapconcat #'llm-chat-prompt-interaction-content
+                 (llm-chat-prompt-interactions prompt)
+                 "\n\n")
+    (error nil)))
+
+(defun proofread--request-log-backend-request-details (event)
+  "Return printable backend request details for EVENT."
+  (let ((prompt (plist-get event :prompt)))
+    (list :backend (plist-get event :backend)
+          :pass (plist-get event :pass)
+          :max-passes (plist-get event :max-passes)
+          :strategy (plist-get event :strategy)
+          :schema (plist-get event :schema)
+          :prompt-text (proofread--request-log-prompt-text prompt)
+          :prompt prompt
+          :reported-diagnostics
+          (plist-get event :reported-diagnostics))))
+
+(defun proofread--request-log-backend-response-details (event)
+  "Return printable backend response details for EVENT."
+  (list :backend (plist-get event :backend)
+        :pass (plist-get event :pass)
+        :response (plist-get event :response)
+        :error (plist-get event :error)
+        :message (plist-get event :message)))
+
+(defun proofread--request-log-record-summary (record)
+  "Return a summary plist for RECORD."
+  (let ((line-column (proofread--request-log-record-line-column record)))
+    (list :log-id (plist-get record :log-id)
+          :request-id (plist-get record :request-id)
+          :status (plist-get record :status)
+          :source-buffer (plist-get record :source-buffer)
+          :beg (plist-get record :beg)
+          :end (plist-get record :end)
+          :line (car-safe line-column)
+          :column (cdr-safe line-column)
+          :created-at (plist-get record :created-at)
+          :updated-at (plist-get record :updated-at)
+          :current-source-text
+          (proofread--request-log-record-current-text record))))
+
+(defun proofread--request-log-insert-section (title value)
+  "Insert a Lisp data section titled TITLE with VALUE."
+  (insert ";;; " title "\n")
+  (pp value (current-buffer))
+  (insert "\n"))
+
+(defun proofread--request-log-show-record (record)
+  "Display detailed proofread request information for RECORD."
+  (let ((buffer (get-buffer-create
+                 (proofread--request-log-request-buffer-name record))))
+    (with-current-buffer buffer
+      (let ((inhibit-read-only t))
+        (setq buffer-read-only nil)
+        (erase-buffer)
+        (if (fboundp 'lisp-data-mode)
+            (lisp-data-mode)
+          (emacs-lisp-mode))
+        (proofread--request-log-insert-section
+         "Summary"
+         (proofread--request-log-record-summary record))
+        (proofread--request-log-insert-section
+         "Chunk request"
+         (list :chunk (plist-get record :chunk)
+               :request (plist-get record :request)))
+        (proofread--request-log-insert-section
+         "Backend requests"
+         (mapcar #'proofread--request-log-backend-request-details
+                 (plist-get record :backend-requests)))
+        (proofread--request-log-insert-section
+         "Backend responses"
+         (mapcar #'proofread--request-log-backend-response-details
+                 (plist-get record :backend-responses)))
+        (proofread--request-log-insert-section
+         "Parsed backend results"
+         (plist-get record :backend-results))
+        (proofread--request-log-insert-section
+         "Final result"
+         (list :status (plist-get record :final-status)
+               :result (plist-get record :final-result)
+               :cache-entry (plist-get record :cache-entry)))
+        (setq buffer-read-only t)
+        (goto-char (point-min))))
+    (pop-to-buffer buffer)))
+
+;;;###autoload
+(defun proofread-show-buffer-requests (buffer)
+  "Show proofread backend requests recorded for BUFFER.
+This command starts recording BUFFER's future proofread request events."
+  (interactive
+   (list
+    (read-buffer "Monitor proofread buffer: "
+                 (or (and (boundp 'proofread--request-log-list-source)
+                          (buffer-live-p proofread--request-log-list-source)
+                          proofread--request-log-list-source)
+                     (current-buffer))
+                 t)))
+  (let ((source (proofread--request-log-source-buffer buffer)))
+    (unless (with-current-buffer source proofread-mode)
+      (user-error "Proofread mode is not enabled in %s" source))
+    (proofread--request-log-enable-source source)
+    (let* ((name (proofread--request-log-list-buffer-name source))
+           (target (or (get-buffer name)
+                       (with-current-buffer (get-buffer-create name)
+                         (proofread-requests-buffer-mode)
+                         (current-buffer))))
+           window)
+      (with-current-buffer target
+        (setq proofread--request-log-list-source source)
+        (revert-buffer)
+        (setq window
+              (display-buffer
+               (current-buffer)
+               `((display-buffer-reuse-window
+                  display-buffer-below-selected)
+                 (window-height . proofread--request-log-fit-list-window)))))
+      (when window
+        (set-window-point window (with-current-buffer target (point-min))))
+      target)))
+
+;;;###autoload
+(defun proofread-show-request (&optional pos)
+  "Show detailed proofread request data for the row at POS."
+  (interactive "d")
+  (let* ((id (or (tabulated-list-get-id pos)
+                 (tabulated-list-get-id)
+                 (user-error "No proofread request at point")))
+         (source (plist-get id :source-buffer))
+         (key (plist-get id :key))
+         (record (or (proofread--request-log-lookup-record source key)
+                     id)))
+    (proofread--request-log-show-record record)))
 
 ;;; Per-buffer diagnostic listings
 
