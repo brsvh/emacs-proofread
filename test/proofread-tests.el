@@ -219,8 +219,15 @@
       (should-not (proofread-test--tree-member-p :background spec))
       (should-not (proofread-test--tree-member-p :color spec))
       (should-not (proofread-test--tree-member-p 'flyspell-incorrect spec))
+      (should-not (proofread-test--tree-member-p 'flymake-warning spec))
       (should-not (proofread-test--tree-member-p 'flymake-error spec))
       (should-not (proofread-test--tree-member-p 'flycheck-error spec)))))
+
+(ert-deftest proofread-test-face-uses-warning-severity ()
+  "Diagnostic text uses a theme-aware warning color."
+  (let ((spec (face-default-spec 'proofread-face)))
+    (should (proofread-test--tree-member-p 'warning spec))
+    (should (proofread-test--tree-member-p :underline spec))))
 
 (ert-deftest proofread-test-popup-faces-use-own-defaults ()
   "Proofread popup faces do not depend on external face definitions."

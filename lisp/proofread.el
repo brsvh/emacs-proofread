@@ -171,7 +171,7 @@ property has a non-nil value is not included in request-ready chunks."
   :group 'proofread)
 
 (defface proofread-face
-  '((t :underline (:style wave)))
+  '((t :inherit warning :underline (:style wave)))
   "Face for proofreading diagnostics."
   :group 'proofread)
 
