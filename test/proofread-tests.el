@@ -2690,6 +2690,90 @@
                  (should (= (length proofread--requests) 3))))))
         (kill-buffer buffer)))))
 
+(ert-deftest proofread-test-max-concurrent-requests-queues-extra-work ()
+  "`proofread-max-concurrent-requests' limits active backend requests."
+  (save-window-excursion
+    (let ((buffer (generate-new-buffer " *proofread-visible-queue*")))
+      (unwind-protect
+          (progn
+            (switch-to-buffer buffer)
+            (insert (concat "第一句。"
+                            "第二句。"
+                            "第三句。"))
+            (proofread-mode 1)
+            (let ((proofread-backend 'llm)
+                  (proofread-llm-provider proofread-test--llm-provider)
+                  (proofread-llm-provider-identity
+                   proofread-test--llm-provider-identity)
+                  (proofread-context-size 0)
+                  (proofread-max-concurrent-requests 2)
+                  (recorder (proofread-test--make-backend-recorder))
+                  (name (proofread--request-log-list-buffer-name buffer)))
+              (proofread-test--with-llm-capabilities
+               (cl-letf (((symbol-function 'window-start)
+                          (lambda (&optional _window) (point-min)))
+                         ((symbol-function 'window-end)
+                          (lambda (&optional _window _update) (point-max)))
+                         ((symbol-function 'proofread-backend-check)
+                          (plist-get recorder :function)))
+                 (proofread-show-buffer-requests buffer)
+                 (proofread-check-visible)
+                 (should (= (length (funcall
+                                     (plist-get recorder :requests)))
+                            2))
+                 (should (= (length proofread--requests) 2))
+                 (should (= (length proofread--request-queue) 1))
+                 (with-current-buffer name
+                   (let ((statuses (mapcar (lambda (entry)
+                                             (aref (cadr entry) 1))
+                                           tabulated-list-entries)))
+                     (should (= (length statuses) 3))
+                     (should (= (cl-count "waiting" statuses
+                                          :test #'equal)
+                                2))
+                     (should (member "queued" statuses))))
+                 (let* ((requests (funcall (plist-get recorder :requests)))
+                        (callbacks (funcall (plist-get recorder :callbacks)))
+                        (first-request (car requests))
+                        (second-request (cadr requests))
+                        (first-callback (car callbacks)))
+                   (should (eq (funcall
+                                first-callback
+                                (proofread--backend-success-result
+                                 first-request nil))
+                               'applied))
+                   (let* ((all-requests (funcall
+                                         (plist-get recorder :requests)))
+                          (third-request (caddr all-requests))
+                          (active-ids
+                           (mapcar (lambda (request)
+                                     (plist-get request :id))
+                                   proofread--requests)))
+                     (should (= (length all-requests) 3))
+                     (should (= (length proofread--requests) 2))
+                     (should-not proofread--request-queue)
+                     (with-current-buffer name
+                       (let ((statuses
+                              (mapcar (lambda (entry)
+                                        (aref (cadr entry) 1))
+                                      tabulated-list-entries)))
+                         (should (member "applied" statuses))
+                         (should (= (cl-count "waiting" statuses
+                                              :test #'equal)
+                                    2))
+                         (should-not (member "queued" statuses))))
+                     (should-not (member (plist-get first-request :id)
+                                         active-ids))
+                     (should (member (plist-get second-request :id)
+                                     active-ids))
+                     (should (member (plist-get third-request :id)
+                                     active-ids))))))))
+        (when-let* ((list-buffer (get-buffer
+                                  (proofread--request-log-list-buffer-name
+                                   buffer))))
+          (kill-buffer list-buffer))
+        (kill-buffer buffer)))))
+
 (ert-deftest proofread-test-active-requests-remain-buffer-local ()
   "Active request state is isolated between buffers."
   (let ((first-buffer (generate-new-buffer " *proofread-requests-a*"))
@@ -4153,12 +4237,72 @@
                              (columns (cadr entry)))
                         (should (= (plist-get id :request-id) 7))
                         (should (equal (aref columns 0) "7"))
-                        (should (equal (aref columns 1) "queued"))
+                        (should (equal (aref columns 1) "ready"))
                         (should (equal (aref columns 3) "1"))
                         (should (equal (aref columns 4) "3"))
                         (should (equal (aref columns 5) "4-8"))
                         (should (equal (aref columns 6) "llm"))
                         (should (equal (aref columns 7) "helo")))))
+                (when-let* ((buffer (get-buffer name)))
+                  (kill-buffer buffer)))))
+        (when (buffer-live-p source)
+          (kill-buffer source))))))
+
+(ert-deftest proofread-test-request-log-buffer-follows-visible-requests ()
+  "`proofread-show-buffer-requests' follows real visible request dispatch."
+  (save-window-excursion
+    (let ((source (generate-new-buffer " *proofread-request-live-source*")))
+      (unwind-protect
+          (progn
+            (switch-to-buffer source)
+            (insert (concat "第一句。"
+                            "第二句。"))
+            (proofread-mode 1)
+            (let ((proofread-backend 'llm)
+                  (proofread-llm-provider proofread-test--llm-provider)
+                  (proofread-llm-provider-identity
+                   proofread-test--llm-provider-identity)
+                  (proofread-context-size 0)
+                  (proofread-max-concurrent-requests 1)
+                  (recorder (proofread-test--make-backend-recorder))
+                  (name (proofread--request-log-list-buffer-name source)))
+              (unwind-protect
+                  (proofread-test--with-llm-capabilities
+                   (cl-letf (((symbol-function 'window-start)
+                              (lambda (&optional _window) (point-min)))
+                             ((symbol-function 'window-end)
+                              (lambda (&optional _window _update)
+                                (point-max)))
+                             ((symbol-function 'proofread-backend-check)
+                              (plist-get recorder :function)))
+                     (proofread-show-buffer-requests source)
+                     (proofread-check-visible)
+                     (with-current-buffer name
+                       (should (= (length tabulated-list-entries) 2))
+                       (let ((statuses
+                              (mapcar (lambda (entry)
+                                        (aref (cadr entry) 1))
+                                      tabulated-list-entries)))
+                         (should (member "waiting" statuses))
+                         (should (member "queued" statuses))))
+                     (let* ((requests (funcall
+                                       (plist-get recorder :requests)))
+                            (callbacks (funcall
+                                        (plist-get recorder :callbacks)))
+                            (first-request (car requests))
+                            (first-callback (car callbacks)))
+                       (should (eq (funcall
+                                    first-callback
+                                    (proofread--backend-success-result
+                                     first-request nil))
+                                   'applied)))
+                     (with-current-buffer name
+                       (let ((statuses
+                              (mapcar (lambda (entry)
+                                        (aref (cadr entry) 1))
+                                      tabulated-list-entries)))
+                         (should (member "applied" statuses))
+                         (should (member "waiting" statuses))))))
                 (when-let* ((buffer (get-buffer name)))
                   (kill-buffer buffer)))))
         (when (buffer-live-p source)
@@ -4227,6 +4371,7 @@
                       (goto-char (point-min))
                       (dolist (heading '(";;; Summary"
                                          ";;; Chunk request"
+                                         ";;; Lifecycle events"
                                          ";;; Backend requests"
                                          ";;; Backend responses"
                                          ";;; Parsed backend results"

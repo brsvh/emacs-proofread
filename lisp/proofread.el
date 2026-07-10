@@ -87,8 +87,10 @@ A value of 0 disables after-context."
   :type 'natnum
   :group 'proofread)
 
-(defcustom proofread-max-concurrent-requests 2
-  "Maximum number of proofreading backend requests active at once."
+(defcustom proofread-max-concurrent-requests 8
+  "Maximum number of proofreading backend requests active at once.
+The limit is per buffer.  A value of 0 keeps cache hits active but prevents
+new backend requests from being sent."
   :type 'natnum
   :group 'proofread)
 
@@ -312,6 +314,9 @@ property has a non-nil value is not included in request-ready chunks."
 
 (defvar-local proofread--requests nil
   "Active proofread requests for the current buffer.")
+
+(defvar-local proofread--request-queue nil
+  "Proofread requests waiting for an available backend request slot.")
 
 (defvar-local proofread--next-request-id 0
   "Next proofread backend request id for the current buffer.")
@@ -979,6 +984,19 @@ When MESSAGE is non-nil, include it as caller-readable error text."
         (setq active t)))
     active))
 
+(defun proofread--active-request-limit ()
+  "Return the current buffer's backend request concurrency limit."
+  (max 0 proofread-max-concurrent-requests))
+
+(defun proofread--active-request-slots ()
+  "Return the number of currently available backend request slots."
+  (max 0 (- (proofread--active-request-limit)
+            (length proofread--requests))))
+
+(defun proofread--request-slot-available-p ()
+  "Return non-nil when another backend request may be sent."
+  (> (proofread--active-request-slots) 0))
+
 (defun proofread--register-active-request (request)
   "Register REQUEST as active in the current buffer."
   (push request proofread--requests)
@@ -1014,11 +1032,19 @@ When MESSAGE is non-nil, include it as caller-readable error text."
 (defun proofread--wrap-backend-callback (request callback)
   "Return a callback that cleans REQUEST state before CALLBACK."
   (lambda (result)
-    (let ((buffer (plist-get request :buffer)))
+    (let ((buffer (plist-get request :buffer))
+          callback-value)
       (when (buffer-live-p buffer)
         (with-current-buffer buffer
-          (proofread--remove-active-request request))))
-    (proofread--invoke-backend-callback callback result)))
+          (proofread--remove-active-request request)))
+      (unwind-protect
+          (setq callback-value
+                (proofread--invoke-backend-callback callback result))
+        (when (buffer-live-p buffer)
+          (with-current-buffer buffer
+            (when proofread-mode
+              (proofread--dispatch-queued-requests)))))
+      callback-value)))
 
 (defun proofread-backend-available-p (&optional backend)
   "Return non-nil if BACKEND can accept proofreading requests.
@@ -1516,6 +1542,9 @@ handle."
     (when (buffer-live-p buffer)
       (with-current-buffer buffer
         (proofread--register-active-request request))
+      (proofread--record-request-event
+       request 'active-request
+       :backend (or backend proofread-backend))
       (let ((wrapped-callback
              (proofread--wrap-backend-callback request callback)))
         (let ((handle
@@ -1535,6 +1564,54 @@ handle."
              :backend (or backend proofread-backend)
              :handle handle))
           handle)))))
+
+(defun proofread--submit-request (request backend)
+  "Submit REQUEST through BACKEND when cache and concurrency permit.
+Return one of the symbols `sent', `cached', `full', `stale', or `error'."
+  (cond
+   ((not (proofread--fresh-request-p request))
+    'stale)
+   ((let ((entry (proofread--cache-read-request request)))
+      (when entry
+        (proofread--apply-cache-entry request entry)
+        t))
+    'cached)
+   ((not (proofread--request-slot-available-p))
+    'full)
+   ((proofread--dispatch-backend-request
+     request #'proofread--handle-backend-result backend)
+    'sent)
+   (t 'error)))
+
+(defun proofread--queue-request (request backend)
+  "Queue REQUEST for BACKEND until a concurrency slot is available."
+  (setq proofread--request-queue
+        (nconc proofread--request-queue
+               (list (list :request request
+                           :backend backend))))
+  (proofread--record-request-event
+   request 'queued-request
+   :backend backend)
+  request)
+
+(defun proofread--dispatch-queued-requests ()
+  "Dispatch queued proofread requests while backend slots are available.
+Return requests that were sent to the backend."
+  (let ((continue t)
+        requests)
+    (while (and continue
+                proofread--request-queue
+                (proofread--request-slot-available-p))
+      (let* ((entry (pop proofread--request-queue))
+             (request (plist-get entry :request))
+             (backend (plist-get entry :backend)))
+        (pcase (proofread--submit-request request backend)
+          ('sent (push request requests))
+          ('full
+           (setq proofread--request-queue
+                 (cons entry proofread--request-queue))
+           (setq continue nil)))))
+    (nreverse requests)))
 
 (defun proofread--request-range-valid-p (request)
   "Return non-nil if REQUEST range is valid in the current buffer."
@@ -1802,18 +1879,16 @@ When BACKEND is nil, use `proofread-backend'.  Return dispatched requests."
   (when (proofread-backend-available-p backend)
     (let ((backend-identity (proofread--backend-identity backend))
           requests)
+      (setq proofread--request-queue nil)
       (dolist (chunk chunks)
         (let ((request (proofread--make-backend-request chunk backend)))
           (setq request (plist-put request :backend backend-identity))
           (proofread--record-request-event
            request 'chunk-request
            :chunk chunk)
-          (let ((entry (proofread--cache-read-request request)))
-            (if entry
-                (proofread--apply-cache-entry request entry)
-              (when (proofread--dispatch-backend-request
-                     request #'proofread--handle-backend-result backend)
-                (push request requests))))))
+          (pcase (proofread--submit-request request backend)
+            ('sent (push request requests))
+            ('full (proofread--queue-request request backend)))))
       (nreverse requests))))
 
 (defun proofread--cancel-request-handle (handle)
@@ -1844,6 +1919,7 @@ When BACKEND is nil, use `proofread-backend'.  Return dispatched requests."
 (defun proofread--clear-scheduled-work ()
   "Clear pending scheduled proofreading work in the current buffer."
   (setq proofread--pending-work nil)
+  (setq proofread--request-queue nil)
   (proofread--cancel-idle-timer))
 
 (defun proofread--idle-timer-run (buffer)
@@ -1873,6 +1949,7 @@ When BACKEND is nil, use `proofread-backend'.  Return dispatched requests."
 (defun proofread--mark-pending-work ()
   "Mark the current buffer as needing scheduled visible proofreading."
   (when proofread-mode
+    (setq proofread--request-queue nil)
     (setq proofread--pending-work t)
     (proofread--schedule-idle-timer)))
 
@@ -2233,11 +2310,12 @@ navigation order."
 (defun proofread--request-log-record-status (type event)
   "Return the request status implied by event TYPE and EVENT."
   (pcase type
-    ('chunk-request 'queued)
-    ('active-request 'active)
-    ('backend-dispatched 'pending)
-    ('backend-request 'sent)
-    ('backend-response 'received)
+    ('chunk-request 'ready)
+    ('queued-request 'queued)
+    ('active-request 'waiting)
+    ('backend-dispatched 'waiting)
+    ('backend-request 'waiting)
+    ('backend-response 'returned)
     ('backend-result
      (if (eq (plist-get (plist-get event :result) :status) 'error)
          'error
@@ -2517,13 +2595,30 @@ navigation order."
              :end (plist-get request :end)
              :request request)))))
 
+(defun proofread--request-log-seed-queued-requests (source)
+  "Record queued requests already present in SOURCE."
+  (with-current-buffer source
+    (dolist (entry proofread--request-queue)
+      (let ((request (plist-get entry :request)))
+        (proofread--request-log-record-event
+         (list :type 'queued-request
+               :time (current-time)
+               :log-id (plist-get request :log-id)
+               :request-id (plist-get request :id)
+               :buffer source
+               :beg (plist-get request :beg)
+               :end (plist-get request :end)
+               :request request
+               :backend (plist-get entry :backend)))))))
+
 (defun proofread--request-log-enable-source (source)
   "Enable proofread request recording for SOURCE."
   (with-current-buffer source
     (setq proofread--request-log-enabled t)
     (proofread--request-log-ensure-records))
   (proofread--request-log-ensure-hook)
-  (proofread--request-log-seed-active-requests source))
+  (proofread--request-log-seed-active-requests source)
+  (proofread--request-log-seed-queued-requests source))
 
 (defun proofread--request-log-refresh-open-buffers (source)
   "Refresh open proofread request list buffers for SOURCE."
@@ -2603,6 +2698,9 @@ navigation order."
          "Chunk request"
          (list :chunk (plist-get record :chunk)
                :request (plist-get record :request)))
+        (proofread--request-log-insert-section
+         "Lifecycle events"
+         (plist-get record :events))
         (proofread--request-log-insert-section
          "Backend requests"
          (mapcar #'proofread--request-log-backend-request-details
@@ -3213,6 +3311,7 @@ When RESET is non-nil, move from the beginning of the buffer."
   (setq-local proofread--popup-visible-p nil)
   (setq-local proofread--pending-ranges nil)
   (setq-local proofread--requests nil)
+  (setq-local proofread--request-queue nil)
   (setq-local proofread--next-request-id 0)
   (setq-local proofread--cache (make-hash-table :test #'equal))
   (setq-local proofread--pending-work nil)
@@ -3227,6 +3326,7 @@ When RESET is non-nil, move from the beginning of the buffer."
   (setq proofread--diagnostics nil)
   (setq proofread--current-diagnostic nil)
   (setq proofread--pending-ranges nil)
+  (setq proofread--request-queue nil)
   (setq proofread--next-request-id 0)
   (setq proofread--cache nil))
 
@@ -3270,10 +3370,14 @@ configured backend."
   (setq proofread--pending-ranges (proofread--visible-ranges))
   (if (proofread-backend-available-p)
       (let* ((chunks (proofread--request-ready-visible-chunks))
-             (requests (proofread--dispatch-request-ready-chunks chunks)))
-        (message "proofread: dispatched %d request%s from %d visible range%s"
+             (requests (proofread--dispatch-request-ready-chunks chunks))
+             (queued (length proofread--request-queue)))
+        (message "proofread: dispatched %d request%s%s from %d visible range%s"
                  (length requests)
                  (if (= (length requests) 1) "" "s")
+                 (if (> queued 0)
+                     (format "; queued %d" queued)
+                   "")
                  (length proofread--pending-ranges)
                  (if (= (length proofread--pending-ranges) 1) "" "s")))
     (message "proofread: collected %d visible range%s; no available backend"
