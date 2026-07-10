@@ -2204,8 +2204,8 @@
                              diagnostics)
                      '((1 . 5) (6 . 10)))))))
 
-(ert-deftest proofread-test-structured-response-out-of-range-is-dropped ()
-  "Structured response diagnostics outside the request chunk are dropped."
+(ert-deftest proofread-test-structured-response-unmatched-text-is-dropped ()
+  "Structured response diagnostics whose text is outside the request are dropped."
   (with-temp-buffer
     (insert "helo")
     (let* ((chunk (car (proofread--request-ready-chunks-for-ranges
@@ -2213,10 +2213,35 @@
            (request (proofread--make-backend-request chunk 'llm))
            (content
             (proofread-test--response-content
-             (list (proofread-test--response-diagnostic 0 99 "helo"))))
+             (list (proofread-test--response-diagnostic 0 99 "world"))))
            (diagnostics
             (proofread--diagnostics-from-structured-response request content 'llm)))
       (should-not diagnostics))))
+
+(ert-deftest proofread-test-structured-response-repairs-mismatched-range ()
+  "Structured response diagnostics recover from wrong ranges using exact text."
+  (with-temp-buffer
+    (insert "青晨六点半，小城的街到刚刚醒来。")
+    (let* ((chunk (car (proofread--request-ready-chunks-for-ranges
+                        (list (cons (point-min) (point-max))))))
+           (request (proofread--make-backend-request chunk 'llm))
+           (content
+            (proofread-test--response-content
+             (list
+              (proofread-test--response-diagnostic 0 2 "青晨" '("清晨"))
+              (proofread-test--response-diagnostic 7 9 "街到" '("街道")))))
+           (diagnostics
+            (proofread--diagnostics-from-structured-response request content 'llm)))
+      (should (= (length diagnostics) 2))
+      (should (equal (mapcar (lambda (diagnostic)
+                               (plist-get diagnostic :text))
+                             diagnostics)
+                     '("青晨" "街到")))
+      (should (equal (mapcar (lambda (diagnostic)
+                               (cons (plist-get diagnostic :beg)
+                                     (plist-get diagnostic :end)))
+                             diagnostics)
+                     '((1 . 3) (10 . 12)))))))
 
 (ert-deftest proofread-test-structured-response-text-mismatch-is-dropped ()
   "Structured response diagnostics whose text does not match the range are dropped."
@@ -2242,7 +2267,7 @@
            (content
             (proofread-test--response-content
              (list
-              (proofread-test--response-diagnostic 0 99 "helo")
+              (proofread-test--response-diagnostic 0 99 "hola")
               (proofread-test--response-diagnostic-with-fields
                0 4 "helo" '(("kind" . "typo")))
               (proofread-test--response-diagnostic 5 9 "wrld" '("world")))))

@@ -1175,6 +1175,61 @@ When BACKEND is nil, check the selected `proofread-backend'."
          (<= beg end)
          (<= end (length text)))))
 
+(defun proofread--string-occurrences (needle haystack)
+  "Return zero-based ranges where NEEDLE occurs in HAYSTACK."
+  (when (and (stringp needle)
+             (not (string-empty-p needle))
+             (stringp haystack))
+    (let ((start 0)
+          ranges)
+      (while (setq start (string-search needle haystack start))
+        (push (cons start (+ start (length needle))) ranges)
+        (setq start (1+ start)))
+      (nreverse ranges))))
+
+(defun proofread--nearest-unique-range (target ranges)
+  "Return the unique range in RANGES nearest to TARGET, or nil."
+  (when (and (integerp target) ranges)
+    (let ((best nil)
+          (best-distance nil)
+          tied)
+      (dolist (range ranges)
+        (let ((distance (abs (- (car range) target))))
+          (cond
+           ((or (not best-distance)
+                (< distance best-distance))
+            (setq best range)
+            (setq best-distance distance)
+            (setq tied nil))
+           ((= distance best-distance)
+            (setq tied t)))))
+      (unless tied best))))
+
+(defun proofread--diagnostic-candidate-matching-range
+    (request candidate relative-beg relative-end)
+  "Return CANDIDATE's corrected chunk-relative range for REQUEST.
+Prefer the reported RELATIVE-BEG and RELATIVE-END when they select the reported
+text exactly.  If the reported range is wrong, fall back to an exact search for
+the reported text inside the request text only."
+  (let* ((request-text (plist-get request :text))
+         (text (plist-get candidate :text))
+         (reported-range (cons relative-beg relative-end)))
+    (cond
+     ((and (proofread--diagnostic-candidate-range-valid-p
+            request relative-beg relative-end)
+           (stringp text)
+           (equal text
+                  (substring request-text relative-beg relative-end)))
+      reported-range)
+     ((and (integerp relative-beg)
+           (integerp relative-end)
+           (stringp text)
+           (not (string-empty-p text)))
+      (let ((ranges (proofread--string-occurrences text request-text)))
+        (or (proofread--nearest-unique-range relative-beg ranges)
+            (and (= (length ranges) 1)
+                 (car ranges))))))))
+
 (defun proofread--diagnostic-candidate-suggestions (value)
   "Return string suggestions from VALUE in original order."
   (when (or (listp value)
@@ -1233,6 +1288,9 @@ When BACKEND is nil, check the selected `proofread-backend'."
   (let* ((range (proofread--diagnostic-candidate-range candidate))
          (relative-beg (car-safe range))
          (relative-end (cdr-safe range))
+         (matching-range
+          (proofread--diagnostic-candidate-matching-range
+           request candidate relative-beg relative-end))
          (request-beg (plist-get request :beg))
          (request-text (plist-get request :text))
          (text (plist-get candidate :text))
@@ -1240,19 +1298,17 @@ When BACKEND is nil, check the selected `proofread-backend'."
                 (plist-get candidate :kind)))
          (message (plist-get candidate :message))
          (absolute-beg (and (integerp request-beg)
-                            (integerp relative-beg)
-                            (+ request-beg relative-beg)))
+                            (integerp (car-safe matching-range))
+                            (+ request-beg (car matching-range))))
          (absolute-end (and (integerp request-beg)
-                            (integerp relative-end)
-                            (+ request-beg relative-end))))
-    (when (and (proofread--diagnostic-candidate-range-valid-p
-                request relative-beg relative-end)
+                            (integerp (cdr-safe matching-range))
+                            (+ request-beg (cdr matching-range)))))
+    (when (and matching-range
+               (stringp request-text)
                (integerp request-beg)
                (stringp text)
                kind
-               (stringp message)
-               (equal text
-                      (substring request-text relative-beg relative-end)))
+               (stringp message))
       (proofread--make-diagnostic
        :beg absolute-beg
        :end absolute-end
