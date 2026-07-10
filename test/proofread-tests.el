@@ -198,6 +198,19 @@
                         (proofread-test--response-diagnostic beg end text))
           fields))
 
+(defun proofread-test--structured-batch (request diagnostics)
+  "Return parsed diagnostic batch for REQUEST and DIAGNOSTICS."
+  (proofread--diagnostic-batch-from-structured-response
+   request (proofread-test--response-content diagnostics) 'llm))
+
+(defun proofread-test--structured-issue-reason (request diagnostic)
+  "Return the first issue reason for DIAGNOSTIC in REQUEST."
+  (plist-get
+   (car (plist-get
+         (proofread-test--structured-batch request (list diagnostic))
+         :issues))
+   :reason))
+
 (ert-deftest proofread-test-normalize-ranges-merges-adjacent-ranges ()
   "Visible range normalization discards invalid ranges and merges duplicates."
   (should (equal (proofread--normalize-ranges
@@ -1558,7 +1571,7 @@
                                 :provider ,proofread-test--llm-provider-identity
                                 :response-strategy prompt-json
                                 :diagnostic-passes 3
-                                :contract-version 1)))
+                                :contract-version 2)))
       (should (proofread--backend-identity-p
                (plist-get request :backend-identity)))
       (proofread--cache-write-request request (list diagnostic))
@@ -1675,6 +1688,32 @@
                   'applied))
       (should-not proofread--diagnostics)
       (should-not proofread--overlays))))
+
+(ert-deftest proofread-test-partial-backend-result-merges-without-caching ()
+  "Partial results preserve old diagnostics, add new ones, and skip cache."
+  (with-temp-buffer
+    (insert "helo wrld")
+    (proofread-mode 1)
+    (let* ((chunk
+            (car (proofread--request-ready-chunks-for-ranges
+                  (list (cons (point-min) (point-max))))))
+           (request (proofread--make-backend-request chunk 'llm))
+           (old (proofread-test--diagnostic-for-range 1 5 "helo"))
+           (new (proofread-test--diagnostic-for-range 6 10 "wrld"))
+           (partial
+            (proofread--backend-partial-success-result
+             request (list new new) '((:reason ambiguous-text)))))
+      (should (eq (proofread--handle-backend-result
+                   (proofread--backend-success-result request (list old)))
+                  'applied))
+      (proofread-clear-cache)
+      (should (eq (proofread--handle-backend-result partial) 'applied))
+      (should (equal proofread--diagnostics (list old new)))
+      (should (= (length proofread--overlays) 2))
+      (should (= (hash-table-count proofread--cache) 0))
+      (should (eq (proofread--handle-backend-result partial) 'applied))
+      (should (equal proofread--diagnostics (list old new)))
+      (should (= (length proofread--overlays) 2)))))
 
 (ert-deftest proofread-test-cache-miss-calls-backend ()
   "A visible chunk with no cache entry is sent to the backend."
@@ -1972,7 +2011,7 @@
           (should (integerp (plist-get provider :session))))
         (should (eq (plist-get identity :response-strategy)
                     'prompt-json))
-        (should (= (plist-get identity :contract-version) 1))
+        (should (= (plist-get identity :contract-version) 2))
         (should-not (string-match-p
                      "secret-token"
                      (prin1-to-string identity)))
@@ -2117,9 +2156,10 @@
     (insert "helo")
     (proofread-mode 1)
     (let* ((proofread-llm-provider 'proofread-test-provider)
+           (proofread-llm-max-diagnostic-passes 1)
            (content
             (proofread-test--response-content
-             (list (proofread-test--response-diagnostic 0 4 "helo"))))
+             (list (proofread-test--response-diagnostic 1 5 "helo"))))
            request
            result)
       (cl-letf (((symbol-function 'llm-chat-async)
@@ -2144,6 +2184,14 @@
                  (lambda ()
                    proofread--diagnostics)))
         (should (eq (plist-get result :status) 'ok))
+        (should-not (plist-get result :partial))
+        (should (= (length (plist-get result :repairs)) 1))
+        (let ((repair (car (plist-get result :repairs))))
+          (should (eq (plist-get repair :action) 'repaired))
+          (should (= (plist-get repair :candidate-index) 0))
+          (should (= (plist-get repair :pass) 1))
+          (should (equal (plist-get repair :reported-range) '(1 . 5)))
+          (should (equal (plist-get repair :range) '(0 . 4))))
         (should-not proofread--active-requests)
         (should (= (length proofread--diagnostics) 1))
         (should (= (length proofread--overlays) 1))
@@ -2204,6 +2252,161 @@
                                    (plist-get diagnostic :text))
                                  (plist-get result :diagnostics))
                          '("helo" "wrld"))))))))
+
+(ert-deftest proofread-test-llm-retries-candidate-issues-within-pass-limit ()
+  "An unusable first pass can recover, but the final result stays partial."
+  (with-temp-buffer
+    (insert "helo")
+    (proofread-mode 1)
+    (let* ((proofread-llm-provider proofread-test--llm-provider)
+           (proofread-llm-provider-identity
+            proofread-test--llm-provider-identity)
+           (proofread-llm-max-diagnostic-passes 2)
+           (chunk (car (proofread--request-ready-chunks-for-ranges
+                        (list (cons (point-min) (point-max))))))
+           (invalid
+            (proofread-test--response-content
+             (list (proofread-test--response-diagnostic 0 4 "hola"))))
+           (valid
+            (proofread-test--response-content
+             (list (proofread-test--response-diagnostic 0 4 "helo"))))
+           calls
+           result)
+      (proofread-test--with-llm-capabilities
+       (cl-letf (((symbol-function 'llm-chat-async)
+                  (lambda (_provider _prompt success _error
+                                     &optional _multi-output)
+                    (setq calls (1+ (or calls 0)))
+                    (funcall success (if (= calls 1) invalid valid))
+                    (intern (format "proofread-test-retry-%d" calls)))))
+         (let ((request (proofread--make-backend-request chunk 'llm)))
+           (proofread--backend-check
+            request (lambda (backend-result) (setq result backend-result))
+            'llm)
+           (should (= calls 2))
+           (should (proofread-test--wait-for (lambda () result)))
+           (should (eq (plist-get result :status) 'ok))
+           (should (plist-get result :partial))
+           (should (= (length (plist-get result :candidate-issues)) 1))
+           (let ((issue (car (plist-get result :candidate-issues))))
+             (should (eq (plist-get issue :action) 'dropped))
+             (should (= (plist-get issue :candidate-index) 0))
+             (should (eq (plist-get issue :reason) 'unmatched-text))
+             (should (= (plist-get issue :pass) 1))
+             (should (equal (plist-get issue :reported-range) '(0 . 4))))
+           (should (equal (mapcar (lambda (diagnostic)
+                                    (plist-get diagnostic :text))
+                                  (plist-get result :diagnostics))
+                          '("helo")))))))))
+
+(ert-deftest proofread-test-llm-errors-after-candidate-retry-exhaustion ()
+  "All-invalid candidate passes end in one terminal backend error."
+  (with-temp-buffer
+    (insert "helo")
+    (proofread-mode 1)
+    (let* ((proofread-llm-provider proofread-test--llm-provider)
+           (proofread-llm-provider-identity
+            proofread-test--llm-provider-identity)
+           (proofread-llm-max-diagnostic-passes 3)
+           (chunk (car (proofread--request-ready-chunks-for-ranges
+                        (list (cons (point-min) (point-max))))))
+           (invalid
+            (proofread-test--response-content
+             (list (proofread-test--response-diagnostic 0 4 "hola"))))
+           calls
+           result)
+      (proofread-test--with-llm-capabilities
+       (cl-letf (((symbol-function 'llm-chat-async)
+                  (lambda (_provider _prompt success _error
+                                     &optional _multi-output)
+                    (setq calls (1+ (or calls 0)))
+                    (funcall success invalid)
+                    (intern (format "proofread-test-invalid-%d" calls)))))
+         (let ((request (proofread--make-backend-request chunk 'llm)))
+           (proofread--backend-check
+            request (lambda (backend-result) (setq result backend-result))
+            'llm)
+           (should (= calls 3))
+           (should (proofread-test--wait-for (lambda () result)))
+           (should (eq (plist-get result :status) 'error))
+           (should (eq (plist-get result :error)
+                       'llm-invalid-diagnostics))
+           (should (= (length (plist-get result :candidate-issues)) 3))
+           (should-not (plist-get result :diagnostics))))))))
+
+(ert-deftest proofread-test-llm-sticky-candidate-issues-exhaust-empty-passes ()
+  "An invalid pass followed by empty passes still exhausts the pass limit."
+  (with-temp-buffer
+    (insert "helo")
+    (proofread-mode 1)
+    (let* ((proofread-llm-provider proofread-test--llm-provider)
+           (proofread-llm-provider-identity
+            proofread-test--llm-provider-identity)
+           (proofread-llm-max-diagnostic-passes 3)
+           (chunk (car (proofread--request-ready-chunks-for-ranges
+                        (list (cons (point-min) (point-max))))))
+           (invalid
+            (proofread-test--response-content
+             (list (proofread-test--response-diagnostic 0 4 "hola"))))
+           (empty (proofread-test--response-content nil))
+           calls
+           result)
+      (proofread-test--with-llm-capabilities
+       (cl-letf (((symbol-function 'llm-chat-async)
+                  (lambda (_provider _prompt success _error
+                                     &optional _multi-output)
+                    (setq calls (1+ (or calls 0)))
+                    (funcall success (if (= calls 1) invalid empty))
+                    (intern (format "proofread-test-empty-%d" calls)))))
+         (let ((request (proofread--make-backend-request chunk 'llm)))
+           (proofread--backend-check
+            request (lambda (backend-result) (setq result backend-result))
+            'llm)
+           (should (= calls 3))
+           (should (proofread-test--wait-for (lambda () result)))
+           (should (eq (plist-get result :status) 'error))
+           (should (eq (plist-get result :error)
+                       'llm-invalid-diagnostics))
+           (should (= (length (plist-get result :candidate-issues)) 1))))))))
+
+(ert-deftest proofread-test-llm-later-transport-error-keeps-partial-results ()
+  "A later transport error preserves usable diagnostics without caching."
+  (with-temp-buffer
+    (insert "helo")
+    (proofread-mode 1)
+    (let* ((proofread-llm-provider proofread-test--llm-provider)
+           (proofread-llm-provider-identity
+            proofread-test--llm-provider-identity)
+           (proofread-llm-max-diagnostic-passes 2)
+           (chunk (car (proofread--request-ready-chunks-for-ranges
+                        (list (cons (point-min) (point-max))))))
+           (valid
+            (proofread-test--response-content
+             (list (proofread-test--response-diagnostic 0 4 "helo"))))
+           calls
+           result)
+      (proofread-test--with-llm-capabilities
+       (cl-letf (((symbol-function 'llm-chat-async)
+                  (lambda (_provider _prompt success error
+                                     &optional _multi-output)
+                    (setq calls (1+ (or calls 0)))
+                    (if (= calls 1)
+                        (funcall success valid)
+                      (funcall error 'transport-error "Network failed"))
+                    (intern (format "proofread-test-transport-%d" calls)))))
+         (let ((request (proofread--make-backend-request chunk 'llm)))
+           (proofread--backend-check
+            request (lambda (backend-result) (setq result backend-result))
+            'llm)
+           (should (= calls 2))
+           (should (proofread-test--wait-for (lambda () result)))
+           (should (eq (plist-get result :status) 'ok))
+           (should (plist-get result :partial))
+           (should (= (length (plist-get result :diagnostics)) 1))
+           (should (eq (proofread--handle-backend-result result) 'applied))
+           (should (= (length proofread--diagnostics) 1))
+           (should (= (length proofread--overlays) 1))
+           (should (= (hash-table-count proofread--cache) 0))))))))
 
 (ert-deftest proofread-test-managed-llm-request-stops-after-becoming-stale ()
   "A managed low-level LLM request cannot continue after edit or disable."
@@ -2283,10 +2486,12 @@
     (insert "helo")
     (proofread-mode 1)
     (let ((proofread-llm-provider 'proofread-test-provider)
+          calls
           result)
       (cl-letf (((symbol-function 'llm-chat-async)
                  (lambda (_provider _prompt success _error
                                     &optional _multi-output)
+                   (setq calls (1+ (or calls 0)))
                    (funcall success "not json")
                    'proofread-test-llm-handle))
                 ((symbol-function 'llm-capabilities)
@@ -2301,6 +2506,7 @@
                      (proofread--handle-backend-result backend-result))
                    'llm))
           (should (proofread-test--wait-for (lambda () result)))
+          (should (= calls 1))
           (should (eq (plist-get result :status) 'error))
           (should (eq (plist-get result :error) 'llm-invalid-response))
           (should-not proofread--active-requests)
@@ -2519,70 +2725,120 @@
                              diagnostics)
                      '((1 . 5) (6 . 10)))))))
 
-(ert-deftest proofread-test-structured-response-unmatched-text-is-error ()
-  "A diagnostic whose text is outside the request invalidates the response."
+(ert-deftest proofread-test-structured-response-unmatched-text-is-isolated ()
+  "A diagnostic whose text is outside the request becomes one issue."
   (with-temp-buffer
     (insert "helo")
     (let* ((chunk (car (proofread--request-ready-chunks-for-ranges
                         (list (cons (point-min) (point-max))))))
            (request (proofread--make-backend-request chunk 'llm))
-           (content
-            (proofread-test--response-content
+           (_ (setq request
+                    (plist-put request :context-before "world")))
+           (batch
+            (proofread-test--structured-batch
+             request
              (list (proofread-test--response-diagnostic 0 99 "world")))))
-      (should-error
-       (proofread--diagnostics-from-structured-response
-        request content 'llm)))))
+      (should-not (plist-get batch :diagnostics))
+      (should-not (plist-get batch :repairs))
+      (should (equal (mapcar (lambda (issue)
+                               (plist-get issue :reason))
+                             (plist-get batch :issues))
+                     '(unmatched-text))))))
 
-(ert-deftest proofread-test-structured-response-rejects-mismatched-range ()
-  "A response is invalid when reported range and text do not agree exactly."
+(ert-deftest proofread-test-structured-response-repairs-unique-exact-text ()
+  "A wrong range is repaired when its text has one exact request match."
   (with-temp-buffer
     (insert "青晨六点半，小城的街到刚刚醒来。")
     (let* ((chunk (car (proofread--request-ready-chunks-for-ranges
                         (list (cons (point-min) (point-max))))))
            (request (proofread--make-backend-request chunk 'llm))
-           (content
-            (proofread-test--response-content
+           (batch
+            (proofread-test--structured-batch
+             request
              (list
               (proofread-test--response-diagnostic 0 2 "青晨" '("清晨"))
-              (proofread-test--response-diagnostic 7 9 "街到" '("街道"))))))
-      (should-error
-       (proofread--diagnostics-from-structured-response
-        request content 'llm)))))
+              (proofread-test--response-diagnostic 7 9 "街到" '("街道")))))
+           (diagnostics (plist-get batch :diagnostics))
+           (repair (car (plist-get batch :repairs))))
+      (should-not (plist-get batch :issues))
+      (should (= (length diagnostics) 2))
+      (should (equal (mapcar #'proofread--diagnostic-range diagnostics)
+                     '((1 . 3) (10 . 12))))
+      (should (equal (plist-get repair :reported-range) '(7 . 9)))
+      (should (equal (plist-get repair :range) '(9 . 11))))))
 
-(ert-deftest proofread-test-structured-response-text-mismatch-is-error ()
-  "A diagnostic whose text does not match invalidates the response."
+(ert-deftest proofread-test-structured-response-ambiguous-text-is-isolated ()
+  "A wrong range is not guessed when its text occurs more than once."
   (with-temp-buffer
-    (insert "helo")
+    (insert "helo x helo")
     (let* ((chunk (car (proofread--request-ready-chunks-for-ranges
                         (list (cons (point-min) (point-max))))))
            (request (proofread--make-backend-request chunk 'llm))
-           (content
-            (proofread-test--response-content
-             (list (proofread-test--response-diagnostic 0 4 "hola")))))
-      (should-error
-       (proofread--diagnostics-from-structured-response
-        request content 'llm)))))
+           (batch
+            (proofread-test--structured-batch
+             request
+             (list (proofread-test--response-diagnostic 6 10 "helo"))))
+           (issue (car (plist-get batch :issues))))
+      (should-not (plist-get batch :diagnostics))
+      (should-not (plist-get batch :repairs))
+      (should (eq (plist-get issue :reason) 'ambiguous-text))
+      (should (equal (plist-get issue :occurrences)
+                     '((0 . 4) (7 . 11)))))))
 
-(ert-deftest proofread-test-structured-response-invalid-candidate-is-error ()
-  "One invalid candidate invalidates the whole structured response."
+(ert-deftest proofread-test-structured-response-exact-repeated-text-is-accepted ()
+  "An exact reported range is accepted even when its text is repeated."
+  (with-temp-buffer
+    (insert "helo x helo")
+    (let* ((chunk (car (proofread--request-ready-chunks-for-ranges
+                        (list (cons (point-min) (point-max))))))
+           (request (proofread--make-backend-request chunk 'llm))
+           (batch
+            (proofread-test--structured-batch
+             request
+             (list (proofread-test--response-diagnostic 7 11 "helo")))))
+      (should (= (length (plist-get batch :diagnostics)) 1))
+      (should-not (plist-get batch :issues))
+      (should-not (plist-get batch :repairs)))))
+
+(ert-deftest proofread-test-structured-response-invalid-empty-range-is-isolated ()
+  "An empty insertion text is not used to repair a nonempty range."
+  (let* ((request '(:beg 1 :end 5 :text "helo"))
+         (batch
+          (proofread-test--structured-batch
+           request
+           (list (proofread-test--response-diagnostic 0 1 "" '("H")))))
+         (issue (car (plist-get batch :issues))))
+    (should-not (plist-get batch :diagnostics))
+    (should (eq (plist-get issue :reason) 'range-text-mismatch))))
+
+(ert-deftest proofread-test-structured-response-isolates-invalid-candidates ()
+  "Invalid candidates do not discard valid diagnostics from one response."
   (with-temp-buffer
     (insert "helo wrld")
     (let* ((chunk (car (proofread--request-ready-chunks-for-ranges
                         (list (cons (point-min) (point-max))))))
            (request (proofread--make-backend-request chunk 'llm))
-           (content
-            (proofread-test--response-content
+           (batch
+            (proofread-test--structured-batch
+             request
              (list
               (proofread-test--response-diagnostic 0 99 "hola")
               (proofread-test--response-diagnostic-with-fields
                0 4 "helo" '(("kind" . "typo")))
+              42
               (proofread-test--response-diagnostic 5 9 "wrld" '("world"))))))
-      (should-error
-       (proofread--diagnostics-from-structured-response
-        request content 'llm)))))
+      (should (equal (mapcar (lambda (diagnostic)
+                               (plist-get diagnostic :text))
+                             (plist-get batch :diagnostics))
+                     '("wrld")))
+      (should (equal (mapcar (lambda (issue)
+                               (plist-get issue :reason))
+                             (plist-get batch :issues))
+                     '(unmatched-text invalid-shape invalid-shape)))
+      (should-not (plist-get batch :repairs)))))
 
-(ert-deftest proofread-test-structured-response-suggestions-must-be-strings ()
-  "A non-string suggestion invalidates the structured response."
+(ert-deftest proofread-test-structured-response-invalid-suggestions-are-isolated ()
+  "A non-string suggestion invalidates only its candidate."
   (with-temp-buffer
     (insert "helo")
     (let* ((chunk (car (proofread--request-ready-chunks-for-ranges
@@ -2595,29 +2851,32 @@
               ("range" . (("beg" . 0)
                           ("end" . 4)))
               ("suggestions" . ["hello" 42 "hullo"])))
-           (content (proofread-test--response-content
-                     (list candidate))))
-      (should-error
-       (proofread--diagnostics-from-structured-response
-        request content 'llm)))))
+           (batch (proofread-test--structured-batch request (list candidate))))
+      (should-not (plist-get batch :diagnostics))
+      (should (eq (plist-get (car (plist-get batch :issues)) :reason)
+                  'invalid-shape)))))
 
-(ert-deftest proofread-test-structured-response-null-arrays-are-error ()
-  "JSON null cannot stand in for diagnostics or suggestions arrays."
+(ert-deftest proofread-test-structured-response-null-arrays-are-isolated ()
+  "A null root array is fatal while null suggestions isolate one candidate."
   (with-temp-buffer
     (insert "helo")
     (let* ((chunk (car (proofread--request-ready-chunks-for-ranges
                         (list (cons (point-min) (point-max))))))
            (request (proofread--make-backend-request chunk 'llm)))
-      (dolist
-          (content
-           '("{\"diagnostics\":null}"
-             "{\"diagnostics\":[{\"kind\":\"spelling\",\"message\":\"issue\",\"text\":\"helo\",\"range\":{\"beg\":0,\"end\":4},\"suggestions\":null}]}"))
-        (should-error
-         (proofread--diagnostics-from-structured-response
-          request content 'llm))))))
+      (should-error
+       (proofread--diagnostics-from-structured-response
+        request "{\"diagnostics\":null}" 'llm))
+      (let ((batch
+             (proofread--diagnostic-batch-from-structured-response
+              request
+              "{\"diagnostics\":[{\"kind\":\"spelling\",\"message\":\"issue\",\"text\":\"helo\",\"range\":{\"beg\":0,\"end\":4},\"suggestions\":null}]}"
+              'llm)))
+        (should-not (plist-get batch :diagnostics))
+        (should (eq (plist-get (car (plist-get batch :issues)) :reason)
+                    'invalid-shape))))))
 
-(ert-deftest proofread-test-structured-response-unknown-fields-are-error ()
-  "Unknown root, candidate, and range fields invalidate the response."
+(ert-deftest proofread-test-structured-response-unknown-fields-are-scoped ()
+  "Unknown root fields are fatal while candidate fields are isolated."
   (with-temp-buffer
     (insert "helo")
     (let* ((chunk (car (proofread--request-ready-chunks-for-ranges
@@ -2633,26 +2892,43 @@
              '(("range" . (("beg" . 0)
                            ("end" . 4)
                            ("extra" . true)))))))
-      (dolist (content
-               (list
-                "{\"diagnostics\":[],\"extra\":true}"
-                (proofread-test--response-content (list candidate-extra))
-                (proofread-test--response-content (list range-extra))))
-        (should-error
-         (proofread--diagnostics-from-structured-response
-          request content 'llm))))))
-
-(ert-deftest proofread-test-structured-response-duplicate-fields-are-error ()
-  "Duplicate fields at every object level invalidate the response."
-  (let ((request '(:beg 1 :end 5 :text "helo")))
-    (dolist
-        (content
-         '("{\"diagnostics\":false,\"diagnostics\":[]}"
-           "{\"diagnostics\":[{\"kind\":\"spelling\",\"kind\":\"style\",\"message\":\"issue\",\"text\":\"helo\",\"range\":{\"beg\":0,\"end\":4},\"suggestions\":[]}]}"
-           "{\"diagnostics\":[{\"kind\":\"spelling\",\"message\":\"issue\",\"text\":\"helo\",\"range\":{\"beg\":0,\"beg\":1,\"end\":4},\"suggestions\":[]}]}"))
       (should-error
        (proofread--diagnostics-from-structured-response
-        request content 'llm)))))
+        request "{\"diagnostics\":[],\"extra\":true}" 'llm))
+      (dolist (candidate (list candidate-extra range-extra))
+        (let ((batch
+               (proofread-test--structured-batch request (list candidate))))
+          (should-not (plist-get batch :diagnostics))
+          (should (eq (plist-get (car (plist-get batch :issues)) :reason)
+                      'invalid-candidate-json))))
+      (let ((batch
+             (proofread-test--structured-batch
+              request (list candidate-extra candidate))))
+        (should (equal (mapcar (lambda (diagnostic)
+                                 (plist-get diagnostic :text))
+                               (plist-get batch :diagnostics))
+                       '("helo")))
+        (should (equal (mapcar (lambda (issue)
+                                 (plist-get issue :reason))
+                               (plist-get batch :issues))
+                       '(invalid-candidate-json)))))))
+
+(ert-deftest proofread-test-structured-response-duplicate-fields-are-scoped ()
+  "Duplicate root fields are fatal while candidate fields are isolated."
+  (let ((request '(:beg 1 :end 5 :text "helo")))
+    (should-error
+     (proofread--diagnostics-from-structured-response
+      request "{\"diagnostics\":false,\"diagnostics\":[]}" 'llm))
+    (dolist
+        (content
+         '("{\"diagnostics\":[{\"kind\":\"spelling\",\"kind\":\"style\",\"message\":\"issue\",\"text\":\"helo\",\"range\":{\"beg\":0,\"end\":4},\"suggestions\":[]}]}"
+           "{\"diagnostics\":[{\"kind\":\"spelling\",\"message\":\"issue\",\"text\":\"helo\",\"range\":{\"beg\":0,\"beg\":1,\"end\":4},\"suggestions\":[]}]}"))
+      (let ((batch
+             (proofread--diagnostic-batch-from-structured-response
+              request content 'llm)))
+        (should-not (plist-get batch :diagnostics))
+        (should (eq (plist-get (car (plist-get batch :issues)) :reason)
+                    'invalid-candidate-json))))))
 
 (ert-deftest proofread-test-structured-response-trailing-commas-are-error ()
   "Trailing commas at every array and object level are parse errors."
@@ -2689,18 +2965,17 @@
                           :end (point-max)
                           :text text
                           :target-kind 'comment))
-           (delimiter
-            (proofread-test--response-content
-             (list (proofread-test--response-diagnostic 0 2 ";;"))))
            (insertion-position
             (+ (string-search "prose" text) (length "prose")))
            (insertion
             (proofread-test--response-content
              (list (proofread-test--response-diagnostic
                     insertion-position insertion-position "" '("."))))))
-      (should-error
-       (proofread--diagnostics-from-structured-response
-        request delimiter 'llm))
+      (should
+       (eq (proofread-test--structured-issue-reason
+            request
+            (proofread-test--response-diagnostic 0 2 ";;"))
+           'outside-target))
       (let ((diagnostic
              (car (proofread--diagnostics-from-structured-response
                    request insertion 'llm))))
@@ -2716,13 +2991,17 @@
                           :beg (point-min)
                           :end (point-max)
                           :text text
-                          :target-kind 'comment))
-           (closing-delimiter
-            (proofread-test--response-content
-             (list (proofread-test--response-diagnostic 6 7 "*" '(""))))))
-      (should-error
-       (proofread--diagnostics-from-structured-response
-        request closing-delimiter 'llm))))
+                          :target-kind 'comment)))
+      (should
+       (eq (proofread-test--structured-issue-reason
+            request
+            (proofread-test--response-diagnostic 6 7 "*" '("")))
+           'outside-target))
+      (should
+       (eq (proofread-test--structured-issue-reason
+            request
+            (proofread-test--response-diagnostic 2 4 "/*" '("")))
+           'outside-target))))
   (with-temp-buffer
     (html-mode)
     (insert "<!--helo-->")
@@ -2733,14 +3012,12 @@
                          :text (buffer-string)
                          :target-kind 'comment)))
       (dolist (candidate '((8 9 "-") (9 10 "-") (10 11 ">")))
-        (should-error
-         (proofread--diagnostics-from-structured-response
-          request
-          (proofread-test--response-content
-           (list (proofread-test--response-diagnostic
-                  (nth 0 candidate) (nth 1 candidate) (nth 2 candidate)
-                  '(""))))
-          'llm)))))
+        (should
+         (eq (proofread-test--structured-issue-reason
+              request
+              (proofread-test--response-diagnostic
+               (nth 0 candidate) (nth 1 candidate) (nth 2 candidate) '("")))
+             'outside-target)))))
   (with-temp-buffer
     (emacs-lisp-mode)
     (insert "\"prose text\"")
@@ -2749,13 +3026,12 @@
                           :beg (point-min)
                           :end (point-max)
                           :text text
-                          :target-kind 'docstring))
-           (delimiter
-            (proofread-test--response-content
-             (list (proofread-test--response-diagnostic 0 1 "\"")))))
-      (should-error
-       (proofread--diagnostics-from-structured-response
-        request delimiter 'llm)))))
+                          :target-kind 'docstring)))
+      (should
+       (eq (proofread-test--structured-issue-reason
+            request
+            (proofread-test--response-diagnostic 0 1 "\""))
+           'outside-target)))))
 
 (ert-deftest proofread-test-structured-response-allows-safe-target-interiors ()
   "Target guards allow prose punctuation and incomplete source containers."
@@ -2790,14 +3066,12 @@
                          :text (buffer-string)
                          :target-kind 'docstring)))
       (dolist (candidate '((5 6 "\\") (6 7 "\"")))
-        (let ((content
-               (proofread-test--response-content
-                (list (proofread-test--response-diagnostic
-                       (nth 0 candidate) (nth 1 candidate) (nth 2 candidate)
-                       '(""))))))
-          (should-error
-           (proofread--diagnostics-from-structured-response
-            request content 'llm)))))))
+        (should
+         (eq (proofread-test--structured-issue-reason
+              request
+              (proofread-test--response-diagnostic
+               (nth 0 candidate) (nth 1 candidate) (nth 2 candidate) '("")))
+             'outside-target))))))
 
 (ert-deftest proofread-test-structured-response-cross-boundary-range ()
   "Character ranges can describe diagnostics across word-like boundaries."
@@ -2823,8 +3097,12 @@
            (list '(("kind" . "spelling")
                    ("message" . "Possible misspelling")
                    ("suggestions" . ["清晨"]))))))
-    (should-error
-     (proofread--diagnostics-from-structured-response request content 'llm))))
+    (let ((batch
+           (proofread--diagnostic-batch-from-structured-response
+            request content 'llm)))
+      (should-not (plist-get batch :diagnostics))
+      (should (eq (plist-get (car (plist-get batch :issues)) :reason)
+                  'invalid-shape)))))
 
 (ert-deftest proofread-test-structured-response-parsed-results-still-stale-check ()
   "Parsed structured response diagnostics still require stale validation."
@@ -3565,6 +3843,79 @@
                  (should-not proofread--overlays)
                  (should-not (proofread--active-request-p request))))))
         (kill-buffer buffer)))))
+
+(ert-deftest proofread-test-backend-errors-are-aggregated-per-request-batch ()
+  "Production dispatch aggregates errors and settles cancelled batch work."
+  (with-temp-buffer
+    (text-mode)
+    (insert "onee\n\ntwoo\n\nthree\n\nfourr")
+    (let ((proofread-auto-check nil)
+          (proofread-backend 'llm)
+          (proofread-llm-provider proofread-test--llm-provider)
+          (proofread-llm-provider-identity
+           proofread-test--llm-provider-identity)
+          (proofread-max-concurrent-requests 10)
+          warnings)
+      (proofread-mode 1)
+      (proofread-test--with-llm-capabilities
+       (let* ((ranges '((1 . 5) (7 . 11) (13 . 18) (20 . 25)))
+              (chunks
+               (mapcar
+                (lambda (range)
+                  (car (proofread--request-ready-chunks-for-ranges
+                        (list range))))
+                ranges))
+              (recorder (proofread-test--make-backend-recorder)))
+         (cl-letf (((symbol-function 'display-warning)
+                    (lambda (&rest args) (push args warnings)))
+                   ((symbol-function 'proofread--backend-check)
+                    (plist-get recorder :function)))
+           (should (= (length (proofread--dispatch-request-ready-chunks
+                               chunks 'llm))
+                      4))
+           (let ((requests (funcall (plist-get recorder :requests)))
+                 (callbacks (funcall (plist-get recorder :callbacks))))
+             (should (= (length requests) 4))
+             (should (cl-every
+                      (lambda (request)
+                        (plist-get (plist-get request :state) :batch))
+                      requests))
+             (dotimes (index 4)
+               (funcall
+                (nth index callbacks)
+                (proofread--backend-error-result
+                 (nth index requests)
+                 'llm-invalid-diagnostics
+                 (format "Failure kind %d" index)))
+               (should (= (length warnings) (if (= index 3) 1 0))))
+             (let ((message (nth 1 (car warnings))))
+               (should (string-match-p "4 requests" message))
+               (should (string-match-p "1 more error kind" message))))
+           (let ((second-recorder (proofread-test--make-backend-recorder)))
+             (cl-letf (((symbol-function 'proofread--backend-check)
+                        (plist-get second-recorder :function)))
+               (proofread--dispatch-request-ready-chunks
+                (cl-subseq chunks 0 2) 'llm)
+               (let ((requests
+                      (funcall (plist-get second-recorder :requests)))
+                     (callbacks
+                      (funcall (plist-get second-recorder :callbacks))))
+                 (funcall
+                  (car callbacks)
+                  (proofread--backend-error-result
+                   (car requests) 'llm-failure "One failure"))
+                 (should (= (length warnings) 1))
+                 (proofread--retire-active-request
+                  (cadr requests) nil 'test-cancelled)
+                 (should (= (length warnings) 2)))))
+           (let ((direct
+                  (proofread--make-backend-request (car chunks) 'llm)))
+             (should
+              (eq (proofread--handle-backend-result
+                   (proofread--backend-error-result
+                    direct 'llm-failure "Direct failure"))
+                  'error))
+             (should (= (length warnings) 3)))))))))
 
 (ert-deftest proofread-test-navigation-sorts-and-filters-diagnostics ()
   "Navigation diagnostics are valid and sorted by start and end position."
@@ -5067,7 +5418,9 @@
            (proofread-llm-max-diagnostic-passes 1)
            (content
             (proofread-test--response-content
-             (list (proofread-test--response-diagnostic 0 4 "helo"))))
+             (list
+              (proofread-test--response-diagnostic 1 5 "helo")
+              (proofread-test--response-diagnostic 0 4 "hola"))))
            request
            events
            status)
@@ -5112,12 +5465,21 @@
                                (eq (plist-get event :type)
                                    'backend-response))
                              events))
+                (backend-result
+                 (cl-find-if (lambda (event)
+                               (eq (plist-get event :type)
+                                   'backend-result))
+                             events))
                 (final-result
                  (car (last events))))
             (should (plist-get backend-request :schema))
             (should (plist-get backend-request :prompt))
             (should (equal (plist-get backend-response :response)
                            content))
+            (should (plist-get (plist-get backend-result :result)
+                               :candidate-issues))
+            (should (plist-get (plist-get backend-result :result)
+                               :repairs))
             (should (eq (plist-get final-result :status)
                         'applied))))))))
 
