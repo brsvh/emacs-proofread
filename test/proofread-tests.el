@@ -227,8 +227,9 @@
 
 (ert-deftest proofread-test-popup-faces-use-own-defaults ()
   "Proofread popup faces do not depend on external face definitions."
-  (should (equal (face-default-spec 'proofread-popup-face)
-                 '((t nil))))
+  (let ((spec (face-default-spec 'proofread-popup-face)))
+    (should-not (proofread-test--tree-member-p 'eldoc-box-body spec))
+    (should-not (proofread-test--tree-member-p 'eldoc-box-border spec)))
   (should (equal (face-default-spec 'proofread-popup-border-face)
                  '((((background dark)) :background "white")
                    (((background light)) :background "black")))))
@@ -1428,6 +1429,11 @@
                                  request (list diagnostic)))
                                'applied))
                    (should (= (hash-table-count proofread--cache) 1))
+                   (proofread-check-visible)
+                   (should (= backend-calls 1))
+                   (should (equal proofread--diagnostics
+                                  (list diagnostic)))
+                   (should (= (length proofread--overlays) 1))
                    (proofread-clear)
                    (setq proofread--diagnostics nil)
                    (proofread-check-visible)
@@ -1436,6 +1442,38 @@
                                   (list diagnostic)))
                    (should (= (length proofread--overlays) 1)))))))
         (kill-buffer buffer)))))
+
+(ert-deftest proofread-test-backend-result-replaces-request-range-diagnostics ()
+  "Repeated results for the same request range do not duplicate diagnostics."
+  (with-temp-buffer
+    (insert "helo wrld")
+    (proofread-mode 1)
+    (let* ((request
+            (list :buffer (current-buffer)
+                  :beg (point-min)
+                  :end (point-max)
+                  :text (buffer-string)
+                  :modified-tick (buffer-chars-modified-tick)
+                  :backend 'llm))
+           (diagnostic
+            (proofread-test--diagnostic-for-range 1 5 "helo")))
+      (should (eq (proofread--handle-backend-result
+                   (proofread--backend-success-result
+                    request (list diagnostic)))
+                  'applied))
+      (should (= (length proofread--diagnostics) 1))
+      (should (= (length proofread--overlays) 1))
+      (should (eq (proofread--handle-backend-result
+                   (proofread--backend-success-result
+                    request (list diagnostic)))
+                  'applied))
+      (should (equal proofread--diagnostics (list diagnostic)))
+      (should (= (length proofread--overlays) 1))
+      (should (eq (proofread--handle-backend-result
+                   (proofread--backend-success-result request nil))
+                  'applied))
+      (should-not proofread--diagnostics)
+      (should-not proofread--overlays))))
 
 (ert-deftest proofread-test-cache-miss-calls-backend ()
   "A visible chunk with no cache entry is sent to the backend."
@@ -3343,6 +3381,115 @@
       (proofread-mode -1)
       (should-not proofread--current-diagnostic)
       (should-not (overlay-buffer overlay)))))
+
+(ert-deftest proofread-test-show-buffer-diagnostics-lists-current-buffer ()
+  "`proofread-show-buffer-diagnostics' lists diagnostics for the source buffer."
+  (save-window-excursion
+    (with-temp-buffer
+      (switch-to-buffer (current-buffer))
+      (insert "aa helo\nbb teh")
+      (proofread-mode 1)
+      (let* ((source (current-buffer))
+             (first
+              (proofread--make-diagnostic
+               :beg 4
+               :end 8
+               :text "helo"
+               :kind 'spelling
+               :message "Possible misspelling"
+               :suggestions '("hello")
+               :confidence 0.9
+               :source 'test))
+             (second
+              (proofread--make-diagnostic
+               :beg 12
+               :end 15
+               :text "teh"
+               :kind 'grammar
+               :message "Use \"the\" here"
+               :suggestions '("the")))
+             (name (proofread--diagnostics-buffer-name)))
+        (unwind-protect
+            (progn
+              (proofread-test--install-diagnostics (list second first))
+              (goto-char 2)
+              (proofread-show-buffer-diagnostics)
+              (should (= (point) 2))
+              (with-current-buffer name
+                (should (eq major-mode 'proofread-diagnostics-buffer-mode))
+                (should (eq proofread--diagnostics-buffer-source source))
+                (should (= (length tabulated-list-entries) 2))
+                (let* ((entry (car tabulated-list-entries))
+                       (id (car entry))
+                       (columns (cadr entry)))
+                  (should (eq (plist-get id :diagnostic) first))
+                  (should (eq (plist-get id :buffer) source))
+                  (should (equal (aref columns 0) "1"))
+                  (should (equal (aref columns 1) "3"))
+                  (should (equal (aref columns 2) "spelling"))
+                  (should (equal (aref columns 3) "test"))
+                  (should (equal (aref columns 4) "helo"))
+                  (should (equal (car (aref columns 5))
+                                 "Possible misspelling")))))
+          (when-let* ((buffer (get-buffer name)))
+            (kill-buffer buffer)))))))
+
+(ert-deftest proofread-test-show-buffer-diagnostics-selects-diagnostic ()
+  "`proofread-show-buffer-diagnostics' highlights the requested diagnostic."
+  (save-window-excursion
+    (with-temp-buffer
+      (switch-to-buffer (current-buffer))
+      (insert "aa helo\nbb teh")
+      (proofread-mode 1)
+      (let* ((first (proofread-test--diagnostic-for-range 4 8 "helo"))
+             (second (proofread-test--diagnostic-for-range 12 15 "teh"))
+             (name (proofread--diagnostics-buffer-name)))
+        (unwind-protect
+            (progn
+              (proofread-test--install-diagnostics (list first second))
+              (cl-letf (((symbol-function 'pulse-momentary-highlight-one-line)
+                         (lambda (&rest _args)
+                           'highlighted)))
+                (proofread-show-buffer-diagnostics second))
+              (with-current-buffer name
+                (should (eq (plist-get (tabulated-list-get-id)
+                                       :diagnostic)
+                            second))))
+          (when-let* ((buffer (get-buffer name)))
+            (kill-buffer buffer)))))))
+
+(ert-deftest proofread-test-show-diagnostic-visits-source ()
+  "`proofread-show-diagnostic' visits the source diagnostic location."
+  (save-window-excursion
+    (with-temp-buffer
+      (switch-to-buffer (current-buffer))
+      (insert "aa helo zz")
+      (proofread-mode 1)
+      (let* ((source (current-buffer))
+             (diagnostic
+              (proofread-test--diagnostic-for-range 4 8 "helo"))
+             (name (proofread--diagnostics-buffer-name)))
+        (unwind-protect
+            (progn
+              (proofread-test--install-diagnostics (list diagnostic))
+              (proofread-show-buffer-diagnostics)
+              (with-current-buffer name
+                (goto-char (point-min))
+                (cl-letf (((symbol-function 'pulse-momentary-highlight-region)
+                           (lambda (&rest _args)
+                             'highlighted)))
+                  (should (eq (proofread-show-diagnostic (point))
+                              source))))
+              (should (= (point) 4))
+              (should (eq proofread--current-diagnostic diagnostic)))
+          (when-let* ((buffer (get-buffer name)))
+            (kill-buffer buffer)))))))
+
+(ert-deftest proofread-test-show-buffer-diagnostics-requires-mode ()
+  "`proofread-show-buffer-diagnostics' requires `proofread-mode'."
+  (with-temp-buffer
+    (insert "helo")
+    (should-error (proofread-show-buffer-diagnostics) :type 'user-error)))
 
 (ert-deftest proofread-test-diagnostic-at-point-finds-covering-diagnostic ()
   "Diagnostic lookup returns the proofread diagnostic covering point."

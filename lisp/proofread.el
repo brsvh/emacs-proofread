@@ -31,12 +31,17 @@
 ;;; Code:
 
 (require 'cl-lib)
+(require 'button)
 (require 'json)
 (require 'llm)
 (require 'posframe)
+(require 'pulse)
 (require 'subr-x)
+(require 'tabulated-list)
 
 (declare-function jieba-rs-module-segment "jieba-rs" (text hmm))
+(declare-function previous-error-this-buffer-no-select "simple"
+                  (&optional n reset))
 
 (defvar jieba-rs-hmm)
 (defvar jieba-rs-segment-function)
@@ -295,6 +300,12 @@ property has a non-nil value is not included in request-ready chunks."
 
 (defvar-local proofread--current-diagnostic nil
   "Currently selected proofread diagnostic in the current buffer.")
+
+(defvar-local proofread-current-diagnostic-line 0
+  "Current line in a proofread diagnostics listing buffer.")
+
+(defvar-local proofread--diagnostics-buffer-source nil
+  "Source buffer for a proofread diagnostics listing buffer.")
 
 (defvar-local proofread--popup-buffer-name nil
   "Hidden posframe buffer name for the current proofread buffer.")
@@ -1937,6 +1948,12 @@ When BACKEND is nil, use the selected `proofread-backend'."
             (plist-get entry :diagnostics)
             request)))))
 
+(defun proofread--clear-diagnostics-in-range (beg end)
+  "Remove current proofread diagnostics intersecting BEG to END."
+  (proofread--invalidate-affected-diagnostics
+   (proofread--overlays-intersecting-range beg end)
+   (proofread--diagnostics-intersecting-range beg end)))
+
 (defun proofread--apply-backend-diagnostics (diagnostics)
   "Record DIAGNOSTICS and create proofread-owned overlays for them."
   (let ((diagnostics (proofread--filter-ignored-diagnostics diagnostics)))
@@ -1945,6 +1962,14 @@ When BACKEND is nil, use the selected `proofread-backend'."
     (dolist (diagnostic diagnostics)
       (proofread--create-overlay diagnostic))
     (proofread--popup-update)))
+
+(defun proofread--replace-backend-diagnostics (request diagnostics)
+  "Replace current diagnostics for REQUEST with DIAGNOSTICS."
+  (let ((beg (proofread--position-integer (plist-get request :beg)))
+        (end (proofread--position-integer (plist-get request :end))))
+    (when (and beg end)
+      (proofread--clear-diagnostics-in-range beg end)))
+  (proofread--apply-backend-diagnostics diagnostics))
 
 (defun proofread--handle-backend-result (result)
   "Handle backend RESULT and return an internal status symbol."
@@ -1955,7 +1980,7 @@ When BACKEND is nil, use the selected `proofread-backend'."
        (if (proofread--fresh-request-p request)
            (with-current-buffer buffer
              (let ((diagnostics (plist-get result :diagnostics)))
-               (proofread--apply-backend-diagnostics diagnostics)
+               (proofread--replace-backend-diagnostics request diagnostics)
                (unless (eq (plist-get result :source) 'cache)
                  (proofread--cache-write-request request diagnostics)))
              'applied)
@@ -2329,6 +2354,192 @@ navigation order."
     (when overlay
       (overlay-put overlay 'face 'proofread-current-face)))
   diagnostic)
+
+;;; Per-buffer diagnostic listings
+
+(defvar proofread-diagnostics-buffer-mode-map
+  (let ((map (make-sparse-keymap)))
+    (define-key map (kbd "RET") #'proofread-goto-diagnostic)
+    (define-key map (kbd "C-m") #'proofread-goto-diagnostic)
+    (define-key map (kbd "SPC") #'proofread-show-diagnostic)
+    (define-key map (kbd "C-o") #'proofread-show-diagnostic)
+    (when (fboundp 'next-error-this-buffer-no-select)
+      (define-key map (kbd "n") #'next-error-this-buffer-no-select)
+      (define-key map (kbd "p") #'previous-error-this-buffer-no-select))
+    map)
+  "Keymap for `proofread-diagnostics-buffer-mode'.")
+
+(defconst proofread--diagnostics-list-format
+  `[("Line" 4 ,(lambda (a b)
+                 (< (plist-get (car a) :line)
+                    (plist-get (car b) :line)))
+     :right-align t)
+    ("Col" 3 nil :right-align t)
+    ("Kind" 8 ,(lambda (a b)
+                 (< (plist-get (car a) :kind-rank)
+                    (plist-get (car b) :kind-rank))))
+    ("Source" 8 t)
+    ("Text" 12 t)
+    ("Message" 0 t)]
+  "Tabulated list format for proofread diagnostics buffers.")
+
+(defun proofread--diagnostic-kind-rank (kind)
+  "Return a stable sort rank for diagnostic KIND."
+  (pcase kind
+    ('spelling 0)
+    ('grammar 1)
+    ('style 2)
+    (_ 3)))
+
+(defun proofread--diagnostic-live-range (diagnostic)
+  "Return DIAGNOSTIC's current live range, or nil."
+  (let ((overlay (proofread--overlay-for-diagnostic diagnostic)))
+    (cond
+     ((and overlay
+           (overlay-start overlay)
+           (overlay-end overlay))
+      (cons (overlay-start overlay)
+            (overlay-end overlay)))
+     (t
+      (proofread--diagnostic-range diagnostic)))))
+
+(defun proofread--diagnostic-line-column (diagnostic)
+  "Return DIAGNOSTIC's current line and column as a cons cell."
+  (let ((range (proofread--diagnostic-live-range diagnostic)))
+    (when range
+      (save-excursion
+        (goto-char (car range))
+        (cons (line-number-at-pos)
+              (- (point) (line-beginning-position)))))))
+
+(defun proofread--diagnostics-in-range (beg end)
+  "Return proofread diagnostics intersecting BEG to END."
+  (let (diagnostics)
+    (dolist (diagnostic (proofread--navigation-diagnostics))
+      (let ((range (proofread--diagnostic-live-range diagnostic)))
+        (when (and range
+                   (proofread--ranges-intersect-p
+                    beg end (car range) (cdr range)))
+          (push diagnostic diagnostics))))
+    (nreverse diagnostics)))
+
+(defun proofread--diagnostics-list-entry (diagnostic)
+  "Return a tabulated list entry for DIAGNOSTIC."
+  (let* ((line-column (proofread--diagnostic-line-column diagnostic))
+         (line (car line-column))
+         (column (cdr line-column))
+         (kind (plist-get diagnostic :kind))
+         (source (plist-get diagnostic :source))
+         (text (plist-get diagnostic :text))
+         (message (plist-get diagnostic :message))
+         (id (list :diagnostic diagnostic
+                   :buffer (current-buffer)
+                   :line line
+                   :kind-rank (proofread--diagnostic-kind-rank kind))))
+    (list
+     id
+     (vector
+      (number-to-string line)
+      (number-to-string column)
+      (proofread--format-diagnostic-field kind)
+      (if source (proofread--format-diagnostic-field source) "-")
+      (if text (proofread--format-diagnostic-field text) "-")
+      (list (if message
+                (proofread--format-diagnostic-field message)
+              "-")
+            'mouse-face 'highlight
+            'help-echo "mouse-2: visit this diagnostic"
+            'face nil
+            'action #'proofread-goto-diagnostic
+            'mouse-action #'proofread-goto-diagnostic)))))
+
+(defun proofread--diagnostics-list-entries ()
+  "Return tabulated list entries for the current buffer diagnostics."
+  (delq nil
+        (mapcar (lambda (diagnostic)
+                  (when (proofread--diagnostic-line-column diagnostic)
+                    (proofread--diagnostics-list-entry diagnostic)))
+                (proofread--navigation-diagnostics))))
+
+(defun proofread--diagnostics-buffer-refresh ()
+  "Refresh entries in the current proofread diagnostics buffer."
+  (setq tabulated-list-format proofread--diagnostics-list-format)
+  (setq tabulated-list-entries
+        (and (buffer-live-p proofread--diagnostics-buffer-source)
+             (with-current-buffer proofread--diagnostics-buffer-source
+               (and proofread-mode
+                    (proofread--diagnostics-list-entries)))))
+  (tabulated-list-init-header))
+
+(defun proofread--diagnostics-buffer-setup ()
+  "Set up refresh and navigation for proofread diagnostics buffers."
+  (setq-local next-error-function #'proofread--diagnostics-next-error)
+  (let ((saved-revert-buffer-function revert-buffer-function))
+    (setq revert-buffer-function
+          (lambda (&rest args)
+            (proofread--diagnostics-buffer-refresh)
+            (apply saved-revert-buffer-function args)))))
+
+(defun proofread-show-diagnostic (pos &optional other-window)
+  "From a Proofread diagnostics buffer, show source of diagnostic at POS."
+  (interactive (list (point) t))
+  (let* ((diagnostics-buffer (current-buffer))
+         (id (or (tabulated-list-get-id pos)
+                 (user-error "Nothing at point")))
+         (diagnostic (plist-get id :diagnostic))
+         (source (plist-get id :buffer))
+         (range (and diagnostic
+                     (buffer-live-p source)
+                     (with-current-buffer source
+                       (proofread--diagnostic-live-range diagnostic)))))
+    (unless (and (buffer-live-p source) range)
+      (user-error "Proofread diagnostic is stale"))
+    (setq proofread-current-diagnostic-line (line-number-at-pos pos))
+    (with-current-buffer source
+      (with-selected-window
+          (display-buffer (current-buffer) other-window)
+        (goto-char (car range))
+        (proofread--mark-current-diagnostic diagnostic)
+        (pulse-momentary-highlight-region
+         (car range) (cdr range)))
+      (setq next-error-last-buffer diagnostics-buffer)
+      (current-buffer))))
+
+(defun proofread-goto-diagnostic (pos)
+  "From a Proofread diagnostics buffer, go to source of diagnostic at POS."
+  (interactive "d")
+  (pop-to-buffer
+   (proofread-show-diagnostic
+    (if (button-type pos)
+        (button-start pos)
+      pos))))
+
+(defun proofread--diagnostics-next-error (n &optional reset)
+  "Move N diagnostics in a proofread diagnostics buffer.
+When RESET is non-nil, move from the beginning of the buffer."
+  (let ((line (if reset 1 proofread-current-diagnostic-line))
+        (total-lines (count-lines (point-min) (point-max))))
+    (goto-char (point-min))
+    (unless (zerop total-lines)
+      (forward-line
+       (1- (max 1 (min total-lines (+ line n))))))
+    (when-let* ((window (get-buffer-window nil t)))
+      (set-window-point window (point)))
+    (proofread-goto-diagnostic (point))))
+
+(define-derived-mode proofread-diagnostics-buffer-mode tabulated-list-mode
+  "Proofread diagnostics"
+  "A mode for listing Proofread diagnostics."
+  :interactive nil
+  (proofread--diagnostics-buffer-setup))
+
+(defun proofread--diagnostics-buffer-name ()
+  "Return the diagnostics buffer name for the current buffer."
+  (format "*Proofread diagnostics for `%s'*" (current-buffer)))
+
+(defun proofread--fit-diagnostics-window (window)
+  "Fit proofread diagnostics WINDOW to its buffer."
+  (fit-window-to-buffer window 15 8))
 
 (defun proofread--popup-buffer ()
   "Return the hidden buffer name used for the current proofread child frame."
@@ -2758,6 +2969,68 @@ configured backend."
   "Check the current buffer for proofreading diagnostics."
   (interactive)
   (proofread--command-placeholder 'proofread-check-buffer))
+
+;;;###autoload
+(defun proofread-show-buffer-diagnostics (&optional diagnostic)
+  "Show a listing of Proofread diagnostics for the current buffer.
+With optional DIAGNOSTIC, find and highlight this diagnostic in the listing.
+
+Interactively, use the diagnostic at point.  For mouse events in margins and
+fringes, use the first diagnostic in the corresponding line, otherwise look in
+the click position.
+
+This function does not move point in the source buffer."
+  (interactive
+   (if (mouse-event-p last-command-event)
+       (with-selected-window (posn-window (event-end last-command-event))
+         (with-current-buffer (window-buffer)
+           (let* ((event-point (posn-point (event-end last-command-event)))
+                  (diagnostics
+                   (when event-point
+                     (or (when-let* ((diagnostic
+                                      (proofread--diagnostic-at-point
+                                       event-point)))
+                           (list diagnostic))
+                         (save-excursion
+                           (goto-char event-point)
+                           (proofread--diagnostics-in-range
+                            (line-beginning-position)
+                            (line-end-position)))))))
+             (unless diagnostics
+               (error "No diagnostics here"))
+             (list (car diagnostics)))))
+     (list (proofread--diagnostic-at-point))))
+  (unless proofread-mode
+    (user-error "Proofread mode is not enabled in the current buffer"))
+  (let* ((name (proofread--diagnostics-buffer-name))
+         (source (current-buffer))
+         (target (or (get-buffer name)
+                     (with-current-buffer (get-buffer-create name)
+                       (proofread-diagnostics-buffer-mode)
+                       (current-buffer))))
+         window)
+    (with-current-buffer target
+      (setq proofread--diagnostics-buffer-source source)
+      (setq next-error-last-buffer (current-buffer))
+      (revert-buffer)
+      (setq window
+            (display-buffer
+             (current-buffer)
+             `((display-buffer-reuse-window
+                display-buffer-below-selected)
+               (window-height . proofread--fit-diagnostics-window))))
+      (when (and window diagnostic)
+        (with-selected-window window
+          (cl-loop initially (goto-char (point-min))
+                   until (eobp)
+                   until (eq (plist-get (tabulated-list-get-id)
+                                        :diagnostic)
+                             diagnostic)
+                   do (forward-line)
+                   finally
+                   (recenter)
+                   (pulse-momentary-highlight-one-line
+                    (point) 'highlight)))))))
 
 ;;;###autoload
 (defun proofread-next ()
