@@ -188,8 +188,6 @@
     ("text" . ,text)
     ("range" . (("beg" . ,beg)
                 ("end" . ,end)))
-    ("token_index" . nil)
-    ("token_range" . nil)
     ("suggestions" . ,(vconcat (or suggestions '("hello"))))
     ("confidence" . 0.9)))
 
@@ -720,8 +718,7 @@
   (with-temp-buffer
     (insert "一二三四五六。")
     (let ((proofread-max-chunk-size 3)
-          (proofread-context-size 0)
-          (proofread-token-map-enabled nil))
+          (proofread-context-size 0))
       (let ((chunks (proofread--chunks-for-ranges
                      (list (cons (point-min) (point-max))))))
         (should (equal (proofread-test--chunk-texts chunks)
@@ -732,117 +729,6 @@
                             (<= (length (plist-get chunk :text))
                                 proofread-max-chunk-size))
                           chunks))))))
-
-(ert-deftest proofread-test-token-map-generation-exact-offsets ()
-  "Token maps use exact chunk-relative offsets."
-  (with-temp-buffer
-    (insert "青晨六点，小城。")
-    (let ((proofread-language "zh")
-          (proofread-context-size 0))
-      (cl-letf (((symbol-function 'jieba-rs-module-segment)
-                 (lambda (_text _hmm)
-                   '("青晨" "六点" "，" "小城" "。"))))
-        (let* ((chunk (car (proofread--request-ready-chunks-for-ranges
-                            (list (cons (point-min) (point-max))))))
-               (tokens (plist-get chunk :tokens)))
-          (should (equal (mapcar (lambda (token)
-                                   (list (plist-get token :index)
-                                         (plist-get token :beg)
-                                         (plist-get token :end)
-                                         (plist-get token :text)))
-                                 tokens)
-                         '((0 0 2 "青晨")
-                           (1 2 4 "六点")
-                           (2 4 5 "，")
-                           (3 5 7 "小城")
-                           (4 7 8 "。"))))
-          (should (equal (plist-get (plist-get chunk :tokenization)
-                                    :prompt-version)
-                         proofread-prompt-version))
-          (dolist (token tokens)
-            (should (equal (plist-get token :text)
-                           (substring (plist-get chunk :text)
-                                      (plist-get token :beg)
-                                      (plist-get token :end))))))))))
-
-(ert-deftest proofread-test-token-map-runs-after-request-filtering ()
-  "Token maps are built only for retained request-ready text."
-  (with-temp-buffer
-    (insert "青晨 http://example.com 小城。")
-    (let ((proofread-language "zh")
-          (proofread-context-size 0))
-      (cl-letf (((symbol-function 'jieba-rs-module-segment)
-                 (lambda (text _hmm)
-                   (pcase text
-                     ("青晨 " '("青晨" " "))
-                     (" 小城。" '(" " "小城" "。"))))))
-        (let* ((chunks (proofread--request-ready-chunks-for-ranges
-                        (list (cons (point-min) (point-max)))))
-               (token-texts
-                (mapcan (lambda (chunk)
-                          (mapcar (lambda (token)
-                                    (plist-get token :text))
-                                  (plist-get chunk :tokens)))
-                        chunks)))
-          (should (equal (proofread-test--chunk-texts chunks)
-                         '("青晨 " " 小城。")))
-          (should (equal token-texts '("青晨" "小城" "。")))
-          (should-not (member "http://example.com" token-texts)))))))
-
-(ert-deftest proofread-test-token-map-falls-back-safely ()
-  "Unavailable, failing, or invalid tokenization creates no token map."
-  (dolist (scenario '(unavailable failing invalid))
-    (with-temp-buffer
-      (insert "青晨")
-      (let ((proofread-language "zh")
-            (proofread-context-size 0))
-        (cl-letf (((symbol-function 'proofread--jieba-tokenization-available-p)
-                   (lambda ()
-                     (not (eq scenario 'unavailable))))
-                  ((symbol-function 'jieba-rs-module-segment)
-                   (lambda (_text _hmm)
-                     (pcase scenario
-                       ('failing (error "synthetic token failure"))
-                       ('invalid '("青" "BAD"))
-                       (_ '("青晨"))))))
-          (let ((chunk (car (proofread--request-ready-chunks-for-ranges
-                             (list (cons (point-min) (point-max)))))))
-            (should-not (plist-get chunk :tokens))
-            (should-not (plist-get chunk :tokenization))))))))
-
-(ert-deftest proofread-test-token-boundary-splits-oversized-sentence ()
-  "Oversized sentences prefer token-boundary splits."
-  (with-temp-buffer
-    (insert "青晨六点小城安静。")
-    (let ((proofread-language "zh")
-          (proofread-context-size 0)
-          (proofread-max-chunk-size 4))
-      (cl-letf (((symbol-function 'jieba-rs-module-segment)
-                 (lambda (_text _hmm)
-                   '("青晨" "六点" "小城" "安静" "。"))))
-        (let ((chunks (proofread--chunks-for-ranges
-                       (list (cons (point-min) (point-max))))))
-          (should (equal (proofread-test--chunk-texts chunks)
-                         '("青晨六点" "小城安静" "。")))
-          (should (cl-every (lambda (chunk)
-                              (<= (length (plist-get chunk :text))
-                                  proofread-max-chunk-size))
-                            chunks)))))))
-
-(ert-deftest proofread-test-oversized-token-falls-back-to-bounded-split ()
-  "A token larger than the chunk limit falls back to character splitting."
-  (with-temp-buffer
-    (insert "超长词汇")
-    (let ((proofread-language "zh")
-          (proofread-context-size 0)
-          (proofread-max-chunk-size 2))
-      (cl-letf (((symbol-function 'jieba-rs-module-segment)
-                 (lambda (_text _hmm)
-                   '("超长词汇"))))
-        (let ((chunks (proofread--chunks-for-ranges
-                       (list (cons (point-min) (point-max))))))
-          (should (equal (proofread-test--chunk-texts chunks)
-                         '("超长" "词汇"))))))))
 
 (ert-deftest proofread-test-sentence-chunking-keeps-unpunctuated-paragraph ()
   "Unpunctuated paragraphs stay one logical sentence."
@@ -1292,12 +1178,10 @@
                         :language "zh"
                         :major-mode 'org-mode
                         :buffer (current-buffer)
-                        :callback #'ignore
-                        :tokens '((:index 0 :beg 0 :end 3 :text "目标"))))
+                        :callback #'ignore))
            (key (proofread--cache-key chunk)))
       (should-not (plist-member key :buffer))
       (should-not (plist-member key :callback))
-      (should-not (plist-member key :tokens))
       (should-not (proofread-test--tree-member-p (current-buffer) key))
       (should-not (proofread-test--tree-member-p proofread-llm-provider key))
       (should-not (proofread-test--tree-member-p "secret-token" key)))))
@@ -1373,10 +1257,12 @@
     (should-not (proofread--cache-read 'key))))
 
 (ert-deftest proofread-test-cache-relative-diagnostic-conversion ()
-  "Cached diagnostics convert exactly between absolute and relative ranges."
+  "Cached diagnostics convert ranges and locators between coordinate systems."
   (let* ((request '(:beg 10 :end 20 :text "0123456789" :backend llm))
          (diagnostic
-          (proofread-test--diagnostic-for-range 12 15 "234"))
+          (plist-put (proofread-test--diagnostic-for-range 12 15 "234")
+                     :locator
+                     '(:kind char-range :beg 12 :end 15)))
          (relative
           (proofread--diagnostic-to-relative diagnostic request))
          (absolute
@@ -1387,6 +1273,8 @@
                    (plist-get diagnostic :beg)))
     (should-not (= (plist-get relative :end)
                    (plist-get diagnostic :end)))
+    (should (equal (plist-get relative :locator)
+                   '(:kind char-range :beg 2 :end 5)))
     (should (equal absolute diagnostic))))
 
 (ert-deftest proofread-test-cache-hit-skips-backend-dispatch ()
@@ -1895,8 +1783,8 @@
                        :source)
                       'llm)))))))
 
-(ert-deftest proofread-test-llm-prompt-includes-token-list ()
-  "LLM prompts include token maps when request tokens are present."
+(ert-deftest proofread-test-llm-prompt-uses-character-ranges ()
+  "LLM prompts use character ranges without token locator hints."
   (with-temp-buffer
     (org-mode)
     (insert "青晨六点。")
@@ -1904,10 +1792,7 @@
           (proofread-context-size 0)
           (proofread-llm-provider 'proofread-test-provider)
           captured-prompt)
-      (cl-letf (((symbol-function 'jieba-rs-module-segment)
-                 (lambda (_text _hmm)
-                   '("青晨" "六点" "。")))
-                ((symbol-function 'llm-chat-async)
+      (cl-letf (((symbol-function 'llm-chat-async)
                  (lambda (_provider prompt _success _error
                                     &optional _multi-output)
                    (setq captured-prompt prompt)
@@ -1923,15 +1808,11 @@
                  (prompt-text
                   (llm-chat-prompt-interaction-content interaction)))
             (should (string-match-p "Text:\n青晨六点。" prompt-text))
-            (should (string-match-p "Tokens:" prompt-text))
-            (should (string-match-p "0 \\[0,2\\] \"青晨\""
+            (should (string-match-p "range end is exclusive"
                                     prompt-text))
-            (should (string-match-p "1 \\[2,4\\] \"六点\""
-                                    prompt-text))
-            (should (string-match-p "token_index" prompt-text))
-            (should (string-match-p "token_range" prompt-text))
-            (should (string-match-p "range and text fields are still required"
-                                    prompt-text))))))))
+            (should-not (string-match-p "Tokens:" prompt-text))
+            (should-not (string-match-p "token_index" prompt-text))
+            (should-not (string-match-p "token_range" prompt-text))))))))
 
 (ert-deftest proofread-test-llm-success-enters-overlay-pipeline ()
   "Fresh LLM diagnostics use the existing result, cache, and overlay path."
@@ -2162,24 +2043,25 @@
       (should (string-match-p "every independent problem" prompt))
       (should (string-match-p "Do not stop after the first" prompt))
       (should (string-match-p "one diagnostic per issue" prompt))
-      (should (string-match-p "adjacent characters and tokens" prompt))
+      (should (string-match-p "adjacent characters" prompt))
       (should (string-match-p "multiple suggestions" prompt))
       (should (string-match-p "best-first order" prompt))
       (should (string-match-p "only for the Text section" prompt))
       (should (string-match-p "zero-based chunk-relative offsets" prompt))
       (should (string-match-p "range end is exclusive" prompt))
       (dolist (field '("kind" "message" "text" "range"
-                       "token_index" "token_range" "suggestions"
-                       "confidence"))
+                       "suggestions" "confidence"))
         (should (string-match-p field prompt)))
       (should-not (string-match-p "source" prompt))
+      (should-not (string-match-p "token_index" prompt))
+      (should-not (string-match-p "token_range" prompt))
       (should (string-match-p "Language: \"en\"" prompt))
       (should (string-match-p "Major mode: text-mode" prompt))
       (should (string-match-p "Text:\nhelo" prompt))
       (should-not (string-match-p "absolute buffer" prompt)))))
 
-(ert-deftest proofread-test-structured-response-prompt-without-tokens-falls-back ()
-  "Token locator details are not required when requests have no tokens."
+(ert-deftest proofread-test-structured-response-prompt-has-no-token-contract ()
+  "Structured response prompts do not expose token locator details."
   (with-temp-buffer
     (text-mode)
     (insert "helo")
@@ -2189,14 +2071,16 @@
            (prompt (proofread--structured-response-prompt request)))
       (should-not (string-match-p "Tokens:" prompt))
       (should-not (string-match-p "When you can localize" prompt))
-      (should (string-match-p "Set token_index and token_range to null"
-                              prompt)))))
+      (should-not (string-match-p "token_index" prompt))
+      (should-not (string-match-p "token_range" prompt)))))
 
 (ert-deftest proofread-test-structured-response-schema-encodes-json-false ()
   "Structured response schema encodes false as a JSON boolean."
   (let ((schema (proofread--structured-response-schema-text)))
     (should (string-match-p "\"additionalProperties\":false" schema))
     (should-not (string-match-p "\"source\"" schema))
+    (should-not (string-match-p "\"token_index\"" schema))
+    (should-not (string-match-p "\"token_range\"" schema))
     (should-not
      (string-match-p "\"additionalProperties\":\"false\"" schema))))
 
@@ -2265,8 +2149,6 @@
                       :message "Possible misspelling"
                       :text "helo"
                       :range (:beg 0 :end 4)
-                      :token_index nil
-                      :token_range nil
                       :suggestions ["hello"]
                       :confidence nil))))
            (diagnostics
@@ -2276,7 +2158,25 @@
       (should (equal (plist-get (car diagnostics) :text) "helo"))
       (should (equal (plist-get (car diagnostics) :suggestions)
                      '("hello")))
-      (should (eq (plist-get (car diagnostics) :source) 'llm)))))
+      (should (eq (plist-get (car diagnostics) :source) 'llm))
+      (should (equal (plist-get (car diagnostics) :locator)
+                     '(:kind char-range :beg 1 :end 5))))))
+
+(ert-deftest proofread-test-structured-response-uses-char-range-locator ()
+  "Structured response diagnostics use internal character range locators."
+  (with-temp-buffer
+    (insert "青晨六点，小城。")
+    (let* ((chunk (car (proofread--request-ready-chunks-for-ranges
+                        (list (cons (point-min) (point-max))))))
+           (request (proofread--make-backend-request chunk 'llm))
+           (content
+            (proofread-test--response-content
+             (list (proofread-test--response-diagnostic 5 7 "小城"))))
+           (diagnostic
+            (car (proofread--diagnostics-from-structured-response
+                  request content 'llm))))
+      (should (equal (plist-get diagnostic :locator)
+                     '(:kind char-range :beg 6 :end 8))))))
 
 (ert-deftest proofread-test-structured-response-preserves-multiple-diagnostics ()
   "Structured response keeps multiple diagnostics from one request."
@@ -2410,87 +2310,31 @@
       (should-not (plist-get (cadr diagnostics) :confidence))
       (should (eq (plist-get (cadr diagnostics) :source) 'llm)))))
 
-(ert-deftest proofread-test-structured-response-token-locators ()
-  "Token locators are consistency hints for otherwise valid diagnostics."
-  (let* ((request '(:beg 10
-                         :end 18
-                         :text "青晨六点"
-                         :tokens ((:index 0 :beg 0 :end 2 :text "青晨")
-                                  (:index 1 :beg 2 :end 4 :text "六点"))))
-         (content
-          (proofread-test--response-content
-           (list
-            (proofread-test--response-diagnostic-with-fields
-             0 2 "青晨" '(("token_index" . 0)))
-            (proofread-test--response-diagnostic
-             2 4 "六点" '("六点钟"))
-            (proofread-test--response-diagnostic-with-fields
-             0 2 "青晨" '(("token_index" . "0"))))))
-         (diagnostics
-          (proofread--diagnostics-from-structured-response request content 'llm)))
-    (should (= (length diagnostics) 3))
-    (should (equal (mapcar (lambda (diagnostic)
-                             (plist-get diagnostic :text))
-                           diagnostics)
-                   '("青晨" "六点" "青晨")))
-    (should (equal (mapcar (lambda (diagnostic)
-                             (cons (plist-get diagnostic :beg)
-                                   (plist-get diagnostic :end)))
-                           diagnostics)
-                   '((10 . 12) (12 . 14) (10 . 12))))))
-
-(ert-deftest proofread-test-structured-response-token-range-locator ()
-  "Token ranges validate against required diagnostic ranges."
+(ert-deftest proofread-test-structured-response-cross-boundary-range ()
+  "Character ranges can describe diagnostics across word-like boundaries."
   (let* ((request '(:beg 1
-                         :end 5
-                         :text "青晨六点"
-                         :tokens ((:index 0 :beg 0 :end 2 :text "青晨")
-                                  (:index 1 :beg 2 :end 4 :text "六点"))))
+                         :end 15
+                         :text "小城的街到刚刚醒来。"))
          (content
           (proofread-test--response-content
            (list
-            (proofread-test--response-diagnostic-with-fields
-             0 4 "青晨六点"
-             '(("token_range" . (("beg" . 0)
-                                 ("end" . 2))))))))
+            (proofread-test--response-diagnostic 3 5 "街到" '("街道")))))
          (diagnostic
           (car (proofread--diagnostics-from-structured-response
                 request content 'llm))))
     (should diagnostic)
-    (should (= (plist-get diagnostic :beg) 1))
-    (should (= (plist-get diagnostic :end) 5))))
+    (should (= (plist-get diagnostic :beg) 4))
+    (should (= (plist-get diagnostic :end) 6))
+    (should (equal (plist-get diagnostic :locator)
+                   '(:kind char-range :beg 4 :end 6)))))
 
-(ert-deftest proofread-test-structured-response-contradictory-token-is-dropped ()
-  "Token locators that contradict range and text reject only that candidate."
-  (let* ((request '(:beg 1
-                         :end 9
-                         :text "青晨六点小城"
-                         :tokens ((:index 0 :beg 0 :end 2 :text "青晨")
-                                  (:index 1 :beg 2 :end 4 :text "六点")
-                                  (:index 2 :beg 4 :end 6 :text "小城"))))
-         (content
-          (proofread-test--response-content
-           (list
-            (proofread-test--response-diagnostic-with-fields
-             0 2 "青晨" '(("token_index" . 1)))
-            (proofread-test--response-diagnostic-with-fields
-             4 6 "小城" '(("token_index" . 2)))))))
-    (let ((diagnostics
-           (proofread--diagnostics-from-structured-response request content 'llm)))
-      (should (= (length diagnostics) 1))
-      (should (equal (plist-get (car diagnostics) :text) "小城")))))
-
-(ert-deftest proofread-test-structured-response-token-only-is-rejected ()
-  "Token-only diagnostics without range and text are rejected."
-  (let* ((request '(:beg 1
-                         :end 5
-                         :text "青晨六点"
-                         :tokens ((:index 0 :beg 0 :end 2 :text "青晨"))))
+(ert-deftest proofread-test-structured-response-without-range-and-text-is-rejected ()
+  "Diagnostics without authoritative range and text are rejected."
+  (let* ((request '(:beg 1 :end 5 :text "青晨六点"))
          (content
           (proofread-test--response-content
            (list '(("kind" . "spelling")
                    ("message" . "Possible misspelling")
-                   ("token_index" . 0)
                    ("suggestions" . ["清晨"]))))))
     (should-not (proofread--diagnostics-from-structured-response request content 'llm))))
 
@@ -2581,39 +2425,8 @@
         (should-not (proofread--cache-read-request
                      (proofread--make-backend-request chunk)))))))
 
-(ert-deftest proofread-test-tokenization-identity-cache-miss ()
-  "Tokenization identity changes miss old cache entries."
-  (let* ((chunk '(:text "青晨"
-                        :language "zh"
-                        :major-mode org-mode
-                        :tokenization (:enabled t
-                                                :function jieba-rs-module-segment
-                                                :hmm t
-                                                :prompt-version "2"
-                                                :user-dict nil)))
-         (base-key (proofread--cache-key chunk 'llm))
-         (changed (copy-sequence chunk))
-         (changed-prompt (copy-sequence chunk)))
-    (setq changed
-          (plist-put changed :tokenization
-                     '(:enabled t
-                                :function jieba-rs-module-segment
-                                :hmm nil
-                                :prompt-version "2"
-                                :user-dict nil)))
-    (setq changed-prompt
-          (plist-put changed-prompt :tokenization
-                     '(:enabled t
-                                :function jieba-rs-module-segment
-                                :hmm t
-                                :prompt-version "3"
-                                :user-dict nil)))
-    (should-not (equal base-key (proofread--cache-key changed 'llm)))
-    (should-not (equal base-key
-                       (proofread--cache-key changed-prompt 'llm)))))
-
-(ert-deftest proofread-test-tokenization-cache-key-excludes-volatile-values ()
-  "Token-aware cache keys exclude volatile objects and secrets."
+(ert-deftest proofread-test-cache-key-excludes-volatile-values ()
+  "Cache keys exclude volatile objects and secrets."
   (with-temp-buffer
     (let* ((proofread-backend 'llm)
            (proofread-llm-provider [:api-key "secret-token"])
@@ -2622,49 +2435,34 @@
                         :language "zh"
                         :major-mode 'org-mode
                         :buffer (current-buffer)
-                        :callback #'ignore
-                        :tokens '((:index 0
-                                          :beg 0
-                                          :end 2
-                                          :text "青晨"))
-                        :tokenization '(:enabled t
-                                                 :function jieba-rs-module-segment
-                                                 :hmm t
-                                                 :prompt-version "2"
-                                                 :user-dict nil)))
+                        :callback #'ignore))
            (key (proofread--cache-key chunk)))
       (should-not (plist-member key :buffer))
       (should-not (plist-member key :callback))
-      (should-not (plist-member key :tokens))
       (should-not (string-match-p "secret-token" (prin1-to-string key)))
       (should-not (string-match-p (buffer-name) (prin1-to-string key))))))
 
-(ert-deftest proofread-test-token-aware-stale-result-is-dropped ()
-  "Token-aware successful results still require stale validation."
+(ert-deftest proofread-test-structured-response-stale-result-is-dropped ()
+  "Structured successful results still require stale validation."
   (with-temp-buffer
     (insert "青晨")
     (proofread-mode 1)
-    (let ((proofread-language "zh"))
-      (cl-letf (((symbol-function 'jieba-rs-module-segment)
-                 (lambda (_text _hmm)
-                   '("青晨"))))
-        (let* ((chunk (car (proofread--request-ready-chunks-for-ranges
-                            (list (cons (point-min) (point-max))))))
-               (request (proofread--make-backend-request chunk 'llm))
-               (content
-                (proofread-test--response-content
-                 (list (proofread-test--response-diagnostic-with-fields
-                        0 2 "青晨" '(("token_index" . 0))))))
-               (diagnostics
-                (proofread--diagnostics-from-structured-response request content 'llm)))
-          (goto-char (point-max))
-          (insert "!")
-          (should (eq (proofread--handle-backend-result
-                       (proofread--backend-success-result
-                        request diagnostics))
-                      'stale))
-          (should-not proofread--diagnostics)
-          (should-not proofread--overlays))))))
+    (let* ((chunk (car (proofread--request-ready-chunks-for-ranges
+                        (list (cons (point-min) (point-max))))))
+           (request (proofread--make-backend-request chunk 'llm))
+           (content
+            (proofread-test--response-content
+             (list (proofread-test--response-diagnostic 0 2 "青晨"))))
+           (diagnostics
+            (proofread--diagnostics-from-structured-response request content 'llm)))
+      (goto-char (point-max))
+      (insert "!")
+      (should (eq (proofread--handle-backend-result
+                   (proofread--backend-success-result
+                    request diagnostics))
+                  'stale))
+      (should-not proofread--diagnostics)
+      (should-not proofread--overlays))))
 
 (ert-deftest proofread-test-backend-request-records-chunk-fields ()
   "Backend requests preserve request-ready chunk metadata."

@@ -4,7 +4,7 @@
 
 ;; Author: Bingshan Chang <chang@bingshan.org>
 ;; Keywords: convenience, wp
-;; Package-Requires: ((emacs "30.1") (jieba-rs "0.1.0") (llm "0.31.1") (posframe "1.5.2"))
+;; Package-Requires: ((emacs "30.1") (llm "0.31.1") (posframe "1.5.2"))
 ;; Version: 0.1.0
 
 ;; This file is not part of GNU Emacs.
@@ -39,13 +39,8 @@
 (require 'subr-x)
 (require 'tabulated-list)
 
-(declare-function jieba-rs-module-segment "jieba-rs" (text hmm))
 (declare-function previous-error-this-buffer-no-select "simple"
                   (&optional n reset))
-
-(defvar jieba-rs-hmm)
-(defvar jieba-rs-segment-function)
-(defvar jieba-rs-user-dict)
 
 (defgroup proofread nil
   "Context-aware proofreading for Emacs buffers."
@@ -133,7 +128,7 @@ uses a single LLM call."
   :type 'natnum
   :group 'proofread)
 
-(defcustom proofread-prompt-version "7"
+(defcustom proofread-prompt-version "8"
   "Prompt contract version used to invalidate diagnostic cache entries."
   :type 'string
   :group 'proofread)
@@ -141,13 +136,6 @@ uses a single LLM call."
 (defcustom proofread-cache-configuration-version 1
   "Configuration version data used to invalidate diagnostic cache entries."
   :type 'sexp
-  :group 'proofread)
-
-(defcustom proofread-token-map-enabled t
-  "Non-nil means build Chinese token maps for LLM diagnostics.
-Token maps are included in prompts as auxiliary locator hints.  They never
-replace chunk-relative range and exact text validation."
-  :type 'boolean
   :group 'proofread)
 
 (defcustom proofread-ignored-faces nil
@@ -197,7 +185,7 @@ property has a non-nil value is not included in request-ready chunks."
   :group 'proofread)
 
 (defconst proofread--diagnostic-keys
-  '(:beg :end :text :kind :message :suggestions :confidence :source)
+  '(:beg :end :text :kind :message :suggestions :confidence :source :locator)
   "Required keys for proofread diagnostic plists.")
 
 (defconst proofread--diagnostic-kinds
@@ -210,7 +198,7 @@ property has a non-nil value is not included in request-ready chunks."
 
 (defconst proofread--backend-request-keys
   '( :id :buffer :beg :end :text :context-before :context-after
-     :language :major-mode :modified-tick :backend :tokens :tokenization)
+     :language :major-mode :modified-tick :backend)
   "Required keys for proofread backend request plists.")
 
 (defconst proofread--structured-response-instructions
@@ -219,17 +207,15 @@ property has a non-nil value is not included in request-ready chunks."
    "schema.  Do not include Markdown, comments, prose, or reasoning outside "
    "the structured response.\n"
    "The top-level response has a diagnostics array.  Each diagnostic has "
-   "kind, message, text, range, token_index, token_range, suggestions, "
-   "and confidence fields.\n"
+   "kind, message, text, range, suggestions, and confidence fields.\n"
    "Report every independent problem in Text.  Do not stop after the first "
    "problem in a sentence; when one sentence has multiple misspellings, grammar "
    "issues, or style issues, return one diagnostic per issue.\n"
    "Prefer the smallest exact text range that identifies each issue, and keep "
    "diagnostics separate unless one correction requires a single combined "
    "range.\n"
-   "For Chinese text, also check adjacent characters and tokens that may form "
-   "one misspelled word; do not assume individually valid neighboring tokens "
-   "are correct in context.\n"
+   "For Chinese text, also check adjacent characters that may form one "
+   "misspelled word; a diagnostic may cover multiple adjacent characters.\n"
    "Report diagnostics only for the Text section.  Use context before and "
    "context after only to understand the Text; never return ranges or text "
    "from context.\n"
@@ -240,8 +226,6 @@ property has a non-nil value is not included in request-ready chunks."
    "Include multiple suggestions when several distinct corrections are useful; "
    "one suggestion or an empty suggestions array is acceptable when there is no "
    "real alternative.\n"
-   "Set token_index and token_range to null when token locators are not "
-   "useful or no token list is provided; range and text remain required.\n"
    "Set confidence to null when unknown.\n"
    "Use an empty diagnostics array when there are no diagnostics.\n")
   "Provider-independent instructions for structured responses.")
@@ -264,16 +248,10 @@ property has a non-nil value is not included in request-ready chunks."
                                  :properties (:beg (:type "integer") :end (:type "integer"))
                                  :required ["beg" "end"]
                                  :additionalProperties ,json-false)
-                          :token_index (:type ["integer" "null"])
-                          :token_range
-                          (:type ["object" "null"]
-                                 :properties (:beg (:type "integer") :end (:type "integer"))
-                                 :required ["beg" "end"]
-                                 :additionalProperties ,json-false)
                           :suggestions (:type "array" :items (:type "string"))
                           :confidence (:type ["number" "null"]))
-                         :required ["kind" "message" "text" "range" "token_index"
-                                    "token_range" "suggestions" "confidence"]
+                         :required ["kind" "message" "text" "range"
+                                    "suggestions" "confidence"]
                          :additionalProperties ,json-false)))
           :required ["diagnostics"]
           :additionalProperties ,json-false)
@@ -583,183 +561,6 @@ the preceding text ends with sentence punctuation."
         (push sentence-span spans)))
     (nreverse spans)))
 
-(defun proofread--chinese-character-p (character)
-  "Return non-nil when CHARACTER is in a common CJK range."
-  (or (<= #x4e00 character #x9fff)
-      (<= #x3400 character #x4dbf)
-      (<= #x20000 character #x2a6df)))
-
-(defun proofread--chinese-text-p (text)
-  "Return non-nil when TEXT contains Chinese characters."
-  (and (stringp text)
-       (catch 'found
-         (cl-loop for character across text
-                  when (proofread--chinese-character-p character)
-                  do (throw 'found t))
-         nil)))
-
-(defun proofread--chinese-language-p (language)
-  "Return non-nil when LANGUAGE identifies Chinese text."
-  (and (stringp language)
-       (string-match-p "\\`zh\\(?:\\'\\|[-_]\\)" language)))
-
-(defun proofread--tokenization-target-p (text &optional language)
-  "Return non-nil when TEXT and LANGUAGE should receive token metadata."
-  (and proofread-token-map-enabled
-       (stringp text)
-       (not (string-empty-p text))
-       (or (proofread--chinese-language-p language)
-           (proofread--chinese-text-p text))))
-
-(defun proofread--jieba-tokenization-available-p ()
-  "Return non-nil when `jieba-rs' word tokenization is available."
-  (and proofread-token-map-enabled
-       (or (fboundp 'jieba-rs-module-segment)
-           (and (require 'jieba-rs nil t)
-                (fboundp 'jieba-rs-module-segment)))))
-
-(defun proofread--jieba-hmm ()
-  "Return the current `jieba-rs' HMM setting."
-  (if (boundp 'jieba-rs-hmm)
-      (symbol-value 'jieba-rs-hmm)
-    t))
-
-(defun proofread--jieba-segment-function ()
-  "Return the configured `jieba-rs' segmentation function."
-  (let ((configured (and (boundp 'jieba-rs-segment-function)
-                         (symbol-value 'jieba-rs-segment-function))))
-    (cond
-     ((and (symbolp configured)
-           (fboundp configured))
-      configured)
-     ((fboundp 'jieba-rs-module-segment)
-      #'jieba-rs-module-segment))))
-
-(defun proofread--jieba-token-output (text)
-  "Return raw `jieba-rs' token output for TEXT, or nil."
-  (when (proofread--jieba-tokenization-available-p)
-    (let ((function (proofread--jieba-segment-function)))
-      (when function
-        (condition-case nil
-            (condition-case nil
-                (funcall function text (proofread--jieba-hmm))
-              (wrong-number-of-arguments
-               (funcall function text)))
-          (error nil))))))
-
-(defun proofread--sequence-list (value)
-  "Return VALUE as a list when VALUE is a list or vector."
-  (cond
-   ((listp value) value)
-   ((vectorp value) (append value nil))))
-
-(defun proofread--token-item-word (item)
-  "Return token word text from segmentation ITEM."
-  (cond
-   ((stringp item) item)
-   ((and (listp item)
-         (plist-member item :word)
-         (stringp (plist-get item :word)))
-    (plist-get item :word))))
-
-(defun proofread--token-item-category (item)
-  "Return token category from segmentation ITEM, or nil."
-  (when (and (listp item)
-             (plist-member item :category))
-    (plist-get item :category)))
-
-(defun proofread--blank-token-p (text)
-  "Return non-nil when TEXT contains only whitespace."
-  (string-match-p "\\`[[:space:]\n\r\t]*\\'" text))
-
-(defun proofread--tokens-from-items (text items)
-  "Return token plists for TEXT from segmentation ITEMS.
-Return nil when ITEMS cannot be mapped exactly onto TEXT."
-  (let ((position 0)
-        (index 0)
-        tokens)
-    (catch 'invalid
-      (dolist (item items)
-        (let* ((word (proofread--token-item-word item))
-               (category (proofread--token-item-category item)))
-          (unless (stringp word)
-            (throw 'invalid nil))
-          (let* ((end (+ position (length word)))
-                 (token-text (and (<= end (length text))
-                                  (substring text position end))))
-            (unless (equal word token-text)
-              (throw 'invalid nil))
-            (unless (or (string-empty-p word)
-                        (proofread--blank-token-p word))
-              (let ((token (list :index index
-                                 :beg position
-                                 :end end
-                                 :text word)))
-                (when category
-                  (setq token (plist-put token :category category)))
-                (push token tokens)
-                (setq index (1+ index))))
-            (setq position end))))
-      (when (= position (length text))
-        (nreverse tokens)))))
-
-(defun proofread--tokens-for-text (text &optional language)
-  "Return chunk-relative tokens for TEXT and LANGUAGE, or nil."
-  (when (proofread--tokenization-target-p text language)
-    (let ((items (proofread--sequence-list
-                  (proofread--jieba-token-output text))))
-      (when items
-        (proofread--tokens-from-items text items)))))
-
-(defun proofread--user-dict-identity ()
-  "Return deterministic identity for `jieba-rs-user-dict', or nil."
-  (let ((file (and (boundp 'jieba-rs-user-dict)
-                   (symbol-value 'jieba-rs-user-dict))))
-    (when (and (stringp file)
-               (file-exists-p file))
-      (let ((attributes (file-attributes file)))
-        (list :file (file-truename file)
-              :mtime (file-attribute-modification-time attributes)
-              :size (file-attribute-size attributes))))))
-
-(defun proofread--tokenization-identity ()
-  "Return stable identity for tokenization-affecting configuration."
-  (when proofread-token-map-enabled
-    (list :enabled t
-          :function (proofread--jieba-segment-function)
-          :hmm (proofread--jieba-hmm)
-          :prompt-version proofread-prompt-version
-          :user-dict (proofread--user-dict-identity))))
-
-(defun proofread--split-span-by-token-boundaries (span)
-  "Split SPAN by token boundaries when possible.
-Return nil when token-boundary splitting is unavailable or cannot keep all
-chunks within `proofread-max-chunk-size'."
-  (let* ((beg (car span))
-         (end (cdr span))
-         (text (buffer-substring-no-properties beg end))
-         (tokens (proofread--tokens-for-text text))
-         (size (max 1 proofread-max-chunk-size))
-         ranges
-         (relative-beg 0))
-    (when tokens
-      (catch 'fallback
-        (while (< relative-beg (length text))
-          (let* ((limit (min (length text) (+ relative-beg size)))
-                 boundary)
-            (dolist (token tokens)
-              (let ((token-end (plist-get token :end)))
-                (when (and (< relative-beg token-end)
-                           (<= token-end limit))
-                  (setq boundary token-end))))
-            (unless boundary
-              (throw 'fallback nil))
-            (push (cons (+ beg relative-beg)
-                        (+ beg boundary))
-                  ranges)
-            (setq relative-beg boundary)))
-        (nreverse ranges)))))
-
 (defun proofread--split-span-by-chunk-size (span)
   "Split SPAN into ranges no larger than `proofread-max-chunk-size'."
   (let ((beg (car span))
@@ -776,8 +577,7 @@ chunks within `proofread-max-chunk-size'."
   "Return sentence-aware bounded chunk spans for visible RANGES."
   (let (spans)
     (dolist (span (proofread--sentence-spans-for-ranges ranges))
-      (dolist (chunk-span (or (proofread--split-span-by-token-boundaries span)
-                              (proofread--split-span-by-chunk-size span)))
+      (dolist (chunk-span (proofread--split-span-by-chunk-size span))
         (push chunk-span spans)))
     (nreverse spans)))
 
@@ -1050,23 +850,15 @@ too large for `proofread-context-size'."
 
 (defun proofread--make-request-ready-chunk (beg end)
   "Return a request-ready proofread chunk for text between BEG and END."
-  (let* ((text (buffer-substring-no-properties beg end))
-         (tokens (proofread--tokens-for-text text proofread-language))
-         (chunk (list :beg beg
-                      :end end
-                      :text text
-                      :major-mode major-mode
-                      :language proofread-language
-                      :context-before (proofread--request-ready-context-before
-                                       beg)
-                      :context-after (proofread--request-ready-context-after
-                                      end)
-                      :modified-tick (buffer-chars-modified-tick))))
-    (if tokens
-        (append chunk
-                (list :tokens tokens
-                      :tokenization (proofread--tokenization-identity)))
-      chunk)))
+  (let ((text (buffer-substring-no-properties beg end)))
+    (list :beg beg
+          :end end
+          :text text
+          :major-mode major-mode
+          :language proofread-language
+          :context-before (proofread--request-ready-context-before beg)
+          :context-after (proofread--request-ready-context-after end)
+          :modified-tick (buffer-chars-modified-tick))))
 
 (defun proofread--request-ready-chunks-from-chunk (chunk)
   "Return request-ready chunks split from paragraph CHUNK."
@@ -1192,33 +984,6 @@ When BACKEND is nil, check the selected `proofread-backend'."
                            proofread-llm-provider)))))
     (_ nil)))
 
-(defun proofread--diagnostic-token-contract (request)
-  "Return token locator prompt text for REQUEST, or an empty string."
-  (when (plist-get request :tokens)
-    (concat
-     "Token locators are optional hints.  When you can localize a "
-     "diagnostic to the token list below, include token_index for one token "
-     "or token_range with token indexes where end is exclusive.  The "
-     "diagnostic range and text fields are still required and authoritative.\n")))
-
-(defun proofread--format-token-for-prompt (token)
-  "Return one prompt line for TOKEN."
-  (format "%d [%d,%d] %S"
-          (plist-get token :index)
-          (plist-get token :beg)
-          (plist-get token :end)
-          (plist-get token :text)))
-
-(defun proofread--diagnostic-token-list (request)
-  "Return formatted token list text for REQUEST, or an empty string."
-  (let ((tokens (plist-get request :tokens)))
-    (if tokens
-        (concat
-         "\nTokens:\n"
-         (mapconcat #'proofread--format-token-for-prompt tokens "\n")
-         "\n")
-      "")))
-
 (defun proofread--structured-response-schema-text ()
   "Return the diagnostic response schema as JSON text."
   (json-encode proofread--structured-response-schema))
@@ -1255,7 +1020,7 @@ When BACKEND is nil, check the selected `proofread-backend'."
       "")
      "Return only additional diagnostics not already reported above.  Do not "
      "repeat diagnostics with the same range and text.  Scan the full Text "
-     "again, especially unreported words and token spans before, after, and "
+     "again, especially unreported words and text spans before, after, and "
      "between the listed ranges.  Use an empty diagnostics array when no "
      "additional problems remain.\n\n")))
 
@@ -1267,13 +1032,11 @@ When BACKEND is nil, check the selected `proofread-backend'."
            "%s\n"
            "%s"
            "%s"
-           "%s"
            "Language: %S\n"
            "Major mode: %S\n\n"
            "Context before:\n%s\n\n"
            "Text:\n%s\n\n"
-           "Context after:\n%s\n"
-           "%s")
+           "Context after:\n%s\n")
    proofread--structured-response-instructions
    (or (proofread--reported-diagnostics-prompt
         request reported-diagnostics)
@@ -1281,13 +1044,11 @@ When BACKEND is nil, check the selected `proofread-backend'."
    (if prompt-json
        (proofread--prompt-json-response-contract)
      "")
-   (or (proofread--diagnostic-token-contract request) "")
    (plist-get request :language)
    (plist-get request :major-mode)
    (or (plist-get request :context-before) "")
    (or (plist-get request :text) "")
-   (or (plist-get request :context-after) "")
-   (proofread--diagnostic-token-list request)))
+   (or (plist-get request :context-after) "")))
 
 (defun proofread--json-read-string (string)
   "Read STRING as JSON and return plist/list data."
@@ -1377,86 +1138,23 @@ When BACKEND is nil, check the selected `proofread-backend'."
   "Return the internal source for diagnostics from a backend result."
   (or default-source 'llm))
 
-(defun proofread--token-by-index (tokens index)
-  "Return token with INDEX from TOKENS, or nil."
-  (catch 'found
-    (dolist (token tokens)
-      (when (equal index (plist-get token :index))
-        (throw 'found token)))
-    nil))
+(defun proofread--char-range-locator (beg end)
+  "Return a diagnostic locator for character positions BEG through END."
+  (list :kind 'char-range
+        :beg beg
+        :end end))
 
-(defun proofread--text-range-for-token-index (request index)
-  "Return chunk-relative text range for token INDEX in REQUEST."
-  (when (integerp index)
-    (let ((token (proofread--token-by-index
-                  (plist-get request :tokens)
-                  index)))
-      (when token
-        (cons (plist-get token :beg)
-              (plist-get token :end))))))
-
-(defun proofread--diagnostic-candidate-token-range (candidate)
-  "Return CANDIDATE's token index range as a cons cell, or nil."
-  (let ((range (plist-get candidate :token_range)))
-    (when (and (listp range)
-               (plist-member range :beg)
-               (plist-member range :end))
-      (cons (plist-get range :beg)
-            (plist-get range :end)))))
-
-(defun proofread--text-range-for-token-range
-    (request beg end)
-  "Return chunk-relative text range for token indexes BEG through END.
-END is exclusive.  Return nil when the token indexes cannot be mapped."
-  (let* ((tokens (plist-get request :tokens))
-         (first (and (integerp beg)
-                     (proofread--token-by-index tokens beg)))
-         (last (and (integerp end)
-                    (< beg end)
-                    (proofread--token-by-index tokens (1- end)))))
-    (when (and first last)
-      (cons (plist-get first :beg)
-            (plist-get last :end)))))
-
-(defun proofread--diagnostic-candidate-token-ranges
-    (request candidate)
-  "Return interpretable token locator ranges for CANDIDATE.
-Malformed token locators are ignored."
-  (let (ranges)
-    (let ((index (plist-get candidate :token_index)))
-      (when (integerp index)
-        (let ((range
-               (proofread--text-range-for-token-index
-                request index)))
-          (when range
-            (push range ranges)))))
-    (let ((token-range
-           (proofread--diagnostic-candidate-token-range candidate)))
-      (when token-range
-        (let ((range
-               (proofread--text-range-for-token-range
-                request (car token-range) (cdr token-range))))
-          (when range
-            (push range ranges)))))
-    (nreverse ranges)))
-
-(defun proofread--diagnostic-candidate-token-consistent-p
-    (request candidate relative-beg relative-end text)
-  "Return non-nil when CANDIDATE token locators do not contradict range.
-REQUEST, RELATIVE-BEG, RELATIVE-END, and TEXT describe the already-validated
-authoritative diagnostic location."
-  (let ((ranges (proofread--diagnostic-candidate-token-ranges
-                 request candidate))
-        (expected (cons relative-beg relative-end))
-        (request-text (plist-get request :text))
-        inconsistent)
-    (dolist (range ranges)
-      (unless (and (equal range expected)
-                   (equal text (substring request-text
-                                          (car range)
-                                          (cdr range))))
-        (setq inconsistent t)))
-    (not inconsistent)))
+(defun proofread--shift-locator (locator offset)
+  "Return LOCATOR shifted by OFFSET when it is a character range."
+  (if (and (listp locator)
+           (eq (plist-get locator :kind) 'char-range)
+           (integerp (plist-get locator :beg))
+           (integerp (plist-get locator :end)))
+      (plist-put
+       (plist-put (copy-sequence locator)
+                  :beg (+ (plist-get locator :beg) offset))
+       :end (+ (plist-get locator :end) offset))
+    locator))
 
 (defun proofread--diagnostic-from-candidate
     (request candidate &optional default-source)
@@ -1469,7 +1167,13 @@ authoritative diagnostic location."
          (text (plist-get candidate :text))
          (kind (proofread--diagnostic-candidate-kind
                 (plist-get candidate :kind)))
-         (message (plist-get candidate :message)))
+         (message (plist-get candidate :message))
+         (absolute-beg (and (integerp request-beg)
+                            (integerp relative-beg)
+                            (+ request-beg relative-beg)))
+         (absolute-end (and (integerp request-beg)
+                            (integerp relative-end)
+                            (+ request-beg relative-end))))
     (when (and (proofread--diagnostic-candidate-range-valid-p
                 request relative-beg relative-end)
                (integerp request-beg)
@@ -1477,12 +1181,10 @@ authoritative diagnostic location."
                kind
                (stringp message)
                (equal text
-                      (substring request-text relative-beg relative-end))
-               (proofread--diagnostic-candidate-token-consistent-p
-                request candidate relative-beg relative-end text))
+                      (substring request-text relative-beg relative-end)))
       (proofread--make-diagnostic
-       :beg (+ request-beg relative-beg)
-       :end (+ request-beg relative-end)
+       :beg absolute-beg
+       :end absolute-end
        :text text
        :kind kind
        :message message
@@ -1490,12 +1192,13 @@ authoritative diagnostic location."
                      (plist-get candidate :suggestions))
        :confidence (proofread--diagnostic-candidate-confidence
                     (plist-get candidate :confidence))
-       :source (proofread--diagnostic-source default-source)))))
+       :source (proofread--diagnostic-source default-source)
+       :locator (proofread--char-range-locator absolute-beg absolute-end)))))
 
 (defun proofread--diagnostics-from-structured-payload
     (request payload &optional default-source)
   "Return proofread diagnostics for REQUEST from parsed PAYLOAD.
-DEFAULT-SOURCE is used for diagnostics without an explicit source."
+DEFAULT-SOURCE is stored as each diagnostic's internal source."
   (let (diagnostics)
     (dolist (candidate (proofread--diagnostic-candidates payload))
       (let ((diagnostic
@@ -1848,9 +1551,7 @@ When BACKEND is nil, use the selected `proofread-backend'."
                    :context (proofread--context-cache-identity chunk)
                    :configuration-version
                    proofread-cache-configuration-version)))
-    (if (plist-get chunk :tokenization)
-        (append key (list :tokenization (plist-get chunk :tokenization)))
-      key)))
+    key))
 
 (defun proofread--ensure-cache ()
   "Return the current buffer's cache table when `proofread-mode' is active."
@@ -1880,6 +1581,12 @@ When BACKEND is nil, use the selected `proofread-backend'."
          (relative (copy-sequence diagnostic)))
     (setq relative (plist-put relative :beg (- beg base)))
     (setq relative (plist-put relative :end (- end base)))
+    (setq relative
+          (plist-put relative
+                     :locator
+                     (proofread--shift-locator
+                      (plist-get diagnostic :locator)
+                      (- base))))
     relative))
 
 (defun proofread--diagnostic-to-absolute (diagnostic request)
@@ -1890,6 +1597,12 @@ When BACKEND is nil, use the selected `proofread-backend'."
          (absolute (copy-sequence diagnostic)))
     (setq absolute (plist-put absolute :beg (+ base beg)))
     (setq absolute (plist-put absolute :end (+ base end)))
+    (setq absolute
+          (plist-put absolute
+                     :locator
+                     (proofread--shift-locator
+                      (plist-get diagnostic :locator)
+                      base)))
     absolute))
 
 (defun proofread--diagnostics-to-relative (diagnostics request)
