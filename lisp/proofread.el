@@ -220,7 +220,7 @@ property has a non-nil value is not included in request-ready chunks."
    "the structured response.\n"
    "The top-level response has a diagnostics array.  Each diagnostic has "
    "kind, message, text, range, token_index, token_range, suggestions, "
-   "confidence, and source fields.\n"
+   "and confidence fields.\n"
    "Report every independent problem in Text.  Do not stop after the first "
    "problem in a sentence; when one sentence has multiple misspellings, grammar "
    "issues, or style issues, return one diagnostic per issue.\n"
@@ -242,7 +242,7 @@ property has a non-nil value is not included in request-ready chunks."
    "real alternative.\n"
    "Set token_index and token_range to null when token locators are not "
    "useful or no token list is provided; range and text remain required.\n"
-   "Set confidence and source to null when unknown.\n"
+   "Set confidence to null when unknown.\n"
    "Use an empty diagnostics array when there are no diagnostics.\n")
   "Provider-independent instructions for structured responses.")
 
@@ -271,10 +271,9 @@ property has a non-nil value is not included in request-ready chunks."
                                  :required ["beg" "end"]
                                  :additionalProperties ,json-false)
                           :suggestions (:type "array" :items (:type "string"))
-                          :confidence (:type ["number" "null"])
-                          :source (:type ["string" "null"]))
+                          :confidence (:type ["number" "null"]))
                          :required ["kind" "message" "text" "range" "token_index"
-                                    "token_range" "suggestions" "confidence" "source"]
+                                    "token_range" "suggestions" "confidence"]
                          :additionalProperties ,json-false)))
           :required ["diagnostics"]
           :additionalProperties ,json-false)
@@ -1374,21 +1373,9 @@ When BACKEND is nil, check the selected `proofread-backend'."
              (<= value 1))
     value))
 
-(defun proofread--diagnostic-candidate-source (candidate &optional default-source)
-  "Return normalized diagnostic source from CANDIDATE.
-When CANDIDATE has no valid source, use DEFAULT-SOURCE or `llm'."
-  (let ((value (plist-get candidate :source)))
-    (cond
-     ((and (plist-member candidate :source)
-           value
-           (symbolp value)
-           (not (keywordp value)))
-      value)
-     ((and (plist-member candidate :source)
-           (stringp value)
-           (not (string= value "")))
-      value)
-     (t (or default-source 'llm)))))
+(defun proofread--diagnostic-source (&optional default-source)
+  "Return the internal source for diagnostics from a backend result."
+  (or default-source 'llm))
 
 (defun proofread--token-by-index (tokens index)
   "Return token with INDEX from TOKENS, or nil."
@@ -1503,8 +1490,7 @@ authoritative diagnostic location."
                      (plist-get candidate :suggestions))
        :confidence (proofread--diagnostic-candidate-confidence
                     (plist-get candidate :confidence))
-       :source (proofread--diagnostic-candidate-source
-                candidate default-source)))))
+       :source (proofread--diagnostic-source default-source)))))
 
 (defun proofread--diagnostics-from-structured-payload
     (request payload &optional default-source)

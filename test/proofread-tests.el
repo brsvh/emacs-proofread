@@ -191,8 +191,7 @@
     ("token_index" . nil)
     ("token_range" . nil)
     ("suggestions" . ,(vconcat (or suggestions '("hello"))))
-    ("confidence" . 0.9)
-    ("source" . nil)))
+    ("confidence" . 0.9)))
 
 (defun proofread-test--response-diagnostic-with-fields
     (beg end text fields)
@@ -2171,8 +2170,9 @@
       (should (string-match-p "range end is exclusive" prompt))
       (dolist (field '("kind" "message" "text" "range"
                        "token_index" "token_range" "suggestions"
-                       "confidence" "source"))
+                       "confidence"))
         (should (string-match-p field prompt)))
+      (should-not (string-match-p "source" prompt))
       (should (string-match-p "Language: \"en\"" prompt))
       (should (string-match-p "Major mode: text-mode" prompt))
       (should (string-match-p "Text:\nhelo" prompt))
@@ -2196,6 +2196,7 @@
   "Structured response schema encodes false as a JSON boolean."
   (let ((schema (proofread--structured-response-schema-text)))
     (should (string-match-p "\"additionalProperties\":false" schema))
+    (should-not (string-match-p "\"source\"" schema))
     (should-not
      (string-match-p "\"additionalProperties\":\"false\"" schema))))
 
@@ -2267,8 +2268,7 @@
                       :token_index nil
                       :token_range nil
                       :suggestions ["hello"]
-                      :confidence nil
-                      :source nil))))
+                      :confidence nil))))
            (diagnostics
             (proofread--diagnostics-from-structured-response
              request payload 'llm)))
@@ -2375,7 +2375,7 @@
                      '("hello" "hullo" "help"))))))
 
 (ert-deftest proofread-test-structured-response-optional-fields-conservative ()
-  "Structured response optional confidence and source fields are validated."
+  "Structured response optional confidence fields are validated."
   (with-temp-buffer
     (insert "helo wrld")
     (let* ((chunk (car (proofread--request-ready-chunks-for-ranges
@@ -2406,7 +2406,7 @@
             (proofread--diagnostics-from-structured-response request content 'llm)))
       (should (= (length diagnostics) 2))
       (should (= (plist-get (car diagnostics) :confidence) 0.75))
-      (should (equal (plist-get (car diagnostics) :source) "provider"))
+      (should (eq (plist-get (car diagnostics) :source) 'llm))
       (should-not (plist-get (cadr diagnostics) :confidence))
       (should (eq (plist-get (cadr diagnostics) :source) 'llm)))))
 
