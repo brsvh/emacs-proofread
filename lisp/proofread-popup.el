@@ -177,8 +177,10 @@
           (posframe-delete proofread-popup--buffer-name)
           (setq proofread-popup--buffer-name nil))
       (error
-       (message "proofread popup delete error: %s"
-                (error-message-string err)))))
+       (proofread--report-warning-without-window
+        (format "Proofread popup delete error: %s"
+                (error-message-string err))
+        "popup cleanup failed; see *Warnings*"))))
   (proofread-popup--reset-state))
 
 (defun proofread-popup--hidehandler (info)
@@ -252,7 +254,7 @@
                             (proofread-popup--anchor-position diagnostic))))
         (if (and diagnostic position)
             (when (proofread-popup--needs-refresh-p diagnostic position)
-              (proofread-popup--show diagnostic))
+	      (proofread-popup--show diagnostic))
           (proofread-popup--hide)))
     (proofread-popup--hide)))
 
@@ -270,10 +272,10 @@
   "Remove buffer-local popup hooks and delete the current child frame."
   (remove-hook 'post-command-hook #'proofread-popup--update t)
   (remove-hook 'proofread-diagnostics-changed-hook
-               #'proofread-popup--update t)
+	       #'proofread-popup--update t)
   (remove-hook 'kill-buffer-hook #'proofread-popup--delete t)
   (remove-hook 'change-major-mode-hook
-               #'proofread-popup--change-major-mode t)
+	       #'proofread-popup--change-major-mode t)
   (proofread-popup--delete))
 
 (define-minor-mode proofread-popup-mode
@@ -314,7 +316,7 @@ of popup messages, disable this mode locally."
 (defun proofread-popup-unload-function ()
   "Remove Proofread popup integration before unloading this library."
   (remove-hook 'proofread-mode-hook
-               #'proofread-popup--sync-with-proofread-mode)
+	       #'proofread-popup--sync-with-proofread-mode)
   (dolist (buffer (buffer-list))
     (with-current-buffer buffer
       (when (bound-and-true-p proofread-popup-mode)

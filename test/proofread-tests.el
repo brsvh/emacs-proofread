@@ -135,6 +135,7 @@
   (list :selected-window (selected-window)
         :window-list (window-list)
         :selected-window-point (window-point (selected-window))
+        :selected-window-start (window-start (selected-window))
         :buffer-point (with-current-buffer buffer (point))
         :window-point (window-point window)
         :window-start (window-start window)))
@@ -956,9 +957,20 @@
                  (recorder (proofread-test--make-backend-recorder)))
             (set-window-buffer user-window user-buffer)
             (with-current-buffer user-buffer
-              (insert "User point must stay here.")
-              (goto-char 8))
-            (set-window-point user-window 8)
+              (dotimes (line 100)
+                (insert (format "User line %03d must stay visible.\n" line)))
+              (goto-char (point-min))
+              (forward-line 50)
+              (move-to-column 8))
+            (set-window-point
+             user-window (with-current-buffer user-buffer (point)))
+            (set-window-start
+             user-window
+             (with-current-buffer user-buffer
+               (save-excursion
+                 (goto-char (point-min))
+                 (forward-line 30)
+                 (point))))
             (with-current-buffer target-buffer
               (emacs-lisp-mode)
               (insert ";; First prose sentence.\n"
@@ -980,7 +992,6 @@
                    proofread-test--llm-provider-identity)
                   (proofread-context-size 0)
                   (proofread-max-concurrent-requests 10)
-                  (warning-display-at-bottom t)
                   (before
                    (proofread-test--window-state
                     target-buffer target-window)))
@@ -992,13 +1003,33 @@
                  (let ((requests (funcall (plist-get recorder :requests)))
                        (callbacks (funcall (plist-get recorder :callbacks))))
                    (should requests)
-                   (cl-mapc
-                    (lambda (request callback)
-                      (funcall
-                       callback
-                       (proofread--backend-error-result
-                        request 'test-error "Simulated background failure")))
-                    requests callbacks))
+                   (let ((valid-index
+                          (cl-position-if
+                           (lambda (request)
+                             (string-search
+                              "First" (plist-get request :text)))
+                           requests)))
+                     (should valid-index)
+                     (let* ((valid-request (nth valid-index requests))
+                            (valid-text (plist-get valid-request :text))
+                            (relative-beg
+                             (string-search "First" valid-text)))
+                       (dotimes (index (length requests))
+                         (funcall
+                          (nth index callbacks)
+                          (if (= index valid-index)
+                              (proofread--llm-success-result
+                               valid-request
+                               (proofread-test--response-content
+                                (list
+                                 (proofread-test--response-diagnostic
+                                  relative-beg (+ relative-beg 5)
+                                  "First" '("First"))))
+                               1)
+                            (proofread--backend-error-result
+                             (nth index requests) 'test-error
+                             (concat "Simulated background failure: "
+                                     (make-string 600 ?x)))))))))
                  (redisplay t)
                  (should (equal
                           (proofread-test--window-state
@@ -3162,9 +3193,17 @@
               (proofread-test--response-content
                (list (proofread-test--response-diagnostic
                       (nth 3 spec) (nth 4 spec) (nth 5 spec) '("fixed"))))))
-        (should
-         (proofread--diagnostics-from-structured-response
-          request content 'llm))))))
+        (goto-char (point-max))
+        (push-mark (point-min) t t)
+        (let ((before-point (point))
+              (before-mark (mark t))
+              (before-mark-active mark-active))
+          (should
+           (proofread--diagnostics-from-structured-response
+            request content 'llm))
+          (should (= (point) before-point))
+          (should (= (mark t) before-mark))
+          (should (eq mark-active before-mark-active)))))))
 
 (ert-deftest proofread-test-structured-response-rejects-string-escapes ()
   "Docstring diagnostics cannot alter escape introducers or quoted characters."
@@ -3955,6 +3994,35 @@
                  (should-not (proofread--active-request-p request))))))
         (kill-buffer buffer)))))
 
+(ert-deftest proofread-test-warning-report-preserves-detail-and-shortens-echo ()
+  "A background warning logs its detail but echoes only a short summary."
+  (let* ((detail (concat "Backend detail line one\n"
+                         (make-string 600 ?x)))
+         (summary (concat "backend request failed\n"
+                          (make-string 600 ?y)))
+         captured-echo
+         captured-minimum-level
+         captured-truncation
+         captured-warning-args)
+    (cl-letf (((symbol-function 'display-warning)
+               (lambda (&rest args)
+                 (setq captured-minimum-level warning-minimum-level)
+                 (setq captured-warning-args args)))
+              ((symbol-function 'message)
+               (lambda (format-string &rest args)
+                 (setq captured-truncation message-truncate-lines)
+                 (setq captured-echo
+                       (apply #'format format-string args)))))
+      (proofread--report-warning-without-window detail summary))
+    (should (equal captured-warning-args
+                   (list 'proofread detail :warning)))
+    (should (eq captured-minimum-level :error))
+    (should captured-truncation)
+    (should (string-prefix-p "proofread: backend request failed "
+                             captured-echo))
+    (should (<= (string-width captured-echo) 120))
+    (should-not (string-match-p "[\n\r]" captured-echo))))
+
 (ert-deftest proofread-test-backend-errors-are-aggregated-per-request-batch ()
   "Production dispatch aggregates errors and settles cancelled batch work."
   (with-temp-buffer
@@ -3966,7 +4034,9 @@
           (proofread-llm-provider-identity
            proofread-test--llm-provider-identity)
           (proofread-max-concurrent-requests 10)
-          warning-levels
+          echo-truncation
+          echoes
+          captured-warning-levels
           warnings)
       (proofread-mode 1)
       (proofread-test--with-llm-capabilities
@@ -3980,9 +4050,13 @@
               (recorder (proofread-test--make-backend-recorder)))
          (cl-letf (((symbol-function 'display-warning)
                     (lambda (&rest args)
-                      (push warning-minimum-level warning-levels)
+                      (push warning-minimum-level
+                            captured-warning-levels)
                       (push args warnings)))
-                   ((symbol-function 'message) #'ignore)
+                   ((symbol-function 'message)
+                    (lambda (format-string &rest args)
+                      (push message-truncate-lines echo-truncation)
+                      (push (apply #'format format-string args) echoes)))
                    ((symbol-function 'proofread--backend-check)
                     (plist-get recorder :function)))
            (should (= (length (proofread--dispatch-request-ready-chunks
@@ -4031,7 +4105,15 @@
                     direct 'llm-failure "Direct failure"))
                   'error))
              (should (= (length warnings) 3))
-             (should (equal warning-levels '(:error :error :error))))))))))
+             (should (equal captured-warning-levels
+                            '(:error :error :error)))
+             (should (equal echo-truncation '(t t t)))
+             (should (= (length echoes) 3))
+             (should (cl-every
+                      (lambda (echo)
+                        (and (< (string-width echo) 80)
+                             (not (string-match-p "[\n\r]" echo))))
+                      echoes)))))))))
 
 (ert-deftest proofread-test-navigation-sorts-and-filters-diagnostics ()
   "Navigation diagnostics are valid and sorted by start and end position."

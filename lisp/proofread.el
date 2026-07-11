@@ -40,6 +40,7 @@
 (require 'pulse)
 (require 'subr-x)
 (require 'tabulated-list)
+(require 'warnings)
 
 (declare-function next-error-this-buffer-no-select "simple"
                   (&optional n))
@@ -481,11 +482,20 @@ interrupting proofreading.")
       (format "Proofreading backend error: %S"
               (plist-get result :error))))
 
-(defun proofread--report-warning-without-window (message)
-  "Log proofread warning MESSAGE without displaying a warning window."
+(defun proofread--message-without-resizing (format-string &rest args)
+  "Display FORMAT-STRING with ARGS as a bounded single-line message."
+  (let* ((message-truncate-lines t)
+         (message
+          (replace-regexp-in-string
+           "[[:space:]]+" " "
+           (string-trim (apply #'format format-string args)))))
+    (message "%s" (truncate-string-to-width message 120 nil nil "..."))))
+
+(defun proofread--report-warning-without-window (message summary)
+  "Log warning MESSAGE without a window and echo short SUMMARY."
   (let ((warning-minimum-level :error))
     (display-warning 'proofread message :warning))
-  (message "proofread: %s" message))
+  (proofread--message-without-resizing "proofread: %s" summary))
 
 (defun proofread--request-batch-error-counts (errors)
   "Return an alist counting backend error message strings in ERRORS."
@@ -525,7 +535,10 @@ interrupting proofreading.")
           (if (> remaining 0)
               (format ", and %d more error kind%s"
                       remaining (if (= remaining 1) "" "s"))
-            "")))))))
+            ""))
+         (format "%d request%s failed; see *Warnings*"
+                 (length errors)
+                 (if (= (length errors) 1) "" "s")))))))
 
 (defun proofread--settle-request-batch (request &optional result status)
   "Settle REQUEST in its shared batch using RESULT and final STATUS."
@@ -550,8 +563,10 @@ interrupting proofreading.")
        (condition-case err
            (funcall function event)
          (error
-          (message "proofread request log hook error: %s"
-                   (error-message-string err))))
+          (proofread--report-warning-without-window
+           (format "Proofread request log hook error: %s"
+                   (error-message-string err))
+           "request log hook failed; see *Warnings*")))
        nil)
      event)))
 
@@ -569,8 +584,10 @@ interrupting proofreading.")
        (condition-case err
            (funcall function)
          (error
-          (message "proofread diagnostics hook error: %s"
-                   (error-message-string err))))
+          (proofread--report-warning-without-window
+           (format "Proofread diagnostics hook error: %s"
+                   (error-message-string err))
+           "diagnostics hook failed; see *Warnings*")))
        nil))))
 
 (defun proofread--record-request-event (request type &rest properties)
@@ -2203,37 +2220,38 @@ source delimiters and ranges crossing distinct syntactic containers."
              (integerp relative-beg)
              (integerp relative-end)
              (with-current-buffer buffer
-               (save-restriction
-                 (widen)
-                 (let* ((beg (+ request-beg relative-beg))
-                        (end (+ request-beg relative-end))
-                        (beg-state (and (<= (point-min) beg)
-                                        (<= beg (point-max))
-                                        (syntax-ppss beg)))
-                        (end-state (and (<= (point-min) end)
-                                        (<= end (point-max))
-                                        (syntax-ppss end)))
-                        (container
-                         (and beg-state
-                              (proofread--syntax-container-range
-                               beg-state kind)))
-                        (interior
-                         (and container
-                              (proofread--syntax-container-interior
-                               container kind))))
-                   (and beg-state
-                        end-state
-                        interior
-                        (equal (nth 8 beg-state) (nth 8 end-state))
-                        (<= (car interior) beg)
-                        (<= end (cdr interior))
-                        (not (proofread--range-touches-syntax-escape-p
-                              beg end))
-                        (pcase kind
-                          ('comment
-                           (and (nth 4 beg-state) (nth 4 end-state)))
-                          ('docstring
-                           (and (nth 3 beg-state) (nth 3 end-state)))))))))))))
+               (save-mark-and-excursion
+                 (save-restriction
+                   (widen)
+                   (let* ((beg (+ request-beg relative-beg))
+                          (end (+ request-beg relative-end))
+                          (beg-state (and (<= (point-min) beg)
+                                          (<= beg (point-max))
+                                          (syntax-ppss beg)))
+                          (end-state (and (<= (point-min) end)
+                                          (<= end (point-max))
+                                          (syntax-ppss end)))
+                          (container
+                           (and beg-state
+                                (proofread--syntax-container-range
+                                 beg-state kind)))
+                          (interior
+                           (and container
+                                (proofread--syntax-container-interior
+                                 container kind))))
+                     (and beg-state
+                          end-state
+                          interior
+                          (equal (nth 8 beg-state) (nth 8 end-state))
+                          (<= (car interior) beg)
+                          (<= end (cdr interior))
+                          (not (proofread--range-touches-syntax-escape-p
+                                beg end))
+                          (pcase kind
+                            ('comment
+                             (and (nth 4 beg-state) (nth 4 end-state)))
+                            ('docstring
+                             (and (nth 3 beg-state) (nth 3 end-state))))))))))))))
 
 (defun proofread--diagnostic-candidate-shape-p (candidate)
   "Return non-nil when CANDIDATE has the required field shapes."
@@ -3669,7 +3687,8 @@ When REQUEST-RANGE is non-nil, record it as their owning request range."
 (defun proofread--report-backend-error (result)
   "Report the backend error described by RESULT."
   (proofread--report-warning-without-window
-   (proofread--backend-error-message result)))
+   (proofread--backend-error-message result)
+   "backend request failed; see *Warnings*"))
 
 (defun proofread--handle-backend-result (result)
   "Handle backend RESULT and return an internal status symbol."
