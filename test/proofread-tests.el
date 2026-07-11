@@ -795,6 +795,94 @@ range; no available backend"))))))
     (with-temp-buffer
       (should proofread-auto-check))))
 
+(ert-deftest
+    proofread-test-mode-enable-schedules-initial-idle-work ()
+  "Enabling automatic checking schedules initial idle work."
+  (with-temp-buffer
+    (insert "Alpha")
+    (let ((proofread-idle-delay 7)
+          scheduled
+          timer-count
+          visible-checks)
+      (cl-letf (((symbol-function 'run-with-idle-timer)
+                 (lambda (seconds repeat function &rest args)
+                   (setq timer-count (1+ (or timer-count 0)))
+                   (setq scheduled
+                         (list seconds repeat function args))
+                   'proofread-test-timer))
+                ((symbol-function 'proofread-check-visible-range)
+                 (lambda ()
+                   (setq visible-checks
+                         (1+ (or visible-checks 0))))))
+        (proofread-mode 1)
+        (should (= timer-count 1))
+        (should proofread--pending-work)
+        (should (eq proofread--idle-timer
+                    'proofread-test-timer))
+        (should (equal scheduled
+                       (list 7 nil #'proofread--idle-timer-run
+                             (list (current-buffer)))))
+        (proofread--mark-pending-work)
+        (should (= timer-count 1))
+        (should (eq (proofread--idle-timer-run
+                     (current-buffer))
+                    'ran))
+        (should (= visible-checks 1))
+        (should-not proofread--pending-work)
+        (should-not proofread--idle-timer)))))
+
+(ert-deftest
+    proofread-test-mode-enable-respects-disabled-auto-check ()
+  "Enabling with automatic checking off schedules no initial work."
+  (with-temp-buffer
+    (insert "Alpha")
+    (setq-local proofread-auto-check nil)
+    (let (timer-count)
+      (cl-letf (((symbol-function 'run-with-idle-timer)
+                 (lambda (_seconds _repeat _function &rest _args)
+                   (setq timer-count (1+ (or timer-count 0)))
+                   'proofread-test-timer)))
+        (proofread-mode 1)
+        (should-not timer-count)
+        (should-not proofread--pending-work)
+        (should-not proofread--idle-timer)))))
+
+(ert-deftest
+    proofread-test-repeated-mode-enable-replaces-initial-timer ()
+  "Repeated mode enable cancels and replaces the initial timer."
+  (with-temp-buffer
+    (insert "Alpha")
+    (let (cancelled timers)
+      (cl-letf (((symbol-function 'run-with-idle-timer)
+                 (lambda (_seconds _repeat _function &rest _args)
+                   (let ((timer
+                          (intern
+                           (format "proofread-test-timer-%d"
+                                   (1+ (length timers))))))
+                     (push timer timers)
+                     timer)))
+                ((symbol-function 'timerp)
+                 (lambda (object)
+                   (memq object timers)))
+                ((symbol-function 'cancel-timer)
+                 (lambda (timer)
+                   (push timer cancelled))))
+        (add-hook 'proofread-diagnostics-changed-hook
+                  #'proofread--mark-pending-work nil t)
+        (proofread-mode 1)
+        (let ((first-timer proofread--idle-timer))
+          (proofread-mode 1)
+          (let ((second-timer proofread--idle-timer))
+            (should (= (length timers) 3))
+            (should (equal cancelled (cdr timers)))
+            (should-not (eq second-timer first-timer))
+            (should (eq second-timer (car timers)))
+            (should proofread--pending-work)
+            (proofread-mode -1)
+            (should (equal cancelled timers))
+            (should-not proofread--pending-work)
+            (should-not proofread--idle-timer)))))))
+
 (ert-deftest proofread-test-positive-options-reject-zero-in-customize
     ()
   "Customize setters reject invalid positive Proofread options."
@@ -892,7 +980,6 @@ range; no available backend"))))))
   "A stale timer does not check after automatic checking is disabled."
   (with-temp-buffer
     (insert "Alpha")
-    (proofread-mode 1)
     (let ((buffer (current-buffer))
           timer-count
           visible-checks)
@@ -904,7 +991,7 @@ range; no available backend"))))))
                 ((symbol-function 'proofread-check-visible-range)
                  (lambda ()
                    (setq visible-checks (1+ (or visible-checks 0))))))
-        (insert "!")
+        (proofread-mode 1)
         (should (= timer-count 1))
         (setq proofread-auto-check nil)
         (should-not (proofread--idle-timer-run buffer))
@@ -920,7 +1007,9 @@ range; no available backend"))))))
   "Mark work pending and schedule a timer after an edit."
   (with-temp-buffer
     (insert "Alpha")
+    (setq-local proofread-auto-check nil)
     (proofread-mode 1)
+    (setq proofread-auto-check t)
     (let ((proofread-idle-delay 7)
           scheduled)
       (cl-letf (((symbol-function 'run-with-idle-timer)
@@ -940,7 +1029,9 @@ range; no available backend"))))))
   "Editing schedules work without calling the backend inline."
   (with-temp-buffer
     (insert "Alpha")
+    (setq-local proofread-auto-check nil)
     (proofread-mode 1)
+    (setq proofread-auto-check t)
     (let ((proofread-backend 'llm)
           backend-calls)
       (cl-letf (((symbol-function 'run-with-idle-timer)
@@ -957,7 +1048,9 @@ range; no available backend"))))))
   "Repeated edits before idle time reuse one timer and run one check."
   (with-temp-buffer
     (insert "Alpha")
+    (setq-local proofread-auto-check nil)
     (proofread-mode 1)
+    (setq proofread-auto-check t)
     (let ((buffer (current-buffer))
           timer-count
           visible-checks)
@@ -982,7 +1075,9 @@ range; no available backend"))))))
   "Activity after an idle callback can schedule later work."
   (with-temp-buffer
     (insert "Alpha")
+    (setq-local proofread-auto-check nil)
     (proofread-mode 1)
+    (setq proofread-auto-check t)
     (let ((buffer (current-buffer))
           timer-count
           visible-checks)
@@ -1035,7 +1130,9 @@ range; no available backend"))))))
                       "(setq target_cursor_stays_here 1)\n"
                       ";; Last prose sentence.\n")
               (setq-local proofread-targets 'comments)
+              (setq-local proofread-auto-check nil)
               (proofread-mode 1)
+              (setq proofread-auto-check t)
               (goto-char (point-min))
               (search-forward "target_cursor")
               (setq proofread--pending-work t))
@@ -1114,7 +1211,9 @@ range; no available backend"))))))
           (let (timer-count)
             (with-current-buffer proofread-buffer
               (insert "Alpha")
-              (proofread-mode 1))
+              (setq-local proofread-auto-check nil)
+              (proofread-mode 1)
+              (setq proofread-auto-check t))
             (with-current-buffer plain-buffer
               (insert "Beta"))
             (cl-letf (((symbol-function 'run-with-idle-timer)
@@ -1146,7 +1245,9 @@ range; no available backend"))))))
           (let (timer-count)
             (with-current-buffer proofread-buffer
               (insert "Alpha")
-              (proofread-mode 1))
+              (setq-local proofread-auto-check nil)
+              (proofread-mode 1)
+              (setq proofread-auto-check t))
             (cl-letf (((symbol-function 'run-with-idle-timer)
                        (lambda (_seconds _repeat _function &rest
                                          _args)
@@ -1165,11 +1266,10 @@ range; no available backend"))))))
   "Disabling `proofread-mode' clears pending work and timer state."
   (with-temp-buffer
     (insert "Alpha")
-    (proofread-mode 1)
     (cl-letf (((symbol-function 'run-with-idle-timer)
                (lambda (_seconds _repeat _function &rest _args)
                  'proofread-test-timer)))
-      (insert "!")
+      (proofread-mode 1)
       (should proofread--pending-work)
       (should proofread--idle-timer)
       (proofread-mode -1)
@@ -1183,7 +1283,6 @@ range; no available backend"))))))
   "A stale timer after mode disable does not run visible checking."
   (with-temp-buffer
     (insert "Alpha")
-    (proofread-mode 1)
     (let ((buffer (current-buffer))
           visible-checks)
       (cl-letf (((symbol-function 'run-with-idle-timer)
@@ -1192,7 +1291,7 @@ range; no available backend"))))))
                 ((symbol-function 'proofread-check-visible-range)
                  (lambda ()
                    (setq visible-checks (1+ (or visible-checks 0))))))
-        (insert "!")
+        (proofread-mode 1)
         (proofread-mode -1)
         (should-not (proofread--idle-timer-run buffer))
         (should-not visible-checks)))))

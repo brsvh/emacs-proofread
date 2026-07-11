@@ -69,9 +69,10 @@ other configuration."
 
 (defcustom proofread-auto-check t
   "Non-nil means schedule automatic checks in `proofread-mode'.
-When nil, buffer changes and window activity do not schedule
-proofreading; use commands such as `proofread-check-visible-range' to
-start checks manually.  This option becomes buffer-local when set."
+When nil, enabling the mode, buffer changes, and window activity do
+not schedule proofreading; use commands such as
+`proofread-check-visible-range' to start checks manually.  This option
+becomes buffer-local when set."
   :type 'boolean
   :local t
   :group 'proofread)
@@ -5976,14 +5977,18 @@ DIAGNOSTICS must be in navigation order.  Return `applied'."
 (defun proofread--enable-buffer ()
   "Enable this buffer's local Proofread hooks and state."
   (when (memq (current-buffer) proofread--mode-buffers)
-    (proofread--disable-buffer))
+    (proofread--disable-buffer)
+    ;; Teardown hooks can schedule work while the mode variable still
+    ;; remains non-nil during an explicit re-enable.
+    (proofread--clear-scheduled-work))
   (proofread--initialize-buffer-state)
   (add-hook 'before-change-functions #'proofread--before-change nil t)
   (add-hook 'after-change-functions #'proofread--after-change nil t)
   (add-hook 'kill-buffer-hook #'proofread--kill-buffer nil t)
   (add-hook 'change-major-mode-hook
             #'proofread--change-major-mode nil t)
-  (proofread--register-mode-buffer))
+  (proofread--register-mode-buffer)
+  (proofread--mark-pending-work))
 
 (defun proofread--disable-buffer ()
   "Disable this buffer's local Proofread hooks and state."
@@ -6226,10 +6231,11 @@ span only when it ends exactly at POSITION."
   "Toggle context-aware proofreading in the current buffer.
 
 When enabled and `proofread-auto-check' is non-nil, proofread
-schedules visible-buffer checks after editing and window activity,
-then dispatches request-ready visible chunks through the configured
-backend.  The option `proofread-targets' controls which kinds of text
-are selected.  When automatic checking is disabled, use
+schedules an initial visible-buffer check when enabled, and further
+checks after editing or window activity.  It then dispatches
+request-ready visible chunks through the configured backend.  The
+option `proofread-targets' controls which kinds of text are selected.
+When automatic checking is disabled, use
 `proofread-check-at-point', `proofread-check-region',
 `proofread-check-buffer', or `proofread-check-visible-range' manually.
 Apply available suggestions with `proofread-correct-at-point',
