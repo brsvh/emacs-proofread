@@ -1,4 +1,4 @@
-;;; proofread-popup-tests.el --- Tests for proofread-popup  -*- lexical-binding: t; -*-
+;;; proofread-popup-tests.el --- Tests  -*- lexical-binding: t; -*-
 
 ;; Copyright (C) 2026 Bingshan Chang <chang@bingshan.org>
 
@@ -17,7 +17,8 @@
 
 (defun proofread-popup-test--diagnostic
     (beg end text &optional suggestions message)
-  "Return a sample diagnostic for BEG, END, TEXT, SUGGESTIONS, and MESSAGE."
+  "Return a sample diagnostic for BEG, END, and TEXT.
+SUGGESTIONS and MESSAGE supply the optional field values."
   (proofread--make-diagnostic
    :beg beg
    :end end
@@ -54,7 +55,8 @@
                   (push buffer-or-name proofread-popup-test--hides)))
                ((symbol-function 'posframe-delete)
                 (lambda (buffer-or-name)
-                  (push buffer-or-name proofread-popup-test--deletes))))
+                  (push buffer-or-name
+                        proofread-popup-test--deletes))))
        ,@body)))
 
 (ert-deftest proofread-popup-test-faces-have-package-defaults ()
@@ -65,7 +67,8 @@
                  '((((background dark)) :background "white")
                    (((background light)) :background "black")))))
 
-(ert-deftest proofread-popup-test-max-width-rejects-zero-in-customize ()
+(ert-deftest
+    proofread-popup-test-max-width-rejects-zero-in-customize ()
   "Customize rejects a nonpositive popup width."
   (should (eq (get 'proofread-popup-max-width 'custom-set)
               #'proofread--set-positive-integer-option))
@@ -97,8 +100,9 @@
     (should-not (memq #'proofread-popup--update
                       proofread-diagnostics-changed-hook))))
 
-(ert-deftest proofread-popup-test-diagnostics-change-shows-automatically ()
-  "A diagnostics notification shows the popup without another command."
+(ert-deftest
+    proofread-popup-test-diagnostics-change-shows-automatically ()
+  "A notification shows the popup without another command."
   (proofread-popup-test--with-posframe-recorder
    (save-window-excursion
      (with-temp-buffer
@@ -114,7 +118,8 @@
          (should (eq proofread-popup--diagnostic
                      (car proofread--diagnostics))))))))
 
-(ert-deftest proofread-popup-test-shows-message-above-diagnostic-start ()
+(ert-deftest
+    proofread-popup-test-shows-message-above-diagnostic-start ()
   "The child frame uses the diagnostic message and range start."
   (proofread-popup-test--with-posframe-recorder
    (save-window-excursion
@@ -140,8 +145,9 @@
                        'proofread-popup-face))
            (should (= (plist-get args :position) 4))
            (should
-            (eq (plist-get args :poshandler)
-                #'posframe-poshandler-point-bottom-left-corner-upward))
+            (eq
+             (plist-get args :poshandler)
+             #'posframe-poshandler-point-bottom-left-corner-upward))
            (should (= (plist-get args :internal-border-width) 1))
            (should (= (plist-get args :left-fringe) 3))
            (should (= (plist-get args :right-fringe) 3))
@@ -149,7 +155,8 @@
            (should (member '(no-accept-focus . t)
                            (plist-get args :override-parameters)))
            (should (member '(no-focus-on-map . t)
-                           (plist-get args :override-parameters)))))))))
+                           (plist-get
+                            args :override-parameters)))))))))
 
 (ert-deftest proofread-popup-test-uses-themed-face-colors ()
   "The child frame forwards colors from the active face."
@@ -183,7 +190,7 @@
                           "theme-border"))))))))
 
 (ert-deftest proofread-popup-test-does-not-refresh-same-diagnostic ()
-  "Moving inside one diagnostic does not repeatedly redraw the child frame."
+  "Movement within one diagnostic does not redraw the child frame."
   (proofread-popup-test--with-posframe-recorder
    (save-window-excursion
      (with-temp-buffer
@@ -199,7 +206,8 @@
          (proofread-popup--update)
          (should (= (length proofread-popup-test--shows) 1)))))))
 
-(ert-deftest proofread-popup-test-refreshes-after-window-state-change ()
+(ert-deftest
+    proofread-popup-test-refreshes-after-window-state-change ()
   "A window layout state change redraws the current diagnostic."
   (proofread-popup-test--with-posframe-recorder
    (save-window-excursion
@@ -222,7 +230,8 @@
            (proofread-popup--update)
            (should (= (length proofread-popup-test--shows) 2))))))))
 
-(ert-deftest proofread-popup-test-inaccessible-start-anchors-at-point ()
+(ert-deftest
+    proofread-popup-test-inaccessible-start-anchors-at-point ()
   "A diagnostic starting outside narrowing is anchored at point."
   (proofread-popup-test--with-posframe-recorder
    (save-window-excursion
@@ -237,8 +246,10 @@
          (goto-char 5)
          (proofread-popup--update)
          (should (= (length proofread-popup-test--shows) 1))
-         (should (= (plist-get (cdar proofread-popup-test--shows) :position)
-                    (point))))))))
+         (should
+          (= (plist-get
+              (cdar proofread-popup-test--shows) :position)
+             (point))))))))
 
 (ert-deftest proofread-popup-test-hides-away-from-diagnostic ()
   "The child frame hides when point leaves diagnostics."
@@ -258,8 +269,9 @@
          (should proofread-popup-test--hides)
          (should-not proofread-popup--diagnostic))))))
 
-(ert-deftest proofread-popup-test-hidehandler-allows-reshow-after-switch ()
-  "Returning after the Posframe hide handler ran shows the popup again."
+(ert-deftest
+    proofread-popup-test-hidehandler-allows-reshow-after-switch ()
+  "The popup returns after Posframe's hide handler runs."
   (proofread-popup-test--with-posframe-recorder
    (save-window-excursion
      (let ((source (generate-new-buffer " *proofread-popup-source*"))
@@ -285,7 +297,8 @@
                          (cons nil source))))
                  (switch-to-buffer source)
                  (proofread-popup--update)
-                 (should (= (length proofread-popup-test--shows) 2)))))
+                 (should
+                  (= (length proofread-popup-test--shows) 2)))))
          (when (buffer-live-p source)
            (kill-buffer source))
          (when (buffer-live-p other)
@@ -330,7 +343,7 @@
     (should-not proofread-popup--user-disabled-p)))
 
 (ert-deftest proofread-popup-test-disable-core-mode-cleans-up ()
-  "Disabling `proofread-mode' disables and cleans up the popup frontend."
+  "Disabling core mode cleans up the popup frontend."
   (proofread-popup-test--with-posframe-recorder
    (save-window-excursion
      (with-temp-buffer
@@ -346,7 +359,8 @@
          (should-not proofread-popup-mode)
          (should proofread-popup-test--hides)
          (should proofread-popup-test--deletes)
-         (should-not (memq #'proofread-popup--update post-command-hook))
+         (should-not
+          (memq #'proofread-popup--update post-command-hook))
          (should-not (memq #'proofread-popup--update
                            proofread-diagnostics-changed-hook))
          (should-not proofread-popup--diagnostic))))))
@@ -368,7 +382,8 @@
          (should-not proofread-mode)
          (should-not proofread-popup-mode)
          (should proofread-popup-test--deletes)
-         (should-not (memq #'proofread-popup--update post-command-hook))
+         (should-not
+          (memq #'proofread-popup--update post-command-hook))
          (should-not (memq #'proofread-popup--update
                            proofread-diagnostics-changed-hook)))))))
 
@@ -395,7 +410,7 @@
            (kill-buffer buffer)))))))
 
 (ert-deftest proofread-popup-test-correct-at-point-hides-frame ()
-  "Point correction immediately hides the corrected diagnostic's frame."
+  "Correction at point immediately hides its diagnostic frame."
   (proofread-popup-test--with-posframe-recorder
    (save-window-excursion
      (with-temp-buffer
@@ -415,7 +430,7 @@
          (should (equal (buffer-string) "aa hello zz")))))))
 
 (ert-deftest proofread-popup-test-unload-cleans-existing-buffers ()
-  "Unloading the frontend deletes popups and removes global integration."
+  "Unloading the frontend removes all popup integration."
   (proofread-popup-test--with-posframe-recorder
    (save-window-excursion
      (let ((buffer (generate-new-buffer " *proofread-popup-unload*")))

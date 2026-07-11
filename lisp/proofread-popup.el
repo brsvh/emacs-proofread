@@ -1,10 +1,12 @@
-;;; proofread-popup.el --- Popup UI for Proofread -*- lexical-binding: t; -*-
+;;; proofread-popup.el --- Popup UI  -*- lexical-binding: t; -*-
 
 ;; Copyright (C) 2026 Bingshan Chang <chang@bingshan.org>
 
 ;; Author: Bingshan Chang <chang@bingshan.org>
 ;; Keywords: convenience, wp
-;; Package-Requires: ((emacs "30.1") (proofread "0.1.0") (posframe "1.5.2"))
+;; Package-Requires: ((emacs "30.1")
+;;                    (proofread "0.1.0")
+;;                    (posframe "1.5.2"))
 ;; Version: 0.1.0
 
 ;; This file is not part of GNU Emacs.
@@ -24,10 +26,10 @@
 
 ;;; Commentary:
 
-;; This optional package displays the Proofread diagnostic at point in a
-;; child frame.  Loading it integrates `proofread-popup-mode' with
-;; `proofread-mode' in each buffer.  The core Proofread package does not
-;; require this package or Posframe.
+;; This optional package displays the Proofread diagnostic at point
+;; in a child frame.  Loading it integrates `proofread-popup-mode'
+;; with `proofread-mode' in each buffer.  The core Proofread package
+;; does not require this package or Posframe.
 
 ;;; Code:
 
@@ -41,7 +43,7 @@
   :prefix "proofread-popup-")
 
 (defcustom proofread-popup-enabled t
-  "Non-nil means show a child-frame message for the diagnostic at point."
+  "Whether to show a child-frame message at point."
   :type 'boolean
   :group 'proofread-popup)
 
@@ -100,7 +102,8 @@
   "Return the hidden buffer name used for the current child frame."
   (or proofread-popup--buffer-name
       (setq proofread-popup--buffer-name
-            (generate-new-buffer-name proofread-popup--buffer-prefix))))
+            (generate-new-buffer-name
+             proofread-popup--buffer-prefix))))
 
 (defun proofread-popup--available-p ()
   "Return non-nil when a Proofread child frame can be shown."
@@ -108,7 +111,7 @@
        (posframe-workable-p)))
 
 (defun proofread-popup--selected-buffer-p ()
-  "Return non-nil when the selected window displays the current buffer."
+  "Return non-nil when the selected window displays this buffer."
   (eq (window-buffer (selected-window))
       (current-buffer)))
 
@@ -149,8 +152,10 @@
         (window-edges)
         (bound-and-true-p text-scale-mode-amount)
         proofread-popup-max-width
-        (proofread-popup--face-color 'proofread-popup-face :foreground)
-        (proofread-popup--face-color 'proofread-popup-face :background)
+        (proofread-popup--face-color
+         'proofread-popup-face :foreground)
+        (proofread-popup--face-color
+         'proofread-popup-face :background)
         (proofread-popup--face-color
          'proofread-popup-border-face :background)))
 
@@ -216,9 +221,11 @@
            :poshandler
            #'posframe-poshandler-point-bottom-left-corner-upward
            :foreground-color
-           (proofread-popup--face-color 'proofread-popup-face :foreground)
+           (proofread-popup--face-color
+            'proofread-popup-face :foreground)
            :background-color
-           (proofread-popup--face-color 'proofread-popup-face :background)
+           (proofread-popup--face-color
+            'proofread-popup-face :background)
            :max-width (max 1 proofread-popup-max-width)
            :min-width 1
            :internal-border-width 1
@@ -250,11 +257,13 @@
            proofread-popup-enabled
            (proofread-popup--selected-buffer-p))
       (let* ((diagnostic (proofread-diagnostic-at-point))
-             (position (and diagnostic
-                            (proofread-popup--anchor-position diagnostic))))
+             (position
+              (and diagnostic
+                   (proofread-popup--anchor-position diagnostic))))
         (if (and diagnostic position)
-            (when (proofread-popup--needs-refresh-p diagnostic position)
-	      (proofread-popup--show diagnostic))
+            (when (proofread-popup--needs-refresh-p
+                   diagnostic position)
+              (proofread-popup--show diagnostic))
           (proofread-popup--hide)))
     (proofread-popup--hide)))
 
@@ -269,25 +278,27 @@
   (proofread-popup--update))
 
 (defun proofread-popup--disable ()
-  "Remove buffer-local popup hooks and delete the current child frame."
+  "Remove local popup hooks and delete the current child frame."
   (remove-hook 'post-command-hook #'proofread-popup--update t)
   (remove-hook 'proofread-diagnostics-changed-hook
-	       #'proofread-popup--update t)
+               #'proofread-popup--update t)
   (remove-hook 'kill-buffer-hook #'proofread-popup--delete t)
   (remove-hook 'change-major-mode-hook
-	       #'proofread-popup--change-major-mode t)
+               #'proofread-popup--change-major-mode t)
   (proofread-popup--delete))
 
 (define-minor-mode proofread-popup-mode
-  "Toggle child-frame messages for Proofread diagnostics in this buffer.
+  "Toggle child-frame messages for Proofread diagnostics here.
 
-This mode is enabled and disabled automatically with `proofread-mode' after
-the optional `proofread-popup' library has been loaded.  To opt one buffer out
-of popup messages, disable this mode locally."
+This mode is enabled and disabled automatically with
+`proofread-mode' after the optional `proofread-popup' library has
+been loaded.  To opt one buffer out of popup messages, disable this
+mode locally."
   :lighter nil
   :group 'proofread-popup
   (when (called-interactively-p 'interactive)
-    (setq proofread-popup--user-disabled-p (not proofread-popup-mode)))
+    (setq proofread-popup--user-disabled-p
+          (not proofread-popup-mode)))
   (if proofread-popup-mode
       (proofread-popup--enable)
     (proofread-popup--disable)))
@@ -299,7 +310,10 @@ of popup messages, disable this mode locally."
 (defun proofread-popup--sync-with-proofread-mode ()
   "Enable or disable popup messages to follow `proofread-mode'."
   (proofread-popup-mode
-   (if (and proofread-mode (not proofread-popup--user-disabled-p)) 1 -1)))
+   (if (and proofread-mode
+            (not proofread-popup--user-disabled-p))
+       1
+     -1)))
 
 (defun proofread-popup--enable-in-existing-buffer ()
   "Enable popup messages in the current Proofread buffer."
@@ -307,7 +321,8 @@ of popup messages, disable this mode locally."
              (not proofread-popup--user-disabled-p))
     (proofread-popup-mode 1)))
 
-(add-hook 'proofread-mode-hook #'proofread-popup--sync-with-proofread-mode)
+(add-hook 'proofread-mode-hook
+          #'proofread-popup--sync-with-proofread-mode)
 
 (dolist (buffer (buffer-list))
   (with-current-buffer buffer
@@ -316,7 +331,7 @@ of popup messages, disable this mode locally."
 (defun proofread-popup-unload-function ()
   "Remove Proofread popup integration before unloading this library."
   (remove-hook 'proofread-mode-hook
-	       #'proofread-popup--sync-with-proofread-mode)
+               #'proofread-popup--sync-with-proofread-mode)
   (dolist (buffer (buffer-list))
     (with-current-buffer buffer
       (when (bound-and-true-p proofread-popup-mode)
