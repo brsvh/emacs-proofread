@@ -211,15 +211,20 @@
 
                     emacs-with-proofread =
                       (emacsPackagesFor base).emacsWithPackages
-                        (epkgs: [
-                          epkgs.proofread
-                        ]);
+                        (
+                          epkgs: with epkgs; [
+                            keycast
+                            proofread
+                          ]
+                        );
 
                     emacs-with-proofread-popup =
                       (emacsPackagesFor base).emacsWithPackages
-                        (epkgs: [
-                          epkgs.proofread-popup
-                        ]);
+                        (
+                          epkgs: with epkgs; [
+                            proofread-popup
+                          ]
+                        );
                   in
                   acc
                   // {
