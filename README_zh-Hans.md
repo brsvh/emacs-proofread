@@ -1,4 +1,4 @@
-<p align="right"><strong>English</strong> · <a href="README_zh-Hans.md">简体中文</a></p>
+<p align="right"><a href="README.md">English</a> · <strong>简体中文</strong></p>
 
 > Copyright (C) 2026 Bingshan Chang <chang@bingshan.org>
 >
@@ -12,29 +12,24 @@
 
 # proofread
 
-Proofread provides asynchronous, context-aware LLM proofreading for GNU Emacs.
-It extracts prose from ordinary text, comments, or docstrings, splits it into
-bounded chunks, and sends those chunks to a configured backend. Spelling,
-grammar, style, and other issues appear as diagnostics that can be reviewed,
-ignored, or corrected in place. Requests run asynchronously, so proofreading
-does not block editing.
+Proofread 为 GNU Emacs 提供异步、上下文感知的 LLM
+校对功能。它从普通文本、注释或文档字符串中提取自然语言，将其拆分为大小受限的文本块，并发送给配置好的后端。拼写、语法、风格及其他问题会以诊断项形式显示，用户可以逐项查看、忽略或直接在原处修正。请求异步运行，因此校对不会阻塞编辑。
 
 <div align="center">
 
-https://github.com/user-attachments/assets/9dc5c4ee-a43e-45b8-a9fc-a372079ed528
+https://github.com/user-attachments/assets/3c77758b-00ab-48e2-9e23-e54e8845d251
 
 </div>
 
-## Getting Started
+## 快速开始
 
-### Installation
+### 安装
 
-The core package requires GNU Emacs 30.1 or later and GNU ELPA `llm` 0.31.1 or
-later. The optional `proofread-popup` package additionally requires `posframe`
-1.5.2 or later. Install `llm` with your Emacs package manager, and install
-`posframe` as well if you want popup diagnostics.
+核心包要求 GNU Emacs 30.1 或更高版本，以及 GNU ELPA `llm` 0.31.1 或更高版本。可选的 `proofread-popup`
+包还要求 `posframe` 1.5.2 或更高版本。请使用你的 Emacs 包管理器安装 `llm`；如需使用弹窗显示诊断信息，再安装
+`posframe`。
 
-Clone this repository and add its `lisp` directory to `load-path`:
+克隆本仓库并将其 `lisp` 目录加入 `load-path`：
 
 ```sh
 git clone https://github.com/brsvh/emacs-proofread.git
@@ -45,8 +40,7 @@ git clone https://github.com/brsvh/emacs-proofread.git
 (require 'proofread)
 ```
 
-Nix users can add both packages to an Emacs package set through the flake's
-default overlay. For example, a NixOS configuration can use:
+Nix 用户可以通过 flake 的默认 overlay 将这两个包添加到 Emacs 包集合中。例如，NixOS 配置可以这样写：
 
 ```nix
 {
@@ -88,9 +82,8 @@ default overlay. For example, a NixOS configuration can use:
 }
 ```
 
-Remove `epkgs.proofread-popup` if only the core package is needed. On
-`x86_64-linux`, the flake also provides ready-made launchers that start Emacs
-with a temporary, clean init directory. Run one from the repository root:
+如果只需要核心包，请移除 `epkgs.proofread-popup`。在 `x86_64-linux` 上，flake
+还提供开箱即用的启动器，它们使用临时、干净的初始化目录启动 Emacs。请在仓库根目录运行其中一个：
 
 ```sh
 nix run .#emacs30-with-proofread
@@ -98,15 +91,12 @@ nix run .#emacs30-with-proofread
 nix run .#emacs31-with-proofread
 ```
 
-These launchers make the packages available on `load-path`; they do not load or
-configure Proofread automatically.
+这些启动器只会让包出现在 `load-path` 中；它们不会自动加载或配置 Proofread。
 
-### Configuration
+### 配置
 
-Both `proofread-backend` and `proofread-llm-provider` default to `nil`, so
-enabling `proofread-mode` alone does not send requests. This example uses the
-local Ollama provider supplied by `llm`; replace `MODEL` with the name of an
-installed Ollama model:
+`proofread-backend` 和 `proofread-llm-provider` 默认均为 `nil`，因此仅启用 `proofread-mode`
+不会发送请求。以下示例使用 `llm` 提供的本地 Ollama 提供程序；请将 `MODEL` 替换为已安装 Ollama 模型的名称：
 
 ```elisp
 (require 'proofread)
@@ -121,237 +111,194 @@ installed Ollama model:
 (add-hook 'prog-mode-hook #'proofread-mode)
 ```
 
-`proofread-llm-provider` may be any provider object supported by `llm`. For a
-remote provider, keep credentials in `auth-source` or another secure facility
-recommended by that provider. The default `proofread-llm-response-strategy` is
-`auto`: it uses a JSON schema when the provider advertises that capability, and
-otherwise falls back to prompt-only JSON.
+`proofread-llm-provider` 可以是 `llm` 支持的任意提供程序对象。对于远程提供程序，请将凭据保存在 `auth-source`
+或该提供程序推荐的其他安全设施中。`proofread-llm-response-strategy` 的默认值为 `auto`：当提供程序声明支持 JSON
+响应时使用 JSON Schema，否则回退到仅由提示词约束的 JSON。
 
-`proofread-targets` controls which text is checked in each buffer:
+`proofread-targets` 控制每个缓冲区中要检查的文本：
 
-| Value                     | Behavior                                                                                     |
-| ------------------------- | -------------------------------------------------------------------------------------------- |
-| `auto`                    | Check comments and docstrings in modes derived from `prog-mode`, and all text in other modes |
-| `all`                     | Check all text                                                                               |
-| `comments`                | Check comments only                                                                          |
-| `docstrings`              | Check docstrings only                                                                        |
-| `comments-and-docstrings` | Check comments and docstrings                                                                |
+| 值                        | 行为                                                                        |
+| ------------------------- | --------------------------------------------------------------------------- |
+| `auto`                    | 在派生自 `prog-mode` 的模式中检查注释和文档字符串，在其他模式中检查全部文本 |
+| `all`                     | 检查全部文本                                                                |
+| `comments`                | 仅检查注释                                                                  |
+| `docstrings`              | 仅检查文档字符串                                                            |
+| `comments-and-docstrings` | 检查注释和文档字符串                                                        |
 
-This option becomes buffer-local when set. To change the default for new
-buffers, use `setq-default`, for example:
+该选项设置后会成为缓冲区局部变量。若要更改新缓冲区的默认值，请使用 `setq-default`，例如：
 
 ```elisp
 (setq-default proofread-targets 'all)
 ```
 
-### Running checks
+### 运行检查
 
-After `M-x proofread-mode`, the default behavior is to check the union of the
-current buffer's visible ranges across all live windows that display it after
-one second of idle time. Enabling the mode, editing, scrolling, or changing the
-window configuration schedules a check. URLs, email addresses, invisible text,
-and text selected by `proofread-ignored-faces` or `proofread-ignored-properties`
-are not sent to the backend.
+执行 `M-x proofread-mode` 后，默认行为是在空闲 1
+秒后检查当前缓冲区在所有显示该缓冲区的活动窗口中的可见范围的并集。启用模式、编辑、滚动或更改窗口配置都会调度一次检查。URL、电子邮件地址、不可见文本，以及由
+`proofread-ignored-faces` 或 `proofread-ignored-properties` 选中的文本不会发送到后端。
 
-Automatic checks cover visible text only. To check another scope explicitly, use
-`proofread-check-at-point`, `proofread-check-region`, `proofread-check-buffer`,
-or `proofread-check-visible-range`. All four commands require `proofread-mode`
-to be enabled. The buffer command respects narrowing; the point command checks
-the request-ready chunk at point, not merely one word.
+自动检查仅覆盖可见文本。若要明确检查其他范围，请使用
+`proofread-check-at-point`、`proofread-check-region`、`proofread-check-buffer` 或
+`proofread-check-visible-range`。这四个命令都要求启用
+`proofread-mode`。缓冲区命令遵循窄化范围；光标处命令检查光标处已准备好发送请求的文本块，而非仅检查一个单词。
 
-Accepted diagnostics use `proofread-face`. Navigate with `proofread-next` and
-`proofread-previous`, inspect full details with `proofread-describe`, or open a
-list below the source window with `proofread-show-buffer-diagnostics`. In that
-list, `RET` visits a diagnostic, `SPC` or `C-o` previews it in another window,
-and `n` or `p` moves through the list.
+通过验证的诊断项使用 `proofread-face` 显示。可用 `proofread-next` 和 `proofread-previous` 导航，用
+`proofread-describe` 查看完整详情，或用 `proofread-show-buffer-diagnostics`
+在源窗口下方打开诊断列表。在该列表中，`RET` 跳转到诊断项，`SPC` 或 `C-o` 在另一个窗口中预览诊断项，`n` 或 `p` 在诊断项之间移动。
 
-### Correcting errors
+### 修正错误
 
-Place point on a diagnostic and run `M-x proofread-correct-at-point`. A single
-suggestion is applied directly; multiple suggestions are selected with
-`completing-read`, so completion UIs such as Vertico work without additional
-integration. Before committing the edit, Proofread verifies that the diagnostic
-is still live, that its original text has not changed, and that a replacement
-will not damage a comment or docstring delimiter.
+将光标置于诊断项上并运行 `M-x proofread-correct-at-point`。只有一个修改建议时会直接应用；有多个修改建议时使用
+`completing-read` 选择，因此 Vertico 等补全界面无需额外集成即可工作。在提交编辑之前，Proofread
+会验证诊断项仍然有效、原文未改变，并确保替换不会破坏注释或文档字符串的分隔符。
 
-Run `M-x proofread-ignore` to dismiss a diagnostic. Ignore records persist for
-the current Emacs session and filter semantically identical diagnostics from
-every buffer in which Proofread is active.
+运行 `M-x proofread-ignore` 可忽略一项诊断。忽略记录在当前 Emacs 会话中持续有效，并会从所有启用 Proofread
+的缓冲区中过滤语义相同的诊断项。
 
 <div align="center">
 
-**Check and correct at point**
+**检查并修正光标处文本**
 
-https://github.com/user-attachments/assets/49bfacf7-1278-47c4-a0c3-180f1fb0b790
+https://github.com/user-attachments/assets/8ce73c38-69af-4b51-bcc8-f913753751fc
 
 </div>
 
-## Advanced features
+## 高级功能
 
 ### `proofread-popup`
 
-`proofread-popup` is an optional frontend based on Posframe. Once the library is
-loaded, `proofread-popup-mode` automatically follows `proofread-mode` in each
-buffer:
+`proofread-popup` 是基于 Posframe 的可选前端。加载该库后，`proofread-popup-mode` 会在每个缓冲区中自动跟随
+`proofread-mode`：
 
 ```elisp
 (require 'proofread-popup)
 ```
 
-When point is on a diagnostic, the frontend displays the diagnostic message in a
-child frame above the start of its range and hides the frame when point moves
-away. The popup does not show suggestions or provide actions. It is unavailable
-in terminals and other environments where child frames do not work. Run
-`M-x proofread-popup-mode` to opt the current buffer out of or back into the
-automatic integration. Its display can also be controlled with
-`proofread-popup-enabled` and `proofread-popup-max-width`.
+当光标位于诊断项上时，该前端会在诊断范围起点上方的子框架中显示诊断消息，并在光标离开时隐藏子框架。弹窗不显示修改建议，也不提供操作。在终端及其他无法使用子框架的环境中，弹窗不可用。运行
+`M-x proofread-popup-mode` 可在当前缓冲区中禁用或重新启用该自动集成。也可以使用 `proofread-popup-enabled`
+和 `proofread-popup-max-width` 控制其显示。
 
-### Batch correction
+### 批量修正
 
-Proofread never rewrites text merely because a backend returned diagnostics.
-Batch correction happens only after the user explicitly invokes one of these
-commands:
+Proofread 不会仅因后端返回诊断就改写文本。只有用户显式调用以下命令，才会执行批量修正：
 
-- `proofread-correct-region` corrects diagnostics fully contained in the active
-  region.
-- `proofread-correct-buffer` corrects diagnostics in the accessible portion of
-  the current buffer.
-- `proofread-correct-visible-range` corrects diagnostics in all visible ranges.
+- `proofread-correct-region` 修正完全包含在活动区域中的诊断项。
+- `proofread-correct-buffer` 修正当前缓冲区可访问部分中的诊断项。
+- `proofread-correct-visible-range` 修正所有可见范围中的诊断项。
 
-Diagnostics without suggestions are skipped, as are later diagnostics that
-overlap an earlier one. Diagnostics with multiple suggestions still prompt
-individually. The entire batch is applied atomically as a single undo step; if
-any replacement fails, all changes in the batch are rolled back.
+不含修改建议的诊断项会被跳过；与较早诊断项重叠的后续诊断项也会被跳过。具有多个修改建议的诊断项仍会逐项询问。整批修改以单个撤销步骤原子地应用；若任何替换失败，整批修改都会回滚。
 
 <div align="center">
 
-**Check and correct a selected region**
+**检查并修正选定区域**
 
-https://github.com/user-attachments/assets/fbac8da1-96b2-4eb6-b08a-f2a1459f02e1
+https://github.com/user-attachments/assets/efd63fe7-eafe-410f-b785-93da7e227424
 
-**Check and correct visible ranges**
+**检查并修正可见范围**
 
-https://github.com/user-attachments/assets/621e7e66-b7ed-4345-8a15-1e4aa08dfad9
+https://github.com/user-attachments/assets/2dda228e-f85c-4500-aea0-549500628c6e
 
 </div>
 
-## Commands
+## 命令
 
-The core mode defines no default key bindings. These commands can be invoked
-with `M-x` or bound by the user:
+核心模式未定义默认按键绑定。以下命令可通过 `M-x` 调用，也可由用户自行绑定：
 
-| Command                             | Description                                                  |
-| ----------------------------------- | ------------------------------------------------------------ |
-| `proofread-mode`                    | Toggle the Proofread minor mode in the current buffer        |
-| `proofread-check-at-point`          | Check the request-ready text chunk at point                  |
-| `proofread-check-region`            | Check the active region                                      |
-| `proofread-check-buffer`            | Check the accessible portion of the current buffer           |
-| `proofread-check-visible-range`     | Check all live-window ranges displaying the current buffer   |
-| `proofread-show-buffer-diagnostics` | Open a list of diagnostics for the current buffer            |
-| `proofread-next`                    | Move to the next diagnostic without wrapping                 |
-| `proofread-previous`                | Move to the previous diagnostic without wrapping             |
-| `proofread-describe`                | Describe the diagnostic at point in a help buffer            |
-| `proofread-correct-at-point`        | Apply a suggestion for the diagnostic at point               |
-| `proofread-correct-region`          | Correct diagnostics contained in the active region           |
-| `proofread-correct-buffer`          | Correct diagnostics in the accessible buffer                 |
-| `proofread-correct-visible-range`   | Correct diagnostics contained in visible ranges              |
-| `proofread-ignore`                  | Ignore the diagnostic at point for this Emacs session        |
-| `proofread-clear`                   | Clear diagnostics and their overlays from the current buffer |
-| `proofread-clear-cache`             | Clear the diagnostic cache for the current buffer            |
-| `proofread-show-buffer-requests`    | Start recording and display backend requests for a buffer    |
+| 命令                                | 说明                                         |
+| ----------------------------------- | -------------------------------------------- |
+| `proofread-mode`                    | 切换当前缓冲区中的 Proofread 次要模式        |
+| `proofread-check-at-point`          | 检查光标处已准备好发送请求的文本块           |
+| `proofread-check-region`            | 检查活动区域                                 |
+| `proofread-check-buffer`            | 检查当前缓冲区的可访问部分                   |
+| `proofread-check-visible-range`     | 检查显示当前缓冲区的所有活动窗口中的可见范围 |
+| `proofread-show-buffer-diagnostics` | 打开当前缓冲区的诊断列表                     |
+| `proofread-next`                    | 移动到下一项诊断，到末尾不循环               |
+| `proofread-previous`                | 移动到上一项诊断，到开头不循环               |
+| `proofread-describe`                | 在帮助缓冲区中说明光标处的诊断项             |
+| `proofread-correct-at-point`        | 应用光标处诊断项的修改建议                   |
+| `proofread-correct-region`          | 修正活动区域中包含的诊断项                   |
+| `proofread-correct-buffer`          | 修正缓冲区可访问部分中的诊断项               |
+| `proofread-correct-visible-range`   | 修正可见范围中包含的诊断项                   |
+| `proofread-ignore`                  | 在当前 Emacs 会话中忽略光标处的诊断项        |
+| `proofread-clear`                   | 清除当前缓冲区中的诊断项及其覆盖层           |
+| `proofread-clear-cache`             | 清除当前缓冲区的诊断缓存                     |
+| `proofread-show-buffer-requests`    | 开始记录并显示某个缓冲区的后端请求           |
 
-In a request list, `RET` or `C-m` invokes `proofread-show-request` to display
-the complete request lifecycle. In a diagnostic list, `RET` or `C-m` invokes
-`proofread-goto-diagnostic`, while `SPC` or `C-o` invokes
-`proofread-show-diagnostic`.
+在请求列表中，`RET` 或 `C-m` 调用 `proofread-show-request` 以显示完整的请求生命周期。在诊断列表中，`RET` 或
+`C-m` 调用 `proofread-goto-diagnostic`，`SPC` 或 `C-o` 则调用
+`proofread-show-diagnostic`。
 
-## Customization options
+## 自定义选项
 
-Run `M-x customize-group RET proofread RET` to edit the core options:
+运行 `M-x customize-group RET proofread RET` 可编辑核心选项：
 
-| Option                                    | Default | Purpose                                                                           |
-| ----------------------------------------- | ------- | --------------------------------------------------------------------------------- |
-| `proofread-language`                      | `nil`   | Give the backend a language hint; `nil` allows inference                          |
-| `proofread-auto-check`                    | `t`     | Schedule checks after enabling, edits, and window activity; buffer-local when set |
-| `proofread-targets`                       | `auto`  | Select all text, comments, or docstrings; buffer-local when set                   |
-| `proofread-docstring-predicate-functions` | `nil`   | Add predicate functions for recognizing docstrings; buffer-local when set         |
-| `proofread-idle-delay`                    | `1.0`   | Wait this many idle seconds before an automatic check                             |
-| `proofread-inhibit-progress-messages`     | `t`     | Suppress background progress, but not errors or explicit command feedback         |
-| `proofread-max-chunk-size`                | `2000`  | Limit the number of characters in each proofreading chunk                         |
-| `proofread-context-size`                  | `300`   | Limit context characters sent on each side of a chunk                             |
-| `proofread-context-sentences-before`      | `1`     | Limit logical context sentences before a chunk                                    |
-| `proofread-context-sentences-after`       | `1`     | Limit logical context sentences after a chunk                                     |
-| `proofread-max-concurrent-requests`       | `8`     | Limit active backend requests per buffer                                          |
-| `proofread-backend`                       | `nil`   | Select the backend; currently `llm`, or `nil` to disable dispatch                 |
-| `proofread-llm-provider`                  | `nil`   | Supply the `llm` provider object                                                  |
-| `proofread-llm-response-strategy`         | `auto`  | Choose provider-enforced JSON schema output or prompt-only JSON                   |
-| `proofread-llm-provider-identity`         | `nil`   | Supply a stable, non-secret provider identity for cache keys                      |
-| `proofread-llm-max-diagnostic-passes`     | `3`     | Limit LLM diagnostic passes for each request                                      |
-| `proofread-cache-max-entries`             | `128`   | Limit per-buffer LRU cache entries; `0` disables caching                          |
-| `proofread-request-log-max-records`       | `100`   | Limit records retained for each monitored buffer                                  |
-| `proofread-ignored-faces`                 | `nil`   | Exclude text whose `face` property matches one of these faces                     |
-| `proofread-ignored-properties`            | `nil`   | Exclude text where one of these text properties is non-`nil`                      |
+| 选项                                      | 默认值 | 用途                                                             |
+| ----------------------------------------- | ------ | ---------------------------------------------------------------- |
+| `proofread-language`                      | `nil`  | 向后端提供语言提示；`nil` 表示允许推断语言                       |
+| `proofread-auto-check`                    | `t`    | 在启用模式、编辑和窗口活动后安排检查；设置后为缓冲区局部变量     |
+| `proofread-targets`                       | `auto` | 选择全部文本、注释或文档字符串；设置后为缓冲区局部变量           |
+| `proofread-docstring-predicate-functions` | `nil`  | 添加识别文档字符串的谓词函数；设置后为缓冲区局部变量             |
+| `proofread-idle-delay`                    | `1.0`  | 自动检查前等待的空闲秒数                                         |
+| `proofread-inhibit-progress-messages`     | `t`    | 抑制后台进度消息，但不抑制错误或显式命令反馈                     |
+| `proofread-max-chunk-size`                | `2000` | 限制每个校对文本块的字符数                                       |
+| `proofread-context-size`                  | `300`  | 限制文本块每侧发送的上下文字符数                                 |
+| `proofread-context-sentences-before`      | `1`    | 限制文本块之前的逻辑上下文句数                                   |
+| `proofread-context-sentences-after`       | `1`    | 限制文本块之后的逻辑上下文句数                                   |
+| `proofread-max-concurrent-requests`       | `8`    | 限制每个缓冲区的活动后端请求数                                   |
+| `proofread-backend`                       | `nil`  | 选择后端；目前支持 `llm`，设为 `nil` 可禁用请求派发              |
+| `proofread-llm-provider`                  | `nil`  | 指定 `llm` 提供程序对象                                          |
+| `proofread-llm-response-strategy`         | `auto` | 选择由提供程序强制执行的 JSON Schema 输出或仅由提示词约束的 JSON |
+| `proofread-llm-provider-identity`         | `nil`  | 为缓存键指定稳定且不含机密信息的提供程序标识                     |
+| `proofread-llm-max-diagnostic-passes`     | `3`    | 限制每个请求的 LLM 诊断轮数                                      |
+| `proofread-cache-max-entries`             | `128`  | 限制每个缓冲区的 LRU 缓存条目数；`0` 表示禁用缓存                |
+| `proofread-request-log-max-records`       | `100`  | 限制每个受监视缓冲区保留的记录数                                 |
+| `proofread-ignored-faces`                 | `nil`  | 排除 `face` 属性与指定 `face` 匹配的文本                         |
+| `proofread-ignored-properties`            | `nil`  | 排除指定文本属性之一为非 `nil` 的文本                            |
 
-The optional frontend also defines `proofread-popup-enabled` (default `t`) and
-`proofread-popup-max-width` (default `80`). Customize diagnostic appearance with
-`proofread-face`, `proofread-current-face`, `proofread-popup-face`, and
-`proofread-popup-border-face`.
+可选前端还定义了 `proofread-popup-enabled`（默认值为 `t`）和 `proofread-popup-max-width`（默认值为
+`80`）。可使用 `proofread-face`、`proofread-current-face`、`proofread-popup-face` 和
+`proofread-popup-border-face` 自定义诊断外观。
 
-### Tuning concurrency
+### 调整并发数
 
-`proofread-max-concurrent-requests` controls the number of active requests per
-buffer. It defaults to `8`; additional requests wait in a queue. Lower it when a
-provider imposes rate limits or when you want to reduce the load on a local
-model:
+`proofread-max-concurrent-requests` 控制每个缓冲区中的活动请求数。默认值为
+`8`；额外请求会在队列中等待。当提供程序实施速率限制，或希望降低本地模型的负载时，可以调低该值：
 
 ```elisp
 (setq proofread-max-concurrent-requests 2)
 ```
 
-At `0`, cache hits remain available but no new backend requests are sent. To
-reduce cost further, lower `proofread-llm-max-diagnostic-passes` from its
-default of `3` to `1`.
+设为 `0` 时，缓存命中仍然可用，但不会发送新的后端请求。若要进一步降低成本，可将 `proofread-llm-max-diagnostic-passes`
+从默认的 `3` 调低到 `1`。
 
-## Behavior and caveats
+## 行为与注意事项
 
-- Requests run asynchronously. A result is applied only if the text, context,
-  target scope, and provider configuration still match the original request;
-  stale results caused by edits are discarded.
-- A remote provider receives the selected text and limited surrounding context,
-  and may charge for its use. Request-monitor buffers also expose the complete
-  prompt and response, which may contain sensitive text.
-- `proofread-show-buffer-requests` starts recording future requests and seeds
-  the log with requests that are active or queued at that moment. It cannot
-  recover requests that have already finished.
-- `proofread-clear` clears current diagnostics but neither the cache nor
-  in-flight requests, so later results may make diagnostics reappear.
-  `proofread-clear-cache` clears only the cache. Disable `proofread-mode` to
-  stop all work and clear its state.
-- Records created by `proofread-ignore` persist only for the current Emacs
-  session; they are not saved, and there is no command to remove one.
+- 请求异步运行。只有当文本、上下文、校对目标范围和提供程序配置仍与原始请求匹配时，才会应用返回结果；编辑导致的过期结果会被丢弃。
+- 远程提供程序会接收选中的文本及有限的周边上下文，并可能收取使用费用。请求监视缓冲区还会显示完整的提示词和响应，其中可能含有敏感文本。
+- `proofread-show-buffer-requests`
+  从调用时开始记录后续请求，并使用当时处于活动或排队状态的请求初始化日志。它无法恢复已经完成的请求。
+- `proofread-clear`
+  会清除当前诊断，但不会清除缓存或进行中的请求，因此后续返回的结果可能使诊断再次出现。`proofread-clear-cache`
+  只清除缓存。若要停止所有工作并清理状态，请禁用 `proofread-mode`。
+- 由 `proofread-ignore` 创建的记录仅在当前 Emacs 会话中持续有效；这些记录不会保存，也没有用于移除记录的命令。
 
-## AI Assistance Disclosure
+## AI 辅助声明
 
-Parts of the code, tests, and documentation in this project were developed with
-assistance from AI tools. All AI-generated output was reviewed and modified by
-the maintainer where necessary. The maintainer remains responsible for the final
-content. No secrets, private user data, or other sensitive information were
-intentionally provided to AI tools.
+本项目中的部分代码、测试和文档是在 AI 工具的辅助下开发的。所有由 AI
+生成的输出均由维护者审查，并在必要时进行了修改。维护者仍对最终内容负责。没有任何机密信息、私人用户数据或其他敏感信息被有意提供给 AI 工具。
 
-## License
+## 项目许可证
 
-emacs-proofread is free software: you can redistribute it and/or modify it under
-the terms of the GNU General Public License as published by the Free Software
-Foundation, either version 3 of the License, or (at your option) any later
-version.
+emacs-proofread 是自由软件：你可以根据自由软件基金会发布的 GNU
+通用公共许可证第三版或任何后续版本，重新分发和/或修改它根据自由软件基金会发布的 GNU 通用公共许可证条款版本 3，或（根据您的选择）任何后续版本版本。
 
-You should have received a copy of the GNU General Public License along with
-this emacs-proofread. If not, see <https://www.gnu.org/licenses/>.
+您应该已经随本 emacs-proofread 收到了 GNU
+通用公共许可证的副本。如果没有，请访问<https://www.gnu.org/licenses/>。
 
-## COPYING of this file
+## 本文许可证
 
 <details>
-<summary>Toggle this to check the license of this file.</summary>
+<summary>展开这里以查看本文许可证。</summary>
 
 ```text
 
