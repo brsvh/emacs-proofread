@@ -287,6 +287,7 @@
                #'proofread-popup--change-major-mode t)
   (proofread-popup--delete))
 
+;;;###autoload
 (define-minor-mode proofread-popup-mode
   "Toggle child-frame messages for Proofread diagnostics here.
 

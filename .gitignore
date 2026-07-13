@@ -10,7 +10,11 @@
 /.direnv
 
 # emacs
+*-autoloads.el
+*-pkg.el
+*.elc
 /.dir-locals.el
+/dist
 
 # nix
 /repl-result-out

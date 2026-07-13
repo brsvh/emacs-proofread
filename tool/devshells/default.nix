@@ -280,4 +280,9 @@ in
       path = "treefmt.toml";
     };
   };
+
+  packages = with pkgs; [
+    gnumake
+    gnutar
+  ];
 }
