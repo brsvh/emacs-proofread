@@ -4018,6 +4018,15 @@ This covers URLs, email, invisible text, faces, and properties."
   (should-not (proofread-diagnostic-range '(:beg 7 :end 6)))
   (should-not (proofread-diagnostic-range '(:beg invalid :end 6))))
 
+(ert-deftest proofread-test-public-diagnostic-field-formatting ()
+  "The shared diagnostic field formatter returns display strings."
+  (let ((string (copy-sequence "literal")))
+    (should (eq (proofread-format-diagnostic-field string) string)))
+  (should (equal (proofread-format-diagnostic-field 'spelling)
+                 "spelling"))
+  (should (equal (proofread-format-diagnostic-field '(bad "text"))
+                 "(bad \"text\")")))
+
 (ert-deftest
     proofread-test-public-diagnostic-at-point-requires-overlay ()
   "Return only live displayed diagnostics from the public lookup."

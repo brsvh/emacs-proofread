@@ -115,13 +115,6 @@
   (eq (window-buffer (selected-window))
       (current-buffer)))
 
-(defun proofread-popup--format-field (value)
-  "Return VALUE formatted for a child-frame message."
-  (cond
-   ((stringp value) value)
-   ((symbolp value) (symbol-name value))
-   (t (format "%S" value))))
-
 (defun proofread-popup--message (diagnostic)
   "Return the child-frame message for DIAGNOSTIC."
   (let* ((raw-message (proofread-diagnostic-message diagnostic))
@@ -130,10 +123,10 @@
     (cond
      ((and message (not (string-empty-p message))) message)
      ((and raw-message (not (stringp raw-message)))
-      (proofread-popup--format-field raw-message))
+      (proofread-format-diagnostic-field raw-message))
      ((proofread-diagnostic-text diagnostic)
       (format "Proofread: %s"
-              (proofread-popup--format-field
+              (proofread-format-diagnostic-field
                (proofread-diagnostic-text diagnostic))))
      (t "Proofread diagnostic"))))
 

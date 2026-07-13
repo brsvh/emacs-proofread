@@ -3412,6 +3412,15 @@ buffer; otherwise return the diagnostic's stored range."
   "Return the text identified by DIAGNOSTIC."
   (plist-get diagnostic :text))
 
+(defun proofread-format-diagnostic-field (value)
+  "Return VALUE formatted as a Proofread diagnostic field.
+Return strings unchanged, symbols by name, and other values using their
+printed representation."
+  (cond
+   ((stringp value) value)
+   ((symbolp value) (symbol-name value))
+   (t (format "%S" value))))
+
 (defun proofread--navigation-entry< (a b)
   "Return non-nil when navigation entry A should sort before B."
   (let ((a-beg (nth 1 a))
@@ -4546,21 +4555,14 @@ When RESET is non-nil, move from the beginning of the buffer."
   "Return the diagnostics buffer name for the current buffer."
   (format "*Proofread diagnostics for `%s'*" (current-buffer)))
 
-(defun proofread--format-diagnostic-field (value)
-  "Return VALUE formatted for a diagnostic description."
-  (cond
-   ((stringp value) value)
-   ((symbolp value) (symbol-name value))
-   (t (format "%S" value))))
-
 (defun proofread--diagnostic-suggestions (diagnostic)
   "Return DIAGNOSTIC suggestions as strings in stored order."
   (let ((suggestions (plist-get diagnostic :suggestions)))
     (cond
      ((null suggestions) nil)
      ((listp suggestions)
-      (mapcar #'proofread--format-diagnostic-field suggestions))
-     (t (list (proofread--format-diagnostic-field suggestions))))))
+      (mapcar #'proofread-format-diagnostic-field suggestions))
+     (t (list (proofread-format-diagnostic-field suggestions))))))
 
 (defun proofread--select-diagnostic-suggestion (diagnostic)
   "Return the selected suggestion string for DIAGNOSTIC."
@@ -5028,20 +5030,20 @@ DIAGNOSTICS must be in navigation order.  Return `applied'."
             (append lines
                     (list ""
                           (format "Kind: %s"
-                                  (proofread--format-diagnostic-field
+                                  (proofread-format-diagnostic-field
                                    kind))))))
     (when message
       (setq lines
             (append lines
                     (list (format "Message: %s"
-                                  (proofread--format-diagnostic-field
+                                  (proofread-format-diagnostic-field
                                    message))))))
     (when text
       (setq lines
             (append lines
                     (list ""
                           "Original text:"
-                          (proofread--format-diagnostic-field
+                          (proofread-format-diagnostic-field
                            text)))))
     (when suggestions
       (setq lines (append lines (list "" "Suggestions:")))
@@ -5054,14 +5056,14 @@ DIAGNOSTICS must be in navigation order.  Return `applied'."
                   (format
                    "%d. %s"
                    index
-                   (proofread--format-diagnostic-field
+                   (proofread-format-diagnostic-field
                     suggestion)))))
           (setq index (1+ index)))))
     (when source
       (setq lines
             (append lines
                     (list (format "Source: %s"
-                                  (proofread--format-diagnostic-field
+                                  (proofread-format-diagnostic-field
                                    source))))))
     (mapconcat #'identity lines "\n")))
 

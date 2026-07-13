@@ -84,6 +84,26 @@ SUGGESTIONS and MESSAGE supply the optional field values."
       (should (equal (proofread-popup--message diagnostic)
                      "Proofread: helo")))))
 
+(ert-deftest proofread-popup-test-uses-shared-diagnostic-field-formatter ()
+  "Popup messages delegate non-string fields to the core formatter."
+  (let ((message-diagnostic
+         (proofread-popup-test--diagnostic
+          1 5 "helo" nil 'misspelling))
+        (text-diagnostic
+         (proofread-popup-test--diagnostic
+          1 5 '(bad "text") nil ""))
+        fields)
+    (cl-letf (((symbol-function 'proofread-format-diagnostic-field)
+               (lambda (value)
+                 (push value fields)
+                 "<formatted>")))
+      (should (equal (proofread-popup--message message-diagnostic)
+                     "<formatted>"))
+      (should (equal (proofread-popup--message text-diagnostic)
+                     "Proofread: <formatted>")))
+    (should (equal (nreverse fields)
+                   '(misspelling (bad "text"))))))
+
 (ert-deftest proofread-popup-test-mode-follows-proofread-mode ()
   "The popup frontend follows the core minor mode automatically."
   (with-temp-buffer
