@@ -49,6 +49,10 @@ in
 
           pkgs = pkgs';
         };
+
+        release = import ./devshells/release.nix {
+          pkgs = pkgs';
+        };
       };
 
       formatter = import ./formatter.nix {

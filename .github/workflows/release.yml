@@ -1,0 +1,498 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions: {}
+
+concurrency:
+  group: emacs-proofread-release
+  cancel-in-progress: false
+  queue: max
+
+env:
+  GITHUB_API_VERSION: "2026-03-10"
+  RELEASE_BRANCH: releases
+  UPSTREAM_REPOSITORY: brsvh/emacs-proofread
+
+jobs:
+  build:
+    name: Build and verify
+    if: >-
+      github.repository == 'brsvh/emacs-proofread' &&
+      github.ref_type == 'tag' &&
+      startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+
+    permissions:
+      contents: read
+
+    outputs:
+      artifact_id: ${{ steps.upload.outputs.artifact-id }}
+
+    steps:
+      - name: Check out release commit
+        uses: actions/checkout@v6.0.3
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Install Nix
+        uses: cachix/install-nix-action@v31.10.7
+        with:
+          github_access_token: ${{ github.token }}
+
+      - name: Validate release source
+        shell: bash
+        env:
+          RELEASE_SHA: ${{ github.sha }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+
+          if [[ ! "$RELEASE_TAG" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
+            printf 'Invalid release tag: %s\n' "$RELEASE_TAG" >&2
+            exit 1
+          fi
+
+          git fetch --force --no-tags origin \
+            refs/heads/main:refs/remotes/origin/main
+          git fetch --force --no-tags origin \
+            "refs/heads/${RELEASE_BRANCH}:refs/remotes/origin/${RELEASE_BRANCH}"
+
+          test "$(git rev-parse HEAD)" = "$RELEASE_SHA"
+          git merge-base --is-ancestor \
+            "$RELEASE_SHA" refs/remotes/origin/main
+
+      - name: Read and verify release history
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+
+          mkdir -p release-input
+          release_ref="refs/remotes/origin/${RELEASE_BRANCH}"
+
+          git show "${release_ref}:manifest.json" \
+            > release-input/latest-manifest.json
+
+          nix develop .#release --command \
+            tool/release/release validate \
+            release-input/latest-manifest.json
+
+          ledger_tag="$(
+            jq -r \
+              'if .tag == null then empty else .tag end' \
+              release-input/latest-manifest.json
+          )"
+
+          if test -n "$ledger_tag"; then
+            if [[ ! "$ledger_tag" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
+              printf 'Invalid ledger tag: %s\n' "$ledger_tag" >&2
+              exit 1
+            fi
+
+            history_ref="${release_ref}:manifests/${ledger_tag}.json"
+            git show "$history_ref" \
+              > release-input/latest-history.json
+            cmp \
+              release-input/latest-manifest.json \
+              release-input/latest-history.json
+
+            gh api \
+              -H "X-GitHub-Api-Version: ${GITHUB_API_VERSION}" \
+              "repos/${GITHUB_REPOSITORY}/releases/tags/${ledger_tag}" \
+              > release-input/previous-release.json
+            jq -e \
+              '.draft == false and .immutable == true' \
+              release-input/previous-release.json
+
+            mkdir release-input/previous-release-assets
+            gh release download "$ledger_tag" \
+              --pattern manifest.json \
+              --dir release-input/previous-release-assets
+            cmp \
+              release-input/latest-manifest.json \
+              release-input/previous-release-assets/manifest.json
+          fi
+
+          current_ref="${release_ref}:manifests/${RELEASE_TAG}.json"
+          if git cat-file -e "$current_ref" 2>/dev/null; then
+            test -n "$ledger_tag"
+            git show "$current_ref" \
+              > release-input/current-history.json
+            nix develop .#release --command \
+              tool/release/release validate \
+              release-input/current-history.json
+
+            test "$(jq -r '.tag' release-input/current-history.json)" \
+              = "$RELEASE_TAG"
+
+            if test "$ledger_tag" = "$RELEASE_TAG"; then
+              cmp \
+                release-input/latest-manifest.json \
+                release-input/current-history.json
+            else
+              test "$(
+                printf '%s\n' "$RELEASE_TAG" "$ledger_tag" \
+                  | sort --version-sort \
+                  | tail -n 1
+              )" = "$ledger_tag"
+
+              gh api \
+                -H "X-GitHub-Api-Version: ${GITHUB_API_VERSION}" \
+                "repos/${GITHUB_REPOSITORY}/releases/tags/${RELEASE_TAG}" \
+                > release-input/current-release.json
+              jq -e \
+                '.draft == false and .immutable == true' \
+                release-input/current-release.json
+
+              mkdir release-input/current-release-assets
+              gh release download "$RELEASE_TAG" \
+                --pattern manifest.json \
+                --dir release-input/current-release-assets
+              cmp \
+                release-input/current-history.json \
+                release-input/current-release-assets/manifest.json
+            fi
+
+            cp \
+              release-input/current-history.json \
+              release-input/previous-manifest.json
+          elif test "$ledger_tag" = "$RELEASE_TAG"; then
+            printf 'Current release history is missing: %s\n' \
+              "$RELEASE_TAG" >&2
+            exit 1
+          else
+            cp \
+              release-input/latest-manifest.json \
+              release-input/previous-manifest.json
+          fi
+
+      - name: Check flake and formatting
+        run: |
+          set -euo pipefail
+          nix flake check --all-systems
+          nix fmt -- --fail-on-change
+          nix develop .#release --command \
+            actionlint \
+            -ignore 'unexpected key "queue"' \
+            .github/workflows/release.yml
+
+      - name: Run tests
+        run: |
+          set -euo pipefail
+          nix run .#emacs30-run-proofread-tests
+          nix run .#emacs31-run-proofread-tests
+
+      - name: Run strict byte compilation
+        run: |
+          set -euo pipefail
+          nix run .#emacs30-byte-compile-proofread
+          nix run .#emacs31-byte-compile-proofread
+
+      - name: Build reproducible package archives
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          nix develop .#release --command make clean
+          nix develop .#release --command make release-archives
+
+          mapfile -t archives < <(
+            nix develop .#release --command \
+              make --silent release-artifacts
+          )
+          test "${#archives[@]}" -gt 0
+          nix develop .#release --command \
+            sha256sum "${archives[@]}" \
+            > release-input/archive-sha256
+
+          nix develop .#release --command make clean
+          nix develop .#release --command make release-archives
+          nix develop .#release --command \
+            sha256sum --check --strict \
+            release-input/archive-sha256
+
+      - name: Prepare and install release snapshot
+        shell: bash
+        env:
+          RELEASE_SHA: ${{ github.sha }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+
+          mapfile -t archives < <(
+            nix develop .#release --command \
+              make --silent release-artifacts
+          )
+
+          nix develop .#release --command \
+            tool/release/release prepare \
+            "$RELEASE_TAG" \
+            "$RELEASE_SHA" \
+            release-input/previous-manifest.json \
+            release-handoff \
+            "${archives[@]}"
+
+          mapfile -t packages < <(
+            jq -r \
+              '.packages[] | select(.lifecycle == "active") | .name' \
+              release-handoff/assets/manifest.json
+          )
+          test "${#packages[@]}" -gt 0
+
+          installables=()
+          version_assignments=()
+          for package in "${packages[@]}"; do
+            installables+=(".#${package}")
+            version="$(nix eval --raw ".#${package}.version")"
+            version_assignments+=("${package}=${version}")
+          done
+
+          nix build --no-link "${installables[@]}"
+          nix develop .#release --command \
+            tool/release/release check-versions \
+            release-handoff/assets/manifest.json \
+            "${version_assignments[@]}"
+
+          nix develop .#release --command \
+            tool/release/release verify-install \
+            release-handoff/assets/manifest.json
+
+      - name: Upload verified handoff
+        id: upload
+        uses: actions/upload-artifact@v7.0.1
+        with:
+          name: release-${{ github.run_id }}-${{ github.run_attempt }}
+          path: release-handoff/
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 0
+
+  publish:
+    name: Publish release
+    needs: build
+    if: >-
+      github.repository == 'brsvh/emacs-proofread' &&
+      github.ref_type == 'tag' &&
+      startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+
+    permissions:
+      contents: write
+
+    environment:
+      name: release
+
+    steps:
+      - name: Download verified handoff
+        uses: actions/download-artifact@v8.0.1
+        with:
+          artifact-ids: ${{ needs.build.outputs.artifact_id }}
+          path: release-handoff
+          digest-mismatch: error
+
+      - name: Validate verified handoff
+        shell: bash
+        env:
+          RELEASE_SHA: ${{ github.sha }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+
+          test -f release-handoff/plan.json
+          test -f release-handoff/release-notes.md
+          test -f release-handoff/expected-assets.txt
+          test -f release-handoff/previous-manifest.json
+          test -d release-handoff/assets
+
+          jq -e \
+            --arg tag "$RELEASE_TAG" \
+            --arg commit "$RELEASE_SHA" \
+            '.tag == $tag and .commit == $commit' \
+            release-handoff/plan.json
+
+          sort --check release-handoff/expected-assets.txt
+          test -z "$(
+            sort release-handoff/expected-assets.txt \
+              | uniq --repeated
+          )"
+
+          while IFS= read -r name; do
+            if [[ ! "$name" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]]; then
+              printf 'Unsafe release asset name: %s\n' "$name" >&2
+              exit 1
+            fi
+          done < release-handoff/expected-assets.txt
+
+          test -z "$(
+            find release-handoff/assets \
+              -mindepth 1 -maxdepth 1 ! -type f -print -quit
+          )"
+          find release-handoff/assets \
+            -mindepth 1 -maxdepth 1 -type f -printf '%f\n' \
+            | sort > release-handoff/actual-assets.txt
+          cmp \
+            release-handoff/expected-assets.txt \
+            release-handoff/actual-assets.txt
+
+          (
+            cd release-handoff/assets
+            sha256sum --check --strict SHA256SUMS
+          )
+
+      - name: Publish or resume immutable release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_SHA: ${{ github.sha }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+
+          api() {
+            gh api \
+              -H "X-GitHub-Api-Version: ${GITHUB_API_VERSION}" \
+              "$@"
+          }
+
+          api "repos/${GITHUB_REPOSITORY}/immutable-releases" \
+            | jq -e '.enabled == true'
+
+          release_json=release-handoff/release.json
+          if api \
+            "repos/${GITHUB_REPOSITORY}/releases/tags/${RELEASE_TAG}" \
+            > "$release_json" 2>/dev/null; then
+            :
+          else
+            gh release create "$RELEASE_TAG" \
+              --draft \
+              --verify-tag \
+              --target "$RELEASE_SHA" \
+              --title "$RELEASE_TAG" \
+              --notes-file release-handoff/release-notes.md
+            api \
+              "repos/${GITHUB_REPOSITORY}/releases/tags/${RELEASE_TAG}" \
+              > "$release_json"
+          fi
+
+          jq -e \
+            --arg tag "$RELEASE_TAG" \
+            '.tag_name == $tag and (.draft == true or .immutable == true)' \
+            "$release_json"
+
+          jq -r '.assets[].name' "$release_json" \
+            | sort > release-handoff/remote-assets.txt
+          while IFS= read -r name; do
+            grep -Fqx "$name" release-handoff/expected-assets.txt || {
+              printf 'Unexpected remote release asset: %s\n' "$name" >&2
+              exit 1
+            }
+            rm -rf release-handoff/remote-asset
+            mkdir release-handoff/remote-asset
+            gh release download "$RELEASE_TAG" \
+              --pattern "$name" \
+              --dir release-handoff/remote-asset
+            cmp \
+              "release-handoff/assets/${name}" \
+              "release-handoff/remote-asset/${name}"
+          done < release-handoff/remote-assets.txt
+
+          if jq -e '.draft == true' "$release_json" >/dev/null; then
+            while IFS= read -r name; do
+              if ! grep -Fqx \
+                "$name" release-handoff/remote-assets.txt; then
+                gh release upload "$RELEASE_TAG" \
+                  "release-handoff/assets/${name}"
+              fi
+            done < release-handoff/expected-assets.txt
+
+            api \
+              "repos/${GITHUB_REPOSITORY}/releases/tags/${RELEASE_TAG}" \
+              > "$release_json"
+            jq -r '.assets[].name' "$release_json" \
+              | sort > release-handoff/remote-assets.txt
+            cmp \
+              release-handoff/expected-assets.txt \
+              release-handoff/remote-assets.txt
+
+            gh release edit "$RELEASE_TAG" \
+              --draft=false \
+              --latest
+          fi
+
+          for _attempt in 1 2 3 4 5; do
+            api \
+              "repos/${GITHUB_REPOSITORY}/releases/tags/${RELEASE_TAG}" \
+              > "$release_json"
+            if jq -e \
+              '.draft == false and .immutable == true' \
+              "$release_json" >/dev/null; then
+              break
+            fi
+            sleep 2
+          done
+          jq -e \
+            '.draft == false and .immutable == true' \
+            "$release_json"
+
+          rm -rf published-assets
+          mkdir published-assets
+          while IFS= read -r name; do
+            gh release download "$RELEASE_TAG" \
+              --pattern "$name" \
+              --dir published-assets
+            cmp \
+              "release-handoff/assets/${name}" \
+              "published-assets/${name}"
+          done < release-handoff/expected-assets.txt
+
+      - name: Check out release metadata
+        uses: actions/checkout@v6.0.3
+        with:
+          ref: releases
+          path: release-metadata
+          fetch-depth: 1
+          persist-credentials: true
+
+      - name: Update release metadata
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+
+          cd release-metadata
+          mkdir -p manifests
+          history="manifests/${RELEASE_TAG}.json"
+          published="../published-assets/manifest.json"
+          previous="../release-handoff/previous-manifest.json"
+
+          if test -f "$history"; then
+            cmp "$history" "$published"
+            if test "$(jq -r '.tag' manifest.json)" \
+              = "$RELEASE_TAG"; then
+              cmp manifest.json "$published"
+            fi
+          else
+            cmp manifest.json "$previous"
+            cp "$published" "$history"
+            cp "$published" manifest.json
+          fi
+
+          if test -n "$(git status --porcelain)"; then
+            git config user.name "github-actions[bot]"
+            git config user.email \
+              "41898282+github-actions[bot]@users.noreply.github.com"
+            git add manifest.json "$history"
+            git commit -m "Record release ${RELEASE_TAG}"
+            git push origin HEAD:releases
+          fi

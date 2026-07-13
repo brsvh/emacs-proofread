@@ -10,6 +10,9 @@ EMACS_BATCH := $(EMACS) -Q --batch
 BUILD_FILE := Makefile
 DIST_DIR := dist
 LISP_DIR := lisp
+RELEASE_PACKAGES := proofread proofread-popup
+RELEASE_ARCHIVE_TARGETS := \
+	$(addsuffix -archive,$(RELEASE_PACKAGES))
 
 # Core package files.
 PROOFREAD_LISP_FILES := $(LISP_DIR)/proofread.el
@@ -40,8 +43,8 @@ ELC_FILES := \
 	$(PROOFREAD_ELC_FILES) \
 	$(PROOFREAD_POPUP_ELC_FILES)
 ARCHIVE_STAMPS := \
-	$(PROOFREAD_ARCHIVE_STAMP) \
-	$(PROOFREAD_POPUP_ARCHIVE_STAMP)
+	$(addprefix $(DIST_DIR)/., \
+	$(addsuffix -archive,$(RELEASE_PACKAGES)))
 GENERATED_FILES := $(PKG_FILES) $(AUTOLOAD_FILES) $(ELC_FILES)
 
 # Batch Emacs expressions.
@@ -110,7 +113,9 @@ endef
 	proofread-popup-pkg \
 	proofread-popup-autoloads \
 	proofread-popup-compile \
-	proofread-popup-archive
+	proofread-popup-archive \
+	release-archives \
+	release-artifacts
 
 all: proofread proofread-popup
 
@@ -141,6 +146,14 @@ proofread-popup-autoloads: $(PROOFREAD_POPUP_AUTOLOADS)
 proofread-popup-compile: $(PROOFREAD_POPUP_ELC_FILES)
 
 proofread-popup-archive: $(PROOFREAD_POPUP_ARCHIVE_STAMP)
+
+release-archives: $(RELEASE_ARCHIVE_TARGETS)
+
+release-artifacts: release-archives
+	@set -eu
+	for stamp in $(ARCHIVE_STAMPS); do
+		cat "$$stamp"
+	done
 
 $(PROOFREAD_PKG): $(PROOFREAD_MAIN) $(BUILD_FILE)
 $(PROOFREAD_POPUP_PKG): $(PROOFREAD_POPUP_MAIN) $(BUILD_FILE)
@@ -238,7 +251,7 @@ $(ARCHIVE_STAMPS):
 		$(RM) "$$old_archive"
 	fi
 	printf '%s\n' "$$archive" > "$@"
-	printf 'Created %s\n' "$$archive"
+	printf 'Created %s\n' "$$archive" >&2
 
 clean:
 	$(RM) $(GENERATED_FILES)

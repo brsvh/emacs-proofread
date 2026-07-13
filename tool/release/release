@@ -1,0 +1,15 @@
+#!/bin/sh
+
+set -eu
+
+script_dir=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
+init_dir=$(mktemp -d)
+trap 'rm -rf "$init_dir"' EXIT HUP INT TERM
+
+emacs \
+	--batch \
+	--init-directory "$init_dir" \
+	-L "$script_dir" \
+	-l proofread-release \
+	-f proofread-release-main \
+	-- "$@"

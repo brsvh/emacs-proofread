@@ -180,6 +180,8 @@
               foldl'
               versions
               ;
+
+            release = with pkgs; emacsPackagesFor emacs31;
           in
           {
             _module = {
@@ -196,7 +198,13 @@
               };
             };
 
-            packages =
+            packages = {
+              inherit (release)
+                proofread
+                proofread-popup
+                ;
+            }
+            //
               foldl'
                 (
                   acc: base:
@@ -204,6 +212,7 @@
                     inherit (pkgs)
                       coreutils
                       emacsPackagesFor
+                      gnutar
                       writeShellApplication
                       ;
 
@@ -250,12 +259,14 @@
 
                           runtimeInputs = [
                             coreutils
+                            gnutar
                           ];
 
                           text = ''
                             coreInitdir="$(mktemp --tmpdir -d emacs-proofread-test-XXXXXX)"
                             popupInitdir="$(mktemp --tmpdir -d emacs-proofread-popup-test-XXXXXX)"
-                            trap 'rm -rf "$coreInitdir" "$popupInitdir"' EXIT
+                            releaseInitdir="$(mktemp --tmpdir -d emacs-proofread-release-test-XXXXXX)"
+                            trap 'rm -rf "$coreInitdir" "$popupInitdir" "$releaseInitdir"' EXIT
 
                             "${emacs-with-proofread}/bin/emacs" --batch \
                               --init-directory "$coreInitdir" \
@@ -266,6 +277,17 @@
                               --init-directory "$popupInitdir" \
                               -l "${
                                 projectRoot + /test/proofread-popup-tests.el
+                              }" \
+                              -f ert-run-tests-batch-and-exit
+
+                            "${emacs-with-proofread}/bin/emacs" --batch \
+                              --init-directory "$releaseInitdir" \
+                              -L "${projectRoot + /tool/release}" \
+                              -l "${
+                                projectRoot + /tool/release/proofread-release.el
+                              }" \
+                              -l "${
+                                projectRoot + /test/proofread-release-tests.el
                               }" \
                               -f ert-run-tests-batch-and-exit
                           '';
@@ -291,6 +313,9 @@
                             cp "${
                               projectRoot + /lisp/proofread-popup.el
                             }" "$workdir/proofread-popup.el"
+                            cp "${
+                              projectRoot + /tool/release/proofread-release.el
+                            }" "$workdir/proofread-release.el"
 
                             "${emacs-with-proofread}/bin/emacs" --batch \
                               --init-directory "$initdir" \
@@ -305,6 +330,12 @@
                               --eval '(setq byte-compile-error-on-warn t)' \
                               -f batch-byte-compile \
                               "$workdir/proofread-popup.el"
+
+                            "${emacs-with-proofread}/bin/emacs" --batch \
+                              --init-directory "$initdir" \
+                              --eval '(setq byte-compile-error-on-warn t)' \
+                              -f batch-byte-compile \
+                              "$workdir/proofread-release.el"
                           '';
                         };
                   }
