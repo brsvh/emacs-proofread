@@ -6549,7 +6549,8 @@ This covers URLs, email, invisible text, faces, and properties."
                      chunk proofread-test--backend))
            (work-key-text
             (prin1-to-string (proofread--request-work-key request))))
-      (proofread--queue-request request proofread-test--backend)
+      (proofread--enqueue-requests
+       (list request) proofread-test--backend)
       (aset name 0 ?o)
       (should
        (equal (plist-get (plist-get request :backend-identity)
@@ -6960,8 +6961,8 @@ This covers URLs, email, invisible text, faces, and properties."
            (ready (nth 2 requests))
            dispatched)
       (should (= (length requests) 3))
-      (dolist (request requests)
-        (proofread--queue-request request proofread-test--backend))
+      (proofread--enqueue-requests
+       requests proofread-test--backend)
       (proofread--invalidate-request invalidated)
       (proofread--set-request-state-flag superseded :superseded)
       (let ((proofread-max-concurrent-requests 0))
@@ -6998,7 +6999,8 @@ This covers URLs, email, invisible text, faces, and properties."
              (request (proofread--make-backend-request
                        chunk proofread-test--backend))
              (log-id (plist-get request :log-id)))
-        (proofread--queue-request request proofread-test--backend)
+        (proofread--enqueue-requests
+         (list request) proofread-test--backend)
         (cl-letf (((symbol-function 'proofread--fresh-request-p)
                    (lambda (_request)
                      (unless reentered
@@ -7046,7 +7048,8 @@ This covers URLs, email, invisible text, faces, and properties."
              (new-chunk (proofread--make-request-ready-chunk 2 6))
              (old (proofread--make-backend-request
                    old-chunk proofread-test--backend)))
-        (proofread--queue-request old proofread-test--backend)
+        (proofread--enqueue-requests
+         (list old) proofread-test--backend)
         (cl-letf (((symbol-function 'proofread--fresh-request-p)
                    (lambda (_request)
                      (unless reentered
@@ -7126,7 +7129,8 @@ This covers URLs, email, invisible text, faces, and properties."
                    (proofread--dispatch-queued-requests))))))
         (setq victim (plist-put victim :handle 'victim-handle))
         (proofread--register-active-request victim)
-        (proofread--queue-request unrelated proofread-test--backend)
+        (proofread--enqueue-requests
+         (list unrelated) proofread-test--backend)
         (cl-letf (((symbol-function 'proofread--fresh-request-p)
                    (lambda (_request) t))
                   ((symbol-function 'proofread--backend-check)
@@ -7173,7 +7177,8 @@ This covers URLs, email, invisible text, faces, and properties."
       (let* ((chunk (proofread--make-request-ready-chunk 1 6))
              (request (proofread--make-backend-request
                        chunk proofread-test--backend)))
-        (proofread--queue-request request proofread-test--backend)
+        (proofread--enqueue-requests
+         (list request) proofread-test--backend)
         (cl-letf (((symbol-function 'proofread--fresh-request-p)
                    (lambda (_request)
                      (unless edited
@@ -7221,7 +7226,8 @@ This covers URLs, email, invisible text, faces, and properties."
                    (goto-char (point-min))
                    (delete-char 1)
                    (insert "X"))))))
-        (proofread--queue-request request proofread-test--backend)
+        (proofread--enqueue-requests
+         (list request) proofread-test--backend)
         (cl-letf (((symbol-function 'proofread--fresh-request-p)
                    (lambda (_request) t))
                   ((symbol-function 'proofread--backend-check)
@@ -7259,7 +7265,8 @@ This covers URLs, email, invisible text, faces, and properties."
              (waiting-log-id (plist-get waiting :log-id)))
         (setq active (plist-put active :handle 'old-handle))
         (proofread--register-active-request active)
-        (proofread--queue-request waiting proofread-test--backend)
+        (proofread--enqueue-requests
+         (list waiting) proofread-test--backend)
         (cl-letf (((symbol-function 'proofread--fresh-request-p)
                    (lambda (_request) t))
                   ((symbol-function 'proofread--backend-check)
@@ -7326,7 +7333,8 @@ This covers URLs, email, invisible text, faces, and properties."
                  (proofread--make-backend-request
                   (car chunks) proofread-test--backend))
                 (waiting-log-id (plist-get waiting :log-id)))
-           (proofread--queue-request waiting proofread-test--backend)
+           (proofread--enqueue-requests
+            (list waiting) proofread-test--backend)
            (cl-letf (((symbol-function 'proofread--backend-check)
                       (lambda (request _callback &optional _backend)
                         (push (plist-get request :log-id)
@@ -7379,7 +7387,8 @@ This covers URLs, email, invisible text, faces, and properties."
               (waiting-log-id (plist-get waiting :log-id)))
          (setq active (plist-put active :handle 'old-handle))
          (proofread--register-active-request active)
-         (proofread--queue-request waiting proofread-test--backend)
+         (proofread--enqueue-requests
+          (list waiting) proofread-test--backend)
          (cl-letf (((symbol-function 'proofread--backend-check)
                     (lambda (request _callback &optional _backend)
                       (push (plist-get request :log-id)
@@ -7426,7 +7435,8 @@ This covers URLs, email, invisible text, faces, and properties."
                       (proofread--make-backend-request
                        chunk proofread-test--backend))
                      (log-id (plist-get request :log-id)))
-                (proofread--queue-request request proofread-test--backend)
+                (proofread--enqueue-requests
+                 (list request) proofread-test--backend)
                 (cl-letf (((symbol-function
                             'proofread--fresh-request-p)
                            (lambda (_request) t))
@@ -7457,7 +7467,8 @@ This covers URLs, email, invisible text, faces, and properties."
       (let* ((chunk (proofread--make-request-ready-chunk 1 6))
              (request (proofread--make-backend-request
                        chunk proofread-test--backend)))
-        (proofread--queue-request request proofread-test--backend)
+        (proofread--enqueue-requests
+         (list request) proofread-test--backend)
         (cl-letf (((symbol-function 'proofread--submit-request)
                    (lambda (&rest _)
                      (error "Simulated submission failure"))))
@@ -7485,7 +7496,8 @@ This covers URLs, email, invisible text, faces, and properties."
              (old (proofread--make-backend-request
                    old-chunk proofread-test--backend))
              (old-log-id (plist-get old :log-id)))
-        (proofread--queue-request old proofread-test--backend)
+        (proofread--enqueue-requests
+         (list old) proofread-test--backend)
         (let ((proofread-request-log-hook
                (list
                 (lambda (event)
@@ -7699,9 +7711,9 @@ This covers URLs, email, invisible text, faces, and properties."
                       '((7 . 9))))
                 proofread-test--backend)))
          (proofread--register-active-request active)
-         (proofread--queue-request waiting proofread-test--backend)
          (proofread--cache-write-request cached nil)
-         (proofread--queue-request cached proofread-test--backend)
+         (proofread--enqueue-requests
+          (list waiting cached) proofread-test--backend)
          (add-hook 'proofread-diagnostics-changed-hook
                    (lambda ()
                      (setq calls (1+ (or calls 0)))
@@ -7808,7 +7820,8 @@ This covers URLs, email, invisible text, faces, and properties."
                   (car (proofread--dispatch-request-ready-chunks
                         (list older-chunk) proofread-test--backend))))
              (should older)
-             (proofread--queue-request unrelated proofread-test--backend)
+             (proofread--enqueue-requests
+              (list unrelated) proofread-test--backend)
              (should (= (length proofread--request-queue) 1))
              (should
               (equal
@@ -7849,8 +7862,8 @@ This covers URLs, email, invisible text, faces, and properties."
                         (plist-get request :log-id))
                       requests)))
         (should (= (length requests) 3))
-        (dolist (request requests)
-          (proofread--queue-request request proofread-test--backend))
+        (proofread--enqueue-requests
+         requests proofread-test--backend)
         (cl-letf (((symbol-function 'proofread--backend-check)
                    (lambda (request callback &optional _backend)
                      (push (plist-get request :log-id)

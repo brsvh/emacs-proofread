@@ -2292,16 +2292,6 @@ Return one of the symbols `sent', `cached', `full', `stale', or
          request 'cancelled :reason 'cleared))))
   nil)
 
-(defun proofread--queue-request (request backend)
-  "Queue REQUEST for BACKEND until a concurrency slot is available."
-  (if (proofread--enqueue-requests (list request) backend)
-      (progn
-        (proofread--record-request-event
-         request 'queued-request
-         :backend backend)
-        request)
-    (proofread--reject-request-during-clear request)))
-
 (defun proofread--request-work-key (request)
   "Return the identity of REQUEST's proofreading work."
   (list (plist-get request :generation)
