@@ -449,20 +449,32 @@ EXTRA-FILES is an alist of additional relative file names and contents."
          (output (expand-file-name "handoff" directory))
          (core-name "proofread-release-fixture-core")
          (addon-name "proofread-release-fixture-addon")
-         (util-name "proofread-release-fixture-util")
-         (util-file (concat util-name ".el"))
+         (llm-name (concat core-name "-llm"))
+         (llm-file (concat llm-name ".el"))
+         (languagetool-name (concat core-name "-languagetool"))
+         (languagetool-file (concat languagetool-name ".el"))
          (core
           (proofread-release-tests--create-archive
            directory core-name "1.0.0"
            '((emacs "30.1"))
-           (format "(require '%s)" util-name)
-           `((,util-file
+           (format "(require '%s)\n(require '%s)"
+                   llm-name languagetool-name)
+           `((,llm-file
               . ,(format
                   (concat
-                   ";;; %s --- Release fixture utility  "
+                   ";;; %s --- Release fixture LLM backend  "
                    "-*- lexical-binding: t; -*-\n\n"
                    "(provide '%s)\n;;; %s ends here\n")
-                  util-file util-name util-file)))))
+                  llm-file llm-name llm-file))
+             (,languagetool-file
+              . ,(format
+                  (concat
+                   ";;; %s --- Release fixture LanguageTool backend  "
+                   "-*- lexical-binding: t; -*-\n\n"
+                   "(provide '%s)\n;;; %s ends here\n")
+                  languagetool-file
+                  languagetool-name
+                  languagetool-file)))))
          (addon
           (proofread-release-tests--create-archive
            directory addon-name "1.1.0"

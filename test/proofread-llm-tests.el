@@ -1,0 +1,1746 @@
+;;; proofread-llm-tests.el --- Tests for the Proofread LLM backend  -*- lexical-binding: t; -*-
+
+;; Copyright (C) 2026 Bingshan Chang <chang@bingshan.org>
+
+;; This file is not part of GNU Emacs.
+
+;;; Commentary:
+
+;; ERT tests for the Proofread LLM backend.
+
+;;; Code:
+
+(require 'cl-lib)
+(require 'ert)
+(require 'json)
+(require 'proofread)
+(require 'proofread-llm)
+
+(declare-function make-llm-deepseek "llm-deepseek" (&rest rest))
+
+(defun proofread-llm-test--tree-member-p (needle tree)
+  "Return non-nil if NEEDLE appears anywhere in TREE."
+  (cond
+   ((eq needle tree) t)
+   ((consp tree)
+    (or (proofread-llm-test--tree-member-p needle (car tree))
+        (proofread-llm-test--tree-member-p needle (cdr tree))))
+   (t nil)))
+
+(defun proofread-llm-test--diagnostic-for-range (beg end text)
+  "Return a sample diagnostic for BEG, END, and TEXT."
+  (proofread--make-diagnostic
+   :beg beg
+   :end end
+   :text text
+   :kind 'spelling
+   :message "Possible misspelling"
+   :suggestions '("hello")
+   :source 'proofread-llm-test-source))
+
+(defun proofread-llm-test--wait-for (predicate &optional timeout)
+  "Wait until PREDICATE returns non-nil or TIMEOUT seconds pass."
+  (let ((deadline (+ (float-time) (or timeout 1.0)))
+        result)
+    (while (and (not (setq result (funcall predicate)))
+                (< (float-time) deadline))
+      (accept-process-output nil 0.01))
+    result))
+
+(defconst proofread-llm-test--provider 'proofread-llm-test-provider
+  "Provider object used for local LLM backend tests.")
+
+(defconst proofread-llm-test--provider-identity
+  "proofread-llm-test-provider"
+  "Stable provider identity used for local LLM backend tests.")
+
+(defun proofread-llm-test--capabilities (_provider)
+  "Return LLM capabilities used by local backend tests."
+  '(json-response))
+
+(defmacro proofread-llm-test--with-capabilities (&rest body)
+  "Run BODY with structured output enabled for the local provider."
+  (declare (indent 0) (debug (body)))
+  `(cl-letf (((symbol-function 'llm-capabilities)
+              #'proofread-llm-test--capabilities))
+     ,@body))
+
+(defmacro proofread-llm-test--with-success (content &rest body)
+  "Run BODY with `llm-chat-async' configured to return CONTENT."
+  (declare (indent 1) (debug (form body)))
+  `(let ((proofread-llm-provider proofread-llm-test--provider)
+         (proofread-llm-provider-identity
+          proofread-llm-test--provider-identity))
+     (cl-letf (((symbol-function 'llm-chat-async)
+                (lambda (_provider _prompt success _error &optional
+                                   _multi-output)
+                  (funcall success ,content)
+                  'proofread-llm-test-handle))
+               ((symbol-function 'llm-capabilities)
+                #'proofread-llm-test--capabilities))
+       ,@body)))
+
+(defmacro proofread-llm-test--with-error (error message &rest body)
+  "Run BODY with `llm-chat-async' signaling ERROR and MESSAGE."
+  (declare (indent 2) (debug (form form body)))
+  `(let ((proofread-llm-provider proofread-llm-test--provider)
+         (proofread-llm-provider-identity
+          proofread-llm-test--provider-identity))
+     (cl-letf (((symbol-function 'llm-chat-async)
+                (lambda (_provider _prompt _success error-callback
+                                   &optional _multi-output)
+                  (funcall error-callback ,error ,message)
+                  'proofread-llm-test-handle))
+               ((symbol-function 'llm-capabilities)
+                #'proofread-llm-test--capabilities))
+       ,@body)))
+
+(defun proofread-llm-test--response-content (diagnostics)
+  "Return structured response text containing DIAGNOSTICS."
+  (json-encode `(("diagnostics" . ,(vconcat diagnostics)))))
+
+(defun proofread-llm-test--response-diagnostic
+    (beg end text &optional suggestions)
+  "Return a diagnostic alist for BEG, END, TEXT, and SUGGESTIONS."
+  `(("kind" . "spelling")
+    ("message" . "Possible misspelling")
+    ("text" . ,text)
+    ("range" . (("beg" . ,beg)
+                ("end" . ,end)))
+    ("suggestions" . ,(vconcat (or suggestions '("hello"))))))
+
+(defun proofread-llm-test--response-diagnostic-with-fields
+    (beg end text fields)
+  "Return a response diagnostic for BEG, END, TEXT, and FIELDS."
+  (append (cl-remove-if (lambda (field)
+                          (assoc (car field) fields))
+                        (proofread-llm-test--response-diagnostic
+                         beg end text))
+          fields))
+
+(defun proofread-llm-test--structured-batch (request diagnostics)
+  "Return parsed diagnostic batch for REQUEST and DIAGNOSTICS."
+  (proofread-llm--diagnostic-batch-from-structured-response
+   request (proofread-llm-test--response-content diagnostics) 'llm))
+
+(defun proofread-llm-test--structured-issue-reason (request diagnostic)
+  "Return the first issue reason for DIAGNOSTIC in REQUEST."
+  (plist-get
+   (car (plist-get
+         (proofread-llm-test--structured-batch request (list diagnostic))
+         :issues))
+   :reason))
+
+(ert-deftest proofread-llm-test-positive-option-rejects-zero-in-customize ()
+  "Customize rejects a non-positive LLM diagnostic pass count."
+  (let ((symbol 'proofread-llm-max-diagnostic-passes))
+    (should (eq (get symbol 'custom-set)
+                #'proofread--set-positive-integer-option))
+    (should-error
+     (funcall (get symbol 'custom-set) symbol 0))))
+
+(ert-deftest proofread-llm-test-backend-identity-is-cache-compatible
+    ()
+  "LLM backend identity is structured and usable for cache entries."
+  (with-temp-buffer
+    (insert "Alpha")
+    (proofread-mode 1)
+    (let* ((proofread-backend 'llm)
+           (proofread-llm-provider proofread-llm-test--provider)
+           (proofread-llm-provider-identity
+            proofread-llm-test--provider-identity)
+           (chunk (car (proofread--request-ready-chunks-for-ranges
+                        (list (cons (point-min) (point-max))))))
+           (request (proofread--make-backend-request chunk 'llm))
+           (diagnostic
+            (proofread-llm-test--diagnostic-for-range 1 6 "Alpha")))
+      (should (equal (proofread--backend-identity)
+                     `(:backend llm
+                                :provider
+                                ,proofread-llm-test--provider-identity
+                                :response-strategy prompt-json
+                                :diagnostic-passes 3
+                                :contract-version 2)))
+      (should (proofread--backend-identity-p
+               (plist-get request :backend-identity)))
+      (proofread--cache-write-request request (list diagnostic))
+      (should (proofread--cache-read-request request)))))
+
+(ert-deftest proofread-llm-test-backend-registers-adapter ()
+  "Register LLM check, identity, and cancellation functions."
+  (let ((descriptor (gethash 'llm proofread--backend-registry)))
+    (should (eq (plist-get descriptor :check)
+                #'proofread-llm--backend-check))
+    (should (eq (plist-get descriptor :identity)
+                #'proofread-llm--provider-identity))
+    (should (eq (plist-get descriptor :cancel)
+                #'proofread-llm--cancel-request-handle))))
+
+(ert-deftest
+    proofread-llm-test-backend-support-is-configuration-independent ()
+  "Keep LLM support detectable despite configuration errors."
+  (let ((proofread-backend 'llm)
+        (proofread-llm-provider nil))
+    (should (proofread--supported-backend-p))
+    (should (proofread--supported-backend-p 'llm)))
+  (let ((proofread-backend 'llm)
+        (proofread-llm-provider 'proofread-llm-test-provider))
+    (should (proofread--supported-backend-p))
+    (should (proofread--supported-backend-p 'llm)))
+  (let ((proofread-backend 'llm)
+        (proofread-llm-provider 'proofread-llm-test-provider)
+        (proofread-llm-response-strategy 'provider-json))
+    (should (proofread--supported-backend-p))
+    (should (proofread--supported-backend-p 'llm)))
+  (proofread-llm-test--with-capabilities
+   (let ((proofread-backend 'llm)
+         (proofread-llm-provider proofread-llm-test--provider))
+     (should (proofread--supported-backend-p))
+     (should (proofread--supported-backend-p 'llm)))))
+
+(ert-deftest
+    proofread-llm-test-provider-unavailable-is-asynchronous-error ()
+  "Missing LLM provider reports an asynchronous backend error."
+  (with-temp-buffer
+    (insert "helo")
+    (let* ((proofread-llm-provider nil)
+           (chunk (car (proofread--request-ready-chunks-for-ranges
+                        (list (cons (point-min) (point-max))))))
+           (request (proofread--make-backend-request chunk 'llm))
+           result)
+      (should (proofread--backend-check
+               request
+               (lambda (backend-result)
+                 (setq result backend-result))
+               'llm))
+      (should-not result)
+      (should (proofread-llm-test--wait-for (lambda () result)))
+      (should (eq (plist-get result :status) 'error))
+      (should (eq (plist-get result :error)
+                  'llm-provider-unavailable)))))
+
+(ert-deftest
+    proofread-llm-test-structured-output-unavailable-is-asynchronous-error
+    ()
+  "Report missing schema output for forced provider JSON."
+  (with-temp-buffer
+    (insert "helo")
+    (let* ((proofread-llm-provider proofread-llm-test--provider)
+           (proofread-llm-response-strategy 'provider-json)
+           (chunk (car (proofread--request-ready-chunks-for-ranges
+                        (list (cons (point-min) (point-max))))))
+           (request (proofread--make-backend-request chunk 'llm))
+           result)
+      (cl-letf (((symbol-function 'llm-capabilities)
+                 (lambda (_provider)
+                   '(generation)))
+                ((symbol-function 'llm-chat-async)
+                 (lambda (&rest _)
+                   (error "Unexpected llm-chat-async call"))))
+        (should (proofread--backend-check
+                 request
+                 (lambda (backend-result)
+                   (setq result backend-result))
+                 'llm))
+        (should-not result)
+        (should (proofread-llm-test--wait-for (lambda () result)))
+        (should (eq (plist-get result :status) 'error))
+        (should (eq (plist-get result :error)
+                    'llm-structured-output-unavailable))))))
+
+(ert-deftest
+    proofread-llm-test-deepseek-v4-flash-uses-prompt-json-fallback ()
+  "Use prompt-only JSON for DeepSeek v4 flash without schemas."
+  (require 'llm-deepseek)
+  (with-temp-buffer
+    (insert "helo")
+    (let* ((proofread-llm-provider
+            (make-llm-deepseek :chat-model "deepseek-v4-flash"))
+           (chunk (car (proofread--request-ready-chunks-for-ranges
+                        (list (cons (point-min) (point-max))))))
+           (request (proofread--make-backend-request chunk 'llm))
+           (content (proofread-llm-test--response-content nil))
+           captured-prompt
+           result)
+      (should-not (memq 'json-response
+                        (llm-capabilities proofread-llm-provider)))
+      (cl-letf (((symbol-function 'llm-chat-async)
+                 (lambda (_provider prompt success _error
+                                    &optional _multi-output)
+                   (setq captured-prompt prompt)
+                   (funcall success content)
+                   'proofread-llm-test-handle)))
+        (should (proofread--backend-check
+                 request
+                 (lambda (backend-result)
+                   (setq result backend-result))
+                 'llm))
+        (should-not result)
+        (should (proofread-llm-test--wait-for (lambda () result)))
+        (should (eq (plist-get result :status) 'ok))
+        (should-not (plist-get result :diagnostics))
+        (should-not (llm-chat-prompt-response-format captured-prompt))
+        (let* ((interaction
+                (car (llm-chat-prompt-interactions captured-prompt)))
+               (prompt-text
+                (llm-chat-prompt-interaction-content interaction)))
+          (should (string-match-p "JSON schema:" prompt-text))
+          (should (string-match-p "no Markdown code fence"
+                                  prompt-text))
+          (should (string-match-p "Text:\nhelo" prompt-text)))))))
+
+(ert-deftest proofread-llm-test-provider-identity-is-stable ()
+  "LLM identity uses stable provider metadata, not provider objects."
+  (let ((proofread-backend 'llm)
+        (proofread-llm-provider
+         [:proofread-llm-test-provider :api-key "secret-token"])
+        (proofread-llm-provider-identity nil))
+    (cl-letf (((symbol-function 'llm-name)
+               (lambda (_provider)
+                 "qwen3:1.7b")))
+      (let ((identity (proofread--backend-identity)))
+        (should (eq (plist-get identity :backend) 'llm))
+        (let ((provider (plist-get identity :provider)))
+          (should (equal (plist-get provider :name) "qwen3:1.7b"))
+          (should (integerp (plist-get provider :session))))
+        (should (eq (plist-get identity :response-strategy)
+                    'prompt-json))
+        (should (= (plist-get identity :contract-version) 2))
+        (should-not (string-match-p
+                     "secret-token"
+                     (prin1-to-string identity)))
+        (dolist (volatile-key
+                 '(:id :buffer :callback :timer :process :request))
+          (should-not (plist-member identity volatile-key)))))))
+
+(ert-deftest proofread-llm-test-provider-identity-cache-miss ()
+  "Changing stable LLM provider identity misses old cache entries."
+  (with-temp-buffer
+    (insert "Alpha")
+    (proofread-mode 1)
+    (let* ((proofread-backend 'llm)
+           (proofread-llm-provider 'proofread-llm-test-provider)
+           (proofread-llm-provider-identity "provider-a")
+           (chunk (car (proofread--request-ready-chunks-for-ranges
+                        (list (cons (point-min) (point-max))))))
+           (request (proofread--make-backend-request chunk))
+           (diagnostic
+            (proofread-llm-test--diagnostic-for-range 1 6 "Alpha")))
+      (proofread--cache-write-request request (list diagnostic))
+      (should (proofread--cache-read-request
+               (proofread--make-backend-request chunk)))
+      (let ((proofread-llm-provider-identity "provider-b"))
+        (should-not (proofread--cache-read-request
+                     (proofread--make-backend-request chunk)))))))
+
+(ert-deftest proofread-llm-test-provider-object-cache-miss ()
+  "Miss the cache when LLM provider objects change."
+  (with-temp-buffer
+    (insert "Alpha")
+    (proofread-mode 1)
+    (let* ((proofread-backend 'llm)
+           (proofread-llm-provider [:provider-a :api-key
+                                                "secret-token"])
+           (proofread-llm-provider-identity nil)
+           (chunk (car (proofread--request-ready-chunks-for-ranges
+                        (list (cons (point-min) (point-max))))))
+           (request (proofread--make-backend-request chunk))
+           (diagnostic
+            (proofread-llm-test--diagnostic-for-range 1 6 "Alpha")))
+      (proofread--cache-write-request request (list diagnostic))
+      (should (proofread--cache-read-request
+               (proofread--make-backend-request chunk)))
+      (let ((proofread-llm-provider [:provider-b :api-key
+                                                 "secret-token"]))
+        (let ((key (proofread--cache-key
+                    (proofread--make-backend-request chunk))))
+          (should-not (proofread-llm-test--tree-member-p
+                       proofread-llm-provider key))
+          (should-not (proofread-llm-test--tree-member-p
+                       "secret-token" key)))
+        (should-not (proofread--cache-read-request
+                     (proofread--make-backend-request chunk)))))))
+
+(ert-deftest
+    proofread-llm-test-dispatch-builds-schema-prompt-asynchronously ()
+  "Dispatch an async schema prompt built from request fields."
+  (with-temp-buffer
+    (text-mode)
+    (insert "helo")
+    (let* ((proofread-language "en")
+           (proofread-llm-provider 'proofread-llm-test-provider)
+           (proofread-llm-max-diagnostic-passes 1)
+           (chunk (car (proofread--request-ready-chunks-for-ranges
+                        (list (cons (point-min) (point-max))))))
+           (request (proofread--make-backend-request chunk 'llm))
+           (content
+            (proofread-llm-test--response-content
+             (list (proofread-llm-test--response-diagnostic 0 4 "helo"))))
+           captured-provider
+           captured-prompt
+           captured-multi-output
+           result)
+      (cl-letf (((symbol-function 'llm-chat-async)
+                 (lambda (provider prompt success _error
+                                   &optional multi-output)
+                   (setq captured-provider provider)
+                   (setq captured-prompt prompt)
+                   (setq captured-multi-output multi-output)
+                   (funcall success content)
+                   'proofread-llm-test-handle))
+                ((symbol-function 'llm-capabilities)
+                 #'proofread-llm-test--capabilities))
+        (let ((handle
+               (proofread--backend-check
+                request
+                (lambda (backend-result)
+                  (setq result backend-result))
+                'llm)))
+          (should (equal (plist-get handle :requests)
+                         '(proofread-llm-test-handle)))
+          (should (eq captured-provider proofread-llm-provider))
+          (should-not captured-multi-output)
+          (should (equal (llm-chat-prompt-response-format
+                          captured-prompt)
+                         proofread-llm--structured-response-schema))
+          (let* ((interaction
+                  (car (llm-chat-prompt-interactions
+                        captured-prompt)))
+                 (prompt-text
+                  (llm-chat-prompt-interaction-content interaction)))
+            (should (string-match-p "requested response schema"
+                                    prompt-text))
+            (should (string-match-p "Language: \"en\"" prompt-text))
+            (should (string-match-p "Major mode: text-mode"
+                                    prompt-text))
+            (should (string-match-p "Text:\nhelo" prompt-text)))
+          (should-not result)
+          (should (proofread-llm-test--wait-for (lambda () result)))
+          (should (eq (plist-get result :status) 'ok))
+          (should (eq (plist-get
+                       (car (plist-get result :diagnostics))
+                       :source)
+                      'llm)))))))
+
+(ert-deftest proofread-llm-test-prompt-describes-character-ranges ()
+  "LLM prompts describe chunk-relative character ranges."
+  (with-temp-buffer
+    (org-mode)
+    (insert "青晨六点。")
+    (let ((proofread-language "zh")
+          (proofread-context-size 0)
+          (proofread-llm-provider 'proofread-llm-test-provider)
+          captured-prompt)
+      (cl-letf (((symbol-function 'llm-chat-async)
+                 (lambda (_provider prompt _success _error
+                                    &optional _multi-output)
+                   (setq captured-prompt prompt)
+                   'proofread-llm-test-handle))
+                ((symbol-function 'llm-capabilities)
+                 #'proofread-llm-test--capabilities))
+        (let* ((chunk (car (proofread--request-ready-chunks-for-ranges
+                            (list (cons (point-min) (point-max))))))
+               (request (proofread--make-backend-request chunk 'llm)))
+          (proofread--backend-check request #'ignore 'llm)
+          (let* ((interaction
+                  (car (llm-chat-prompt-interactions
+                        captured-prompt)))
+                 (prompt-text
+                  (llm-chat-prompt-interaction-content interaction)))
+            (should (string-match-p "Text:\n青晨六点。" prompt-text))
+            (should (string-match-p "range end is exclusive"
+                                    prompt-text))))))))
+
+(ert-deftest proofread-llm-test-success-enters-overlay-pipeline ()
+  "Send fresh LLM diagnostics through the normal result path."
+  (with-temp-buffer
+    (insert "helo")
+    (proofread-mode 1)
+    (let* ((proofread-llm-provider 'proofread-llm-test-provider)
+           (proofread-llm-max-diagnostic-passes 1)
+           (content
+            (proofread-llm-test--response-content
+             (list (proofread-llm-test--response-diagnostic 1 5 "helo"))))
+           request
+           result)
+      (cl-letf (((symbol-function 'llm-chat-async)
+                 (lambda (_provider _prompt success _error
+                                    &optional _multi-output)
+                   (run-at-time 0 nil (lambda () (funcall success
+                                                          content)))
+                   'proofread-llm-test-handle))
+                ((symbol-function 'llm-capabilities)
+                 #'proofread-llm-test--capabilities))
+        (setq request
+              (proofread--make-backend-request
+               (car (proofread--request-ready-chunks-for-ranges
+                     (list (cons (point-min) (point-max)))))
+               'llm))
+        (should (proofread--dispatch-backend-request
+                 request
+                 (lambda (backend-result)
+                   (setq result backend-result)
+                   (proofread--handle-backend-result backend-result))
+                 'llm))
+        (should (proofread-llm-test--wait-for
+                 (lambda ()
+                   proofread--diagnostics)))
+        (should (eq (plist-get result :status) 'ok))
+        (should-not (plist-get result :partial))
+        (should (= (length (plist-get result :repairs)) 1))
+        (let ((repair (car (plist-get result :repairs))))
+          (should (eq (plist-get repair :action) 'repaired))
+          (should (= (plist-get repair :candidate-index) 0))
+          (should (= (plist-get repair :pass) 1))
+          (should (equal (plist-get repair :reported-range) '(1 . 5)))
+          (should (equal (plist-get repair :range) '(0 . 4))))
+        (should-not proofread--active-requests)
+        (should (= (length proofread--diagnostics) 1))
+        (should (= (length proofread--overlays) 1))
+        (should (= (hash-table-count proofread--cache) 1))))))
+
+(ert-deftest proofread-llm-test-collects-additional-diagnostic-passes
+    ()
+  "LLM backend can collect additional diagnostics in later passes."
+  (with-temp-buffer
+    (insert "helo wrld")
+    (proofread-mode 1)
+    (let* ((proofread-llm-provider 'proofread-llm-test-provider)
+           (proofread-llm-max-diagnostic-passes 2)
+           (chunk (car (proofread--request-ready-chunks-for-ranges
+                        (list (cons (point-min) (point-max))))))
+           request
+           (first
+            (proofread-llm-test--response-content
+             (list (proofread-llm-test--response-diagnostic 0 4 "helo"))))
+           (second
+            (proofread-llm-test--response-content
+             (list (proofread-llm-test--response-diagnostic 5 9 "wrld"))))
+           calls
+           prompts
+           result)
+      (cl-letf (((symbol-function 'llm-chat-async)
+                 (lambda (_provider prompt success _error
+                                    &optional _multi-output)
+                   (push prompt prompts)
+                   (setq calls (1+ (or calls 0)))
+                   (funcall success
+                            (if (= calls 1)
+                                first
+                              second))
+                   (intern (format "proofread-llm-test-handle-%d"
+                                   calls))))
+                ((symbol-function 'llm-capabilities)
+                 #'proofread-llm-test--capabilities))
+        (setq request (proofread--make-backend-request chunk 'llm))
+        (should (> (plist-get request :generation) 0))
+        (let ((handle (proofread--backend-check
+                       request
+                       (lambda (backend-result)
+                         (setq result backend-result))
+                       'llm)))
+          (should (= calls 2))
+          (should (= (length (plist-get handle :requests)) 2))
+          (let* ((second-prompt (car prompts))
+                 (interaction
+                  (car (llm-chat-prompt-interactions second-prompt)))
+                 (prompt-text
+                  (llm-chat-prompt-interaction-content interaction)))
+            (should (string-match-p "Already reported diagnostics"
+                                    prompt-text))
+            (should (string-match-p
+                     "Return only additional diagnostics"
+                     prompt-text)))
+          (should (proofread-llm-test--wait-for (lambda () result)))
+          (should (eq (plist-get result :status) 'ok))
+          (should (equal (mapcar (lambda (diagnostic)
+                                   (plist-get diagnostic :text))
+                                 (plist-get result :diagnostics))
+                         '("helo" "wrld"))))))))
+
+(ert-deftest
+    proofread-llm-test-retries-candidate-issues-within-pass-limit ()
+  "Recover from an unusable first pass while retaining partial state."
+  (with-temp-buffer
+    (insert "helo")
+    (proofread-mode 1)
+    (let* ((proofread-llm-provider proofread-llm-test--provider)
+           (proofread-llm-provider-identity
+            proofread-llm-test--provider-identity)
+           (proofread-llm-max-diagnostic-passes 2)
+           (chunk (car (proofread--request-ready-chunks-for-ranges
+                        (list (cons (point-min) (point-max))))))
+           (invalid
+            (proofread-llm-test--response-content
+             (list (proofread-llm-test--response-diagnostic 0 4 "hola"))))
+           (valid
+            (proofread-llm-test--response-content
+             (list (proofread-llm-test--response-diagnostic 0 4 "helo"))))
+           calls
+           result)
+      (proofread-llm-test--with-capabilities
+       (cl-letf (((symbol-function 'llm-chat-async)
+                  (lambda (_provider _prompt success _error
+                                     &optional _multi-output)
+                    (setq calls (1+ (or calls 0)))
+                    (funcall success (if (= calls 1) invalid valid))
+                    (intern (format "proofread-llm-test-retry-%d"
+                                    calls)))))
+         (let ((request
+                (proofread--make-backend-request chunk 'llm)))
+           (proofread--backend-check
+            request (lambda (backend-result) (setq result
+                                                   backend-result))
+            'llm)
+           (should (= calls 2))
+           (should (proofread-llm-test--wait-for (lambda () result)))
+           (should (eq (plist-get result :status) 'ok))
+           (should (plist-get result :partial))
+           (should (= (length (plist-get result :candidate-issues))
+                      1))
+           (let ((issue (car (plist-get result :candidate-issues))))
+             (should (eq (plist-get issue :action) 'dropped))
+             (should (= (plist-get issue :candidate-index) 0))
+             (should (eq (plist-get issue :reason) 'unmatched-text))
+             (should (= (plist-get issue :pass) 1))
+             (should
+              (equal (plist-get issue :reported-range)
+                     '(0 . 4))))
+           (should (equal (mapcar (lambda (diagnostic)
+                                    (plist-get diagnostic :text))
+                                  (plist-get result :diagnostics))
+                          '("helo")))))))))
+
+(ert-deftest
+    proofread-llm-test-errors-after-candidate-retry-exhaustion ()
+  "All-invalid candidate passes end in one terminal backend error."
+  (with-temp-buffer
+    (insert "helo")
+    (proofread-mode 1)
+    (let* ((proofread-llm-provider proofread-llm-test--provider)
+           (proofread-llm-provider-identity
+            proofread-llm-test--provider-identity)
+           (proofread-llm-max-diagnostic-passes 3)
+           (chunk (car (proofread--request-ready-chunks-for-ranges
+                        (list (cons (point-min) (point-max))))))
+           (invalid
+            (proofread-llm-test--response-content
+             (list (proofread-llm-test--response-diagnostic 0 4 "hola"))))
+           calls
+           result)
+      (proofread-llm-test--with-capabilities
+       (cl-letf (((symbol-function 'llm-chat-async)
+                  (lambda (_provider _prompt success _error
+                                     &optional _multi-output)
+                    (setq calls (1+ (or calls 0)))
+                    (funcall success invalid)
+                    (intern (format "proofread-llm-test-invalid-%d"
+                                    calls)))))
+         (let ((request
+                (proofread--make-backend-request chunk 'llm)))
+           (proofread--backend-check
+            request (lambda (backend-result) (setq result
+                                                   backend-result))
+            'llm)
+           (should (= calls 3))
+           (should (proofread-llm-test--wait-for (lambda () result)))
+           (should (eq (plist-get result :status) 'error))
+           (should (eq (plist-get result :error)
+                       'llm-invalid-diagnostics))
+           (should (= (length (plist-get result :candidate-issues))
+                      3))
+           (should-not (plist-get result :diagnostics))))))))
+
+(ert-deftest
+    proofread-llm-test-sticky-candidate-issues-exhaust-empty-passes ()
+  "Exhaust pass limits after an invalid pass and empty retries."
+  (with-temp-buffer
+    (insert "helo")
+    (proofread-mode 1)
+    (let* ((proofread-llm-provider proofread-llm-test--provider)
+           (proofread-llm-provider-identity
+            proofread-llm-test--provider-identity)
+           (proofread-llm-max-diagnostic-passes 3)
+           (chunk (car (proofread--request-ready-chunks-for-ranges
+                        (list (cons (point-min) (point-max))))))
+           (invalid
+            (proofread-llm-test--response-content
+             (list (proofread-llm-test--response-diagnostic 0 4 "hola"))))
+           (empty (proofread-llm-test--response-content nil))
+           calls
+           result)
+      (proofread-llm-test--with-capabilities
+       (cl-letf (((symbol-function 'llm-chat-async)
+                  (lambda (_provider _prompt success _error
+                                     &optional _multi-output)
+                    (setq calls (1+ (or calls 0)))
+                    (funcall success (if (= calls 1) invalid empty))
+                    (intern (format "proofread-llm-test-empty-%d"
+                                    calls)))))
+         (let ((request
+                (proofread--make-backend-request chunk 'llm)))
+           (proofread--backend-check
+            request (lambda (backend-result) (setq result
+                                                   backend-result))
+            'llm)
+           (should (= calls 3))
+           (should (proofread-llm-test--wait-for (lambda () result)))
+           (should (eq (plist-get result :status) 'error))
+           (should (eq (plist-get result :error)
+                       'llm-invalid-diagnostics))
+           (should (= (length (plist-get result :candidate-issues))
+                      1))))))))
+
+(ert-deftest
+    proofread-llm-test-later-transport-error-keeps-partial-results ()
+  "Preserve partial results after a later transport error."
+  (with-temp-buffer
+    (insert "helo")
+    (proofread-mode 1)
+    (let* ((proofread-llm-provider proofread-llm-test--provider)
+           (proofread-llm-provider-identity
+            proofread-llm-test--provider-identity)
+           (proofread-llm-max-diagnostic-passes 2)
+           (chunk (car (proofread--request-ready-chunks-for-ranges
+                        (list (cons (point-min) (point-max))))))
+           (valid
+            (proofread-llm-test--response-content
+             (list (proofread-llm-test--response-diagnostic 0 4 "helo"))))
+           calls
+           result)
+      (proofread-llm-test--with-capabilities
+       (cl-letf (((symbol-function 'llm-chat-async)
+                  (lambda (_provider _prompt success error
+                                     &optional _multi-output)
+                    (setq calls (1+ (or calls 0)))
+                    (if (= calls 1)
+                        (funcall success valid)
+                      (funcall error 'transport-error
+                               "Network failed"))
+                    (intern (format "proofread-llm-test-transport-%d"
+                                    calls)))))
+         (let ((request
+                (proofread--make-backend-request chunk 'llm)))
+           (proofread--backend-check
+            request (lambda (backend-result) (setq result
+                                                   backend-result))
+            'llm)
+           (should (= calls 2))
+           (should (proofread-llm-test--wait-for (lambda () result)))
+           (should (eq (plist-get result :status) 'ok))
+           (should (plist-get result :partial))
+           (should (= (length (plist-get result :diagnostics)) 1))
+           (should (eq (proofread--handle-backend-result result)
+                       'applied))
+           (should (= (length proofread--diagnostics) 1))
+           (should (= (length proofread--overlays) 1))
+           (should (= (hash-table-count proofread--cache) 0))))))))
+
+(ert-deftest
+    proofread-llm-test-managed-request-stops-after-becoming-stale ()
+  "Stop managed LLM requests after an edit or mode disable."
+  (dolist (scenario '(edited disabled))
+    (with-temp-buffer
+      (insert "helo")
+      (proofread-mode 1)
+      (let ((proofread-llm-provider proofread-llm-test--provider)
+            (proofread-llm-provider-identity
+             proofread-llm-test--provider-identity)
+            (proofread-llm-max-diagnostic-passes 2)
+            (content
+             (proofread-llm-test--response-content
+              (list (proofread-llm-test--response-diagnostic 0 4
+                                                             "helo"))))
+            callbacks
+            calls
+            result)
+        (proofread-llm-test--with-capabilities
+         (let* ((chunk (car
+                        (proofread--request-ready-chunks-for-ranges
+                         (list (cons (point-min) (point-max))))))
+                (request (proofread--make-backend-request chunk
+                                                          'llm)))
+           (should (> (plist-get request :generation) 0))
+           (cl-letf (((symbol-function 'llm-chat-async)
+                      (lambda (_provider _prompt success _error
+                                         &optional _multi-output)
+                        (setq calls (1+ (or calls 0)))
+                        (push success callbacks)
+                        (intern (format "proofread-llm-test-managed-%d"
+                                        calls)))))
+             (proofread--backend-check
+              request
+              (lambda (backend-result)
+                (setq result backend-result))
+              'llm)
+             (should (= calls 1))
+             (pcase scenario
+               ('edited
+                (goto-char (point-min))
+                (delete-char 1))
+               ('disabled (proofread-mode -1)))
+             (funcall (car callbacks) content)
+             (should (proofread-llm-test--wait-for (lambda () result)))
+             (should (= calls 1)))))))))
+
+(ert-deftest
+    proofread-llm-test-error-preserves-buffer-and-clears-request ()
+  "LLM error callbacks preserve text and clear active request state."
+  (with-temp-buffer
+    (insert "helo")
+    (proofread-mode 1)
+    (let ((proofread-llm-provider 'proofread-llm-test-provider)
+          (before-text (buffer-string))
+          result)
+      (cl-letf (((symbol-function 'llm-chat-async)
+                 (lambda (_provider _prompt _success error
+                                    &optional _multi-output)
+                   (funcall error 'llm-error "boom")
+                   'proofread-llm-test-handle))
+                ((symbol-function 'llm-capabilities)
+                 #'proofread-llm-test--capabilities))
+        (let* ((chunk (car (proofread--request-ready-chunks-for-ranges
+                            (list (cons (point-min) (point-max))))))
+               (request (proofread--make-backend-request chunk 'llm)))
+          (should (proofread--dispatch-backend-request
+                   request
+                   (lambda (backend-result)
+                     (setq result backend-result))
+                   'llm))
+          (should (proofread-llm-test--wait-for (lambda () result)))
+          (should (eq (plist-get result :status) 'error))
+          (should (eq (plist-get result :error) 'llm-error))
+          (should (equal (buffer-string) before-text))
+          (should-not proofread--active-requests)
+          (should-not proofread--overlays))))))
+
+(ert-deftest proofread-llm-test-invalid-success-response-is-error ()
+  "Turn unparsable LLM success responses into errors."
+  (with-temp-buffer
+    (insert "helo")
+    (proofread-mode 1)
+    (let ((proofread-llm-provider 'proofread-llm-test-provider)
+          calls
+          result)
+      (cl-letf (((symbol-function 'llm-chat-async)
+                 (lambda (_provider _prompt success _error
+                                    &optional _multi-output)
+                   (setq calls (1+ (or calls 0)))
+                   (funcall success "not json")
+                   'proofread-llm-test-handle))
+                ((symbol-function 'llm-capabilities)
+                 #'proofread-llm-test--capabilities))
+        (let* ((chunk (car (proofread--request-ready-chunks-for-ranges
+                            (list (cons (point-min) (point-max))))))
+               (request (proofread--make-backend-request chunk 'llm)))
+          (should (proofread--dispatch-backend-request
+                   request
+                   (lambda (backend-result)
+                     (setq result backend-result)
+                     (proofread--handle-backend-result
+                      backend-result))
+                   'llm))
+          (should (proofread-llm-test--wait-for (lambda () result)))
+          (should (= calls 1))
+          (should (eq (plist-get result :status) 'error))
+          (should (eq (plist-get result :error)
+                      'llm-invalid-response))
+          (should-not proofread--active-requests)
+          (should-not proofread--overlays)
+          (should (= (hash-table-count proofread--cache) 0)))))))
+
+(ert-deftest proofread-llm-test-stale-results-are-dropped ()
+  "Cancel or stale LLM results after invalidating their source."
+  (dolist (scenario '(killed disabled modified text-mismatch))
+    (let ((buffer (generate-new-buffer
+                   (format " *proofread-llm-stale-%s*" scenario)))
+          success
+          request
+          result)
+      (unwind-protect
+          (progn
+            (with-current-buffer buffer
+              (insert "helo")
+              (proofread-mode 1)
+              (let* ((proofread-llm-provider
+                      'proofread-llm-test-provider)
+                     (proofread-llm-max-diagnostic-passes 1)
+                     (chunk
+                      (car
+                       (proofread--request-ready-chunks-for-ranges
+                        (list (cons (point-min)
+                                    (point-max)))))))
+                (cl-letf (((symbol-function 'llm-chat-async)
+                           (lambda (_provider _prompt callback _error
+                                              &optional _multi-output)
+                             (setq success callback)
+                             'proofread-llm-test-handle))
+                          ((symbol-function 'llm-capabilities)
+                           #'proofread-llm-test--capabilities)
+                          ((symbol-function 'llm-cancel-request)
+                           (lambda (_handle)
+                             nil)))
+                  (setq request
+                        (proofread--make-backend-request chunk 'llm))
+                  (should (proofread--dispatch-backend-request
+                           request
+                           (lambda (backend-result)
+                             (setq result
+                                   (proofread--handle-backend-result
+                                    backend-result)))
+                           'llm)))))
+            (pcase scenario
+              ('killed
+               (kill-buffer buffer))
+              ('disabled
+               (with-current-buffer buffer
+                 (proofread-mode -1)))
+              ('modified
+               (with-current-buffer buffer
+                 (goto-char (point-max))
+                 (insert "!")))
+              ('text-mismatch
+               (with-current-buffer buffer
+                 (delete-region (point-min) (point-max))
+                 (insert "halo"))))
+            (funcall
+             success
+             (proofread-llm-test--response-content
+              (list (proofread-llm-test--response-diagnostic 0 4
+                                                             "helo"))))
+            (if (or (memq scenario '(killed disabled))
+                    (proofread--request-invalidated-p request))
+                (progn
+                  (accept-process-output nil 0.02)
+                  (should-not result))
+              (should (proofread-llm-test--wait-for (lambda () result)))
+              (should (eq result 'stale)))
+            (when (buffer-live-p buffer)
+              (with-current-buffer buffer
+                (should-not proofread--diagnostics)
+                (should-not proofread--overlays))))
+        (when (buffer-live-p buffer)
+          (kill-buffer buffer))))))
+
+(ert-deftest
+    proofread-llm-test-structured-response-prompt-requests-contract ()
+  "Describe chunk-relative schema ranges in diagnostic prompts."
+  (with-temp-buffer
+    (text-mode)
+    (insert "helo")
+    (let* ((proofread-language "en")
+           (chunk (car (proofread--request-ready-chunks-for-ranges
+                        (list (cons (point-min) (point-max))))))
+           (request (proofread--make-backend-request chunk 'llm))
+           (prompt (proofread-llm--structured-response-prompt request)))
+      (should (string-match-p "requested response schema" prompt))
+      (should (string-match-p "diagnostics array" prompt))
+      (should (string-match-p "every independent problem" prompt))
+      (should (string-match-p "Do not stop after the first" prompt))
+      (should (string-match-p "one diagnostic per issue" prompt))
+      (should (string-match-p "adjacent characters" prompt))
+      (should (string-match-p "multiple suggestions" prompt))
+      (should (string-match-p "best-first order" prompt))
+      (should (string-match-p "only for the Text section" prompt))
+      (should (string-match-p "zero-based chunk-relative offsets"
+                              prompt))
+      (should (string-match-p "range end is exclusive" prompt))
+      (dolist (field '("kind" "message" "text" "range" "suggestions"))
+        (should (string-match-p field prompt)))
+      (should-not (string-match-p "source" prompt))
+      (should (string-match-p "Language: \"en\"" prompt))
+      (should (string-match-p "Major mode: text-mode" prompt))
+      (should (string-match-p "Text:\nhelo" prompt))
+      (should-not (string-match-p "absolute buffer" prompt)))))
+
+(ert-deftest
+    proofread-llm-test-structured-response-schema-encodes-json-false ()
+  "Structured response schema encodes false as a JSON boolean."
+  (let ((schema (proofread-llm--structured-response-schema-text)))
+    (should (string-match-p "\"additionalProperties\":false" schema))
+    (should-not (string-match-p "\"source\"" schema))
+    (should-not
+     (string-match-p "\"additionalProperties\":\"false\"" schema))))
+
+(ert-deftest
+    proofread-llm-test-structured-response-extra-text-around-payload-is-error
+    ()
+  "Structured response parser rejects extra text around a payload."
+  (with-temp-buffer
+    (insert "helo")
+    (let* ((chunk (car (proofread--request-ready-chunks-for-ranges
+                        (list (cons (point-min) (point-max))))))
+           (request (proofread--make-backend-request chunk 'llm))
+           (content
+            (concat "Result follows:\n"
+                    (proofread-llm-test--response-content
+                     (list
+                      (proofread-llm-test--response-diagnostic
+                       0 4 "helo")))
+                    "\nDone.")))
+      (should-error
+       (proofread-llm--diagnostics-from-structured-response
+        request content 'llm)))))
+
+(ert-deftest
+    proofread-llm-test-structured-response-ambiguous-extra-json-is-error
+    ()
+  "Structured response parser rejects multiple payloads."
+  (with-temp-buffer
+    (insert "helo")
+    (let* ((chunk (car (proofread--request-ready-chunks-for-ranges
+                        (list (cons (point-min) (point-max))))))
+           (request (proofread--make-backend-request chunk 'llm))
+           (payload
+            (proofread-llm-test--response-content
+             (list (proofread-llm-test--response-diagnostic 0 4
+                                                            "helo")))))
+      (should-error
+       (proofread-llm--diagnostics-from-structured-response
+        request (concat payload "\n" payload) 'llm)))))
+
+(ert-deftest
+    proofread-llm-test-structured-response-non-json-content-is-error ()
+  "Non-schema structured response text is a parse error."
+  (with-temp-buffer
+    (insert "helo")
+    (let* ((chunk (car (proofread--request-ready-chunks-for-ranges
+                        (list (cons (point-min) (point-max))))))
+           (request (proofread--make-backend-request chunk 'llm)))
+      (should-error
+       (proofread-llm--diagnostics-from-structured-response
+        request "I found a spelling issue." 'llm)))))
+
+(ert-deftest
+    proofread-llm-test-structured-response-malformed-json-is-error ()
+  "Malformed structured response JSON is a parse error."
+  (with-temp-buffer
+    (insert "helo")
+    (let* ((chunk (car (proofread--request-ready-chunks-for-ranges
+                        (list (cons (point-min) (point-max))))))
+           (request (proofread--make-backend-request chunk 'llm)))
+      (should-error
+       (proofread-llm--diagnostics-from-structured-response
+        request "Before {\"diagnostics\":[} after" 'llm)))))
+
+(ert-deftest
+    proofread-llm-test-structured-response-rejects-non-json-payload ()
+  "Structured responses reject non-JSON Lisp payloads."
+  (with-temp-buffer
+    (insert "helo")
+    (let* ((chunk (car (proofread--request-ready-chunks-for-ranges
+                        (list (cons (point-min) (point-max))))))
+           (request (proofread--make-backend-request chunk 'llm))
+           (payload '(:diagnostics nil)))
+      (should-error
+       (proofread-llm--diagnostics-from-structured-response
+        request payload 'llm)))))
+
+(ert-deftest
+    proofread-llm-test-structured-response-uses-absolute-buffer-range ()
+  "Structured response diagnostics use absolute buffer ranges."
+  (with-temp-buffer
+    (insert "青晨六点，小城。")
+    (let* ((chunk (car (proofread--request-ready-chunks-for-ranges
+                        (list (cons (point-min) (point-max))))))
+           (request (proofread--make-backend-request chunk 'llm))
+           (content
+            (proofread-llm-test--response-content
+             (list (proofread-llm-test--response-diagnostic 5 7 "小城"))))
+           (diagnostic
+            (car (proofread-llm--diagnostics-from-structured-response
+                  request content 'llm))))
+      (should (equal (proofread--diagnostic-range diagnostic)
+                     '(6 . 8))))))
+
+(ert-deftest
+    proofread-llm-test-structured-response-preserves-multiple-diagnostics
+    ()
+  "Structured response keeps multiple diagnostics from one request."
+  (with-temp-buffer
+    (insert "helo wrld")
+    (let* ((chunk (car (proofread--request-ready-chunks-for-ranges
+                        (list (cons (point-min) (point-max))))))
+           (request (proofread--make-backend-request chunk 'llm))
+           (content
+            (proofread-llm-test--response-content
+             (list
+              (proofread-llm-test--response-diagnostic 0 4 "helo"
+                                                       '("hello"))
+              (proofread-llm-test--response-diagnostic 5 9 "wrld"
+                                                       '("world")))))
+           (diagnostics
+            (proofread-llm--diagnostics-from-structured-response
+             request content 'llm)))
+      (should (= (length diagnostics) 2))
+      (should (equal (mapcar (lambda (diagnostic)
+                               (plist-get diagnostic :text))
+                             diagnostics)
+                     '("helo" "wrld")))
+      (should (equal (mapcar (lambda (diagnostic)
+                               (cons (plist-get diagnostic :beg)
+                                     (plist-get diagnostic :end)))
+                             diagnostics)
+                     '((1 . 5) (6 . 10)))))))
+
+(ert-deftest
+    proofread-llm-test-structured-response-unmatched-text-is-isolated ()
+  "A diagnostic whose text is outside the request becomes one issue."
+  (with-temp-buffer
+    (insert "helo")
+    (let* ((chunk (car (proofread--request-ready-chunks-for-ranges
+                        (list (cons (point-min) (point-max))))))
+           (request (proofread--make-backend-request chunk 'llm))
+           (_ (setq request
+                    (plist-put request :context-before "world")))
+           (batch
+            (proofread-llm-test--structured-batch
+             request
+             (list (proofread-llm-test--response-diagnostic 0 99
+                                                            "world")))))
+      (should-not (plist-get batch :diagnostics))
+      (should-not (plist-get batch :repairs))
+      (should (equal (mapcar (lambda (issue)
+                               (plist-get issue :reason))
+                             (plist-get batch :issues))
+                     '(unmatched-text))))))
+
+(ert-deftest
+    proofread-llm-test-structured-response-repairs-unique-exact-text ()
+  "Repair a wrong range when its text has one unique request match."
+  (with-temp-buffer
+    (insert "青晨六点半，小城的街到刚刚醒来。")
+    (let* ((chunk (car (proofread--request-ready-chunks-for-ranges
+                        (list (cons (point-min) (point-max))))))
+           (request (proofread--make-backend-request chunk 'llm))
+           (batch
+            (proofread-llm-test--structured-batch
+             request
+             (list
+              (proofread-llm-test--response-diagnostic 0 2 "青晨"
+                                                       '("清晨"))
+              (proofread-llm-test--response-diagnostic 7 9 "街到"
+                                                       '("街道")))))
+           (diagnostics (plist-get batch :diagnostics))
+           (repair (car (plist-get batch :repairs))))
+      (should-not (plist-get batch :issues))
+      (should (= (length diagnostics) 2))
+      (should (equal (mapcar #'proofread--diagnostic-range
+                             diagnostics)
+                     '((1 . 3) (10 . 12))))
+      (should (equal (plist-get repair :reported-range) '(7 . 9)))
+      (should (equal (plist-get repair :range) '(9 . 11))))))
+
+(ert-deftest
+    proofread-llm-test-structured-response-ambiguous-text-is-isolated ()
+  "A wrong range is not guessed when its text occurs more than once."
+  (with-temp-buffer
+    (insert "helo x helo")
+    (let* ((chunk (car (proofread--request-ready-chunks-for-ranges
+                        (list (cons (point-min) (point-max))))))
+           (request (proofread--make-backend-request chunk 'llm))
+           (batch
+            (proofread-llm-test--structured-batch
+             request
+             (list (proofread-llm-test--response-diagnostic 6 10
+                                                            "helo"))))
+           (issue (car (plist-get batch :issues))))
+      (should-not (plist-get batch :diagnostics))
+      (should-not (plist-get batch :repairs))
+      (should (eq (plist-get issue :reason) 'ambiguous-text))
+      (should (equal (plist-get issue :occurrences)
+                     '((0 . 4) (7 . 11)))))))
+
+(ert-deftest
+    proofread-llm-test-structured-response-exact-repeated-text-is-accepted
+    ()
+  "Accept exact reported ranges even when their text repeats."
+  (with-temp-buffer
+    (insert "helo x helo")
+    (let* ((chunk (car (proofread--request-ready-chunks-for-ranges
+                        (list (cons (point-min) (point-max))))))
+           (request (proofread--make-backend-request chunk 'llm))
+           (batch
+            (proofread-llm-test--structured-batch
+             request
+             (list (proofread-llm-test--response-diagnostic 7 11
+                                                            "helo")))))
+      (should (= (length (plist-get batch :diagnostics)) 1))
+      (should-not (plist-get batch :issues))
+      (should-not (plist-get batch :repairs)))))
+
+(ert-deftest
+    proofread-llm-test-structured-response-invalid-empty-range-is-isolated
+    ()
+  "An empty insertion text is not used to repair a nonempty range."
+  (let* ((request '(:beg 1 :end 5 :text "helo"))
+         (batch
+          (proofread-llm-test--structured-batch
+           request
+           (list (proofread-llm-test--response-diagnostic
+                  0 1 "" '("H")))))
+         (issue (car (plist-get batch :issues))))
+    (should-not (plist-get batch :diagnostics))
+    (should (eq (plist-get issue :reason) 'range-text-mismatch))))
+
+(ert-deftest
+    proofread-llm-test-structured-response-isolates-invalid-candidates ()
+  "Keep valid diagnostics when a response has invalid candidates."
+  (with-temp-buffer
+    (insert "helo wrld")
+    (let* ((chunk (car (proofread--request-ready-chunks-for-ranges
+                        (list (cons (point-min) (point-max))))))
+           (request (proofread--make-backend-request chunk 'llm))
+           (batch
+            (proofread-llm-test--structured-batch
+             request
+             (list
+              (proofread-llm-test--response-diagnostic 0 99 "hola")
+              (proofread-llm-test--response-diagnostic-with-fields
+               0 4 "helo" '(("kind" . "typo")))
+              42
+              (proofread-llm-test--response-diagnostic 5 9 "wrld"
+                                                       '("world"))))))
+      (should (equal (mapcar (lambda (diagnostic)
+                               (plist-get diagnostic :text))
+                             (plist-get batch :diagnostics))
+                     '("wrld")))
+      (should (equal (mapcar (lambda (issue)
+                               (plist-get issue :reason))
+                             (plist-get batch :issues))
+                     '(unmatched-text invalid-shape invalid-shape)))
+      (should-not (plist-get batch :repairs)))))
+
+(ert-deftest
+    proofread-llm-test-structured-response-invalid-suggestions-are-isolated
+    ()
+  "A non-string suggestion invalidates only its candidate."
+  (with-temp-buffer
+    (insert "helo")
+    (let* ((chunk (car (proofread--request-ready-chunks-for-ranges
+                        (list (cons (point-min) (point-max))))))
+           (request (proofread--make-backend-request chunk 'llm))
+           (candidate
+            '(("kind" . "spelling")
+              ("message" . "Possible misspelling")
+              ("text" . "helo")
+              ("range" . (("beg" . 0)
+                          ("end" . 4)))
+              ("suggestions" . ["hello" 42 "hullo"])))
+           (batch
+            (proofread-llm-test--structured-batch
+             request (list candidate))))
+      (should-not (plist-get batch :diagnostics))
+      (should (eq (plist-get (car (plist-get batch :issues)) :reason)
+                  'invalid-shape)))))
+
+(ert-deftest
+    proofread-llm-test-structured-response-null-arrays-are-isolated ()
+  "Treat a null root as fatal but isolate null suggestions."
+  (with-temp-buffer
+    (insert "helo")
+    (let* ((chunk (car (proofread--request-ready-chunks-for-ranges
+                        (list (cons (point-min) (point-max))))))
+           (request (proofread--make-backend-request chunk 'llm)))
+      (should-error
+       (proofread-llm--diagnostics-from-structured-response
+        request "{\"diagnostics\":null}" 'llm))
+      (let ((batch
+             (proofread-llm--diagnostic-batch-from-structured-response
+              request
+              (concat "{\"diagnostics\":[{"
+                      "\"kind\":\"spelling\","
+                      "\"message\":\"issue\","
+                      "\"text\":\"helo\","
+                      "\"range\":{\"beg\":0,\"end\":4},"
+                      "\"suggestions\":null}]}")
+              'llm)))
+        (should-not (plist-get batch :diagnostics))
+        (should (eq (plist-get (car (plist-get batch :issues))
+                               :reason)
+                    'invalid-shape))))))
+
+(ert-deftest
+    proofread-llm-test-structured-response-unknown-fields-are-scoped ()
+  "Unknown root fields are fatal while candidate fields are isolated."
+  (with-temp-buffer
+    (insert "helo")
+    (let* ((chunk (car (proofread--request-ready-chunks-for-ranges
+                        (list (cons (point-min) (point-max))))))
+           (request (proofread--make-backend-request chunk 'llm))
+           (candidate
+            (proofread-llm-test--response-diagnostic 0 4 "helo"))
+           (candidate-extra
+            (append candidate '(("extra" . true))))
+           (range-extra
+            (proofread-llm-test--response-diagnostic-with-fields
+             0 4 "helo"
+             '(("range" . (("beg" . 0)
+                           ("end" . 4)
+                           ("extra" . true)))))))
+      (should-error
+       (proofread-llm--diagnostics-from-structured-response
+        request "{\"diagnostics\":[],\"extra\":true}" 'llm))
+      (dolist (candidate (list candidate-extra range-extra))
+        (let ((batch
+               (proofread-llm-test--structured-batch
+                request (list candidate))))
+          (should-not (plist-get batch :diagnostics))
+          (should (eq (plist-get (car (plist-get batch :issues))
+                                 :reason)
+                      'invalid-candidate-json))))
+      (let ((batch
+             (proofread-llm-test--structured-batch
+              request (list candidate-extra candidate))))
+        (should (equal (mapcar (lambda (diagnostic)
+                                 (plist-get diagnostic :text))
+                               (plist-get batch :diagnostics))
+                       '("helo")))
+        (should (equal (mapcar (lambda (issue)
+                                 (plist-get issue :reason))
+                               (plist-get batch :issues))
+                       '(invalid-candidate-json)))))))
+
+(ert-deftest
+    proofread-llm-test-structured-response-duplicate-fields-are-scoped ()
+  "Reject duplicate root fields but isolate candidate duplicates."
+  (let ((request '(:beg 1 :end 5 :text "helo")))
+    (should-error
+     (proofread-llm--diagnostics-from-structured-response
+      request "{\"diagnostics\":false,\"diagnostics\":[]}" 'llm))
+    (dolist
+        (content
+         '("{\"diagnostics\":[{\"kind\":\"spelling\",\
+\"kind\":\"style\",\"message\":\"issue\",\
+\"text\":\"helo\",\"range\":{\"beg\":0,\"end\":4},\
+\"suggestions\":[]}]}"
+           "{\"diagnostics\":[{\"kind\":\"spelling\",\
+\"message\":\"issue\",\"text\":\"helo\",\
+\"range\":{\"beg\":0,\"beg\":1,\"end\":4},\
+\"suggestions\":[]}]}"))
+      (let ((batch
+             (proofread-llm--diagnostic-batch-from-structured-response
+              request content 'llm)))
+        (should-not (plist-get batch :diagnostics))
+        (should (eq (plist-get (car (plist-get batch :issues))
+                               :reason)
+                    'invalid-candidate-json))))))
+
+(ert-deftest
+    proofread-llm-test-structured-response-trailing-commas-are-error ()
+  "Trailing commas at every array and object level are parse errors."
+  (let ((request '(:beg 1 :end 5 :text "helo")))
+    (dolist
+        (content
+         '("{\"diagnostics\":[],}"
+           "{\"diagnostics\":[{\"kind\":\"spelling\",\
+\"message\":\"issue\",\"text\":\"helo\",\
+\"range\":{\"beg\":0,\"end\":4},\"suggestions\":[]},]}"
+           "{\"diagnostics\":[{\"kind\":\"spelling\",\
+\"message\":\"issue\",\"text\":\"helo\",\
+\"range\":{\"beg\":0,\"end\":4},\"suggestions\":[],}]}"
+           "{\"diagnostics\":[{\"kind\":\"spelling\",\
+\"message\":\"issue\",\"text\":\"helo\",\
+\"range\":{\"beg\":0,\"end\":4,},\"suggestions\":[]}]}"
+           "{\"diagnostics\":[{\"kind\":\"spelling\",\
+\"message\":\"issue\",\"text\":\"helo\",\
+\"range\":{\"beg\":0,\"end\":4},\
+\"suggestions\":[\"hello\",]}]}"))
+      (should-error
+       (proofread-llm--diagnostics-from-structured-response
+        request content 'llm)))))
+
+(ert-deftest
+    proofread-llm-test-structured-response-does-not-intern-unknown-keys ()
+  "Rejected JSON object keys do not enter the global symbol table."
+  (let ((key "proofread-llm-test-unknown-key-7dc65efef5634c08")
+        (request '(:beg 1 :end 5 :text "helo")))
+    (should-not (intern-soft key))
+    (should-error
+     (proofread-llm--diagnostics-from-structured-response
+      request (format "{\"diagnostics\":[],\"%s\":true}" key) 'llm))
+    (should-not (intern-soft key))))
+
+(ert-deftest
+    proofread-llm-test-structured-response-rejects-source-delimiters ()
+  "Reject comment and docstring delimiters as proofreading targets."
+  (with-temp-buffer
+    (emacs-lisp-mode)
+    (insert ";; prose text\n")
+    (let* ((text (buffer-string))
+           (request (list :buffer (current-buffer)
+                          :beg (point-min)
+                          :end (point-max)
+                          :text text
+                          :target-kind 'comment))
+           (insertion-position
+            (+ (string-search "prose" text) (length "prose")))
+           (insertion
+            (proofread-llm-test--response-content
+             (list (proofread-llm-test--response-diagnostic
+                    insertion-position insertion-position ""
+                    '("."))))))
+      (should
+       (eq (proofread-llm-test--structured-issue-reason
+            request
+            (proofread-llm-test--response-diagnostic 0 2 ";;"))
+           'outside-target))
+      (let ((diagnostic
+             (car (proofread-llm--diagnostics-from-structured-response
+                   request insertion 'llm))))
+        (should (= (plist-get diagnostic :beg)
+                   (+ (point-min) insertion-position)))
+        (should (= (plist-get diagnostic :beg)
+                   (plist-get diagnostic :end))))))
+  (with-temp-buffer
+    (c-mode)
+    (insert "/*helo*/")
+    (let* ((text (buffer-string))
+           (request (list :buffer (current-buffer)
+                          :beg (point-min)
+                          :end (point-max)
+                          :text text
+                          :target-kind 'comment)))
+      (should
+       (eq (proofread-llm-test--structured-issue-reason
+            request
+            (proofread-llm-test--response-diagnostic 6 7 "*" '("")))
+           'outside-target))
+      (should
+       (eq (proofread-llm-test--structured-issue-reason
+            request
+            (proofread-llm-test--response-diagnostic 2 4 "/*" '("")))
+           'outside-target))))
+  (with-temp-buffer
+    (html-mode)
+    (insert "<!--helo-->")
+    (syntax-propertize (point-max))
+    (let ((request (list :buffer (current-buffer)
+                         :beg (point-min)
+                         :end (point-max)
+                         :text (buffer-string)
+                         :target-kind 'comment)))
+      (dolist (candidate '((8 9 "-") (9 10 "-") (10 11 ">")))
+        (should
+         (eq (proofread-llm-test--structured-issue-reason
+              request
+              (proofread-llm-test--response-diagnostic
+               (nth 0 candidate) (nth 1 candidate) (nth 2 candidate)
+               '("")))
+             'outside-target)))))
+  (with-temp-buffer
+    (emacs-lisp-mode)
+    (insert "\"prose text\"")
+    (let* ((text (buffer-string))
+           (request (list :buffer (current-buffer)
+                          :beg (point-min)
+                          :end (point-max)
+                          :text text
+                          :target-kind 'docstring)))
+      (should
+       (eq (proofread-llm-test--structured-issue-reason
+            request
+            (proofread-llm-test--response-diagnostic 0 1 "\""))
+           'outside-target)))))
+
+(ert-deftest
+    proofread-llm-test-structured-response-allows-safe-target-interiors ()
+  "Allow prose punctuation and incomplete source containers."
+  (dolist (spec '((c-mode "/*helo!*/" comment 6 7 "!")
+                  (c-mode "/*helo" comment 2 6 "helo")
+                  (emacs-lisp-mode "\"helo" docstring 1 5 "helo")))
+    (with-temp-buffer
+      (funcall (nth 0 spec))
+      (insert (nth 1 spec))
+      (syntax-propertize (point-max))
+      (let* ((request (list :buffer (current-buffer)
+                            :beg (point-min)
+                            :end (point-max)
+                            :text (buffer-string)
+                            :target-kind (nth 2 spec)))
+             (content
+              (proofread-llm-test--response-content
+               (list (proofread-llm-test--response-diagnostic
+                      (nth 3 spec) (nth 4 spec) (nth 5 spec)
+                      '("fixed"))))))
+        (goto-char (point-max))
+        (push-mark (point-min) t t)
+        (let ((before-point (point))
+              (before-mark (mark t))
+              (before-mark-active mark-active))
+          (should
+           (proofread-llm--diagnostics-from-structured-response
+            request content 'llm))
+          (should (= (point) before-point))
+          (should (= (mark t) before-mark))
+          (should (eq mark-active before-mark-active)))))))
+
+(ert-deftest
+    proofread-llm-test-structured-response-rejects-string-escapes ()
+  "Forbid docstring edits to escapes or quoted characters."
+  (with-temp-buffer
+    (emacs-lisp-mode)
+    (insert "\"Say \\\"helo\\\".\"")
+    (let ((request (list :buffer (current-buffer)
+                         :beg (point-min)
+                         :end (point-max)
+                         :text (buffer-string)
+                         :target-kind 'docstring)))
+      (dolist (candidate '((5 6 "\\") (6 7 "\"")))
+        (should
+         (eq (proofread-llm-test--structured-issue-reason
+              request
+              (proofread-llm-test--response-diagnostic
+               (nth 0 candidate) (nth 1 candidate) (nth 2 candidate)
+               '("")))
+             'outside-target))))))
+
+(ert-deftest proofread-llm-test-structured-response-cross-boundary-range
+    ()
+  "Accept diagnostic ranges across word-like boundaries."
+  (let* ((request '(:beg 1
+                         :end 15
+                         :text "小城的街到刚刚醒来。"))
+         (content
+          (proofread-llm-test--response-content
+           (list
+            (proofread-llm-test--response-diagnostic 3 5 "街到"
+                                                     '("街道")))))
+         (diagnostic
+          (car (proofread-llm--diagnostics-from-structured-response
+                request content 'llm))))
+    (should diagnostic)
+    (should (= (plist-get diagnostic :beg) 4))
+    (should (= (plist-get diagnostic :end) 6))))
+
+(ert-deftest
+    proofread-llm-test-structured-response-without-range-and-text-is-rejected
+    ()
+  "Diagnostics without authoritative range and text are rejected."
+  (let* ((request '(:beg 1 :end 5 :text "青晨六点"))
+         (content
+          (proofread-llm-test--response-content
+           (list '(("kind" . "spelling")
+                   ("message" . "Possible misspelling")
+                   ("suggestions" . ["清晨"]))))))
+    (let ((batch
+           (proofread-llm--diagnostic-batch-from-structured-response
+            request content 'llm)))
+      (should-not (plist-get batch :diagnostics))
+      (should (eq (plist-get (car (plist-get batch :issues)) :reason)
+                  'invalid-shape)))))
+
+(ert-deftest
+    proofread-llm-test-structured-response-parsed-results-still-stale-check
+    ()
+  "Apply stale validation to parsed structured diagnostics."
+  (with-temp-buffer
+    (insert "helo")
+    (proofread-mode 1)
+    (let* ((chunk (car (proofread--request-ready-chunks-for-ranges
+                        (list (cons (point-min) (point-max))))))
+           (request (proofread--make-backend-request chunk 'llm))
+           (content
+            (proofread-llm-test--response-content
+             (list (proofread-llm-test--response-diagnostic 0 4 "helo"))))
+           (diagnostics
+            (proofread-llm--diagnostics-from-structured-response
+             request content 'llm)))
+      (goto-char (point-max))
+      (insert "!")
+      (should (eq (proofread--handle-backend-result
+                   (proofread--backend-success-result
+                    request diagnostics))
+                  'stale))
+      (should-not proofread--diagnostics)
+      (should-not proofread--overlays)
+      (should (equal (buffer-string) "helo!")))))
+
+(ert-deftest proofread-llm-test-structured-response-strategy-cache-miss ()
+  "Miss cached responses when the LLM response strategy changes."
+  (with-temp-buffer
+    (insert "helo")
+    (proofread-mode 1)
+    (let* ((proofread-backend 'llm)
+           (proofread-llm-provider proofread-llm-test--provider)
+           (proofread-llm-provider-identity "provider")
+           (proofread-llm-response-strategy 'provider-json)
+           (chunk (car (proofread--request-ready-chunks-for-ranges
+                        (list (cons (point-min) (point-max))))))
+           (diagnostic
+            (proofread-llm-test--diagnostic-for-range 1 5 "helo")))
+      (proofread-llm-test--with-capabilities
+       (let ((request (proofread--make-backend-request chunk)))
+         (proofread--cache-write-request request (list diagnostic))
+         (should (proofread--cache-read-request
+                  (proofread--make-backend-request chunk)))
+         (let ((proofread-llm-response-strategy 'prompt-json))
+           (should-not (proofread--cache-read-request
+                        (proofread--make-backend-request
+                         chunk)))))))))
+
+(ert-deftest proofread-llm-test-diagnostic-passes-cache-miss ()
+  "Cache entries miss when LLM diagnostic pass count changes."
+  (with-temp-buffer
+    (insert "helo")
+    (proofread-mode 1)
+    (let* ((proofread-backend 'llm)
+           (proofread-llm-provider proofread-llm-test--provider)
+           (proofread-llm-provider-identity "provider")
+           (proofread-llm-max-diagnostic-passes 1)
+           (chunk (car (proofread--request-ready-chunks-for-ranges
+                        (list (cons (point-min) (point-max))))))
+           (request (proofread--make-backend-request chunk))
+           (diagnostic
+            (proofread-llm-test--diagnostic-for-range 1 5 "helo")))
+      (proofread--cache-write-request request (list diagnostic))
+      (should (proofread--cache-read-request
+               (proofread--make-backend-request chunk)))
+      (let ((proofread-llm-max-diagnostic-passes 2))
+        (should-not (proofread--cache-read-request
+                     (proofread--make-backend-request chunk)))))))
+
+(ert-deftest
+    proofread-llm-test-structured-response-stale-result-is-dropped ()
+  "Structured successful results still require stale validation."
+  (with-temp-buffer
+    (insert "青晨")
+    (proofread-mode 1)
+    (let* ((chunk (car (proofread--request-ready-chunks-for-ranges
+                        (list (cons (point-min) (point-max))))))
+           (request (proofread--make-backend-request chunk 'llm))
+           (content
+            (proofread-llm-test--response-content
+             (list (proofread-llm-test--response-diagnostic 0 2 "青晨"))))
+           (diagnostics
+            (proofread-llm--diagnostics-from-structured-response
+             request content 'llm)))
+      (goto-char (point-max))
+      (insert "!")
+      (should (eq (proofread--handle-backend-result
+                   (proofread--backend-success-result
+                    request diagnostics))
+                  'stale))
+      (should-not proofread--diagnostics)
+      (should-not proofread--overlays))))
+
+(ert-deftest proofread-llm-test-backend-success-is-asynchronous ()
+  "LLM backend success callbacks happen after dispatch returns."
+  (with-temp-buffer
+    (insert "Alpha")
+    (proofread-llm-test--with-success
+     (proofread-llm-test--response-content nil)
+     (let* ((chunk (car (proofread--request-ready-chunks-for-ranges
+                         (list (cons (point-min) (point-max))))))
+            (request (proofread--make-backend-request chunk))
+            result)
+       (should (proofread--backend-check
+                request
+                (lambda (backend-result)
+                  (setq result backend-result))
+                'llm))
+       (should-not result)
+       (should (proofread-llm-test--wait-for (lambda () result)))
+       (should (eq (plist-get result :status) 'ok))
+       (should (eq (plist-get result :request) request))
+       (should (listp (plist-get result :diagnostics)))))))
+
+(ert-deftest proofread-llm-test-backend-error-is-asynchronous ()
+  "LLM backend error callbacks happen after dispatch returns."
+  (with-temp-buffer
+    (insert "Alpha")
+    (proofread-llm-test--with-error
+     'llm-failure "LLM failure"
+     (let* ((chunk (car (proofread--request-ready-chunks-for-ranges
+                         (list (cons (point-min) (point-max))))))
+            (request (proofread--make-backend-request chunk))
+            result)
+       (should (proofread--backend-check
+                request
+                (lambda (backend-result)
+                  (setq result backend-result))
+                'llm))
+       (should-not result)
+       (should (proofread-llm-test--wait-for (lambda () result)))
+       (should (eq (plist-get result :status) 'error))
+       (should (eq (plist-get result :request) request))
+       (should (eq (plist-get result :error) 'llm-failure))
+       (should (equal (plist-get result :message) "LLM failure"))))))
+
+(ert-deftest proofread-llm-test-request-log-hook-observes-lifecycle ()
+  "Expose LLM request stages and final status in request events."
+  (with-temp-buffer
+    (insert "helo")
+    (proofread-mode 1)
+    (let* ((proofread-llm-provider 'proofread-llm-test-provider)
+           (proofread-llm-max-diagnostic-passes 1)
+           (content
+            (proofread-llm-test--response-content
+             (list
+              (proofread-llm-test--response-diagnostic 1 5 "helo")
+              (proofread-llm-test--response-diagnostic 0 4 "hola"))))
+           request
+           events
+           status)
+      (cl-letf (((symbol-function 'llm-chat-async)
+                 (lambda (_provider _prompt success _error
+                                    &optional _multi-output)
+                   (run-at-time 0 nil (lambda () (funcall success
+                                                          content)))
+                   'proofread-llm-test-handle))
+                ((symbol-function 'llm-capabilities)
+                 #'proofread-llm-test--capabilities))
+        (setq request
+              (proofread--make-backend-request
+               (car (proofread--request-ready-chunks-for-ranges
+                     (list (cons (point-min) (point-max)))))
+               'llm))
+        (let ((proofread-request-log-hook
+               (list (lambda (event)
+                       (push event events)))))
+          (should (proofread--dispatch-backend-request
+                   request
+                   (lambda (backend-result)
+                     (setq status
+                           (proofread--handle-backend-result
+                            backend-result)))
+                   'llm))
+          (should (proofread-llm-test--wait-for (lambda () status)))
+          (setq events (nreverse events))
+          (let ((types (mapcar (lambda (event)
+                                 (plist-get event :type))
+                               events)))
+            (should (memq 'backend-request types))
+            (should (memq 'backend-response types))
+            (should (memq 'backend-result types))
+            (should (memq 'final-result types)))
+          (let ((backend-request
+                 (cl-find-if (lambda (event)
+                               (eq (plist-get event :type)
+                                   'backend-request))
+                             events))
+                (backend-response
+                 (cl-find-if (lambda (event)
+                               (eq (plist-get event :type)
+                                   'backend-response))
+                             events))
+                (backend-result
+                 (cl-find-if (lambda (event)
+                               (eq (plist-get event :type)
+                                   'backend-result))
+                             events))
+                (final-result
+                 (car (last events))))
+            (should (plist-get backend-request :schema))
+            (should (plist-get backend-request :prompt))
+            (should (equal (plist-get backend-response :response)
+                           content))
+            (should (plist-get (plist-get backend-result :result)
+                               :candidate-issues))
+            (should (plist-get (plist-get backend-result :result)
+                               :repairs))
+            (should (eq (plist-get final-result :status)
+                        'applied))))))))
+
+(provide 'proofread-llm-tests)
+;;; proofread-llm-tests.el ends here

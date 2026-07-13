@@ -10,27 +10,34 @@ EMACS_BATCH := $(EMACS) -Q --batch
 BUILD_FILE := Makefile
 DIST_DIR := dist
 LISP_DIR := lisp
+PROOFREAD_DIR := $(LISP_DIR)/proofread
+PROOFREAD_POPUP_DIR := $(LISP_DIR)/proofread-popup
 RELEASE_PACKAGES := proofread proofread-popup
 RELEASE_ARCHIVE_TARGETS := \
 	$(addsuffix -archive,$(RELEASE_PACKAGES))
 
 # Core package files.
-PROOFREAD_LISP_FILES := $(LISP_DIR)/proofread.el
+PROOFREAD_LISP_FILES := \
+	$(PROOFREAD_DIR)/proofread.el \
+	$(PROOFREAD_DIR)/proofread-llm.el \
+	$(PROOFREAD_DIR)/proofread-languagetool.el
 PROOFREAD_MAIN := $(firstword $(PROOFREAD_LISP_FILES))
 PROOFREAD_ELC_FILES := $(PROOFREAD_LISP_FILES:.el=.elc)
-PROOFREAD_PKG := $(LISP_DIR)/proofread-pkg.el
-PROOFREAD_AUTOLOADS := $(LISP_DIR)/proofread-autoloads.el
+PROOFREAD_PKG := $(PROOFREAD_DIR)/proofread-pkg.el
+PROOFREAD_AUTOLOADS := $(PROOFREAD_DIR)/proofread-autoloads.el
 PROOFREAD_ARCHIVE_STAMP := $(DIST_DIR)/.proofread-archive
 
 # Popup package files.
-PROOFREAD_POPUP_LISP_FILES := $(LISP_DIR)/proofread-popup.el
+PROOFREAD_POPUP_LISP_FILES := \
+	$(PROOFREAD_POPUP_DIR)/proofread-popup.el
 PROOFREAD_POPUP_MAIN := \
 	$(firstword $(PROOFREAD_POPUP_LISP_FILES))
 PROOFREAD_POPUP_ELC_FILES := \
 	$(PROOFREAD_POPUP_LISP_FILES:.el=.elc)
-PROOFREAD_POPUP_PKG := $(LISP_DIR)/proofread-popup-pkg.el
+PROOFREAD_POPUP_PKG := \
+	$(PROOFREAD_POPUP_DIR)/proofread-popup-pkg.el
 PROOFREAD_POPUP_AUTOLOADS := \
-	$(LISP_DIR)/proofread-popup-autoloads.el
+	$(PROOFREAD_POPUP_DIR)/proofread-popup-autoloads.el
 PROOFREAD_POPUP_ARCHIVE_STAMP := \
 	$(DIST_DIR)/.proofread-popup-archive
 
@@ -188,7 +195,7 @@ $(AUTOLOAD_FILES):
 $(PROOFREAD_ELC_FILES) &: \
 	$(PROOFREAD_LISP_FILES) \
 	$(BUILD_FILE)
-	$(EMACS_BATCH) -L $(LISP_DIR) \
+	$(EMACS_BATCH) -L $(PROOFREAD_DIR) \
 		--eval '(setq byte-compile-error-on-warn t)' \
 		-f batch-byte-compile $(PROOFREAD_LISP_FILES)
 
@@ -196,7 +203,9 @@ $(PROOFREAD_POPUP_ELC_FILES) &: \
 	$(PROOFREAD_POPUP_LISP_FILES) \
 	$(PROOFREAD_ELC_FILES) \
 	$(BUILD_FILE)
-	$(EMACS_BATCH) -L $(LISP_DIR) \
+	$(EMACS_BATCH) \
+		-L $(PROOFREAD_DIR) \
+		-L $(PROOFREAD_POPUP_DIR) \
 		--eval '(setq byte-compile-error-on-warn t)' \
 		-f batch-byte-compile $(PROOFREAD_POPUP_LISP_FILES)
 

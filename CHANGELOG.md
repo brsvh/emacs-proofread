@@ -3,6 +3,42 @@
 This file records notable user-visible changes to `proofread` and
 `proofread-popup`. For detailed development history, see the Git log.
 
+## Unreleased
+
+### `proofread`
+
+#### Added
+
+- Add a local LanguageTool backend with asynchronous HTTP requests, safe UTF-16
+  offset conversion, configurable language and rule selection, request timeouts,
+  and optional management of a session-local LanguageTool server. LanguageTool
+  remains an optional runtime dependency used only by this backend.
+- Add a backend registry with lazy loading, backend-specific cache identities,
+  and backend-specific request cancellation.
+
+#### Changed
+
+- Move the package sources into `lisp/proofread/` and split the implementation
+  into `proofread.el`, `proofread-llm.el`, and `proofread-languagetool.el`. Move
+  the optional popup package into `lisp/proofread-popup/`.
+- Keep backend-private functions and variables under their feature namespaces,
+  and centralize shared callback scheduling and position conversion in the core
+  library.
+- Split core, LLM, and LanguageTool tests into independent suites, and align
+  backend test symbols with their feature namespaces.
+- Stop loading GNU ELPA `llm` from the core library until the LLM backend is
+  selected or required explicitly.
+
+### Packaging
+
+#### Changed
+
+- Include all three Proofread source files in Make and Nix package builds,
+  source archives, strict byte compilation, and clean-install verification.
+- Provide the pinned Nixpkgs LanguageTool HTTP server, with a local sentence
+  cache, only in repository development shells, test runners, and Emacs
+  launchers; keep the Emacs package independent of Nix and Java runtimes.
+
 ## v0.1.0 - 2026-07-13
 
 Initial release.

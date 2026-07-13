@@ -12,12 +12,12 @@ Free Documentation License".
 
 # proofread
 
-Proofread provides asynchronous, context-aware LLM proofreading for GNU Emacs.
-It extracts prose from ordinary text, comments, or docstrings, splits it into
-bounded chunks, and sends those chunks to a configured backend. Spelling,
-grammar, style, and other issues appear as diagnostics that can be reviewed,
-ignored, or corrected in place. Requests run asynchronously, so proofreading
-does not block editing.
+Proofread provides asynchronous, context-aware proofreading for GNU Emacs. It
+extracts prose from ordinary text, comments, or docstrings, splits it into
+bounded chunks, and sends those chunks to an LLM or local LanguageTool backend.
+Spelling, grammar, style, and other issues appear as diagnostics that can be
+reviewed, ignored, or corrected in place. Requests run asynchronously, so
+proofreading does not block editing.
 
 <div align="center">
 
@@ -29,19 +29,23 @@ https://github.com/user-attachments/assets/9dc5c4ee-a43e-45b8-a9fc-a372079ed528
 
 ### Installation
 
-The core package requires GNU Emacs and GNU ELPA `llm`. The optional
-`proofread-popup` package additionally requires `posframe`. Install `llm` with
-your Emacs package manager, and install `posframe` as well if you want popup
-diagnostics.
+The `proofread` package requires GNU Emacs and GNU ELPA `llm`, and contains the
+core, LLM, and LanguageTool libraries. LanguageTool itself is an optional
+runtime dependency used only when `proofread-backend` is `languagetool`; the
+core and LLM backend neither load nor start it. That backend can reuse any
+compatible local v2 HTTP server; automatic startup additionally requires a
+`languagetool-http-server` executable on `exec-path`. The optional
+`proofread-popup` package additionally requires `posframe`.
 
-Clone this repository and add its `lisp` directory to `load-path`:
+Clone this repository and add its package directories to `load-path`:
 
 ```sh
 git clone https://github.com/brsvh/emacs-proofread.git
 ```
 
 ```elisp
-(add-to-list 'load-path "/path/to/emacs-proofread/lisp")
+(add-to-list 'load-path "/path/to/emacs-proofread/lisp/proofread")
+(add-to-list 'load-path "/path/to/emacs-proofread/lisp/proofread-popup")
 (require 'proofread)
 ```
 
@@ -86,6 +90,7 @@ installed Ollama model:
 
 ```elisp
 (require 'proofread)
+(require 'proofread-llm)
 (require 'llm-ollama)
 
 (setq proofread-backend 'llm
@@ -102,6 +107,70 @@ remote provider, keep credentials in `auth-source` or another secure facility
 recommended by that provider. The default `proofread-llm-response-strategy` is
 `auto`: it uses a JSON schema when the provider advertises that capability, and
 otherwise falls back to prompt-only JSON.
+
+To use automatic local startup, make sure `languagetool-http-server` is on
+`exec-path` or set `proofread-languagetool-command` to its absolute path. The
+command may also be an argv list whose first item is the executable and whose
+remaining items are fixed arguments; it is invoked directly without a shell. Do
+not put credentials in command arguments, which may be visible in process
+listings; use a protected properties file or environment variable instead. An
+already-running local server needs no executable in Emacs. LanguageTool language
+values are codes such as `en-US`, `zh-CN`, or `de-DE`, not display names such as
+`"English"`:
+
+```elisp
+(require 'proofread)
+(require 'proofread-languagetool)
+
+(setq proofread-backend 'languagetool
+      proofread-language "en-US")
+
+(add-hook 'text-mode-hook #'proofread-mode)
+(add-hook 'prog-mode-hook #'proofread-mode)
+```
+
+The backend first probes `http://127.0.0.1:8081/v2`. It reuses an existing
+LanguageTool server when available; otherwise, by default, it starts one
+session-wide `languagetool-http-server` process and waits asynchronously for it
+to become healthy. Emacs stops only the process that it owns. Set
+`proofread-languagetool-auto-start` to `nil` when an external service manages
+the endpoint. The commands `proofread-languagetool-start-server` and
+`proofread-languagetool-stop-server` control the managed process explicitly.
+Plain HTTP endpoints are accepted only on the loopback interface; use HTTPS for
+any non-loopback service.
+
+When `proofread-language` is `nil`, the backend sends `language=auto`. Set
+`proofread-languagetool-preferred-variants` in that case so variant-dependent
+spelling dictionaries can run, for example:
+
+```elisp
+(setq proofread-language nil
+      proofread-languagetool-preferred-variants '("en-US" "de-DE"))
+```
+
+Configuration is intentionally divided into request policy and server runtime.
+Language, checking level, preferred variants, mother tongue, and rule/category
+selection are HTTP parameters sent for each check; keep those settings in Emacs,
+where Proofread can include them in cache validation. The optional
+`proofread-languagetool-config-file` is instead for server-wide Java properties
+such as model paths, cache sizing, and resource limits. It is applied only when
+Proofread starts its managed process and cannot configure an already-running
+external server. Keep checking policy under Emacs control rather than placing it
+in the server properties file.
+
+The server URL, automatic-start flag, command, properties file, startup timeout,
+and health-probe timeout are session-global because one managed process is
+shared by all buffers; buffer-local bindings for those options are rejected.
+Request timeout, checking level, variants, mother tongue, and rule/category
+controls become buffer-local when set. A managed-server properties file must be
+a local absolute path.
+
+The local open-source server keeps checked text on the local machine, but it
+does not include LanguageTool's cloud-only AI rules. Automatic language
+detection is also less accurate without a separately configured fastText model,
+so an explicit language code is the most predictable configuration. See the
+official [local server guide](https://dev.languagetool.org/http-server.html) and
+[HTTP API](https://languagetool.org/http-api/) for upstream details.
 
 `proofread-targets` controls which text is checked in each buffer:
 
@@ -258,7 +327,7 @@ Run `M-x customize-group RET proofread RET` to edit the core options:
 | `proofread-context-sentences-before`      | `1`     | Limit logical context sentences before a chunk                                    |
 | `proofread-context-sentences-after`       | `1`     | Limit logical context sentences after a chunk                                     |
 | `proofread-max-concurrent-requests`       | `8`     | Limit active backend requests per buffer                                          |
-| `proofread-backend`                       | `nil`   | Select the backend; currently `llm`, or `nil` to disable dispatch                 |
+| `proofread-backend`                       | `nil`   | Select `llm` or `languagetool`; `nil` disables dispatch                           |
 | `proofread-llm-provider`                  | `nil`   | Supply the `llm` provider object                                                  |
 | `proofread-llm-response-strategy`         | `auto`  | Choose provider-enforced JSON schema output or prompt-only JSON                   |
 | `proofread-llm-provider-identity`         | `nil`   | Supply a stable, non-secret provider identity for cache keys                      |
@@ -267,6 +336,33 @@ Run `M-x customize-group RET proofread RET` to edit the core options:
 | `proofread-request-log-max-records`       | `100`   | Limit records retained for each monitored buffer                                  |
 | `proofread-ignored-faces`                 | `nil`   | Exclude text whose `face` property matches one of these faces                     |
 | `proofread-ignored-properties`            | `nil`   | Exclude text where one of these text properties is non-`nil`                      |
+
+The LanguageTool library defines a separate `proofread-languagetool` Customize
+group:
+
+| Option                                       | Default                    | Purpose                                                       |
+| -------------------------------------------- | -------------------------- | ------------------------------------------------------------- |
+| `proofread-languagetool-server-url`          | `http://127.0.0.1:8081/v2` | Select the local or externally managed v2 API endpoint        |
+| `proofread-languagetool-auto-start`          | `t`                        | Start a session-local server when the endpoint is unavailable |
+| `proofread-languagetool-command`             | `languagetool-http-server` | Select an executable or argv prefix for managed startup       |
+| `proofread-languagetool-config-file`         | `nil`                      | Pass an optional local Java properties file to the server     |
+| `proofread-languagetool-startup-timeout`     | `15.0`                     | Limit the overall managed-server startup wait                 |
+| `proofread-languagetool-health-timeout`      | `3.0`                      | Limit one server health probe                                 |
+| `proofread-languagetool-request-timeout`     | `10.0`                     | Limit one `/check` request                                    |
+| `proofread-languagetool-level`               | `default`                  | Select normal or `picky` checking                             |
+| `proofread-languagetool-preferred-variants`  | `nil`                      | Choose variants when `proofread-language` is inferred         |
+| `proofread-languagetool-mother-tongue`       | `nil`                      | Enable applicable false-friend checks                         |
+| `proofread-languagetool-enabled-rules`       | `nil`                      | Enable rule IDs                                               |
+| `proofread-languagetool-disabled-rules`      | `nil`                      | Disable rule IDs                                              |
+| `proofread-languagetool-enabled-categories`  | `nil`                      | Enable category IDs                                           |
+| `proofread-languagetool-disabled-categories` | `nil`                      | Disable category IDs                                          |
+| `proofread-languagetool-enabled-only`        | `nil`                      | Run only explicitly enabled rules and categories              |
+
+`proofread-languagetool-enabled-only` requires at least one enabled rule or
+category and cannot be combined with disabled rules or categories. Language,
+level, variant, mother-tongue, rule, and category settings are included in the
+backend cache identity, so changing them does not reuse results produced by a
+different checking policy.
 
 The optional frontend also defines `proofread-popup-enabled` (default `t`) and
 `proofread-popup-max-width` (default `80`). Customize diagnostic appearance with
@@ -293,9 +389,10 @@ default of `3` to `1`.
 - Requests run asynchronously. A result is applied only if the text, context,
   target scope, and provider configuration still match the original request;
   stale results caused by edits are discarded.
-- A remote provider receives the selected text and limited surrounding context,
-  and may charge for its use. Request-monitor buffers also expose the complete
-  prompt and response, which may contain sensitive text.
+- A remote LLM provider or non-loopback LanguageTool service receives the
+  selected text and limited surrounding context, and may charge for its use.
+  Request-monitor buffers also expose complete prompts or HTTP parameters and
+  responses, which may contain sensitive text.
 - `proofread-show-buffer-requests` starts recording future requests and seeds
   the log with requests that are active or queued at that moment. It cannot
   recover requests that have already finished.
@@ -303,6 +400,9 @@ default of `3` to `1`.
   in-flight requests, so later results may make diagnostics reappear.
   `proofread-clear-cache` clears only the cache. Disable `proofread-mode` to
   stop all work and clear its state.
+- The cache cannot detect an upgrade or model change in an externally managed
+  LanguageTool server that keeps the same URL. Run `proofread-clear-cache` after
+  such a change.
 - Records created by `proofread-ignore` persist only for the current Emacs
   session; they are not saved, and there is no command to remove one.
 
@@ -337,13 +437,24 @@ default overlay. For example, a NixOS configuration can use:
 }
 ```
 
-Remove `epkgs.proofread-popup` if only the core package is needed. On supported
-systems, the flake also provides ready-made launchers that start Emacs with a
-temporary, clean init directory. Use `nix flake show` from the repository root
-to find a suitable launcher, then run it with `nix run`.
+Remove `epkgs.proofread-popup` if only the core package is needed. The
+`epkgs.proofread` derivation remains a normal Emacs package and does not
+propagate LanguageTool or Java as runtime dependencies.
 
-These launchers make the packages available on `load-path`; they do not load or
-configure Proofread automatically.
+For repository development, the default `nix develop` shell and the flake's
+ready-made Emacs launchers put a pinned Nixpkgs LanguageTool server on PATH.
+Their development-only `languagetool-http-server` wrapper uses a 1,000-sentence
+local cache. When `proofread-languagetool-config-file` is set, that explicit
+properties file replaces the wrapper's cache-only default and controls the
+complete server configuration.
+
+On supported systems, the flake also provides ready-made launchers that start
+Emacs with a temporary, clean init directory. Use `nix flake show` from the
+repository root to find a suitable launcher, then run it with `nix run`.
+
+These development launchers make the packages available on `load-path` and the
+LanguageTool server available on `exec-path`; they do not load or configure
+Proofread automatically.
 
 ## AI Assistance Disclosure
 

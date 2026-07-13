@@ -34,6 +34,10 @@ let
     ]
   );
 
+  languageToolServer =
+    pkgs.callPackage ../languagetool.nix
+      { };
+
   formatters = with pkgs; [
     elisp-format
     mbake
@@ -284,5 +288,6 @@ in
   packages = with pkgs; [
     gnumake
     gnutar
+    languageToolServer
   ];
 }

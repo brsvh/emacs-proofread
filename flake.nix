@@ -1,5 +1,5 @@
 {
-  description = "Context-aware LLM proofreading for GNU Emacs";
+  description = "Context-aware proofreading for GNU Emacs";
 
   inputs = {
     flake-parts = {
@@ -72,19 +72,21 @@
                       ;
                   in
                   melpaBuild {
+                    files = ''("proofread.el" "proofread-llm.el" "proofread-languagetool.el")'';
+
                     packageRequires = [
                       llm
                     ];
 
                     meta = {
-                      description = "Context-aware LLM proofreading for GNU Emacs";
+                      description = "Context-aware proofreading for GNU Emacs";
                       homepage = "https://github.com/brsvh/emacs-proofread";
                       license = licenses.gpl3Plus;
                       maintainers = with maintainers; [ brsvh ];
                     };
 
                     pname = "proofread";
-                    src = projectRoot + /lisp/proofread.el;
+                    src = projectRoot + /lisp/proofread;
                     version = "0.1.0";
                   };
 
@@ -117,7 +119,9 @@
                     };
 
                     pname = "proofread-popup";
-                    src = projectRoot + /lisp/proofread-popup.el;
+                    src =
+                      projectRoot
+                      + /lisp/proofread-popup/proofread-popup.el;
                     version = "0.1.0";
                   };
 
@@ -180,6 +184,10 @@
               foldl'
               versions
               ;
+
+            languageToolServer = pkgs.callPackage (
+              projectRoot + /tool/languagetool.nix
+            ) { };
 
             release = with pkgs; emacsPackagesFor emacs31;
           in
@@ -245,6 +253,7 @@
                           runtimeInputs = [
                             coreutils
                             emacs-with-proofread-popup
+                            languageToolServer
                           ];
 
                           text = ''
@@ -260,17 +269,44 @@
                           runtimeInputs = [
                             coreutils
                             gnutar
+                            languageToolServer
                           ];
 
                           text = ''
-                            coreInitdir="$(mktemp --tmpdir -d emacs-proofread-test-XXXXXX)"
-                            popupInitdir="$(mktemp --tmpdir -d emacs-proofread-popup-test-XXXXXX)"
-                            releaseInitdir="$(mktemp --tmpdir -d emacs-proofread-release-test-XXXXXX)"
-                            trap 'rm -rf "$coreInitdir" "$popupInitdir" "$releaseInitdir"' EXIT
+                            testRoot="$(mktemp --tmpdir -d emacs-proofread-tests-XXXXXX)"
+                            trap 'rm -rf "$testRoot"' EXIT
+
+                            coreInitdir="$testRoot/core"
+                            llmInitdir="$testRoot/llm"
+                            languageToolInitdir="$testRoot/languagetool"
+                            popupInitdir="$testRoot/popup"
+                            releaseInitdir="$testRoot/release"
+
+                            mkdir -p \
+                              "$coreInitdir" \
+                              "$llmInitdir" \
+                              "$languageToolInitdir" \
+                              "$popupInitdir" \
+                              "$releaseInitdir"
 
                             "${emacs-with-proofread}/bin/emacs" --batch \
                               --init-directory "$coreInitdir" \
                               -l "${projectRoot + /test/proofread-tests.el}" \
+                              -f ert-run-tests-batch-and-exit
+
+                            "${emacs-with-proofread}/bin/emacs" --batch \
+                              --init-directory "$llmInitdir" \
+                              -l "${
+                                projectRoot + /test/proofread-llm-tests.el
+                              }" \
+                              -f ert-run-tests-batch-and-exit
+
+                            "${emacs-with-proofread}/bin/emacs" --batch \
+                              --init-directory "$languageToolInitdir" \
+                              -l "${
+                                projectRoot
+                                + /test/proofread-languagetool-tests.el
+                              }" \
                               -f ert-run-tests-batch-and-exit
 
                             "${emacs-with-proofread-popup}/bin/emacs" --batch \
@@ -300,6 +336,7 @@
 
                           runtimeInputs = [
                             coreutils
+                            languageToolServer
                           ];
 
                           text = ''
@@ -308,10 +345,18 @@
                             trap 'rm -rf "$initdir" "$workdir"' EXIT
 
                             cp "${
-                              projectRoot + /lisp/proofread.el
+                              projectRoot + /lisp/proofread/proofread.el
                             }" "$workdir/proofread.el"
                             cp "${
-                              projectRoot + /lisp/proofread-popup.el
+                              projectRoot + /lisp/proofread/proofread-llm.el
+                            }" "$workdir/proofread-llm.el"
+                            cp "${
+                              projectRoot
+                              + /lisp/proofread/proofread-languagetool.el
+                            }" "$workdir/proofread-languagetool.el"
+                            cp "${
+                              projectRoot
+                              + /lisp/proofread-popup/proofread-popup.el
                             }" "$workdir/proofread-popup.el"
                             cp "${
                               projectRoot + /tool/release/proofread-release.el
@@ -323,6 +368,26 @@
                               --eval '(setq byte-compile-error-on-warn t)' \
                               -f batch-byte-compile \
                               "$workdir/proofread.el"
+
+                            "${emacs-with-proofread}/bin/emacs" --batch \
+                              --init-directory "$initdir" \
+                              -L "$workdir" \
+                              --eval '(setq byte-compile-error-on-warn t)' \
+                              -f batch-byte-compile \
+                              "$workdir/proofread-llm.el" \
+                              "$workdir/proofread-languagetool.el"
+
+                            "${emacs-with-proofread}/bin/emacs" --batch \
+                              --init-directory "$initdir" \
+                              -L "$workdir" \
+                              --eval '(progn
+                                (require (quote proofread))
+                                (require (quote proofread-llm))
+                                (require (quote proofread-languagetool))
+                                (unless (executable-find
+                                         "languagetool-http-server")
+                                  (error
+                                   "LanguageTool server is unavailable")))'
 
                             "${emacs-with-proofread-popup}/bin/emacs" --batch \
                               --init-directory "$initdir" \
