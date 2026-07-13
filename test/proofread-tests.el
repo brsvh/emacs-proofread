@@ -235,6 +235,25 @@
                     (20 . 30)))
                  '((10 . 35)))))
 
+(ert-deftest proofread-test-new-diagnostics-preserves-input-order ()
+  "Keep only first unseen diagnostics in input order."
+  (let* ((existing
+          (proofread-test--diagnostic-for-range 6 10 "wrld"))
+         (later-range
+          (proofread-test--diagnostic-for-range 11 15 "agin"))
+         (earlier-range
+          (proofread-test--diagnostic-for-range 1 5 "helo"))
+         (diagnostics
+          (list later-range (copy-sequence existing) earlier-range
+                (copy-sequence later-range) (copy-sequence earlier-range)))
+         (original-diagnostics (copy-sequence diagnostics))
+         (result
+          (proofread--new-diagnostics diagnostics (list existing))))
+    (should (equal diagnostics original-diagnostics))
+    (should (= (length result) 2))
+    (should (eq (car result) later-range))
+    (should (eq (cadr result) earlier-range))))
+
 (ert-deftest proofread-test-face-defaults-avoid-fixed-colors ()
   "Proofread faces are defined without fixed color attributes."
   (dolist (face '(proofread-face proofread-current-face))
@@ -2019,9 +2038,9 @@ This covers URLs, email, invisible text, faces, and properties."
 
 (ert-deftest
     proofread-test-partial-backend-result-merges-without-caching ()
-  "Merge partial results without writing them to the cache."
+  "Merge unique partial results once without writing them to the cache."
   (with-temp-buffer
-    (insert "helo wrld")
+    (insert "helo bad wrld")
     (proofread-mode 1)
     (let* ((chunk
             (car (proofread--request-ready-chunks-for-ranges
@@ -2029,24 +2048,47 @@ This covers URLs, email, invisible text, faces, and properties."
            (request (proofread--make-backend-request
                      chunk proofread-test--backend))
            (old (proofread-test--diagnostic-for-range 1 5 "helo"))
-           (new (proofread-test--diagnostic-for-range 6 10 "wrld"))
+           (later-range
+            (proofread-test--diagnostic-for-range 10 14 "wrld"))
+           (earlier-range
+            (proofread-test--diagnostic-for-range 6 9 "bad"))
            (partial
             (proofread--backend-partial-success-result
-             request (list new new) '((:reason ambiguous-text)))))
+             request
+             (list later-range (copy-sequence old) earlier-range
+                   (copy-sequence later-range)
+                   (copy-sequence earlier-range))
+             '((:reason ambiguous-text))))
+           (original-create-overlay
+            (symbol-function 'proofread--create-overlay))
+           (created 0)
+           (changed 0))
       (should (eq (proofread--handle-backend-result
                    (proofread--backend-success-result request (list
                                                                old)))
                   'applied))
       (proofread-clear-cache)
-      (should (eq (proofread--handle-backend-result partial)
-                  'applied))
-      (should (equal proofread--diagnostics (list old new)))
-      (should (= (length proofread--overlays) 2))
-      (should (= (hash-table-count proofread--cache) 0))
-      (should (eq (proofread--handle-backend-result partial)
-                  'applied))
-      (should (equal proofread--diagnostics (list old new)))
-      (should (= (length proofread--overlays) 2)))))
+      (add-hook 'proofread-diagnostics-changed-hook
+                (lambda () (setq changed (1+ changed))) nil t)
+      (cl-letf (((symbol-function 'proofread--create-overlay)
+                 (lambda (diagnostic)
+                   (setq created (1+ created))
+                   (funcall original-create-overlay diagnostic))))
+        (should (eq (proofread--handle-backend-result partial)
+                    'applied))
+        (should (equal proofread--diagnostics
+                       (list old later-range earlier-range)))
+        (should (= (length proofread--overlays) 3))
+        (should (= created 2))
+        (should (= changed 1))
+        (should (= (hash-table-count proofread--cache) 0))
+        (should (eq (proofread--handle-backend-result partial)
+                    'applied))
+        (should (equal proofread--diagnostics
+                       (list old later-range earlier-range)))
+        (should (= (length proofread--overlays) 3))
+        (should (= created 2))
+        (should (= changed 1))))))
 
 (ert-deftest proofread-test-cache-miss-calls-backend ()
   "A visible chunk with no cache entry is sent to the backend."

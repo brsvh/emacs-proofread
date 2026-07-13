@@ -2296,13 +2296,20 @@ DEFAULT-SOURCE is stored as each diagnostic's internal source."
         (throw 'found t)))
     nil))
 
+(defun proofread--new-diagnostics (diagnostics existing)
+  "Return unique DIAGNOSTICS that are not represented in EXISTING.
+Preserve the first occurrence of each diagnostic and its input order."
+  (let (new)
+    (dolist (diagnostic diagnostics)
+      (unless (or (proofread--diagnostic-member-p diagnostic existing)
+                  (proofread--diagnostic-member-p diagnostic new))
+        (push diagnostic new)))
+    (nreverse new)))
+
 (defun proofread--append-new-diagnostics (diagnostics new-diagnostics)
   "Return DIAGNOSTICS followed by non-duplicate NEW-DIAGNOSTICS."
-  (let ((merged (copy-sequence diagnostics)))
-    (dolist (diagnostic new-diagnostics)
-      (unless (proofread--diagnostic-member-p diagnostic merged)
-        (setq merged (append merged (list diagnostic)))))
-    merged))
+  (append diagnostics
+          (proofread--new-diagnostics new-diagnostics diagnostics)))
 
 (defun proofread--unsupported-backend-check (backend request callback)
   "Report unsupported BACKEND for REQUEST through CALLBACK.
@@ -3240,16 +3247,11 @@ range."
   "Merge partial REQUEST's new DIAGNOSTICS into existing ones."
   (let ((beg (proofread--position-integer (plist-get request :beg)))
         (end (proofread--position-integer (plist-get request :end)))
-        new-diagnostics)
-    (dolist (diagnostic diagnostics)
-      (unless (or (proofread--diagnostic-member-p
-                   diagnostic proofread--diagnostics)
-                  (proofread--diagnostic-member-p
-                   diagnostic new-diagnostics))
-        (push diagnostic new-diagnostics)))
+        (new-diagnostics
+         (proofread--new-diagnostics diagnostics proofread--diagnostics)))
     (when (and beg end new-diagnostics)
       (proofread--apply-backend-diagnostics
-       (nreverse new-diagnostics) (cons beg end)))))
+       new-diagnostics (cons beg end)))))
 
 (defun proofread--report-backend-error (result)
   "Report the backend error described by RESULT."

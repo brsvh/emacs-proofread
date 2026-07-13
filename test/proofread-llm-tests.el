@@ -584,12 +584,12 @@
 
 (ert-deftest proofread-llm-test-collects-additional-diagnostic-passes
     ()
-  "LLM backend can collect additional diagnostics in later passes."
+  "Collect unique LLM diagnostics in first-seen order across passes."
   (with-temp-buffer
-    (insert "helo wrld")
+    (insert "helo wrld agin")
     (proofread-mode 1)
     (let* ((proofread-llm-provider 'proofread-llm-test-provider)
-           (proofread-llm-max-diagnostic-passes 2)
+           (proofread-llm-max-diagnostic-passes 3)
            (chunk (car (proofread--request-ready-chunks-for-ranges
                         (list (cons (point-min) (point-max))))))
            request
@@ -598,7 +598,16 @@
              (list (proofread-llm-test--response-diagnostic 0 4 "helo"))))
            (second
             (proofread-llm-test--response-content
-             (list (proofread-llm-test--response-diagnostic 5 9 "wrld"))))
+             (list
+              (proofread-llm-test--response-diagnostic 0 4 "helo")
+              (proofread-llm-test--response-diagnostic 5 9 "wrld")
+              (proofread-llm-test--response-diagnostic 5 9 "wrld"))))
+           (third
+            (proofread-llm-test--response-content
+             (list
+              (proofread-llm-test--response-diagnostic 5 9 "wrld")
+              (proofread-llm-test--response-diagnostic 10 14 "agin")
+              (proofread-llm-test--response-diagnostic 10 14 "agin"))))
            calls
            prompts
            result)
@@ -608,9 +617,10 @@
                    (push prompt prompts)
                    (setq calls (1+ (or calls 0)))
                    (funcall success
-                            (if (= calls 1)
-                                first
-                              second))
+                            (pcase calls
+                              (1 first)
+                              (2 second)
+                              (_ third)))
                    (intern (format "proofread-llm-test-handle-%d"
                                    calls))))
                 ((symbol-function 'llm-capabilities)
@@ -622,11 +632,11 @@
                        (lambda (backend-result)
                          (setq result backend-result))
                        'llm)))
-          (should (= calls 2))
-          (should (= (length (plist-get handle :requests)) 2))
-          (let* ((second-prompt (car prompts))
+          (should (= calls 3))
+          (should (= (length (plist-get handle :requests)) 3))
+          (let* ((later-prompt (car prompts))
                  (interaction
-                  (car (llm-chat-prompt-interactions second-prompt)))
+                  (car (llm-chat-prompt-interactions later-prompt)))
                  (prompt-text
                   (llm-chat-prompt-interaction-content interaction)))
             (should (string-match-p "Already reported diagnostics"
@@ -639,7 +649,7 @@
           (should (equal (mapcar (lambda (diagnostic)
                                    (plist-get diagnostic :text))
                                  (plist-get result :diagnostics))
-                         '("helo" "wrld"))))))))
+                         '("helo" "wrld" "agin"))))))))
 
 (ert-deftest
     proofread-llm-test-retries-candidate-issues-within-pass-limit ()
