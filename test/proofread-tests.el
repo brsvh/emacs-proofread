@@ -14,6 +14,24 @@
 (require 'ert)
 (require 'proofread)
 
+;;;; Test state
+
+(defconst proofread-test--backend 'proofread-test-backend
+  "Backend symbol used by core Proofread tests.")
+
+(defconst proofread-test--unavailable-backend
+  'proofread-test-unavailable-backend
+  "Unregistered backend used when core tests require no backend.")
+
+(defvar proofread-test--backend-identity-token
+  'proofread-test-identity
+  "Stable identity token used by the test backend.")
+
+(defvar proofread-test--backend-check-function nil
+  "Optional implementation for the test backend check function.")
+
+;;;; Test helpers
+
 (defun proofread-test--tree-member-p (needle tree)
   "Return non-nil if NEEDLE appears anywhere in TREE."
   (cond
@@ -31,7 +49,7 @@
    :text "helo"
    :kind 'spelling
    :message "Possible misspelling"
-   :suggestions '("hello")
+   :suggestions '( "hello")
    :source 'test))
 
 (defun proofread-test--diagnostic-for-range (beg end text)
@@ -42,7 +60,7 @@
    :text text
    :kind 'spelling
    :message "Possible misspelling"
-   :suggestions '("hello")
+   :suggestions '( "hello")
    :source 'test))
 
 (defun proofread-test--diagnostic-with-kind (beg end text kind)
@@ -53,7 +71,7 @@
    :text text
    :kind kind
    :message "Possible issue"
-   :suggestions '("fixed")
+   :suggestions '( "fixed")
    :source 'test))
 
 (defun proofread-test--diagnostic-with-suggestions
@@ -106,18 +124,18 @@
               chunks))
 
 (defun proofread-test--request-ready-chunks-for-ranges (ranges)
-  "Return request-ready chunks from target islands selected by RANGES."
+  "Return request-ready chunks from islands selected by RANGES."
   (proofread--request-ready-chunks-for-islands
    (proofread--target-islands-for-ranges ranges)))
 
 (defun proofread-test--flush-request-log-refresh (source)
-  "Refresh pending request list updates for SOURCE immediately."
+  "Refresh SOURCE's pending request listings immediately."
   (with-current-buffer source
     (proofread--cancel-request-log-refresh-timer)
     (proofread--refresh-request-log-list-buffers)))
 
 (defun proofread-test--wait-for (predicate &optional timeout)
-  "Wait until PREDICATE returns non-nil or TIMEOUT seconds pass."
+  "Wait for PREDICATE to return non-nil or TIMEOUT seconds to pass."
   (let ((deadline (+ (float-time) (or timeout 1.0)))
         result)
     (while (and (not (setq result (funcall predicate)))
@@ -179,20 +197,6 @@ When HANDLE is non-nil, attach it as the backend handle."
         :window-point (window-point window)
         :window-start (window-start window)))
 
-(defconst proofread-test--backend 'proofread-test-backend
-  "Backend symbol used by core Proofread tests.")
-
-(defconst proofread-test--unavailable-backend
-  'proofread-test-unavailable-backend
-  "Unregistered backend used when core tests require no backend.")
-
-(defvar proofread-test--backend-identity-token
-  'proofread-test-identity
-  "Stable identity token used by the test backend.")
-
-(defvar proofread-test--backend-check-function nil
-  "Optional implementation for the test backend check function.")
-
 (defun proofread-test--backend-identity ()
   "Return the current identity of the test backend."
   (list :backend proofread-test--backend
@@ -209,13 +213,15 @@ When HANDLE is non-nil, attach it as the backend handle."
            0 nil
            (lambda ()
              (unless (plist-get handle :cancelled)
-               (proofread--invoke-backend-callback callback result)))))
+               (proofread--invoke-backend-callback
+                callback result)))))
     handle))
 
 (defun proofread-test--backend-check (request callback)
   "Check REQUEST with the configured test backend and CALLBACK."
   (if proofread-test--backend-check-function
-      (funcall proofread-test--backend-check-function request callback)
+      (funcall proofread-test--backend-check-function
+               request callback)
     (proofread-test--defer-backend-result
      callback (proofread--backend-success-result request nil))))
 
@@ -234,7 +240,8 @@ When HANDLE is non-nil, attach it as the backend handle."
   `(let ((proofread-backend proofread-test--backend))
      ,@body))
 
-(defmacro proofread-test--with-backend-success (diagnostics &rest body)
+(defmacro proofread-test--with-backend-success
+    (diagnostics &rest body)
   "Run BODY with the test backend returning DIAGNOSTICS."
   (declare (indent 1) (debug (form body)))
   `(let ((proofread-backend proofread-test--backend)
@@ -242,10 +249,12 @@ When HANDLE is non-nil, attach it as the backend handle."
           (lambda (request callback)
             (proofread-test--defer-backend-result
              callback
-             (proofread--backend-success-result request ,diagnostics)))))
+             (proofread--backend-success-result
+              request ,diagnostics)))))
      ,@body))
 
-(defmacro proofread-test--with-backend-error (error message &rest body)
+(defmacro proofread-test--with-backend-error
+    (error message &rest body)
   "Run BODY with the test backend returning ERROR and MESSAGE."
   (declare (indent 2) (debug (form form body)))
   `(let ((proofread-backend proofread-test--backend)
@@ -257,13 +266,7 @@ When HANDLE is non-nil, attach it as the backend handle."
               request ,error ,message)))))
      ,@body))
 
-(proofread--register-backend
- proofread-test--backend
- :check #'proofread-test--backend-check
- :identity #'proofread-test--backend-identity
- :cancel #'proofread-test--backend-cancel)
-
-(setq proofread-backend proofread-test--unavailable-backend)
+;;;; Range and diagnostic tests
 
 (ert-deftest proofread-test-normalize-ranges-merges-adjacent-ranges ()
   "Normalize visible ranges, dropping invalid or duplicate ranges."
@@ -282,13 +285,15 @@ When HANDLE is non-nil, attach it as the backend handle."
     (let ((end (copy-marker 3)))
       (should
        (equal (proofread--normalize-region-range end 0)
-              '(0 . 3))))))
+              '( 0 . 3))))))
 
-(ert-deftest proofread-test-region-commands-preserve-boundary-errors ()
+(ert-deftest
+    proofread-test-region-commands-preserve-boundary-errors ()
   "Preserve region argument errors before mode validation."
   (with-temp-buffer
     (insert "abc")
-    (dolist (command '(proofread-check-region proofread-correct-region))
+    (dolist (command
+             '( proofread-check-region proofread-correct-region))
       (dolist (case '((nil invalid "No active region")
                       (invalid
                        2
@@ -310,8 +315,11 @@ When HANDLE is non-nil, attach it as the backend handle."
          (earlier-range
           (proofread-test--diagnostic-for-range 1 5 "helo"))
          (diagnostics
-          (list later-range (copy-sequence existing) earlier-range
-                (copy-sequence later-range) (copy-sequence earlier-range)))
+          (list later-range
+                (copy-sequence existing)
+                earlier-range
+                (copy-sequence later-range)
+                (copy-sequence earlier-range)))
          (original-diagnostics (copy-sequence diagnostics))
          (result
           (proofread--new-diagnostics diagnostics (list existing))))
@@ -325,19 +333,19 @@ When HANDLE is non-nil, attach it as the backend handle."
     ()
   "Scan unsorted conflicts without deduplicating or copying entries."
   (let* ((duplicate (list 'duplicate))
-         (adjacent-left (cons 'adjacent-left '(1 . 4)))
-         (contains (cons 'contains '(2 . 8)))
-         (overlap (cons 'overlap '(3 . 5)))
-         (zero-left (cons 'zero-left '(4 . 4)))
-         (contained (cons 'contained '(5 . 6)))
-         (zero-right (cons 'zero-right '(7 . 7)))
-         (adjacent-right (cons 'adjacent-right '(7 . 9)))
-         (zero-query-left (cons 'zero-query-left '(9 . 10)))
-         (zero-query-right (cons 'zero-query-right '(10 . 12)))
-         (duplicate-first (cons duplicate '(15 . 16)))
-         (duplicate-second (cons duplicate '(17 . 19)))
-         (adjacent-late (cons 'adjacent-late '(18 . 20)))
-         (ranges (list '(14 . 18) '(10 . 10) '(4 . 7)))
+         (adjacent-left (cons 'adjacent-left '( 1 . 4)))
+         (contains (cons 'contains '( 2 . 8)))
+         (overlap (cons 'overlap '( 3 . 5)))
+         (zero-left (cons 'zero-left '( 4 . 4)))
+         (contained (cons 'contained '( 5 . 6)))
+         (zero-right (cons 'zero-right '( 7 . 7)))
+         (adjacent-right (cons 'adjacent-right '( 7 . 9)))
+         (zero-query-left (cons 'zero-query-left '( 9 . 10)))
+         (zero-query-right (cons 'zero-query-right '( 10 . 12)))
+         (duplicate-first (cons duplicate '( 15 . 16)))
+         (duplicate-second (cons duplicate '( 17 . 19)))
+         (adjacent-late (cons 'adjacent-late '( 18 . 20)))
+         (ranges (list '( 14 . 18) '( 10 . 10) '( 4 . 7)))
          (entries
           (list duplicate-second adjacent-left zero-right contained
                 zero-query-right contains adjacent-late overlap
@@ -361,10 +369,10 @@ When HANDLE is non-nil, attach it as the backend handle."
     proofread-test-range-conflicting-entries-sorts-equal-starts-by-end
     ()
   "Find zero-width conflicts behind equal-start nonconflicts."
-  (let* ((range-entry (cons 'range-candidate '(1 . 2)))
-         (zero-entry (cons 'zero-candidate '(2 . 2)))
+  (let* ((range-entry (cons 'range-candidate '( 1 . 2)))
+         (zero-entry (cons 'zero-candidate '( 2 . 2)))
          (nonconflicting-entry
-          (cons 'nonconflicting-candidate '(2 . 4)))
+          (cons 'nonconflicting-candidate '( 2 . 4)))
          (range-result
           (proofread--range-conflicting-entries
            '((2 . 4) (2 . 2))
@@ -503,7 +511,8 @@ When HANDLE is non-nil, attach it as the backend handle."
                                   active-input)
                               (eq proofread--claimed-requests
                                   claimed-input)
-                              (eq proofread--request-queue queue-input)
+                              (eq proofread--request-queue
+                                  queue-input)
                               (eq proofread--request-queue-tail
                                   original-tail))
                    (setq unpublished nil))
@@ -590,7 +599,8 @@ When HANDLE is non-nil, attach it as the backend handle."
            (diagnostics
             (list left interior interior-copy zero right covered
                   end-zero after))
-           (overlays (proofread-test--install-diagnostics diagnostics))
+           (overlays
+            (proofread-test--install-diagnostics diagnostics))
            (interior-overlay (nth 1 overlays))
            (interior-copy-overlay (nth 2 overlays))
            (zero-overlay (nth 3 overlays))
@@ -600,7 +610,9 @@ When HANDLE is non-nil, attach it as the backend handle."
       (should-not (eq interior interior-copy))
       (let ((affected (proofread--edit-affected-state 3 3))
             (expected-overlays
-             (list zero-overlay interior-copy-overlay interior-overlay))
+             (list zero-overlay
+                   interior-copy-overlay
+                   interior-overlay))
             (expected-diagnostics (list interior interior-copy zero)))
         (should (equal (car affected) expected-overlays))
         (should (cl-every #'eq (car affected) expected-overlays))
@@ -613,11 +625,14 @@ When HANDLE is non-nil, attach it as the backend handle."
         (should (equal (car affected) expected-overlays))
         (should (cl-every #'eq (car affected) expected-overlays))
         (should (equal (cdr affected) expected-diagnostics))
-        (should (cl-every #'eq (cdr affected) expected-diagnostics))))))
+        (should
+         (cl-every #'eq (cdr affected) expected-diagnostics))))))
+
+;;;; Overlay and mode tests
 
 (ert-deftest proofread-test-face-defaults-avoid-fixed-colors ()
   "Proofread faces are defined without fixed color attributes."
-  (dolist (face '(proofread-face proofread-current-face))
+  (dolist (face '( proofread-face proofread-current-face))
     (should (facep face))
     (let ((spec (face-default-spec face)))
       (should-not (proofread-test--tree-member-p :foreground spec))
@@ -701,17 +716,20 @@ When HANDLE is non-nil, attach it as the backend handle."
       (let ((ordinary-overlays
              (copy-sequence proofread--pending-invalidated-overlays))
             (ordinary-diagnostics
-             (copy-sequence proofread--pending-invalidated-diagnostics)))
+             (copy-sequence
+              proofread--pending-invalidated-diagnostics)))
         (setq proofread--pending-invalidated-overlays nil)
         (setq proofread--pending-invalidated-diagnostics nil)
-        (let ((proofread--inhibit-overlay-invalidation (current-buffer))
+        (let ((proofread--inhibit-overlay-invalidation
+               (current-buffer))
               (proofread--deferred-correction-overlays nil)
               (proofread--deferred-correction-diagnostics nil))
           (proofread--before-change 3 3)
           (proofread--before-change 3 3)
           (should (= (length proofread--deferred-correction-overlays)
                      (length ordinary-overlays)))
-          (should (= (length proofread--deferred-correction-diagnostics)
+          (should (= (length
+                      proofread--deferred-correction-diagnostics)
                      (length ordinary-diagnostics)))
           (dolist (overlay ordinary-overlays)
             (should (memq overlay
@@ -819,6 +837,8 @@ When HANDLE is non-nil, attach it as the backend handle."
     (proofread-check-visible-range)
     (should-not proofread--active-requests)))
 
+;;;; Check command tests
+
 (ert-deftest proofread-test-check-commands-require-mode ()
   "Proofread check commands require `proofread-mode'."
   (with-temp-buffer
@@ -870,7 +890,7 @@ When HANDLE is non-nil, attach it as the backend handle."
                         (mapcar (lambda (request)
                                   (plist-get request :text))
                                 requests)
-                        '("Alpha " "beta." "Gamma.")))
+                        '( "Alpha " "beta." "Gamma.")))
                (dolist (request requests)
                  (should
                   (equal (plist-get request :language) "en"))))
@@ -887,8 +907,8 @@ When HANDLE is non-nil, attach it as the backend handle."
 (ert-deftest proofread-test-programming-checks-preserve-window-state
     ()
   "Preserve point and window position during programming checks."
-  (dolist (command '(proofread-check-visible-range
-                     proofread-check-buffer))
+  (dolist (command '( proofread-check-visible-range
+                      proofread-check-buffer))
     (save-window-excursion
       (let ((buffer
              (generate-new-buffer
@@ -936,14 +956,14 @@ When HANDLE is non-nil, attach it as the backend handle."
     (let ((beg (match-beginning 0)))
       (search-forward "SECRET")
       (add-text-properties (match-beginning 0) (match-end 0)
-                           '(proofread-test-ignore t))
+                           '( proofread-test-ignore t))
       (search-forward "beta.")
       (let ((end (match-end 0)))
         (setq-local proofread-auto-check nil)
         (proofread-mode 1)
         (let ((proofread-backend proofread-test--backend)
               (proofread-context-size 0)
-              (proofread-ignored-properties '(proofread-test-ignore))
+              (proofread-ignored-properties '( proofread-test-ignore))
               (recorder (proofread-test--make-backend-recorder)))
           (proofread-test--with-backend
            (cl-letf (((symbol-function 'proofread--backend-check)
@@ -954,7 +974,7 @@ When HANDLE is non-nil, attach it as the backend handle."
                (mapcar (lambda (request)
                          (plist-get request :text))
                        (funcall (plist-get recorder :requests)))
-               '("Alpha " " beta."))))))))))
+               '( "Alpha " " beta."))))))))))
 
 (ert-deftest
     proofread-test-check-region-interactively-requires-active-region
@@ -1083,7 +1103,7 @@ When HANDLE is non-nil, attach it as the backend handle."
     (let ((proofread-max-chunk-size 3))
       (goto-char 4)
       (should (equal (proofread--request-ready-range-at-point)
-                     '(4 . 7)))))
+                     '( 4 . 7)))))
   (with-temp-buffer
     (insert "First.\n\n")
     (setq-local proofread-auto-check nil)
@@ -1105,11 +1125,11 @@ When HANDLE is non-nil, attach it as the backend handle."
     (search-forward "SECRET")
     (let ((beg (match-beginning 0))
           (end (match-end 0)))
-      (add-text-properties beg end '(proofread-test-ignore t))
+      (add-text-properties beg end '( proofread-test-ignore t))
       (goto-char beg)
       (setq-local proofread-auto-check nil)
       (proofread-mode 1)
-      (let ((proofread-ignored-properties '(proofread-test-ignore)))
+      (let ((proofread-ignored-properties '( proofread-test-ignore)))
         (should-error (proofread-check-at-point) :type 'user-error)
         (should-not proofread--active-requests)))))
 
@@ -1133,7 +1153,7 @@ When HANDLE is non-nil, attach it as the backend handle."
                  (push (apply #'format format-string args)
                        messages))))
       (proofread--progress-message "proofread: %s" "checking")
-      (should (equal messages '("proofread: checking"))))))
+      (should (equal messages '( "proofread: checking"))))))
 
 (ert-deftest
     proofread-test-check-visible-range-is-quiet-in-background ()
@@ -1187,7 +1207,7 @@ When HANDLE is non-nil, attach it as the backend handle."
                 (call-interactively #'proofread-check-visible-range)
                 (should
                  (equal messages
-                        '("proofread: collected 1 visible \
+                        '( "proofread: collected 1 visible \
 range; no available backend"))))))
         (kill-buffer buffer)))))
 
@@ -1292,11 +1312,12 @@ range; no available backend"))))))
             (should-not proofread--pending-work)
             (should-not proofread--idle-timer)))))))
 
-(ert-deftest proofread-test-positive-option-rejects-zero-in-customize ()
+(ert-deftest
+    proofread-test-positive-option-rejects-zero-in-customize ()
   "Customize rejects a non-positive maximum chunk size."
   (let ((symbol 'proofread-max-chunk-size))
     (should (eq (get symbol 'custom-set)
-                #'proofread--set-positive-integer-option))
+                #'proofread-set-positive-integer-option))
     (should-error
      (funcall (get symbol 'custom-set) symbol 0))))
 
@@ -1307,7 +1328,7 @@ range; no available backend"))))))
     (insert "Alpha")
     (setq-local proofread-auto-check nil)
     (proofread-mode 1)
-    (let ((proofread--request-queue '(manual-request))
+    (let ((proofread--request-queue '( manual-request))
           timer-count)
       (cl-letf (((symbol-function 'run-with-idle-timer)
                  (lambda (_seconds _repeat _function &rest _args)
@@ -1318,7 +1339,7 @@ range; no available backend"))))))
         (should-not proofread--pending-work)
         (should-not proofread--idle-timer)
         (should (equal proofread--request-queue
-                       '(manual-request)))))))
+                       '( manual-request)))))))
 
 (ert-deftest
     proofread-test-auto-check-disabled-does-not-schedule-window-work
@@ -1333,7 +1354,7 @@ range; no available backend"))))))
             (insert "Alpha")
             (setq-local proofread-auto-check nil)
             (proofread-mode 1)
-            (let ((proofread--request-queue '(manual-request))
+            (let ((proofread--request-queue '( manual-request))
                   timer-count)
               (cl-letf (((symbol-function 'run-with-idle-timer)
                          (lambda (_seconds _repeat _function &rest
@@ -1347,7 +1368,7 @@ range; no available backend"))))))
                 (should-not proofread--pending-work)
                 (should-not proofread--idle-timer)
                 (should (equal proofread--request-queue
-                               '(manual-request))))))
+                               '( manual-request))))))
         (kill-buffer buffer)))))
 
 (ert-deftest
@@ -1372,14 +1393,14 @@ range; no available backend"))))))
                          (lambda () t))
                         ((symbol-function
                           'proofread--request-ready-chunks-for-islands)
-                         (lambda (_islands) '((:text "Alpha"))))
+                         (lambda (_islands) '(( :text "Alpha"))))
                         ((symbol-function
                           'proofread--dispatch-request-ready-chunks)
                          (lambda (chunks)
                            (setq dispatched chunks)
-                           '(proofread-test-request))))
+                           '( proofread-test-request))))
                 (proofread-check-visible-range)
-                (should (equal dispatched '((:text "Alpha")))))))
+                (should (equal dispatched '(( :text "Alpha")))))))
         (kill-buffer buffer)))))
 
 (ert-deftest
@@ -1409,6 +1430,8 @@ range; no available backend"))))))
         (insert "?")
         (should (= timer-count 2))
         (should proofread--pending-work)))))
+
+;;;; Automatic check tests
 
 (ert-deftest proofread-test-edit-schedules-idle-work ()
   "Mark work pending and schedule a timer after an edit."
@@ -1588,10 +1611,11 @@ range; no available backend"))))))
                                (list
                                 (proofread--diagnostic-from-request-relative-range
                                  valid-request
-                                 (cons relative-beg (+ relative-beg 5))
+                                 (cons relative-beg
+                                       (+ relative-beg 5))
                                  (list :kind 'spelling
                                        :message "Test diagnostic"
-                                       :suggestions '("First")
+                                       :suggestions '( "First")
                                        :source
                                        proofread-test--backend))))
                             (proofread--backend-error-result
@@ -1712,6 +1736,8 @@ range; no available backend"))))))
     (should-not (buffer-live-p buffer))
     (should-not (proofread--idle-timer-run buffer))))
 
+;;;; Chunk and context tests
+
 (ert-deftest proofread-test-chunk-spans-for-ranges-ordinary-paragraph
     ()
   "Sentence chunk spans record exact buffer boundaries."
@@ -1725,7 +1751,7 @@ range; no available backend"))))))
                    (list (cons (point-min) paragraph-end)))))
       (should (= (length spans) 2))
       (should (equal (proofread-test--span-texts spans)
-                     '("First paragraph." "Second line.")))
+                     '( "First paragraph." "Second line.")))
       (should (= (caar spans) (point-min)))
       (should (= (cdr (car (last spans))) paragraph-end)))))
 
@@ -1745,7 +1771,7 @@ range; no available backend"))))))
                    (list (cons (point-min) (point-max))))))
       (should (equal spans '((1 . 6) (6 . 11) (11 . 13))))
       (should (equal (proofread-test--span-texts spans)
-                     '("abcde" "fghij" "kl")))
+                     '( "abcde" "fghij" "kl")))
       (should (cl-every (lambda (span)
                           (<= (- (cdr span) (car span))
                               proofread-max-chunk-size))
@@ -1779,7 +1805,7 @@ range; no available backend"))))))
     (let ((spans (proofread--chunk-spans-for-ranges
                   (list (cons (point-min) (point-max))))))
       (should (equal (proofread-test--span-texts spans)
-                     '("第一句。" "第二句！" "第三句？"))))))
+                     '( "第一句。" "第二句！" "第三句？"))))))
 
 (ert-deftest
     proofread-test-sentence-chunking-keeps-hard-wrapped-sentence ()
@@ -1789,7 +1815,7 @@ range; no available backend"))))))
     (let ((spans (proofread--chunk-spans-for-ranges
                   (list (cons (point-min) (point-max))))))
       (should (equal (proofread-test--span-texts spans)
-                     '("第一句\n第二句")))
+                     '( "第一句\n第二句")))
       (should (equal spans
                      (list (cons (point-min) (point-max))))))))
 
@@ -1803,10 +1829,10 @@ range; no available backend"))))))
     (let ((spans (proofread--chunk-spans-for-ranges
                   (list (cons (point-min) (point-max))))))
       (should (equal (proofread-test--span-texts spans)
-                     '("Dr. Smith measured 3.14."
-                       "It rained."
-                       "Visit example.com/path?"
-                       "Done!"))))))
+                     '( "Dr. Smith measured 3.14."
+                        "It rained."
+                        "Visit example.com/path?"
+                        "Done!"))))))
 
 (ert-deftest proofread-test-sentence-chunking-keeps-closing-quote ()
   "Keep closing quotes and brackets with sentence punctuation."
@@ -1815,7 +1841,7 @@ range; no available backend"))))))
     (let ((spans (proofread--chunk-spans-for-ranges
                   (list (cons (point-min) (point-max))))))
       (should (equal (proofread-test--span-texts spans)
-                     '("他说“第一句。”" "第二句。"))))))
+                     '( "他说“第一句。”" "第二句。"))))))
 
 (ert-deftest
     proofread-test-sentence-chunking-bounds-oversized-sentence ()
@@ -1826,7 +1852,7 @@ range; no available backend"))))))
       (let ((spans (proofread--chunk-spans-for-ranges
                     (list (cons (point-min) (point-max))))))
         (should (equal (proofread-test--span-texts spans)
-                       '("一二三" "四五六" "。")))
+                       '( "一二三" "四五六" "。")))
         (should (equal spans
                        '((1 . 4) (4 . 7) (7 . 8))))
         (should (cl-every (lambda (span)
@@ -1842,7 +1868,7 @@ range; no available backend"))))))
     (let ((spans (proofread--chunk-spans-for-ranges
                   (list (cons (point-min) (point-max))))))
       (should (equal (proofread-test--span-texts spans)
-                     '("第一句 第二句")))
+                     '( "第一句 第二句")))
       (should (= (length spans) 1)))))
 
 (ert-deftest proofread-test-sentence-chunking-filtering-still-applies
@@ -1869,14 +1895,14 @@ range; no available backend"))))))
                       (search-forward "DROP")
                       (match-beginning 0)))
           (drop-end (match-end 0))
-          (proofread-ignored-faces '(proofread-test-ignore))
-          (proofread-ignored-properties '(proofread-test-ignore))
+          (proofread-ignored-faces '( proofread-test-ignore))
+          (proofread-ignored-properties '( proofread-test-ignore))
           (proofread-context-size 0))
-      (add-text-properties hidden-beg hidden-end '(invisible t))
+      (add-text-properties hidden-beg hidden-end '( invisible t))
       (add-text-properties skip-beg skip-end
-                           '(face proofread-test-ignore))
+                           '( face proofread-test-ignore))
       (add-text-properties drop-beg drop-end
-                           '(proofread-test-ignore t))
+                           '( proofread-test-ignore t))
       (let* ((chunks (proofread-test--request-ready-chunks-for-ranges
                       (list (cons (point-min) (point-max)))))
              (text (mapconcat #'identity
@@ -1911,7 +1937,7 @@ range; no available backend"))))))
       (let ((spans (proofread--chunk-spans-for-ranges
                     (list (cons (point-min) (point-max))))))
         (should (equal (proofread-test--span-texts spans)
-                       '("第一句。" "第二句。")))
+                       '( "第一句。" "第二句。")))
         (should (equal (buffer-string) before-text))
         (should (= (buffer-chars-modified-tick) before-tick))
         (should (= (point) before-point))
@@ -1931,7 +1957,7 @@ range; no available backend"))))))
            (chunks (proofread-test--request-ready-chunks-for-ranges
                     (list (cons (point-min) (point-max)))))
            (texts (proofread-test--chunk-texts chunks)))
-      (should (equal texts '("Alpha " " Beta")))
+      (should (equal texts '( "Alpha " " Beta")))
       (should-not (string-match-p "http://example.com/path"
                                   (mapconcat #'identity texts ""))))))
 
@@ -1943,7 +1969,7 @@ range; no available backend"))))))
            (chunks (proofread-test--request-ready-chunks-for-ranges
                     (list (cons (point-min) (point-max)))))
            (texts (proofread-test--chunk-texts chunks)))
-      (should (equal texts '("Alpha " " Beta")))
+      (should (equal texts '( "Alpha " " Beta")))
       (should-not (string-match-p "user@example.com"
                                   (mapconcat #'identity texts ""))))))
 
@@ -1957,15 +1983,15 @@ range; no available backend"))))))
                       (search-forward "SKIP")
                       (match-beginning 0)))
           (skip-end (match-end 0))
-          (proofread-ignored-faces '(proofread-test-ignore))
+          (proofread-ignored-faces '( proofread-test-ignore))
           (proofread-context-size 0))
       (add-text-properties skip-beg skip-end
-                           '(face (bold proofread-test-ignore)))
+                           '( face (bold proofread-test-ignore)))
       (should (equal
                (proofread-test--chunk-texts
                 (proofread-test--request-ready-chunks-for-ranges
                  (list (cons (point-min) (point-max)))))
-               '("Alpha " " Beta"))))))
+               '( "Alpha " " Beta"))))))
 
 (ert-deftest
     proofread-test-request-ready-chunks-filter-ignored-property ()
@@ -1977,15 +2003,15 @@ range; no available backend"))))))
                       (search-forward "SKIP")
                       (match-beginning 0)))
           (skip-end (match-end 0))
-          (proofread-ignored-properties '(proofread-test-ignore))
+          (proofread-ignored-properties '( proofread-test-ignore))
           (proofread-context-size 0))
       (add-text-properties skip-beg skip-end
-                           '(proofread-test-ignore t))
+                           '( proofread-test-ignore t))
       (should (equal
                (proofread-test--chunk-texts
                 (proofread-test--request-ready-chunks-for-ranges
                  (list (cons (point-min) (point-max)))))
-               '("Alpha " " Beta"))))))
+               '( "Alpha " " Beta"))))))
 
 (ert-deftest proofread-test-request-ready-chunks-filter-invisible ()
   "Request-ready chunks exclude invisible text by default."
@@ -1997,12 +2023,12 @@ range; no available backend"))))))
                         (match-beginning 0)))
           (hidden-end (match-end 0))
           (proofread-context-size 0))
-      (add-text-properties hidden-beg hidden-end '(invisible t))
+      (add-text-properties hidden-beg hidden-end '( invisible t))
       (should (equal
                (proofread-test--chunk-texts
                 (proofread-test--request-ready-chunks-for-ranges
                  (list (cons (point-min) (point-max)))))
-               '("Alpha " " Beta"))))))
+               '( "Alpha " " Beta"))))))
 
 (ert-deftest proofread-test-request-ready-chunks-preserve-metadata ()
   "Filtered chunks preserve exact text and stale-result metadata."
@@ -2014,7 +2040,7 @@ range; no available backend"))))))
       (let ((chunks (proofread-test--request-ready-chunks-for-ranges
                      (list (cons (point-min) (point-max))))))
         (should (equal (proofread-test--chunk-texts chunks)
-                       '("Keep " " TARGET tail")))
+                       '( "Keep " " TARGET tail")))
         (dolist (chunk chunks)
           (should (equal (plist-get chunk :text)
                          (buffer-substring-no-properties
@@ -2105,7 +2131,8 @@ range; no available backend"))))))
     (let* ((proofread-language "zh")
            (proofread-context-size 300)
            (range (list (cons (point-min) (point-max))))
-           (plain (proofread-test--request-ready-chunks-for-ranges range)))
+           (plain
+            (proofread-test--request-ready-chunks-for-ranges range)))
       (visual-line-mode 1)
       (let ((wrapped (proofread-test--request-ready-chunks-for-ranges
                       range)))
@@ -2139,13 +2166,13 @@ range; no available backend"))))))
   "Org structural lines stop request-ready sentence context search."
   (dolist
       (text
-       '("前文。\n* 标题\n目标句。"
-         "前文。\n#+TITLE: 标题\n目标句。"
-         "前文。\n:PROPERTIES:\n\
+       '( "前文。\n* 标题\n目标句。"
+          "前文。\n#+TITLE: 标题\n目标句。"
+          "前文。\n:PROPERTIES:\n\
 :CUSTOM_ID: x\n:END:\n目标句。"
-         "前文。\n- 项目\n目标句。"
-         "前文。\n| 表格 |\n目标句。"
-         "前文。\n#+begin_quote\n引用。\n\
+          "前文。\n- 项目\n目标句。"
+          "前文。\n| 表格 |\n目标句。"
+          "前文。\n#+begin_quote\n引用。\n\
 #+end_quote\n目标句。"))
     (with-temp-buffer
       (org-mode)
@@ -2185,13 +2212,13 @@ This covers URLs, email, invisible text, faces, and properties."
           (drop-end (match-end 0))
           (proofread-language "zh")
           (proofread-context-size 300)
-          (proofread-ignored-faces '(proofread-test-ignore))
-          (proofread-ignored-properties '(proofread-test-ignore)))
-      (add-text-properties hidden-beg hidden-end '(invisible t))
+          (proofread-ignored-faces '( proofread-test-ignore))
+          (proofread-ignored-properties '( proofread-test-ignore)))
+      (add-text-properties hidden-beg hidden-end '( invisible t))
       (add-text-properties skip-beg skip-end
-                           '(face proofread-test-ignore))
+                           '( face proofread-test-ignore))
       (add-text-properties drop-beg drop-end
-                           '(proofread-test-ignore t))
+                           '( proofread-test-ignore t))
       (let* ((chunks (proofread-test--request-ready-chunks-for-ranges
                       (list (cons (point-min) (point-max)))))
              (chunk (proofread-test--chunk-with-text chunks
@@ -2238,6 +2265,8 @@ This covers URLs, email, invisible text, faces, and properties."
         (should (equal (plist-get chunk :context-before) "def"))
         (should (equal (plist-get chunk :context-after) "uvw"))))))
 
+;;;; Cache tests
+
 (ert-deftest proofread-test-cache-key-varies-by-identity ()
   "Cache keys change when text or environment identity changes."
   (with-temp-buffer
@@ -2245,9 +2274,12 @@ This covers URLs, email, invisible text, faces, and properties."
     (let ((proofread-language "en")
           (proofread-test--backend-identity-token "identity-a"))
       (insert "Alpha")
-      (let* ((chunk (car (proofread-test--request-ready-chunks-for-ranges
-                          (list (cons (point-min) (point-max))))))
-             (base-key (proofread--cache-key chunk proofread-test--backend)))
+      (let* ((chunk
+              (car (proofread-test--request-ready-chunks-for-ranges
+                    (list (cons (point-min) (point-max))))))
+             (base-key
+              (proofread--cache-key
+               chunk proofread-test--backend)))
         (let ((proofread-test--backend-identity-token "identity-b"))
           (should-not
            (equal base-key
@@ -2258,7 +2290,8 @@ This covers URLs, email, invisible text, faces, and properties."
                 (plist-put changed-language :language "fr"))
           (should-not (equal base-key
                              (proofread--cache-key
-                              changed-language proofread-test--backend))))
+                              changed-language
+                              proofread-test--backend))))
         (let ((changed-mode (copy-sequence chunk)))
           (setq changed-mode
                 (plist-put changed-mode :major-mode 'org-mode))
@@ -2270,19 +2303,21 @@ This covers URLs, email, invisible text, faces, and properties."
                 (plist-put changed-text :text "Beta"))
           (should-not (equal base-key
                              (proofread--cache-key
-                              changed-text proofread-test--backend))))))))
+                              changed-text
+                              proofread-test--backend))))))))
 
 (ert-deftest proofread-test-cache-key-varies-by-context ()
   "Cover context, configuration, and content in cache keys."
   (let* ((proofread-context-size 300)
          (proofread-context-sentences-before 1)
          (proofread-context-sentences-after 1)
-         (chunk '(:text "目标句。"
-                        :context-before "前文。"
-                        :context-after "后文。"
-                        :language "zh"
-                        :major-mode org-mode))
-         (base-key (proofread--cache-key chunk proofread-test--backend))
+         (chunk '( :text "目标句。"
+                   :context-before "前文。"
+                   :context-after "后文。"
+                   :language "zh"
+                   :major-mode org-mode))
+         (base-key
+          (proofread--cache-key chunk proofread-test--backend))
          (context (plist-get base-key :context)))
     (should (eq (plist-get context :strategy) 'sentence-window))
     (let ((proofread-context-sentences-before 2))
@@ -2335,29 +2370,30 @@ This covers URLs, email, invisible text, faces, and properties."
     (should-not proofread--cache)
     (should-not (proofread--cache-read 'key))))
 
-(ert-deftest proofread-test-request-relative-diagnostic-construction ()
+(ert-deftest
+    proofread-test-request-relative-diagnostic-construction ()
   "Construct canonical diagnostics from request-relative ranges."
-  (let* ((request '(:beg 20 :end 28 :text "This are"
-                         :target-kind text))
-         (properties '(:kind grammar
-                             :message "Agreement"
-                             :suggestions ("is")
-                             :source test))
+  (let* ((request '( :beg 20 :end 28 :text "This are"
+                     :target-kind text))
+         (properties '( :kind grammar
+                        :message "Agreement"
+                        :suggestions ("is")
+                        :source test))
          (diagnostic
           (proofread--diagnostic-from-request-relative-range
-           request '(5 . 8) properties)))
+           request '( 5 . 8) properties)))
     (should
      (equal diagnostic
-            '(:beg 25 :end 28 :text "are" :kind grammar
-                   :message "Agreement" :suggestions ("is")
-                   :source test :target-kind text)))
+            '( :beg 25 :end 28 :text "are" :kind grammar
+               :message "Agreement" :suggestions ("is")
+               :source test :target-kind text)))
     (should
      (equal
       (proofread--diagnostic-from-request-relative-range
-       request '(8 . 8) properties)
-      '(:beg 28 :end 28 :text "" :kind grammar
-             :message "Agreement" :suggestions ("is")
-             :source test :target-kind text)))))
+       request '( 8 . 8) properties)
+      '( :beg 28 :end 28 :text "" :kind grammar
+         :message "Agreement" :suggestions ("is")
+         :source test :target-kind text)))))
 
 (ert-deftest proofread-test-request-relative-diagnostic-marker-base ()
   "Convert a live request marker into integer diagnostic positions."
@@ -2369,19 +2405,20 @@ This covers URLs, email, invisible text, faces, and properties."
                           :target-kind 'text))
            (diagnostic
             (proofread--diagnostic-from-request-relative-range
-             request '(5 . 8)
-             '(:kind grammar :message "Agreement"
-                     :suggestions ("is") :source test))))
+             request '( 5 . 8)
+             '( :kind grammar :message "Agreement"
+                :suggestions ("is") :source test))))
       (should (equal (proofread--diagnostic-range diagnostic)
-                     '(12 . 15)))
+                     '( 12 . 15)))
       (should (integerp (plist-get diagnostic :beg)))
       (should (integerp (plist-get diagnostic :end))))))
 
-(ert-deftest proofread-test-request-relative-diagnostic-validates-bounds ()
+(ert-deftest
+    proofread-test-request-relative-diagnostic-validates-bounds ()
   "Reject relative diagnostic ranges outside their request text."
-  (let ((request '(:beg 20 :end 28 :text "This are"))
-        (properties '(:kind grammar :message "Agreement"
-                            :suggestions nil :source test)))
+  (let ((request '( :beg 20 :end 28 :text "This are"))
+        (properties '( :kind grammar :message "Agreement"
+                       :suggestions nil :source test)))
     (dolist (range '((-1 . 0) (0 . 9) (6 . 5)
                      (nil . 4) (0)))
       (should
@@ -2391,15 +2428,15 @@ This covers URLs, email, invisible text, faces, and properties."
          (should-error
           (proofread--diagnostic-from-request-relative-range
            request range properties))))))
-    (dolist (invalid-request '((:beg nil :text "This are")
-                               (:beg 20 :text nil)))
+    (dolist (invalid-request '(( :beg nil :text "This are")
+                               ( :beg 20 :text nil)))
       (should
        (string-match-p
         "outside the request text"
         (error-message-string
          (should-error
           (proofread--diagnostic-from-request-relative-range
-           invalid-request '(0 . 4) properties))))))))
+           invalid-request '( 0 . 4) properties))))))))
 
 (ert-deftest
     proofread-test-request-relative-diagnostic-validates-target ()
@@ -2413,25 +2450,25 @@ This covers URLs, email, invisible text, faces, and properties."
                           :end (point-max)
                           :text (buffer-string)
                           :target-kind 'comment))
-           (properties '(:kind spelling
-                               :message "Possible misspelling"
-                               :suggestions ("the")
-                               :source test)))
+           (properties '( :kind spelling
+                          :message "Possible misspelling"
+                          :suggestions ("the")
+                          :source test)))
       (should-not
        (proofread--diagnostic-from-request-relative-range
-        request '(0 . 2) properties))
+        request '( 0 . 2) properties))
       (should
        (equal
         (proofread--diagnostic-from-request-relative-range
-         request '(3 . 6) properties)
-        '(:beg 4 :end 7 :text "teh" :kind spelling
-               :message "Possible misspelling" :suggestions ("the")
-               :source test :target-kind comment))))))
+         request '( 3 . 6) properties)
+        '( :beg 4 :end 7 :text "teh" :kind spelling
+           :message "Possible misspelling" :suggestions ("the")
+           :source test :target-kind comment))))))
 
 (ert-deftest proofread-test-cache-relative-diagnostic-conversion ()
   "Cached diagnostics convert ranges between coordinate systems."
-  (let* ((request '(:beg 10 :end 20 :text "0123456789"
-                         :backend proofread-test-backend))
+  (let* ((request '( :beg 10 :end 20 :text "0123456789"
+                     :backend proofread-test-backend))
          (diagnostic (proofread-test--diagnostic-for-range 12 15
                                                            "234"))
          (relative
@@ -2532,7 +2569,7 @@ This covers URLs, email, invisible text, faces, and properties."
 
 (ert-deftest
     proofread-test-partial-backend-result-merges-without-caching ()
-  "Merge unique partial results once without writing them to the cache."
+  "Merge unique partial results without writing them to the cache."
   (with-temp-buffer
     (insert "helo bad wrld")
     (proofread-mode 1)
@@ -2626,11 +2663,12 @@ This covers URLs, email, invisible text, faces, and properties."
             (proofread-mode 1)
             (let* ((proofread-backend proofread-test--backend)
                    (proofread-context-size 0)
-                   (chunks (proofread-test--request-ready-chunks-for-ranges
-                            (list (cons (point-min) (point-max)))))
+                   (chunks
+                    (proofread-test--request-ready-chunks-for-ranges
+                     (list (cons (point-min) (point-max)))))
                    (cached-request
-                    (proofread--make-backend-request (car chunks)
-                                                     proofread-test--backend))
+                    (proofread--make-backend-request
+                     (car chunks) proofread-test--backend))
                    (cached-diagnostic
                     (proofread-test--diagnostic-with-kind
                      1 6 "Alpha" 'spelling))
@@ -2651,7 +2689,7 @@ This covers URLs, email, invisible text, faces, and properties."
                                    (plist-get request :text))
                                  (funcall (plist-get recorder
                                                      :requests)))
-                                '(" Beta")))
+                                '( " Beta")))
                  (should (equal proofread--diagnostics
                                 (list cached-diagnostic)))
                  (should (= (length proofread--overlays) 1))))))
@@ -2664,8 +2702,9 @@ This covers URLs, email, invisible text, faces, and properties."
     (proofread-mode 1)
     (let* ((proofread-backend proofread-test--backend)
            (proofread-test--backend-identity-token "identity-a")
-           (chunk (car (proofread-test--request-ready-chunks-for-ranges
-                        (list (cons (point-min) (point-max))))))
+           (chunk
+            (car (proofread-test--request-ready-chunks-for-ranges
+                  (list (cons (point-min) (point-max))))))
            (request (proofread--make-backend-request
                      chunk proofread-test--backend))
            (diagnostic
@@ -2685,8 +2724,9 @@ This covers URLs, email, invisible text, faces, and properties."
   (with-temp-buffer
     (insert "helo")
     (proofread-mode 1)
-    (let* ((chunk (car (proofread-test--request-ready-chunks-for-ranges
-                        (list (cons (point-min) (point-max))))))
+    (let* ((chunk
+            (car (proofread-test--request-ready-chunks-for-ranges
+                  (list (cons (point-min) (point-max))))))
            (request (proofread--make-backend-request
                      chunk proofread-test--backend))
            (diagnostic
@@ -2714,8 +2754,9 @@ This covers URLs, email, invisible text, faces, and properties."
   (with-temp-buffer
     (insert "helo")
     (proofread-mode 1)
-    (let* ((chunk (car (proofread-test--request-ready-chunks-for-ranges
-                        (list (cons (point-min) (point-max))))))
+    (let* ((chunk
+            (car (proofread-test--request-ready-chunks-for-ranges
+                  (list (cons (point-min) (point-max))))))
            (request (proofread--make-backend-request chunk))
            (diagnostic
             (proofread-test--diagnostic-for-range 1 5 "helo"))
@@ -2727,6 +2768,8 @@ This covers URLs, email, invisible text, faces, and properties."
                   'stale))
       (should-not proofread--diagnostics)
       (should-not proofread--overlays))))
+
+;;;; Backend and scheduler tests
 
 (ert-deftest proofread-test-backend-registry-routes-adapter-functions
     ()
@@ -2746,16 +2789,16 @@ This covers URLs, email, invisible text, faces, and properties."
        (list :backend proofread-test--backend :cancelled nil))
      :identity
      (lambda ()
-       '(:backend proofread-test-backend :contract-version 1))
+       '( :backend proofread-test-backend :contract-version 1))
      :cancel
      (lambda (handle)
        (setq cancelled handle)))
     (should (proofread--supported-backend-p proofread-test--backend))
     (should (equal (proofread--backend-identity
                     proofread-test--backend)
-                   '(:backend proofread-test-backend
-                              :contract-version 1)))
-    (let* ((request '(:id 1))
+                   '( :backend proofread-test-backend
+                      :contract-version 1)))
+    (let* ((request '( :id 1))
            (handle
             (proofread--backend-check
              request
@@ -2787,8 +2830,8 @@ This covers URLs, email, invisible text, faces, and properties."
                   :check (lambda (_request _callback) 'test-handle)
                   :identity
                   (lambda ()
-                    '(:backend proofread-test-lazy
-                               :contract-version 1)))
+                    '( :backend proofread-test-lazy
+                       :contract-version 1)))
                  t)))
       (should (proofread--supported-backend-p 'proofread-test-lazy))
       (should (eq loaded-feature 'proofread-test-lazy-feature))
@@ -2810,8 +2853,9 @@ This covers URLs, email, invisible text, faces, and properties."
   (with-temp-buffer
     (insert "helo")
     (let* ((proofread-backend 'unknown-backend)
-           (chunk (car (proofread-test--request-ready-chunks-for-ranges
-                        (list (cons (point-min) (point-max))))))
+           (chunk
+            (car (proofread-test--request-ready-chunks-for-ranges
+                  (list (cons (point-min) (point-max))))))
            (request
             (proofread--make-backend-request
              chunk 'unknown-backend))
@@ -2854,8 +2898,9 @@ This covers URLs, email, invisible text, faces, and properties."
     (let ((proofread-language "en")
           (proofread-context-size 3))
       (insert "abcTARGETxyz")
-      (let* ((chunk (car (proofread-test--request-ready-chunks-for-ranges
-                          '((4 . 10)))))
+      (let* ((chunk
+              (car (proofread-test--request-ready-chunks-for-ranges
+                    '((4 . 10)))))
              (request (proofread--make-backend-request chunk)))
         (dolist (key proofread--backend-request-keys)
           (should (plist-member request key)))
@@ -2874,8 +2919,9 @@ This covers URLs, email, invisible text, faces, and properties."
   "Unsupported backends report an asynchronous protocol error."
   (with-temp-buffer
     (insert "Alpha")
-    (let* ((chunk (car (proofread-test--request-ready-chunks-for-ranges
-                        (list (cons (point-min) (point-max))))))
+    (let* ((chunk
+            (car (proofread-test--request-ready-chunks-for-ranges
+                  (list (cons (point-min) (point-max))))))
            (request (proofread--make-backend-request chunk))
            result)
       (should (proofread--backend-check
@@ -2897,8 +2943,9 @@ This covers URLs, email, invisible text, faces, and properties."
     (proofread-test--with-backend-success
      nil
      (let* ((buffer (current-buffer))
-            (chunk (car (proofread-test--request-ready-chunks-for-ranges
-                         (list (cons (point-min) (point-max))))))
+            (chunk
+             (car (proofread-test--request-ready-chunks-for-ranges
+                   (list (cons (point-min) (point-max))))))
             (request (proofread--make-backend-request chunk))
             result
             active-at-callback)
@@ -2926,8 +2973,9 @@ This covers URLs, email, invisible text, faces, and properties."
     (let* ((proofread-backend proofread-test--backend)
            (buffer (current-buffer))
            (before-text (buffer-string))
-           (chunk (car (proofread-test--request-ready-chunks-for-ranges
-                        (list (cons (point-min) (point-max))))))
+           (chunk
+            (car (proofread-test--request-ready-chunks-for-ranges
+                  (list (cons (point-min) (point-max))))))
            (request (proofread--make-backend-request chunk))
            result
            active-at-callback)
@@ -2983,7 +3031,7 @@ This covers URLs, email, invisible text, faces, and properties."
                  (should (equal (mapcar (lambda (request)
                                           (plist-get request :text))
                                         requests)
-                                '("Alpha " " Beta")))
+                                '( "Alpha " " Beta")))
                  (should (= (length callbacks) 2))
                  (should (= (length proofread--active-requests) 2))
                  (should-not proofread--diagnostics)
@@ -3026,9 +3074,9 @@ This covers URLs, email, invisible text, faces, and properties."
                           (mapcar (lambda (request)
                                     (plist-get request :text))
                                   requests)
-                          '("青晨六点半，小城的街到刚刚醒来。"
-                            "卖豆浆的滩主把炉子推到巷口。"
-                            "几个上班的人撑着伞从桥边经过。")))
+                          '( "青晨六点半，小城的街到刚刚醒来。"
+                             "卖豆浆的滩主把炉子推到巷口。"
+                             "几个上班的人撑着伞从桥边经过。")))
                  (dolist (request requests)
                    (should (equal
                             (plist-get request :text)
@@ -3113,7 +3161,8 @@ This covers URLs, email, invisible text, faces, and properties."
                      (should (= (length proofread--active-requests)
                                 2))
                      (should-not proofread--request-queue)
-                     (proofread-test--flush-request-log-refresh buffer)
+                     (proofread-test--flush-request-log-refresh
+                      buffer)
                      (with-current-buffer name
                        (let ((statuses
                               (mapcar (lambda (entry)
@@ -3243,10 +3292,10 @@ This covers URLs, email, invisible text, faces, and properties."
         (should-not (eq live diagnostic))
         (goto-char (point-min))
         (insert "x")
-        (should (equal (proofread--diagnostic-range live) '(2 . 6)))
+        (should (equal (proofread--diagnostic-range live) '( 2 . 6)))
         (should
          (equal (proofread--diagnostic-range diagnostic)
-                '(1 . 5)))
+                '( 1 . 5)))
         (should (eq (car (plist-get result :diagnostics))
                     diagnostic))))))
 
@@ -3501,7 +3550,7 @@ This covers URLs, email, invisible text, faces, and properties."
                  (setq captured-truncation message-truncate-lines)
                  (setq captured-echo
                        (apply #'format format-string args)))))
-      (proofread--report-warning-without-window detail summary))
+      (proofread-report-warning-without-window detail summary))
     (should (equal captured-warning-args
                    (list 'proofread detail :warning)))
     (should (eq captured-minimum-level :error))
@@ -3530,8 +3579,9 @@ This covers URLs, email, invisible text, faces, and properties."
               (chunks
                (mapcar
                 (lambda (range)
-                  (car (proofread-test--request-ready-chunks-for-ranges
-                        (list range))))
+                  (car
+                   (proofread-test--request-ready-chunks-for-ranges
+                    (list range))))
                 ranges))
               (recorder (proofread-test--make-backend-recorder)))
          (cl-letf (((symbol-function 'display-warning)
@@ -3595,23 +3645,27 @@ This covers URLs, email, invisible text, faces, and properties."
                   (cadr requests) nil 'test-cancelled)
                  (should (= (length warnings) 2)))))
            (let ((direct
-                  (proofread--make-backend-request (car chunks)
-                                                   proofread-test--backend)))
+                  (proofread--make-backend-request
+                   (car chunks) proofread-test--backend)))
              (should
               (eq (proofread--handle-backend-result
                    (proofread--backend-error-result
-                    direct 'proofread-test-backend-failure "Direct failure"))
+                    direct
+                    'proofread-test-backend-failure
+                    "Direct failure"))
                   'error))
              (should (= (length warnings) 3))
              (should (equal captured-warning-levels
-                            '(:error :error :error)))
-             (should (equal echo-truncation '(t t t)))
+                            '( :error :error :error)))
+             (should (equal echo-truncation '( t t t)))
              (should (= (length echoes) 3))
              (should (cl-every
                       (lambda (echo)
                         (and (< (string-width echo) 80)
                              (not (string-match-p "[\n\r]" echo))))
                       echoes)))))))))
+
+;;;; Navigation and presentation tests
 
 (ert-deftest proofread-test-navigation-sorts-and-filters-diagnostics
     ()
@@ -3833,7 +3887,7 @@ This covers URLs, email, invisible text, faces, and properties."
                :text "helo"
                :kind 'spelling
                :message "Possible misspelling"
-               :suggestions '("hello")
+               :suggestions '( "hello")
                :source 'test))
              (second
               (proofread--make-diagnostic
@@ -3842,7 +3896,7 @@ This covers URLs, email, invisible text, faces, and properties."
                :text "teh"
                :kind 'grammar
                :message "Use \"the\" here"
-               :suggestions '("the")))
+               :suggestions '( "the")))
              (name (proofread--diagnostics-buffer-name)))
         (unwind-protect
             (progn
@@ -4014,9 +4068,9 @@ This covers URLs, email, invisible text, faces, and properties."
   (should (equal
            (proofread-diagnostic-range
             (proofread-test--diagnostic-for-range 3 6 "cde"))
-           '(3 . 6)))
-  (should-not (proofread-diagnostic-range '(:beg 7 :end 6)))
-  (should-not (proofread-diagnostic-range '(:beg invalid :end 6))))
+           '( 3 . 6)))
+  (should-not (proofread-diagnostic-range '( :beg 7 :end 6)))
+  (should-not (proofread-diagnostic-range '( :beg invalid :end 6))))
 
 (ert-deftest proofread-test-public-diagnostic-field-formatting ()
   "The shared diagnostic field formatter returns display strings."
@@ -4024,7 +4078,7 @@ This covers URLs, email, invisible text, faces, and properties."
     (should (eq (proofread-format-diagnostic-field string) string)))
   (should (equal (proofread-format-diagnostic-field 'spelling)
                  "spelling"))
-  (should (equal (proofread-format-diagnostic-field '(bad "text"))
+  (should (equal (proofread-format-diagnostic-field '( bad "text"))
                  "(bad \"text\")")))
 
 (ert-deftest
@@ -4088,7 +4142,7 @@ This covers URLs, email, invisible text, faces, and properties."
             :text "helo"
             :kind 'spelling
             :message "Possible misspelling"
-            :suggestions '("hello"))))
+            :suggestions '( "hello"))))
       (proofread-test--install-diagnostics (list diagnostic))
       (add-hook 'proofread-diagnostics-changed-hook
                 (lambda ()
@@ -4132,7 +4186,7 @@ This covers URLs, email, invisible text, faces, and properties."
            :text "helo"
            :kind 'spelling
            :message "Possible misspelling"
-           :suggestions '("hello")
+           :suggestions '( "hello")
            :source proofread-test--backend))
          (description
           (proofread--format-diagnostic-description diagnostic)))
@@ -4157,7 +4211,7 @@ This covers URLs, email, invisible text, faces, and properties."
               :text "helo"
               :kind 'spelling
               :message "Possible misspelling"
-              :suggestions '("hello")
+              :suggestions '( "hello")
               :source proofread-test--backend)))
         (proofread-test--install-diagnostics (list diagnostic))
         (goto-char 2)
@@ -4187,7 +4241,7 @@ This covers URLs, email, invisible text, faces, and properties."
               :text "helo"
               :kind 'spelling
               :message "Possible misspelling"
-              :suggestions '("hello" "help" "hero"))))
+              :suggestions '( "hello" "help" "hero"))))
         (proofread-test--install-diagnostics (list diagnostic))
         (goto-char 2)
         (proofread-describe)
@@ -4315,9 +4369,11 @@ This covers URLs, email, invisible text, faces, and properties."
           :beg 1
           :end 5
           :text "helo"
-          :suggestions '(hello "hullo" 42))))
+          :suggestions '( hello "hullo" 42))))
     (should (equal (proofread--diagnostic-suggestions diagnostic)
-                   '("hello" "hullo" "42")))))
+                   '( "hello" "hullo" "42")))))
+
+;;;; Correction tests
 
 (ert-deftest proofread-test-correct-at-point-single-suggestion ()
   "Apply one point suggestion without prompting."
@@ -4331,7 +4387,7 @@ This covers URLs, email, invisible text, faces, and properties."
             :text "helo"
             :kind 'spelling
             :message "Possible misspelling"
-            :suggestions '("hello"))))
+            :suggestions '( "hello"))))
       (proofread-test--install-diagnostics (list diagnostic))
       (goto-char 5)
       (cl-letf (((symbol-function 'completing-read)
@@ -4358,7 +4414,7 @@ This covers URLs, email, invisible text, faces, and properties."
         (proofread-test--install-diagnostics
          (list
           (proofread-test--diagnostic-with-suggestions
-           1 5 "helo" '("hello"))))
+           1 5 "helo" '( "hello"))))
         (goto-char 2)
         (setq entry-point 'single)
         (proofread-correct-at-point))
@@ -4368,12 +4424,12 @@ This covers URLs, email, invisible text, faces, and properties."
         (proofread-test--install-diagnostics
          (list
           (proofread-test--diagnostic-with-suggestions
-           1 5 "helo" '("hello"))
+           1 5 "helo" '( "hello"))
           (proofread-test--diagnostic-with-suggestions
-           6 10 "wrld" '("world"))))
+           6 10 "wrld" '( "world"))))
         (setq entry-point 'batch)
         (proofread-correct-buffer)))
-    (should (equal (nreverse calls) '(single batch)))))
+    (should (equal (nreverse calls) '( single batch)))))
 
 (ert-deftest
     proofread-test-single-correction-preserves-transaction-order ()
@@ -4384,7 +4440,7 @@ This covers URLs, email, invisible text, faces, and properties."
     (proofread-test--install-diagnostics
      (list
       (proofread-test--diagnostic-with-suggestions
-       4 8 "helo" '("hello"))))
+       4 8 "helo" '( "hello"))))
     (goto-char 5)
     (set-mark (point-max))
     (setq mark-active t)
@@ -4401,14 +4457,15 @@ This covers URLs, email, invisible text, faces, and properties."
                    (funcall original-boundary))))
         (proofread-correct-at-point))
       (should (equal (nreverse events)
-                     '(boundary (hook 9 12 t) boundary)))
+                     '( boundary (hook 9 12 t) boundary)))
       (should (= (point) 9))
       (should (= (mark) 12))
       (should mark-active))))
 
 (ert-deftest
-    proofread-test-single-correction-validates-container-before-undo ()
-  "Reject a stale source container before opening an undo transaction."
+    proofread-test-single-correction-validates-container-before-undo
+    ()
+  "Reject a stale container before opening an undo transaction."
   (with-temp-buffer
     (emacs-lisp-mode)
     (insert "helo")
@@ -4416,7 +4473,7 @@ This covers URLs, email, invisible text, faces, and properties."
     (let ((diagnostic
            (proofread--make-diagnostic
             :beg 1 :end 5 :text "helo" :kind 'spelling
-            :suggestions '("hello") :source 'test
+            :suggestions '( "hello") :source 'test
             :target-kind 'docstring))
           (original-boundary (symbol-function 'undo-boundary))
           (boundaries 0))
@@ -4440,7 +4497,7 @@ This covers URLs, email, invisible text, faces, and properties."
     (proofread-test--install-diagnostics
      (list
       (proofread-test--diagnostic-with-suggestions
-       4 8 "helo" '("hello"))))
+       4 8 "helo" '( "hello"))))
     (goto-char 5)
     (let (change-points)
       (add-hook 'before-change-functions
@@ -4448,7 +4505,7 @@ This covers URLs, email, invisible text, faces, and properties."
                   (push (point) change-points))
                 nil t)
       (proofread-correct-at-point)
-      (should (equal (nreverse change-points) '(5 4))))))
+      (should (equal (nreverse change-points) '( 5 4))))))
 
 (ert-deftest
     proofread-test-batch-correction-preserves-transaction-order ()
@@ -4459,7 +4516,7 @@ This covers URLs, email, invisible text, faces, and properties."
     (proofread-test--install-diagnostics
      (list
       (proofread-test--diagnostic-with-suggestions
-       4 8 "helo" '("hello"))))
+       4 8 "helo" '( "hello"))))
     (goto-char 5)
     (set-mark (point-max))
     (setq mark-active t)
@@ -4476,7 +4533,7 @@ This covers URLs, email, invisible text, faces, and properties."
                    (funcall original-boundary))))
         (proofread-correct-buffer))
       (should (equal (nreverse events)
-                     '(boundary boundary (hook 4 12 t))))
+                     '( boundary boundary (hook 4 12 t))))
       (should (= (point) 4))
       (should (= (mark) 12))
       (should mark-active))))
@@ -4493,7 +4550,7 @@ This covers URLs, email, invisible text, faces, and properties."
             :text "helo"
             :kind 'spelling
             :message "Possible misspelling"
-            :suggestions '("hello" "hullo" "hallo")))
+            :suggestions '( "hello" "hullo" "hallo")))
           candidates-seen)
       (proofread-test--install-diagnostics (list diagnostic))
       (goto-char 5)
@@ -4502,7 +4559,7 @@ This covers URLs, email, invisible text, faces, and properties."
                    (setq candidates-seen candidates)
                    "hullo")))
         (should (eq (proofread-correct-at-point) 'applied)))
-      (should (equal candidates-seen '("hello" "hullo" "hallo")))
+      (should (equal candidates-seen '( "hello" "hullo" "hallo")))
       (should (equal (buffer-string) "aa hullo zz")))))
 
 (ert-deftest proofread-test-correct-at-point-uses-native-completion ()
@@ -4521,7 +4578,7 @@ This covers URLs, email, invisible text, faces, and properties."
             :text "helo"
             :kind 'spelling
             :message "Possible misspelling"
-            :suggestions '("hello" "hullo" "hallo")))
+            :suggestions '( "hello" "hullo" "hallo")))
           prompt-seen
           candidates-seen
           require-match-seen)
@@ -4536,7 +4593,7 @@ This covers URLs, email, invisible text, faces, and properties."
                    "hallo")))
         (should (eq (proofread-correct-at-point) 'applied)))
       (should (equal prompt-seen "Apply suggestion: "))
-      (should (equal candidates-seen '("hello" "hullo" "hallo")))
+      (should (equal candidates-seen '( "hello" "hullo" "hallo")))
       (should require-match-seen)
       (should (equal (buffer-string) "aa hallo zz"))
       (should-not (get-buffer proofread--description-buffer-name)))))
@@ -4548,12 +4605,12 @@ This covers URLs, email, invisible text, faces, and properties."
     (proofread-mode 1)
     (let ((diagnostic
            (proofread-test--diagnostic-with-suggestions
-            1 5 "helo" '("hello"))))
+            1 5 "helo" '( "hello"))))
       (proofread-test--install-diagnostics (list diagnostic))
       (goto-char (point-min))
       (insert "xx ")
-      (should (equal (proofread-diagnostic-range diagnostic) '(4 .
-                                                                 8)))
+      (should (equal (proofread-diagnostic-range diagnostic) '( 4 .
+                                                                8)))
       (goto-char 5)
       (proofread-correct-at-point)
       (should (equal (buffer-string) "xx hello")))))
@@ -4566,7 +4623,7 @@ This covers URLs, email, invisible text, faces, and properties."
     (proofread-mode 1)
     (let ((diagnostic
            (proofread-test--diagnostic-with-suggestions
-            2 2 "" '("X"))))
+            2 2 "" '( "X"))))
       (proofread-test--install-diagnostics (list diagnostic))
       (goto-char 2)
       (should (eq (proofread-diagnostic-at-point) diagnostic))
@@ -4576,8 +4633,8 @@ This covers URLs, email, invisible text, faces, and properties."
 
 (ert-deftest proofread-test-public-command-scope-names ()
   "Check and correction commands use matching scope suffixes."
-  (dolist (operation '(check correct))
-    (dolist (scope '(at-point region buffer visible-range))
+  (dolist (operation '( check correct))
+    (dolist (scope '( at-point region buffer visible-range))
       (should
        (commandp
         (intern (format "proofread-%s-%s" operation scope)))))))
@@ -4590,13 +4647,13 @@ This covers URLs, email, invisible text, faces, and properties."
     (proofread-mode 1)
     (let ((first
            (proofread-test--diagnostic-with-suggestions
-            1 5 "helo" '("hello")))
+            1 5 "helo" '( "hello")))
           (second
            (proofread-test--diagnostic-with-suggestions
-            10 14 "wrld" '("world")))
+            10 14 "wrld" '( "world")))
           (outside
            (proofread-test--diagnostic-with-suggestions
-            16 20 "ouut" '("out"))))
+            16 20 "ouut" '( "out"))))
       (proofread-test--install-diagnostics
        (list first second outside))
       (should (eq (proofread-correct-region 14 1) 'applied))
@@ -4604,7 +4661,7 @@ This covers URLs, email, invisible text, faces, and properties."
       (should (equal proofread--diagnostics (list outside)))
       (should
        (equal (proofread-diagnostic-range outside)
-              '(18 . 22))))))
+              '( 18 . 22))))))
 
 (ert-deftest
     proofread-test-correct-region-validates-interactive-bounds ()
@@ -4641,10 +4698,10 @@ This covers URLs, email, invisible text, faces, and properties."
     (proofread-mode 1)
     (let ((outside
            (proofread-test--diagnostic-with-suggestions
-            1 5 "helo" '("hello")))
+            1 5 "helo" '( "hello")))
           (inside
            (proofread-test--diagnostic-with-suggestions
-            13 17 "wrld" '("world"))))
+            13 17 "wrld" '( "world"))))
       (proofread-test--install-diagnostics (list outside inside))
       (narrow-to-region 13 17)
       (should (eq (proofread-correct-buffer) 'applied))
@@ -4653,8 +4710,8 @@ This covers URLs, email, invisible text, faces, and properties."
       (widen)
       (should (equal (buffer-string) "helo middle world"))
       (should (equal proofread--diagnostics (list outside)))
-      (should (equal (proofread-diagnostic-range outside) '(1 .
-                                                              5))))))
+      (should (equal (proofread-diagnostic-range outside) '( 1 .
+                                                             5))))))
 
 (ert-deftest proofread-test-correct-visible-range-uses-all-ranges ()
   "Correct only diagnostics in visible ranges."
@@ -4663,21 +4720,21 @@ This covers URLs, email, invisible text, faces, and properties."
     (proofread-mode 1)
     (let ((first
            (proofread-test--diagnostic-with-suggestions
-            1 5 "helo" '("hello")))
+            1 5 "helo" '( "hello")))
           (hidden
            (proofread-test--diagnostic-with-suggestions
-            10 14 "wrld" '("world")))
+            10 14 "wrld" '( "world")))
           (last
            (proofread-test--diagnostic-with-suggestions
-            19 23 "ouut" '("out"))))
+            19 23 "ouut" '( "out"))))
       (proofread-test--install-diagnostics (list first hidden last))
       (cl-letf (((symbol-function 'proofread--visible-ranges)
                  (lambda () '((1 . 5) (19 . 23)))))
         (should (eq (proofread-correct-visible-range) 'applied)))
       (should (equal (buffer-string) "hello and wrld and out"))
       (should (equal proofread--diagnostics (list hidden)))
-      (should (equal (proofread-diagnostic-range hidden) '(11 .
-                                                              15))))))
+      (should (equal (proofread-diagnostic-range hidden) '( 11 .
+                                                            15))))))
 
 (ert-deftest
     proofread-test-correct-buffer-skips-unavailable-suggestions ()
@@ -4690,7 +4747,7 @@ This covers URLs, email, invisible text, faces, and properties."
             1 5 "note" nil))
           (available
            (proofread-test--diagnostic-with-suggestions
-            6 10 "helo" '("hello"))))
+            6 10 "helo" '( "hello"))))
       (proofread-test--install-diagnostics (list unavailable
                                                  available))
       (should (eq (proofread-correct-buffer) 'applied))
@@ -4705,7 +4762,7 @@ This covers URLs, email, invisible text, faces, and properties."
     (proofread-mode 1)
     (let ((available
            (proofread-test--diagnostic-with-suggestions
-            1 5 "helo" '("hello")))
+            1 5 "helo" '( "hello")))
           (adjacent
            (proofread-test--diagnostic-with-suggestions
             5 9 "wrld" nil)))
@@ -4713,7 +4770,8 @@ This covers URLs, email, invisible text, faces, and properties."
       (proofread-correct-buffer)
       (should (equal (buffer-string) "hellowrld"))
       (should (equal proofread--diagnostics (list adjacent)))
-      (should (equal (proofread-diagnostic-range adjacent) '(6 . 10)))
+      (should
+       (equal (proofread-diagnostic-range adjacent) '( 6 . 10)))
       (should (equal (buffer-substring-no-properties 6 10) "wrld")))))
 
 (ert-deftest
@@ -4768,10 +4826,10 @@ This covers URLs, email, invisible text, faces, and properties."
     (proofread-mode 1)
     (let ((long
            (proofread-test--diagnostic-with-suggestions
-            1 5 "abcd" '("long")))
+            1 5 "abcd" '( "long")))
           (short
            (proofread-test--diagnostic-with-suggestions
-            1 3 "ab" '("XY"))))
+            1 3 "ab" '( "XY"))))
       (proofread-test--install-diagnostics (list long short))
       (should (eq (proofread-correct-buffer) 'applied))
       (should (equal (buffer-string) "XYcdef"))
@@ -4785,10 +4843,10 @@ This covers URLs, email, invisible text, faces, and properties."
     (proofread-mode 1)
     (let ((first
            (proofread-test--diagnostic-with-suggestions
-            2 2 "" '("X")))
+            2 2 "" '( "X")))
           (second
            (proofread-test--diagnostic-with-suggestions
-            2 2 "" '("Y"))))
+            2 2 "" '( "Y"))))
       (proofread-test--install-diagnostics (list first second))
       (proofread-correct-buffer)
       (should (equal (buffer-string) "aXb"))
@@ -4802,10 +4860,10 @@ This covers URLs, email, invisible text, faces, and properties."
     (proofread-mode 1)
     (let ((first
            (proofread-test--diagnostic-with-suggestions
-            1 5 "helo" '("hello")))
+            1 5 "helo" '( "hello")))
           (second
            (proofread-test--diagnostic-with-suggestions
-            6 10 "wrld" '("world")))
+            6 10 "wrld" '( "world")))
           (survivor
            (proofread-test--diagnostic-with-suggestions
             11 15 "tail" nil)))
@@ -4814,12 +4872,12 @@ This covers URLs, email, invisible text, faces, and properties."
       (setq buffer-undo-list nil)
       (proofread-correct-buffer)
       (should (equal (buffer-string) "hello world tail"))
-      (should (equal (proofread-diagnostic-range survivor) '(13 .
-                                                                17)))
+      (should (equal (proofread-diagnostic-range survivor) '( 13 .
+                                                              17)))
       (undo)
       (should (equal (buffer-string) "helo wrld tail"))
-      (should (equal (proofread-diagnostic-range survivor) '(11 .
-                                                                15)))
+      (should (equal (proofread-diagnostic-range survivor) '( 11 .
+                                                              15)))
       (should (equal (buffer-substring-no-properties 11 15)
                      "tail")))))
 
@@ -4827,14 +4885,14 @@ This covers URLs, email, invisible text, faces, and properties."
   "Preserve text and diagnostics when correction raises an error."
   (with-temp-buffer
     (insert "helo wrld")
-    (add-text-properties 1 5 '(read-only t))
+    (add-text-properties 1 5 '( read-only t))
     (proofread-mode 1)
     (let ((first
            (proofread-test--diagnostic-with-suggestions
-            1 5 "helo" '("hello")))
+            1 5 "helo" '( "hello")))
           (second
            (proofread-test--diagnostic-with-suggestions
-            6 10 "wrld" '("world"))))
+            6 10 "wrld" '( "world"))))
       (proofread-test--install-diagnostics (list first second))
       (should-error (proofread-correct-buffer))
       (should (equal (buffer-string) "helo wrld"))
@@ -4849,7 +4907,7 @@ This covers URLs, email, invisible text, faces, and properties."
     (proofread-mode 1)
     (let ((diagnostic
            (proofread-test--diagnostic-with-suggestions
-            1 5 "helo" '("hello" "hullo"))))
+            1 5 "helo" '( "hello" "hullo"))))
       (proofread-test--install-diagnostics (list diagnostic))
       (cl-letf (((symbol-function 'completing-read)
                  (lambda (&rest _)
@@ -4871,7 +4929,7 @@ This covers URLs, email, invisible text, faces, and properties."
            (proofread-test--diagnostic-for-range 2 2 ""))
           (target
            (proofread-test--diagnostic-with-suggestions
-            2 6 "helo" '("hello" "hullo"))))
+            2 6 "helo" '( "hello" "hullo"))))
       (proofread-test--install-diagnostics (list survivor target))
       (goto-char 3)
       (cl-letf
@@ -4946,10 +5004,10 @@ This covers URLs, email, invisible text, faces, and properties."
            (diagnostic
             (proofread--diagnostic-from-request-relative-range
              request
-             '(2 . 6)
+             '( 2 . 6)
              (list :kind 'spelling
                    :message "Possible misspelling"
-                   :suggestions '("hello!")
+                   :suggestions '( "hello!")
                    :source proofread-test--backend))))
       (proofread-test--install-diagnostics (list diagnostic))
       (goto-char (plist-get diagnostic :beg))
@@ -4967,12 +5025,12 @@ This covers URLs, email, invisible text, faces, and properties."
     (let ((first
            (proofread--make-diagnostic
             :beg 2 :end 6 :text "helo" :kind 'spelling
-            :suggestions '("hello") :source 'test
+            :suggestions '( "hello") :source 'test
             :target-kind 'docstring))
           (second
            (proofread--make-diagnostic
             :beg 7 :end 11 :text "wrld" :kind 'spelling
-            :suggestions '("world") :source 'test
+            :suggestions '( "world") :source 'test
             :target-kind 'docstring)))
       (proofread-test--install-diagnostics (list first second))
       (should (eq (proofread-correct-buffer) 'applied))
@@ -4980,7 +5038,7 @@ This covers URLs, email, invisible text, faces, and properties."
 
 (ert-deftest
     proofread-test-batch-container-error-rolls-back-transaction ()
-  "Roll back earlier batch edits when a source delimiter becomes unsafe."
+  "Roll back batch edits when a source delimiter becomes unsafe."
   (with-temp-buffer
     (emacs-lisp-mode)
     (insert "\"helo wrld\"")
@@ -4989,12 +5047,12 @@ This covers URLs, email, invisible text, faces, and properties."
     (let* ((first
             (proofread--make-diagnostic
              :beg 2 :end 6 :text "helo" :kind 'spelling
-             :suggestions '("\"") :source 'test
+             :suggestions '( "\"") :source 'test
              :target-kind 'docstring))
            (second
             (proofread--make-diagnostic
              :beg 7 :end 11 :text "wrld" :kind 'spelling
-             :suggestions '("world") :source 'test
+             :suggestions '( "world") :source 'test
              :target-kind 'docstring))
            (diagnostics (list first second))
            (overlays
@@ -5050,10 +5108,10 @@ This covers URLs, email, invisible text, faces, and properties."
     (proofread-mode 1)
     (let ((first
            (proofread-test--diagnostic-with-suggestions
-            1 5 "helo" '("hello")))
+            1 5 "helo" '( "hello")))
           (second
            (proofread-test--diagnostic-with-suggestions
-            6 10 "tail" '("tall")))
+            6 10 "tail" '( "tall")))
           nested-edit)
       (proofread-test--install-diagnostics (list first second))
       (add-hook
@@ -5085,13 +5143,13 @@ This covers URLs, email, invisible text, faces, and properties."
             (proofread-mode 1)
             (proofread-test--install-diagnostics
              (list (proofread-test--diagnostic-with-suggestions
-                    1 5 "helo" '("hello")))))
+                    1 5 "helo" '( "hello")))))
           (with-current-buffer source
             (insert "wrng")
             (proofread-mode 1)
             (proofread-test--install-diagnostics
              (list (proofread-test--diagnostic-with-suggestions
-                    1 5 "wrng" '("wrong"))))
+                    1 5 "wrng" '( "wrong"))))
             (let (nested-edit)
               (add-hook
                'after-change-functions
@@ -5127,7 +5185,7 @@ This covers URLs, email, invisible text, faces, and properties."
             (proofread-mode 1)
             (proofread-test--install-diagnostics
              (list (proofread-test--diagnostic-with-suggestions
-                    1 5 "helo" '("hello")))))
+                    1 5 "helo" '( "hello")))))
           (with-current-buffer source
             (emacs-lisp-mode)
             (insert "\"helo\"")
@@ -5137,7 +5195,7 @@ This covers URLs, email, invisible text, faces, and properties."
                    (proofread--make-diagnostic
                     :beg 2 :end 6 :text "helo" :kind 'spelling
                     :message "Possible misspelling"
-                    :suggestions '("hello\\") :source 'test
+                    :suggestions '( "hello\\") :source 'test
                     :target-kind 'docstring))
                   nested-edit)
               (proofread-test--install-diagnostics (list diagnostic))
@@ -5176,10 +5234,10 @@ This covers URLs, email, invisible text, faces, and properties."
     (let ((calls 0)
           (first
            (proofread-test--diagnostic-with-suggestions
-            1 5 "helo" '("hello")))
+            1 5 "helo" '( "hello")))
           (second
            (proofread-test--diagnostic-with-suggestions
-            6 10 "wrld" '("world"))))
+            6 10 "wrld" '( "world"))))
       (proofread-test--install-diagnostics (list first second))
       (add-hook 'proofread-diagnostics-changed-hook
                 (lambda ()
@@ -5216,7 +5274,7 @@ This covers URLs, email, invisible text, faces, and properties."
             :end 999
             :text "helo"
             :kind 'spelling
-            :suggestions '("hello"))))
+            :suggestions '( "hello"))))
       (setq proofread--diagnostics (list diagnostic))
       (goto-char 2)
       (should-error (proofread-correct-at-point) :type 'user-error)
@@ -5233,7 +5291,7 @@ This covers URLs, email, invisible text, faces, and properties."
              :end 5
              :text "helo"
              :kind 'spelling
-             :suggestions '("hello")))
+             :suggestions '( "hello")))
            (overlay
             (car (proofread-test--install-diagnostics
                   (list diagnostic)))))
@@ -5253,7 +5311,7 @@ This covers URLs, email, invisible text, faces, and properties."
             :end 5
             :text "helo"
             :kind 'spelling
-            :suggestions '("hello"))))
+            :suggestions '( "hello"))))
       (proofread-test--install-diagnostics (list diagnostic))
       (goto-char 2)
       (should-error (proofread-correct-at-point) :type 'user-error)
@@ -5272,7 +5330,7 @@ This covers URLs, email, invisible text, faces, and properties."
             :end 8
             :text "helo"
             :kind 'spelling
-            :suggestions '("hello"))))
+            :suggestions '( "hello"))))
       (proofread-test--install-diagnostics (list diagnostic))
       (goto-char 5)
       (proofread-correct-at-point)
@@ -5291,7 +5349,7 @@ This covers URLs, email, invisible text, faces, and properties."
              :end 8
              :text "helo"
              :kind 'spelling
-             :suggestions '("hello")))
+             :suggestions '( "hello")))
            (overlap
             (proofread-test--diagnostic-for-range 5 8 "elo"))
            (outside
@@ -5328,7 +5386,7 @@ This covers URLs, email, invisible text, faces, and properties."
               :text "helo"
               :kind 'spelling
               :message "Possible misspelling"
-              :suggestions '("hello")))
+              :suggestions '( "hello")))
             (text (buffer-string)))
         (proofread-test--install-diagnostics (list diagnostic))
         (goto-char 1)
@@ -5336,6 +5394,8 @@ This covers URLs, email, invisible text, faces, and properties."
         (should (equal (buffer-string) text))
         (proofread-describe)
         (should (equal (buffer-string) text))))))
+
+;;;; Ignore tests
 
 (ert-deftest proofread-test-ignore-key-exact-text-and-kind ()
   "Ignore keys include language and diagnostic meaning, not location."
@@ -5357,12 +5417,12 @@ This covers URLs, email, invisible text, faces, and properties."
           (different-message
            (proofread--make-diagnostic
             :beg 10 :end 14 :text "helo" :kind 'spelling
-            :message "Different issue" :suggestions '("hello")
+            :message "Different issue" :suggestions '( "hello")
             :source 'test)))
       (should (equal (proofread--diagnostic-ignore-key diagnostic)
-                     '(:language "en" :text "helo" :kind spelling
-                                 :message "Possible issue" :source
-                                 test)))
+                     '( :language "en" :text "helo" :kind spelling
+                        :message "Possible issue" :source
+                        test)))
       (proofread--record-ignored-diagnostic diagnostic)
       (should (proofread--diagnostic-ignored-p same))
       (should-not (proofread--diagnostic-ignored-p different-kind))
@@ -5487,6 +5547,8 @@ This covers URLs, email, invisible text, faces, and properties."
         (should-not proofread--diagnostics)
         (should-not proofread--overlays)))))
 
+;;;; Listing tests
+
 (ert-deftest proofread-test-negative-request-log-limit-is-safe ()
   "A negative direct request-log limit is clamped instead of looping."
   (with-temp-buffer
@@ -5601,7 +5663,8 @@ This covers URLs, email, invisible text, faces, and properties."
                        (lambda (&optional _frame)
                          (error "Unexpected global buffer scan")))
                       ((symbol-function 'run-at-time)
-                       (lambda (_time _repeat function &rest arguments)
+                       (lambda (_time _repeat function
+                                      &rest arguments)
                          (setq schedules (1+ schedules))
                          (setq refresh-function function)
                          (setq refresh-arguments arguments)
@@ -5695,7 +5758,8 @@ This covers URLs, email, invisible text, faces, and properties."
                               (plist-get recorder :function)))
                      (proofread-show-buffer-requests source)
                      (proofread-check-visible-range)
-                     (proofread-test--flush-request-log-refresh source)
+                     (proofread-test--flush-request-log-refresh
+                      source)
                      (with-current-buffer name
                        (should (= (length tabulated-list-entries) 2))
                        (let ((statuses
@@ -5719,7 +5783,8 @@ This covers URLs, email, invisible text, faces, and properties."
                           (proofread--backend-success-result
                            first-request nil))
                          'applied)))
-                     (proofread-test--flush-request-log-refresh source)
+                     (proofread-test--flush-request-log-refresh
+                      source)
                      (with-current-buffer name
                        (let ((statuses
                               (mapcar (lambda (entry)
@@ -5862,7 +5927,8 @@ This covers URLs, email, invisible text, faces, and properties."
           (should-not proofread--request-log-sources)
           (should-not (memq #'proofread--request-log-record-event
                             proofread-request-log-hook)))
-      (dolist (buffer (list diagnostics-buffer requests-buffer source))
+      (dolist (buffer
+               (list diagnostics-buffer requests-buffer source))
         (when (buffer-live-p buffer)
           (kill-buffer buffer))))))
 
@@ -5953,17 +6019,17 @@ This covers URLs, email, invisible text, faces, and properties."
   "Preserve backend-specific HTTP request and response details."
   (let ((request-details
          (proofread--request-log-backend-request-details
-          '(:backend languagetool
-                     :method "POST"
-                     :url "http://127.0.0.1:8081/v2/check"
-                     :parameters (("language" . "en-US")
-                                  ("text" . "helo")))))
+          '( :backend languagetool
+             :method "POST"
+             :url "http://127.0.0.1:8081/v2/check"
+             :parameters (("language" . "en-US")
+                          ("text" . "helo")))))
         (response-details
          (proofread--request-log-backend-response-details
-          '(:backend languagetool
-                     :url "http://127.0.0.1:8081/v2/check"
-                     :http-status 200
-                     :response "{\"matches\":[]}"))))
+          '( :backend languagetool
+             :url "http://127.0.0.1:8081/v2/check"
+             :http-status 200
+             :response "{\"matches\":[]}"))))
     (should (equal (plist-get request-details :method) "POST"))
     (should
      (equal (plist-get request-details :parameters)
@@ -6012,13 +6078,13 @@ This covers URLs, email, invisible text, faces, and properties."
                           (list (list :backend proofread-test--backend
                                       :pass 1
                                       :schema
-                                      '(:type "object")
+                                      '( :type "object")
                                       :prompt nil))
                           :backend-responses
                           (list (list :backend proofread-test--backend
                                       :pass 1
                                       :response
-                                      '(:diagnostics nil)))
+                                      '( :diagnostics nil)))
                           :backend-results (list result)
                           :final-status 'applied
                           :final-result result))
@@ -6032,18 +6098,20 @@ This covers URLs, email, invisible text, faces, and properties."
                       (should buffer-read-only)
                       (should (eq major-mode 'lisp-data-mode))
                       (goto-char (point-min))
-                      (dolist (heading '(";;; Summary"
-                                         ";;; Chunk request"
-                                         ";;; Lifecycle events"
-                                         ";;; Backend requests"
-                                         ";;; Backend responses"
-                                         ";;; Parsed backend results"
-                                         ";;; Final result"))
+                      (dolist (heading '( ";;; Summary"
+                                          ";;; Chunk request"
+                                          ";;; Lifecycle events"
+                                          ";;; Backend requests"
+                                          ";;; Backend responses"
+                                          ";;; Parsed backend results"
+                                          ";;; Final result"))
                         (should (search-forward heading nil t)))))
                 (when-let* ((buffer (get-buffer detail-name)))
                   (kill-buffer buffer)))))
         (when (buffer-live-p source)
           (kill-buffer source))))))
+
+;;;; Target selection tests
 
 (ert-deftest proofread-test-targets-default-auto-and-buffer-local ()
   "`proofread-targets' defaults to automatic buffer-local selection."
@@ -6081,7 +6149,7 @@ This covers URLs, email, invisible text, faces, and properties."
                       (mapcar (lambda (chunk)
                                 (plist-get chunk :target-kind))
                               chunks))
-                     '(comment docstring))))))
+                     '( comment docstring))))))
 
 (ert-deftest proofread-test-targets-auto-text-mode-selects-all-text ()
   "Automatic non-programming targets include the accessible text."
@@ -6255,7 +6323,8 @@ This covers URLs, email, invisible text, faces, and properties."
                             (plist-get chunk :target-kind))))
            (request (proofread--make-backend-request
                      comment proofread-test--backend))
-           (key (proofread--cache-key comment proofread-test--backend)))
+           (key
+            (proofread--cache-key comment proofread-test--backend)))
       (should comment)
       (should docstring)
       (should (eq (plist-get request :target-policy)
@@ -6279,7 +6348,8 @@ This covers URLs, email, invisible text, faces, and properties."
                             changed-kind proofread-test--backend)))
         (should-not (equal key
                            (proofread--cache-key
-                            changed-policy proofread-test--backend)))))))
+                            changed-policy
+                            proofread-test--backend)))))))
 
 (ert-deftest proofread-test-target-option-change-makes-request-stale
     ()
@@ -6389,7 +6459,7 @@ This covers URLs, email, invisible text, faces, and properties."
            (diagnostic
             (proofread--make-diagnostic
              :beg position :end position :text "" :kind 'grammar
-             :message "Missing punctuation" :suggestions '(".")
+             :message "Missing punctuation" :suggestions '( ".")
              :source 'test :target-kind 'text))
            (overlay
             (car (proofread-test--install-diagnostics
@@ -6431,11 +6501,13 @@ This covers URLs, email, invisible text, faces, and properties."
                  (proofread-context-sentences-before 1)
                  (proofread-context-sentences-after 1)
                  (later-chunk
-                  (car (proofread-test--request-ready-chunks-for-ranges
-                        (list (cons later-beg later-end)))))
+                  (car
+                   (proofread-test--request-ready-chunks-for-ranges
+                    (list (cons later-beg later-end)))))
                  (isolated-chunk
-                  (car (proofread-test--request-ready-chunks-for-ranges
-                        (list (cons isolated-beg isolated-end))))))
+                  (car
+                   (proofread-test--request-ready-chunks-for-ranges
+                    (list (cons isolated-beg isolated-end))))))
             (should (= (length domains) 2))
             (should (< (car first-domain) later-beg))
             (should (<= later-end (cdr first-domain)))
@@ -6575,7 +6647,8 @@ This covers URLs, email, invisible text, faces, and properties."
   (with-temp-buffer
     (insert "Alpha prose.")
     (setq-local proofread-auto-check nil)
-    (setq-local proofread-ignored-properties '(proofread-test-ignore))
+    (setq-local proofread-ignored-properties
+                '( proofread-test-ignore))
     (proofread-mode 1)
     (let* ((chunk
             (car (proofread-test--request-ready-chunks-for-ranges
@@ -6586,7 +6659,7 @@ This covers URLs, email, invisible text, faces, and properties."
       (add-text-properties
        (plist-get request :beg)
        (1+ (plist-get request :beg))
-       '(proofread-test-ignore t))
+       '( proofread-test-ignore t))
       (should (= chars-tick (buffer-chars-modified-tick)))
       (should-not (proofread--fresh-request-p request))))
   (with-temp-buffer
@@ -6599,7 +6672,7 @@ This covers URLs, email, invisible text, faces, and properties."
            (request (proofread--make-backend-request
                      chunk proofread-test--backend)))
       (setq-local proofread-ignored-properties
-                  '(proofread-test-ignore))
+                  '( proofread-test-ignore))
       (should (proofread--fresh-request-p request)))))
 
 (ert-deftest
@@ -6680,13 +6753,16 @@ This covers URLs, email, invisible text, faces, and properties."
                         new-log-id))
              (should-not proofread--diagnostics))))))))
 
+;;;; Backend lifecycle tests
+
 (ert-deftest proofread-test-backend-callback-is-at-most-once ()
   "Complete requests only once when backends callback twice."
   (with-temp-buffer
     (insert "Alpha")
     (proofread-mode 1)
-    (let* ((chunk (car (proofread-test--request-ready-chunks-for-ranges
-                        (list (cons (point-min) (point-max))))))
+    (let* ((chunk
+            (car (proofread-test--request-ready-chunks-for-ranges
+                  (list (cons (point-min) (point-max))))))
            (request (proofread--make-backend-request
                      chunk proofread-test--backend))
            captured-callback
@@ -6753,7 +6829,7 @@ This covers URLs, email, invisible text, faces, and properties."
     (let* ((diagnostic
             (proofread--make-diagnostic
              :beg 2 :end 2 :text "" :kind 'grammar
-             :message "Missing punctuation" :suggestions '(",")
+             :message "Missing punctuation" :suggestions '( ",")
              :source 'test))
            (overlay (car (proofread-test--install-diagnostics
                           (list diagnostic)))))
@@ -6770,8 +6846,9 @@ This covers URLs, email, invisible text, faces, and properties."
   (with-temp-buffer
     (insert "helo helo")
     (proofread-mode 1)
-    (let* ((chunk (car (proofread-test--request-ready-chunks-for-ranges
-                        '((6 . 10)))))
+    (let* ((chunk
+            (car (proofread-test--request-ready-chunks-for-ranges
+                  '((6 . 10)))))
            (request (proofread--make-backend-request
                      chunk proofread-test--backend)))
       (goto-char (point-min))
@@ -6790,8 +6867,9 @@ This covers URLs, email, invisible text, faces, and properties."
     (proofread-mode 1)
     (let* ((proofread-backend proofread-test--backend)
            (proofread-test--backend-identity-token "identity-a")
-           (chunk (car (proofread-test--request-ready-chunks-for-ranges
-                        (list (cons (point-min) (point-max))))))
+           (chunk
+            (car (proofread-test--request-ready-chunks-for-ranges
+                  (list (cons (point-min) (point-max))))))
            (request (proofread--make-backend-request
                      chunk proofread-test--backend))
            (key (plist-get request :cache-key))
@@ -6823,22 +6901,24 @@ This covers URLs, email, invisible text, faces, and properties."
       (should
        (equal (plist-get (plist-get request :backend-identity)
                          :token)
-              '(:name "alpha")))
+              '( :name "alpha")))
       (should (equal (prin1-to-string (proofread--request-work-key
                                        request))
                      work-key-text))
       (should (proofread--request-work-pending-p request))
       (should-not (proofread--fresh-request-p request)))))
 
-(ert-deftest proofread-test-backend-identity-change-makes-request-stale ()
+(ert-deftest
+    proofread-test-backend-identity-change-makes-request-stale ()
   "Invalidate old requests when the backend identity changes."
   (with-temp-buffer
     (insert "Alpha")
     (proofread-mode 1)
     (let* ((proofread-backend proofread-test--backend)
            (proofread-test--backend-identity-token "identity-a")
-           (chunk (car (proofread-test--request-ready-chunks-for-ranges
-                        (list (cons (point-min) (point-max))))))
+           (chunk
+            (car (proofread-test--request-ready-chunks-for-ranges
+                  (list (cons (point-min) (point-max))))))
            (request (proofread--make-backend-request
                      chunk proofread-test--backend)))
       (let ((proofread-test--backend-identity-token "identity-b"))
@@ -6853,8 +6933,9 @@ This covers URLs, email, invisible text, faces, and properties."
     (search-forward "Target.")
     (let* ((beg (match-beginning 0))
            (end (match-end 0))
-           (chunk (car (proofread-test--request-ready-chunks-for-ranges
-                        (list (cons beg end)))))
+           (chunk
+            (car (proofread-test--request-ready-chunks-for-ranges
+                  (list (cons beg end)))))
            (request (proofread--make-backend-request
                      chunk proofread-test--backend)))
       (goto-char (point-min))
@@ -7018,7 +7099,7 @@ This covers URLs, email, invisible text, faces, and properties."
                 (claimed-selected superseded)
                 (queued-selected superseded))))
       (should (equal cancelled-handles
-                     '(active-first-handle active-last-handle)))
+                     '( active-first-handle active-last-handle)))
       (dolist (request selected)
         (should
          (proofread--request-state-flag-p request :cancelled))))))
@@ -7130,8 +7211,8 @@ This covers URLs, email, invisible text, faces, and properties."
                 (setq schedule-state
                       (and
                        (equal cancelled-handles
-                              '(active-first-handle
-                                active-last-handle))
+                              '( active-first-handle
+                                 active-last-handle))
                        (equal
                         (mapcar
                          (lambda (entry)
@@ -7152,7 +7233,7 @@ This covers URLs, email, invisible text, faces, and properties."
                 (claimed-selected stale)
                 (queued-selected stale))))
       (should (equal cancelled-handles
-                     '(active-first-handle active-last-handle)))
+                     '( active-first-handle active-last-handle)))
       (should (= schedule-calls 1))
       (should schedule-state)
       (dolist (request selected)
@@ -7172,18 +7253,19 @@ This covers URLs, email, invisible text, faces, and properties."
   (with-temp-buffer
     (insert "helo")
     (proofread-mode 1)
-    (let* ((chunk (car (proofread-test--request-ready-chunks-for-ranges
-                        (list (cons (point-min) (point-max))))))
+    (let* ((chunk
+            (car (proofread-test--request-ready-chunks-for-ranges
+                  (list (cons (point-min) (point-max))))))
            (older (proofread--make-backend-request
                    chunk proofread-test--backend))
            (newer (proofread--make-backend-request
                    chunk proofread-test--backend))
            (old-diagnostic
             (proofread-test--diagnostic-with-suggestions
-             1 5 "helo" '("hullo")))
+             1 5 "helo" '( "hullo")))
            (new-diagnostic
             (proofread-test--diagnostic-with-suggestions
-             1 5 "helo" '("hello"))))
+             1 5 "helo" '( "hello"))))
       (proofread--register-active-request older)
       (proofread--finish-superseded-requests
        (proofread--supersede-conflicting-requests (list newer)))
@@ -7377,10 +7459,11 @@ This covers URLs, email, invisible text, faces, and properties."
       (proofread-mode 1)
       (let* ((victim-chunk (proofread--make-request-ready-chunk 1 4))
              (new-chunk (proofread--make-request-ready-chunk 2 5))
-             (unrelated-chunk (proofread--make-request-ready-chunk 5
-                                                                   8))
-             (victim (proofread--make-backend-request victim-chunk
-                                                      proofread-test--backend))
+             (unrelated-chunk
+              (proofread--make-request-ready-chunk 5 8))
+             (victim
+              (proofread--make-backend-request
+               victim-chunk proofread-test--backend))
              (unrelated
               (proofread--make-backend-request
                unrelated-chunk proofread-test--backend))
@@ -7407,8 +7490,8 @@ This covers URLs, email, invisible text, faces, and properties."
                        (push log-id submitted-log-ids)
                        (push (cons log-id callback) callbacks)
                        (list :backend 'test :log-id log-id)))))
-          (proofread--dispatch-request-ready-chunks (list new-chunk)
-                                                    proofread-test--backend)
+          (proofread--dispatch-request-ready-chunks
+           (list new-chunk) proofread-test--backend)
           (should (equal submitted-log-ids (list unrelated-log-id)))
           (should (proofread--request-state-flag-p victim
                                                    :superseded))
@@ -7526,10 +7609,12 @@ This covers URLs, email, invisible text, faces, and properties."
       (proofread-mode 1)
       (let* ((waiting-chunk (proofread--make-request-ready-chunk 1 4))
              (active-chunk (proofread--make-request-ready-chunk 5 8))
-             (waiting (proofread--make-backend-request waiting-chunk
-                                                       proofread-test--backend))
-             (active (proofread--make-backend-request active-chunk
-                                                      proofread-test--backend))
+             (waiting
+              (proofread--make-backend-request
+               waiting-chunk proofread-test--backend))
+             (active
+              (proofread--make-backend-request
+               active-chunk proofread-test--backend))
              (waiting-log-id (plist-get waiting :log-id)))
         (setq active (plist-put active :handle 'old-handle))
         (proofread--register-active-request active)
@@ -8042,7 +8127,7 @@ This covers URLs, email, invisible text, faces, and properties."
            (should (equal (mapcar (lambda (request)
                                     (plist-get request :text))
                                   proofread--active-requests)
-                          '("bcde")))
+                          '( "bcde")))
            (should-not proofread--request-queue)
            (should-not proofread--request-queue-tail)))))))
 
@@ -8081,8 +8166,8 @@ This covers URLs, email, invisible text, faces, and properties."
                  (proofread--make-backend-request
                   cached-chunk proofread-test--backend))
                 (unrelated
-                 (proofread--make-backend-request unrelated-chunk
-                                                  proofread-test--backend)))
+                 (proofread--make-backend-request
+                  unrelated-chunk proofread-test--backend)))
            (proofread--cache-write-request cached-preview nil)
            (let ((older
                   (car (proofread--dispatch-request-ready-chunks
@@ -8102,7 +8187,7 @@ This covers URLs, email, invisible text, faces, and properties."
              (should (equal (mapcar (lambda (request)
                                       (plist-get request :text))
                                     backend-requests)
-                            '("abc" "def")))
+                            '( "abc" "def")))
              (should-not (proofread--active-request-p older))
              (should (proofread--active-request-p unrelated))
              (should-not proofread--request-queue)
@@ -8156,7 +8241,7 @@ This covers URLs, email, invisible text, faces, and properties."
 (ert-deftest
     proofread-test-adjacent-zero-width-diagnostic-keeps-owner ()
   "Keep boundary diagnostics until their owner is cleaned."
-  (dolist (producer '(left right))
+  (dolist (producer '( left right))
     (dolist (callback-order '((left right) (right left)))
       (with-temp-buffer
         (insert "abcdef")
@@ -8166,11 +8251,13 @@ This covers URLs, email, invisible text, faces, and properties."
               (proofread-cache-max-entries 0))
           (proofread-mode 1)
           (let* ((left-chunk
-                  (car (proofread-test--request-ready-chunks-for-ranges
-                        '((1 . 4)))))
+                  (car
+                   (proofread-test--request-ready-chunks-for-ranges
+                    '((1 . 4)))))
                  (right-chunk
-                  (car (proofread-test--request-ready-chunks-for-ranges
-                        '((4 . 7)))))
+                  (car
+                   (proofread-test--request-ready-chunks-for-ranges
+                    '((4 . 7)))))
                  (left-request
                   (proofread--make-backend-request
                    left-chunk proofread-test--backend))
@@ -8185,7 +8272,7 @@ This covers URLs, email, invisible text, faces, and properties."
                   (proofread--make-diagnostic
                    :beg 4 :end 4 :text "" :kind 'grammar
                    :message "Missing boundary punctuation"
-                   :suggestions '(".") :source 'test))
+                   :suggestions '( ".") :source 'test))
                  (neighbor-diagnostic
                   (if (eq producer 'left)
                       (proofread-test--diagnostic-for-range 5 6 "e")
@@ -8228,6 +8315,17 @@ This covers URLs, email, invisible text, faces, and properties."
                              (list neighbor-diagnostic)))
               (should (proofread--overlay-for-diagnostic
                        live-neighbor)))))))))
+
+;;;; Runtime setup
+
+(progn
+  (proofread--register-backend
+   proofread-test--backend
+   :check #'proofread-test--backend-check
+   :identity #'proofread-test--backend-identity
+   :cancel #'proofread-test--backend-cancel)
+  (setq proofread-backend
+        proofread-test--unavailable-backend))
 
 (provide 'proofread-tests)
 ;;; proofread-tests.el ends here

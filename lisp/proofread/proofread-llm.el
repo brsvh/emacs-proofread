@@ -1,4 +1,4 @@
-;;; proofread-llm.el --- LLM backend for Proofread  -*- lexical-binding: t; -*-
+;;; proofread-llm.el --- LLM backend  -*- lexical-binding: t; -*-
 
 ;; Copyright (C) 2026 Bingshan Chang <chang@bingshan.org>
 
@@ -36,6 +36,8 @@
 (require 'subr-x)
 (require 'warnings)
 
+;;;; Options
+
 (defcustom proofread-llm-provider nil
   "Provider object used when `proofread-backend' is `llm'.
 Users should configure this with a provider constructor from the GNU
@@ -50,9 +52,9 @@ provider advertises `json-response', and otherwise falls back to
 prompt-only JSON.  The value `provider-json' requires `json-response'.
 The value `prompt-json' always uses ordinary chat output and asks the
 model to return only JSON."
-  :type '(choice (const :tag "Auto" auto)
-                 (const :tag "Provider JSON schema" provider-json)
-                 (const :tag "Prompt-only JSON" prompt-json))
+  :type '( choice (const :tag "Auto" auto)
+           (const :tag "Provider JSON schema" provider-json)
+           (const :tag "Prompt-only JSON" prompt-json))
   :group 'proofread)
 
 (defcustom proofread-llm-provider-identity nil
@@ -68,14 +70,35 @@ entries across equivalent provider objects in the same buffer."
 Additional passes ask only for problems not already reported.  A value
 of 1 uses a single LLM call."
   :type 'natnum
-  :set #'proofread--set-positive-integer-option
+  :set #'proofread-set-positive-integer-option
   :group 'proofread)
+
+;;;; Provider state
+
+(defvar proofread-llm--provider-identity-sequence 0
+  "Sequence for session-local LLM provider identities.")
+
+(defvar proofread-llm--provider-session-identities
+  (make-hash-table :test #'eq :weakness 'key)
+  "Session-local identities for LLM provider objects.")
+
+;;;; Structured response contract
 
 (defconst proofread-llm--contract-version 3
   "Version of the LLM prompt, response, and cache identity contract.")
 
+(defconst proofread-llm--empty-json-object
+  'proofread-llm--empty-json-object
+  "Sentinel preserving an empty JSON object's type.")
+
+(defconst proofread-llm--json-false 'proofread-llm--json-false
+  "Sentinel preserving a JSON false value's type.")
+
+(defconst proofread-llm--json-null 'proofread-llm--json-null
+  "Sentinel preserving a JSON null value's type.")
+
 (defconst proofread-llm--diagnostic-kinds
-  '(spelling grammar style other)
+  '( spelling grammar style other)
   "Diagnostic kind symbols accepted from structured responses.")
 
 (defconst proofread-llm--diagnostic-kind-names
@@ -148,30 +171,6 @@ of 1 uses a single LLM call."
      :additionalProperties ,json-false)
   "JSON schema for structured LLM responses.")
 
-(defun proofread-llm--result-with-candidate-metadata
-    (result candidate-issues repairs)
-  "Return RESULT with optional CANDIDATE-ISSUES and REPAIRS metadata."
-  (when candidate-issues
-    (setq result
-          (plist-put result :candidate-issues candidate-issues)))
-  (when repairs
-    (setq result (plist-put result :repairs repairs)))
-  result)
-
-(defun proofread-llm--backend-invalid-diagnostics-result
-    (request candidate-issues repairs)
-  "Return an error for REQUEST with no usable diagnostic candidates.
-CANDIDATE-ISSUES and REPAIRS describe the responses that were
-rejected."
-  (proofread-llm--result-with-candidate-metadata
-   (proofread--backend-error-result
-    request 'llm-invalid-diagnostics
-    (format (concat "No usable diagnostic candidates after %d "
-                    "rejected candidate%s")
-            (length candidate-issues)
-            (if (= (length candidate-issues) 1) "" "s")))
-   candidate-issues repairs))
-
 (defun proofread-llm--structured-response-schema-text ()
   "Return the diagnostic response schema as JSON text."
   (json-encode proofread-llm--structured-response-schema))
@@ -197,7 +196,8 @@ rejected."
             (plist-get diagnostic :kind)
             (plist-get diagnostic :message))))
 
-(defun proofread-llm--reported-diagnostics-prompt (request diagnostics)
+(defun proofread-llm--reported-diagnostics-prompt
+    (request diagnostics)
   "Return prompt text for REQUEST's reported DIAGNOSTICS."
   (when diagnostics
     (concat
@@ -249,14 +249,31 @@ them."
    (or (plist-get request :text) "")
    (or (plist-get request :context-after) "")))
 
-(defconst proofread-llm--empty-json-object 'proofread-llm--empty-json-object
-  "Sentinel preserving an empty JSON object's type.")
+(defun proofread-llm--prompt
+    (request strategy &optional reported-diagnostics)
+  "Return an `llm-chat-prompt' for REQUEST using STRATEGY.
+REPORTED-DIAGNOSTICS are included to avoid duplicates across passes."
+  (pcase strategy
+    ('provider-json
+     (llm-make-chat-prompt
+      (proofread-llm--structured-response-prompt
+       request nil reported-diagnostics)
+      :response-format proofread-llm--structured-response-schema))
+    ('prompt-json
+     (llm-make-chat-prompt
+      (proofread-llm--structured-response-prompt
+       request t reported-diagnostics)))
+    (_ (error "Unsupported llm response strategy: %S" strategy))))
 
-(defconst proofread-llm--json-false 'proofread-llm--json-false
-  "Sentinel preserving a JSON false value's type.")
+(defun proofread-llm--request-log-prompt-text (prompt)
+  "Return a plain prompt text summary from PROMPT, or nil."
+  (condition-case nil
+      (mapconcat #'llm-chat-prompt-interaction-content
+                 (llm-chat-prompt-interactions prompt)
+                 "\n\n")
+    (error nil)))
 
-(defconst proofread-llm--json-null 'proofread-llm--json-null
-  "Sentinel preserving a JSON null value's type.")
+;;;; Structured response parsing
 
 (defun proofread-llm--json-schema-property (schema key)
   "Return the property entry for string KEY in SCHEMA, or nil.
@@ -271,7 +288,8 @@ the child schema.  Unknown keys are not interned."
           (setq property (cons keyword child-schema)))))
     property))
 
-(defun proofread-llm--normalize-json-value (value schema &optional context)
+(defun proofread-llm--normalize-json-value
+    (value schema &optional context)
   "Return VALUE normalized according to SCHEMA.
 CONTEXT names the containing object for error messages."
   (cond
@@ -418,7 +436,7 @@ exactly once in the request text."
        (let ((suggestions (plist-get candidate :suggestions)))
          (and
           (cl-every (lambda (key) (plist-member candidate key))
-                    '(:kind :message :text :range :suggestions))
+                    '( :kind :message :text :range :suggestions))
           (proofread-llm--diagnostic-candidate-kind
            (plist-get candidate :kind))
           (stringp (plist-get candidate :message))
@@ -537,7 +555,7 @@ is the already validated chunk-relative range for CANDIDATE."
                  (plist-get request :backend)
                  'unknown))))))
 
-(defun proofread-llm--diagnostic-batch-from-structured-payload
+(defun proofread-llm--parse-structured-payload
     (request payload &optional default-source)
   "Return parsed diagnostic batch for REQUEST from PAYLOAD.
 DEFAULT-SOURCE is stored as each diagnostic's internal source.
@@ -580,30 +598,40 @@ invalidating the whole payload."
           :issues (nreverse issues)
           :repairs (nreverse repairs))))
 
-(defun proofread-llm--diagnostic-batch-from-structured-response
+(defun proofread-llm--parse-structured-response
     (request content &optional default-source)
   "Return parsed diagnostic batch for REQUEST from response CONTENT.
 Use DEFAULT-SOURCE when it is non-nil."
-  (proofread-llm--diagnostic-batch-from-structured-payload
+  (proofread-llm--parse-structured-payload
    request
    (proofread-llm--structured-response-payload content)
    default-source))
 
-(defun proofread-llm--prompt
-    (request strategy &optional reported-diagnostics)
-  "Return an `llm-chat-prompt' for REQUEST using STRATEGY.
-REPORTED-DIAGNOSTICS are included to avoid duplicates across passes."
-  (pcase strategy
-    ('provider-json
-     (llm-make-chat-prompt
-      (proofread-llm--structured-response-prompt
-       request nil reported-diagnostics)
-      :response-format proofread-llm--structured-response-schema))
-    ('prompt-json
-     (llm-make-chat-prompt
-      (proofread-llm--structured-response-prompt
-       request t reported-diagnostics)))
-    (_ (error "Unsupported llm response strategy: %S" strategy))))
+;;;; Backend results
+
+(defun proofread-llm--result-with-candidate-metadata
+    (result candidate-issues repairs)
+  "Return RESULT with optional CANDIDATE-ISSUES and REPAIRS metadata."
+  (when candidate-issues
+    (setq result
+          (plist-put result :candidate-issues candidate-issues)))
+  (when repairs
+    (setq result (plist-put result :repairs repairs)))
+  result)
+
+(defun proofread-llm--backend-invalid-diagnostics-result
+    (request candidate-issues repairs)
+  "Return an error for REQUEST with no usable diagnostic candidates.
+CANDIDATE-ISSUES and REPAIRS describe the responses that were
+rejected."
+  (proofread-llm--result-with-candidate-metadata
+   (proofread--backend-error-result
+    request 'llm-invalid-diagnostics
+    (format (concat "No usable diagnostic candidates after %d "
+                    "rejected candidate%s")
+            (length candidate-issues)
+            (if (= (length candidate-issues) 1) "" "s")))
+   candidate-issues repairs))
 
 (defun proofread-llm--diagnostic-metadata-for-pass (items pass)
   "Return copies of diagnostic metadata ITEMS annotated with PASS."
@@ -624,7 +652,7 @@ PASS identifies the diagnostic pass for request logging."
         (condition-case err
             (let*
                 ((batch
-                  (proofread-llm--diagnostic-batch-from-structured-response
+                  (proofread-llm--parse-structured-response
                    request response 'llm))
                  (diagnostics (plist-get batch :diagnostics))
                  (issues
@@ -676,6 +704,8 @@ PASS identifies the diagnostic pass for request logging."
      :result result)
     result))
 
+;;;; Provider selection and identity
+
 (defun proofread-llm--provider-json-response-p (provider)
   "Return non-nil when PROVIDER advertises JSON response support."
   (condition-case nil
@@ -698,6 +728,47 @@ When PROVIDER is nil, use `proofread-llm-provider'."
         ('prompt-json 'prompt-json)
         (_ nil)))))
 
+(defun proofread-llm--diagnostic-passes ()
+  "Return the configured number of diagnostic LLM passes."
+  (unless (and (integerp proofread-llm-max-diagnostic-passes)
+               (> proofread-llm-max-diagnostic-passes 0))
+    (user-error "Proofread diagnostic pass count must be positive"))
+  proofread-llm-max-diagnostic-passes)
+
+(defun proofread-llm--provider-session-identity (provider)
+  "Return a non-secret session-local identity for PROVIDER."
+  (or (gethash provider proofread-llm--provider-session-identities)
+      (puthash provider
+               (cl-incf proofread-llm--provider-identity-sequence)
+               proofread-llm--provider-session-identities)))
+
+(defun proofread-llm--provider-name ()
+  "Return a stable display name for `proofread-llm-provider', or nil."
+  (when proofread-llm-provider
+    (condition-case nil
+        (llm-name proofread-llm-provider)
+      (error nil))))
+
+(defun proofread-llm--provider-identity ()
+  "Return stable cache identity for the configured LLM provider."
+  (list :backend 'llm
+        :provider
+        (if proofread-llm-provider
+            (or proofread-llm-provider-identity
+                (list
+                 :name
+                 (or (proofread-llm--provider-name) 'unknown)
+                 :session
+                 (proofread-llm--provider-session-identity
+                  proofread-llm-provider)))
+          'unconfigured)
+        :response-strategy
+        (proofread-llm--response-strategy proofread-llm-provider)
+        :diagnostic-passes (proofread-llm--diagnostic-passes)
+        :contract-version proofread-llm--contract-version))
+
+;;;; Request execution
+
 (defun proofread-llm--deliver-result (handle callback result)
   "Schedule RESULT for CALLBACK and record its timer in HANDLE."
   (unless (or (plist-get handle :cancelled)
@@ -705,13 +776,6 @@ When PROVIDER is nil, use `proofread-llm-provider'."
     (setf (plist-get handle :delivered) t)
     (setf (plist-get handle :timer)
           (proofread--defer-backend-callback callback result))))
-
-(defun proofread-llm--diagnostic-passes ()
-  "Return the configured number of diagnostic LLM passes."
-  (unless (and (integerp proofread-llm-max-diagnostic-passes)
-               (> proofread-llm-max-diagnostic-passes 0))
-    (user-error "Proofread diagnostic pass count must be positive"))
-  proofread-llm-max-diagnostic-passes)
 
 (defun proofread-llm--finish-or-continue
     (request callback submit max-passes pass diagnostics
@@ -810,7 +874,8 @@ state."
                         :strategy strategy
                         :prompt prompt
                         :prompt-text
-                        (proofread-llm--request-log-prompt-text prompt)
+                        (proofread-llm--request-log-prompt-text
+                         prompt)
                         :schema
                         (llm-chat-prompt-response-format prompt)
                         :reported-diagnostics diagnostics)
@@ -871,53 +936,6 @@ state."
        provider strategy request callback handle)))
     handle))
 
-(defvar proofread-llm--provider-identity-sequence 0
-  "Sequence for session-local LLM provider identities.")
-
-(defvar proofread-llm--provider-session-identities
-  (make-hash-table :test #'eq :weakness 'key)
-  "Session-local identities for LLM provider objects.")
-
-(defun proofread-llm--provider-session-identity (provider)
-  "Return a non-secret session-local identity for PROVIDER."
-  (or (gethash provider proofread-llm--provider-session-identities)
-      (puthash provider
-               (cl-incf proofread-llm--provider-identity-sequence)
-               proofread-llm--provider-session-identities)))
-
-(defun proofread-llm--provider-name ()
-  "Return a stable display name for `proofread-llm-provider', or nil."
-  (when proofread-llm-provider
-    (condition-case nil
-        (llm-name proofread-llm-provider)
-      (error nil))))
-
-(defun proofread-llm--provider-identity ()
-  "Return stable cache identity for the configured LLM provider."
-  (list :backend 'llm
-        :provider
-        (if proofread-llm-provider
-            (or proofread-llm-provider-identity
-                (list
-                 :name
-                 (or (proofread-llm--provider-name) 'unknown)
-                 :session
-                 (proofread-llm--provider-session-identity
-                  proofread-llm-provider)))
-          'unconfigured)
-        :response-strategy
-        (proofread-llm--response-strategy proofread-llm-provider)
-        :diagnostic-passes (proofread-llm--diagnostic-passes)
-        :contract-version proofread-llm--contract-version))
-
-(defun proofread-llm--request-log-prompt-text (prompt)
-  "Return a plain prompt text summary from PROMPT, or nil."
-  (condition-case nil
-      (mapconcat #'llm-chat-prompt-interaction-content
-                 (llm-chat-prompt-interactions prompt)
-                 "\n\n")
-    (error nil)))
-
 (defun proofread-llm--cancel-request-handle (handle)
   "Cancel the LLM requests recorded in backend HANDLE."
   (let ((warning-minimum-level :error)
@@ -926,16 +944,19 @@ state."
       (ignore-errors
         (llm-cancel-request request-handle)))))
 
-(proofread--register-backend
- 'llm
- :check #'proofread-llm--backend-check
- :identity #'proofread-llm--provider-identity
- :cancel #'proofread-llm--cancel-request-handle)
-
 (defun proofread-llm-unload-function ()
   "Unregister the LLM backend before unloading this library."
   (proofread--unregister-backend 'llm)
   nil)
+
+;;;; Runtime registration
+
+(progn
+  (proofread--register-backend
+   'llm
+   :check #'proofread-llm--backend-check
+   :identity #'proofread-llm--provider-identity
+   :cancel #'proofread-llm--cancel-request-handle))
 
 (provide 'proofread-llm)
 ;;; proofread-llm.el ends here

@@ -16,6 +16,8 @@
 (require 'proofread)
 (require 'proofread-languagetool)
 
+;;;; Test support
+
 (defun proofread-languagetool-test--request (&rest properties)
   "Return a sample backend request extended by PROPERTIES."
   (append properties
@@ -29,11 +31,11 @@
                 :buffer (current-buffer))))
 
 (defun proofread-languagetool-test--match
-    (offset length &optional issue-type message replacements)
-  "Return a LanguageTool match at OFFSET with LENGTH.
+    (offset match-length &optional issue-type message replacements)
+  "Return a LanguageTool match at OFFSET with MATCH-LENGTH.
 ISSUE-TYPE, MESSAGE, and REPLACEMENTS customize the match."
   `((offset . ,offset)
-    (length . ,length)
+    (length . ,match-length)
     (message . ,(or message "Possible problem"))
     (replacements .
                   ,(mapcar (lambda (value)
@@ -46,8 +48,9 @@ ISSUE-TYPE, MESSAGE, and REPLACEMENTS customize the match."
   (let ((buffer (generate-new-buffer " *proofread-lt-response*")))
     (with-current-buffer buffer
       (insert (format "HTTP/1.1 %d Test\r\n\r\n" status))
-      (setq-local url-http-response-status status)
-      (setq-local url-http-end-of-headers (copy-marker (point)))
+      (set (make-local-variable 'url-http-response-status) status)
+      (set (make-local-variable 'url-http-end-of-headers)
+           (copy-marker (point)))
       (insert body))
     buffer))
 
@@ -59,18 +62,19 @@ CALLBACK-STATUS is the status plist passed to the URL callback."
     (with-current-buffer buffer
       (erase-buffer)
       (insert (format "HTTP/1.1 %d Test\r\n\r\n" status))
-      (setq-local url-http-response-status status)
-      (setq-local url-http-end-of-headers (copy-marker (point)))
+      (set (make-local-variable 'url-http-response-status) status)
+      (set (make-local-variable 'url-http-end-of-headers)
+           (copy-marker (point)))
       (insert body)
       (apply (plist-get call :callback)
              (cons callback-status (plist-get call :arguments))))))
 
 (defun proofread-languagetool-test--assert-no-redirects (buffer)
-  "Assert that retrieval BUFFER persistently disables redirects."
+  "Assert that redirects remain disabled in retrieval BUFFER."
   (should (buffer-live-p buffer))
   (with-current-buffer buffer
     (should (local-variable-p 'url-max-redirections))
-    (should (= url-max-redirections 0))))
+    (should (= (symbol-value 'url-max-redirections) 0))))
 
 (defun proofread-languagetool-test--wait-for
     (predicate &optional timeout)
@@ -133,6 +137,8 @@ CALLBACK-STATUS is the status plist passed to the URL callback."
          (progn ,@body)
        (proofread-languagetool-test--cleanup-state))))
 
+;;;; Registration, configuration, and identity
+
 (ert-deftest proofread-languagetool-test-registered-backend ()
   "The LanguageTool feature registers all backend operations."
   (let ((descriptor
@@ -151,16 +157,17 @@ CALLBACK-STATUS is the status plist passed to the URL callback."
         (proofread-languagetool-auto-start t)
         (proofread-languagetool-level 'picky)
         (proofread-languagetool-preferred-variants
-         '("de-DE" "en-US" "de-DE"))
+         '( "de-DE" "en-US" "de-DE"))
         (proofread-languagetool-mother-tongue "zh-CN")
-        (proofread-languagetool-enabled-rules '("B" "A"))
-        (proofread-languagetool-disabled-rules '("D" "C"))
-        (proofread-languagetool-enabled-categories '("STYLE"))
-        (proofread-languagetool-disabled-categories '("TYPO"))
+        (proofread-languagetool-enabled-rules '( "B" "A"))
+        (proofread-languagetool-disabled-rules '( "D" "C"))
+        (proofread-languagetool-enabled-categories '( "STYLE"))
+        (proofread-languagetool-disabled-categories '( "TYPO"))
         (proofread-languagetool-enabled-only nil)
         (proofread-languagetool-command
          "proofread-languagetool-missing-test-command"))
-    (cl-letf (((symbol-function 'executable-find) (lambda (_command) nil)))
+    (cl-letf (((symbol-function 'executable-find)
+               (lambda (_command) nil)))
       (let ((command-identity
              (list
               :fingerprint
@@ -171,19 +178,19 @@ CALLBACK-STATUS is the status plist passed to the URL callback."
         (should
          (equal
           (proofread-languagetool--identity)
-          `(:backend languagetool
-                     :server-url "http://127.0.0.1:8081/v2"
-                     :server-config nil
-                     :server-command ,command-identity
-                     :level picky
-                     :preferred-variants ("de-DE" "en-US")
-                     :mother-tongue "zh-CN"
-                     :enabled-rules ("A" "B")
-                     :disabled-rules ("C" "D")
-                     :enabled-categories ("STYLE")
-                     :disabled-categories ("TYPO")
-                     :enabled-only nil
-                     :contract-version 1)))))))
+          `( :backend languagetool
+             :server-url "http://127.0.0.1:8081/v2"
+             :server-config nil
+             :server-command ,command-identity
+             :level picky
+             :preferred-variants ("de-DE" "en-US")
+             :mother-tongue "zh-CN"
+             :enabled-rules ("A" "B")
+             :disabled-rules ("C" "D")
+             :enabled-categories ("STYLE")
+             :disabled-categories ("TYPO")
+             :enabled-only nil
+             :contract-version 1)))))))
 
 (ert-deftest proofread-languagetool-test-port-requirements ()
   "External URLs may omit a port, but managed startup may not."
@@ -215,12 +222,13 @@ CALLBACK-STATUS is the status plist passed to the URL callback."
     (should-error
      (proofread-languagetool--managed-port session))))
 
-(ert-deftest proofread-languagetool-test-auto-start-needs-managed-url ()
+(ert-deftest
+    proofread-languagetool-test-auto-start-needs-managed-url ()
   "Automatic startup requires a direct, explicit local endpoint."
-  (dolist (url '("https://example.com/v2"
-                 "https://example.com/proxy/v2"
-                 "http://127.0.0.1/v2"
-                 "http://127.0.0.1:18081/proxy/v2"))
+  (dolist (url '( "https://example.com/v2"
+                  "https://example.com/proxy/v2"
+                  "http://127.0.0.1/v2"
+                  "http://127.0.0.1:18081/proxy/v2"))
     (let ((proofread-languagetool-server-url url)
           (proofread-languagetool-auto-start t))
       (should-error
@@ -230,17 +238,19 @@ CALLBACK-STATUS is the status plist passed to the URL callback."
       (should
        (proofread-languagetool--server-session-snapshot)))))
 
-(ert-deftest proofread-languagetool-test-config-file-must-be-local-absolute ()
+(ert-deftest
+    proofread-languagetool-test-config-file-must-be-local-absolute ()
   "Server config paths cannot depend on a buffer or remote host."
-  (dolist (path '("languagetool.properties"
-                  "../languagetool.properties"
-                  "/ssh:user@example.test:/etc/languagetool.properties"))
+  (dolist (path '( "languagetool.properties"
+                   "../languagetool.properties"
+                   "/ssh:user@example.test:/etc/languagetool.properties"))
     (let ((proofread-languagetool-auto-start t)
           (proofread-languagetool-config-file path))
       (should-error
        (proofread-languagetool--server-session-snapshot)))))
 
-(ert-deftest proofread-languagetool-test-config-identity-follows-symlink ()
+(ert-deftest
+    proofread-languagetool-test-config-identity-follows-symlink ()
   "Server identity follows the resolved config-file target."
   (let* ((directory (make-temp-file "proofread-lt-config-" t))
          (first (expand-file-name "first.properties" directory))
@@ -274,7 +284,7 @@ CALLBACK-STATUS is the status plist passed to the URL callback."
   (let ((executable (make-temp-file "proofread-lt-command-"))
         (proofread-languagetool-auto-start t)
         (proofread-languagetool-command
-         '("test-languagetool" "--fixed" "argument")))
+         '( "test-languagetool" "--fixed" "argument")))
     (unwind-protect
         (progn
           (set-file-modes executable #o700)
@@ -288,16 +298,22 @@ CALLBACK-STATUS is the status plist passed to the URL callback."
                           "--fixed" "argument")))
             (cl-letf (((symbol-function 'executable-find)
                        (lambda (_command)
-                         (ert-fail "The snapshotted command was searched again"))))
+                         (ert-fail
+                          (concat "The snapshotted command was "
+                                  "searched again")))))
               (should (equal
-                       (proofread-languagetool--server-command session)
+                       (proofread-languagetool--server-command
+                        session)
                        (list (file-truename executable)
                              "--fixed" "argument"))))))
       (delete-file executable))))
 
-(ert-deftest proofread-languagetool-test-command-cache-identity-is-safe ()
-  "Command changes invalidate cache identity without exposing arguments."
-  (cl-letf (((symbol-function 'executable-find) (lambda (_command) nil)))
+(ert-deftest
+    proofread-languagetool-test-command-cache-identity-is-safe ()
+  "Command changes invalidate cache identity.
+The identity does not expose arguments."
+  (cl-letf (((symbol-function 'executable-find)
+             (lambda (_command) nil)))
     (let* ((secret "proofread-languagetool-test-secret")
            (proofread-languagetool-auto-start t)
            (proofread-languagetool-command
@@ -305,7 +321,7 @@ CALLBACK-STATUS is the status plist passed to the URL callback."
            (first (proofread-languagetool--identity)))
       (should-not (string-match-p secret (prin1-to-string first)))
       (setq proofread-languagetool-command
-            '("different-missing-languagetool" "--fixed"))
+            '( "different-missing-languagetool" "--fixed"))
       (should-not
        (equal first (proofread-languagetool--identity))))))
 
@@ -322,7 +338,7 @@ CALLBACK-STATUS is the status plist passed to the URL callback."
           (session (proofread-languagetool--server-session-snapshot)))
       (should-not (plist-member backend-identity :server-config))
       (should-not (plist-member backend-identity :server-command))
-      (dolist (key '(:server-config :command :startup-timeout))
+      (dolist (key '( :server-config :command :startup-timeout))
         (should-not (plist-member (plist-get session :identity) key)))
       (setq proofread-languagetool-command 42)
       (setq proofread-languagetool-config-file "relative.properties")
@@ -380,15 +396,18 @@ CALLBACK-STATUS is the status plist passed to the URL callback."
          (should (string-match-p "command must"
                                  (plist-get result :message))))))))
 
+;;;; Request encoding and response parsing
+
 (ert-deftest proofread-languagetool-test-request-parameters ()
   "Request data contains context, language, and rule controls."
   (let ((proofread-languagetool-level 'picky)
         (proofread-languagetool-preferred-variants
-         '("en-US" "de-DE"))
+         '( "en-US" "de-DE"))
         (proofread-languagetool-mother-tongue "zh-CN")
-        (proofread-languagetool-enabled-rules '("RULE_B" "RULE_A"))
+        (proofread-languagetool-enabled-rules
+         '( "RULE_B" "RULE_A"))
         (proofread-languagetool-disabled-rules nil)
-        (proofread-languagetool-enabled-categories '("STYLE"))
+        (proofread-languagetool-enabled-categories '( "STYLE"))
         (proofread-languagetool-disabled-categories nil)
         (proofread-languagetool-enabled-only t))
     (let* ((request
@@ -403,14 +422,14 @@ CALLBACK-STATUS is the status plist passed to the URL callback."
       (should (equal (cdr (assoc "text" parameters))
                      "😀 This are fine."))
       (dolist (part
-               '("language=auto"
-                 "level=picky"
-                 "preferredVariants=en-US%2Cde-DE"
-                 "motherTongue=zh-CN"
-                 "enabledRules=RULE_A%2CRULE_B"
-                 "enabledCategories=STYLE"
-                 "enabledOnly=true"
-                 "text=%F0%9F%98%80%20This%20are%20fine."))
+               '( "language=auto"
+                  "level=picky"
+                  "preferredVariants=en-US%2Cde-DE"
+                  "motherTongue=zh-CN"
+                  "enabledRules=RULE_A%2CRULE_B"
+                  "enabledCategories=STYLE"
+                  "enabledOnly=true"
+                  "text=%F0%9F%98%80%20This%20are%20fine."))
         (should (string-match-p (regexp-quote part) body))))))
 
 (ert-deftest proofread-languagetool-test-preferred-variant-order ()
@@ -418,12 +437,12 @@ CALLBACK-STATUS is the status plist passed to the URL callback."
   (should
    (equal
     (proofread-languagetool--normalized-preferred-variants
-     '("en-US" "de-DE" "en-US"))
-    '("en-US" "de-DE")))
+     '( "en-US" "de-DE" "en-US"))
+    '( "en-US" "de-DE")))
   (should-error
    (proofread-languagetool--normalized-preferred-variants
-    '("en-US" "en-GB")))
-  (dolist (invalid '("en" "en-" "-US"))
+    '( "en-US" "en-GB")))
+  (dolist (invalid '( "en" "en-" "-US"))
     (should-error
      (proofread-languagetool--normalized-preferred-variants
       (list invalid)))))
@@ -431,8 +450,8 @@ CALLBACK-STATUS is the status plist passed to the URL callback."
 (ert-deftest proofread-languagetool-test-enabled-only-validation ()
   "Enabled-only mode rejects contradictory rule configuration."
   (let ((proofread-languagetool-enabled-only t)
-        (proofread-languagetool-enabled-rules '("RULE"))
-        (proofread-languagetool-disabled-rules '("OTHER")))
+        (proofread-languagetool-enabled-rules '( "RULE"))
+        (proofread-languagetool-disabled-rules '( "OTHER")))
     (should-error
      (proofread-languagetool--request-data
       (proofread-languagetool-test--request))))
@@ -460,8 +479,9 @@ CALLBACK-STATUS is the status plist passed to the URL callback."
     (should-not
      (proofread-languagetool--utf16-offset-to-index text 99))))
 
-(ert-deftest proofread-languagetool-test-matches-require-json-array ()
-  "The response `matches' member distinguishes arrays from false values."
+(ert-deftest
+    proofread-languagetool-test-matches-require-json-array ()
+  "Distinguish the response `matches' array from false values."
   (with-temp-buffer
     (let* ((request (proofread-languagetool-test--request))
            (request-data
@@ -469,10 +489,10 @@ CALLBACK-STATUS is the status plist passed to the URL callback."
       (should-not
        (proofread-languagetool--parse-response
         request request-data "{\"matches\":[]}"))
-      (dolist (response '("{\"matches\":null}"
-                          "{\"matches\":false}"
-                          "{\"matches\":{}}"
-                          "{}"))
+      (dolist (response '( "{\"matches\":null}"
+                           "{\"matches\":false}"
+                           "{\"matches\":{}}"
+                           "{}"))
         (should-error
          (proofread-languagetool--parse-response
           request request-data response))))))
@@ -503,8 +523,10 @@ CALLBACK-STATUS is the status plist passed to the URL callback."
       (should-not (intern-soft nested-key)))))
 
 (ert-deftest
-    proofread-languagetool-test-matches-filter-context-and-zero-width ()
-  "Convert target matches while rejecting context and crossing matches."
+    proofread-languagetool-test-matches-filter-context-and-zero-width
+    ()
+  "Convert matches that stay within the target.
+Reject context-only and target-crossing matches."
   (with-temp-buffer
     (let* ((request (proofread-languagetool-test--request))
            (request-data
@@ -516,9 +538,9 @@ CALLBACK-STATUS is the status plist passed to the URL callback."
                         ,(proofread-languagetool-test--match
                           2 2 "grammar" "Crossing" nil)
                         ,(proofread-languagetool-test--match
-                          3 8 "grammar" "Agreement" '("This is"))
+                          3 8 "grammar" "Agreement" '( "This is"))
                         ,(proofread-languagetool-test--match
-                          3 0 "style" "Insert" '("Well, "))))))
+                          3 0 "style" "Insert" '( "Well, "))))))
            (diagnostics
             (proofread-languagetool--parse-response
              request request-data (json-encode payload))))
@@ -530,7 +552,7 @@ CALLBACK-STATUS is the status plist passed to the URL callback."
         (should (equal (plist-get agreement :text) "This are"))
         (should (eq (plist-get agreement :kind) 'grammar))
         (should (equal (plist-get agreement :suggestions)
-                       '("This is")))
+                       '( "This is")))
         (should (= (plist-get insertion :beg) 20))
         (should (= (plist-get insertion :end) 20))
         (should (equal (plist-get insertion :text) ""))))))
@@ -546,7 +568,7 @@ CALLBACK-STATUS is the status plist passed to the URL callback."
             `((matches .
                        (,(proofread-languagetool-test--match
                           3 8 "grammar" "Agreement"
-                          '("This is" "This is"))))))
+                          '( "This is" "This is"))))))
            calls)
       (cl-letf
           (((symbol-function
@@ -558,15 +580,15 @@ CALLBACK-STATUS is the status plist passed to the URL callback."
          (equal
           (proofread-languagetool--parse-response
            request request-data (json-encode payload))
-          '(sentinel))))
+          '( sentinel))))
       (should
        (equal calls
               (list
-               (list request '(0 . 8)
-                     '(:kind grammar
-                             :message "Agreement"
-                             :suggestions ("This is")
-                             :source languagetool))))))))
+               (list request '( 0 . 8)
+                     '( :kind grammar
+                        :message "Agreement"
+                        :suggestions ("This is")
+                        :source languagetool))))))))
 
 (ert-deftest proofread-languagetool-test-comment-delimiter-is-safe ()
   "LanguageTool matches cannot edit comment delimiters."
@@ -588,9 +610,9 @@ CALLBACK-STATUS is the status plist passed to the URL callback."
            (payload
             `((matches .
                        (,(proofread-languagetool-test--match
-                          0 2 "typographical" "Delimiter" '(""))
+                          0 2 "typographical" "Delimiter" '( ""))
                         ,(proofread-languagetool-test--match
-                          3 3 "misspelling" "Spelling" '("the"))))))
+                          3 3 "misspelling" "Spelling" '( "the"))))))
            (diagnostics
             (proofread-languagetool--parse-response
              request request-data (json-encode payload))))
@@ -598,6 +620,8 @@ CALLBACK-STATUS is the status plist passed to the URL callback."
       (should (= (plist-get (car diagnostics) :beg) 4))
       (should (= (plist-get (car diagnostics) :end) 7))
       (should (equal (plist-get (car diagnostics) :text) "teh")))))
+
+;;;; HTTP request lifecycle
 
 (ert-deftest proofread-languagetool-test-ready-server-posts-async ()
   "A ready external server receives an asynchronous POST request."
@@ -620,7 +644,8 @@ CALLBACK-STATUS is the status plist passed to the URL callback."
                              :buffer buffer
                              :method url-request-method
                              :data url-request-data
-                             :max-redirections url-max-redirections
+                             :max-redirections
+                             (symbol-value 'url-max-redirections)
                              :headers url-request-extra-headers))
                  buffer))))
          (let ((proofread-request-log-hook
@@ -649,8 +674,8 @@ CALLBACK-STATUS is the status plist passed to the URL callback."
               (equal (mapcar (lambda (event)
                                (plist-get event :type))
                              events)
-                     '(backend-request backend-response
-                                       backend-result)))
+                     '( backend-request backend-response
+                        backend-result)))
              (let ((request-event (nth 0 events))
                    (response-event (nth 1 events))
                    (result-event (nth 2 events)))
@@ -718,8 +743,10 @@ CALLBACK-STATUS is the status plist passed to the URL callback."
                              "LanguageTool HTTP status 599: "
                              "Error: invalid language"))))))))))
 
-(ert-deftest proofread-languagetool-test-request-timeout-cleans-buffer ()
-  "Current request timeout invalidates readiness; stale timeout does not."
+(ert-deftest
+    proofread-languagetool-test-request-timeout-cleans-buffer ()
+  "A current timeout invalidates readiness.
+A stale timeout leaves readiness unchanged."
   (proofread-languagetool-test--with-state
    (with-temp-buffer
      (let ((proofread-languagetool--server-state 'ready)
@@ -759,7 +786,8 @@ CALLBACK-STATUS is the status plist passed to the URL callback."
          (dolist (buffer url-buffers)
            (should-not (buffer-live-p buffer))))))))
 
-(ert-deftest proofread-languagetool-test-sync-submit-error-is-deferred ()
+(ert-deftest
+    proofread-languagetool-test-sync-submit-error-is-deferred ()
   "A synchronous URL submission failure still calls back later."
   (proofread-languagetool-test--with-state
    (with-temp-buffer
@@ -790,6 +818,8 @@ CALLBACK-STATUS is the status plist passed to the URL callback."
            (should-not
             (memq handle proofread-languagetool--live-handles))))))))
 
+;;;; Backend and server teardown
+
 (ert-deftest proofread-languagetool-test-stop-settles-live-handles ()
   "Stopping settles HTTP, waiting, deferred, and reentrant work."
   (proofread-languagetool-test--with-state
@@ -801,7 +831,8 @@ CALLBACK-STATUS is the status plist passed to the URL callback."
             (original-kill
              (symbol-function
               'proofread-languagetool--kill-url-buffer))
-            call handle reentrant-handle waiting-handle deferred-handle
+            call handle reentrant-handle waiting-handle
+            deferred-handle
             result reentrant-result waiting-result deferred-result
             scheduled)
        (cl-letf
@@ -936,7 +967,7 @@ CALLBACK-STATUS is the status plist passed to the URL callback."
            (run-at-time 60 nil #'ignore))
           (proofread-languagetool--probe-retry-timer
            (run-at-time 60 nil #'ignore))
-          (proofread-languagetool--probe-retry-token '(retry))
+          (proofread-languagetool--probe-retry-token '( retry))
           (proofread-languagetool--probe-timeout-timer
            (run-at-time 60 nil #'ignore))
           (probe-buffer
@@ -986,13 +1017,15 @@ CALLBACK-STATUS is the status plist passed to the URL callback."
           (cl-letf (((symbol-function 'remove-hook) #'ignore)
                     ((symbol-function 'proofread--unregister-backend)
                      #'ignore)
-                    ((symbol-function 'proofread-languagetool--teardown)
+                    ((symbol-function
+                      'proofread-languagetool--teardown)
                      #'ignore))
             (proofread-languagetool-unload-function))
           (should-not (buffer-live-p buffer)))
       (proofread-languagetool--kill-url-buffer buffer))))
 
-(ert-deftest proofread-languagetool-test-failing-waiter-does-not-orphan-next ()
+(ert-deftest
+    proofread-languagetool-test-failing-waiter-does-not-orphan-next ()
   "One signaling callback cannot prevent later waiter settlement."
   (proofread-languagetool-test--with-state
    (let* ((bad
@@ -1015,7 +1048,10 @@ CALLBACK-STATUS is the status plist passed to the URL callback."
      (should-not proofread-languagetool--server-waiters)
      (should-not proofread-languagetool--live-handles))))
 
-(ert-deftest proofread-languagetool-test-waiter-uses-check-time-snapshot ()
+;;;; Server sessions and readiness
+
+(ert-deftest
+    proofread-languagetool-test-waiter-uses-check-time-snapshot ()
   "A waiting request posts the options and endpoint it captured."
   (proofread-languagetool-test--with-state
    (with-temp-buffer
@@ -1069,7 +1105,8 @@ CALLBACK-STATUS is the status plist passed to the URL callback."
           (cadr calls) 200 "{\"matches\":[]}")
          (should (eq (plist-get result :status) 'ok)))))))
 
-(ert-deftest proofread-languagetool-test-session-change-invalidates-ready ()
+(ert-deftest
+    proofread-languagetool-test-session-change-invalidates-ready ()
   "Changing URL, config, or command invalidates a ready session."
   (proofread-languagetool-test--with-state
    (with-temp-buffer
@@ -1098,7 +1135,8 @@ CALLBACK-STATUS is the status plist passed to the URL callback."
              (lambda (process) (setq deleted process)))
             ((symbol-function 'make-process)
              (lambda (&rest _ignored)
-               (ert-fail "A healthy changed endpoint was not reused")))
+               (ert-fail
+                "A healthy changed endpoint was not reused")))
             ((symbol-function 'url-retrieve)
              (lambda (url callback arguments &rest _ignored)
                (let ((buffer
@@ -1112,7 +1150,8 @@ CALLBACK-STATUS is the status plist passed to the URL callback."
                                            :buffer buffer
                                            :method url-request-method
                                            :max-redirections
-                                           url-max-redirections))))
+                                           (symbol-value
+                                            'url-max-redirections)))))
                  buffer))))
          (proofread-languagetool--check
           (proofread-languagetool-test--request)
@@ -1141,7 +1180,8 @@ CALLBACK-STATUS is the status plist passed to the URL callback."
           (cadr calls) 200 "{\"matches\":[]}")
          (should (eq (plist-get result :status) 'ok)))))))
 
-(ert-deftest proofread-languagetool-test-session-identity-covers-lifecycle ()
+(ert-deftest
+    proofread-languagetool-test-session-identity-covers-lifecycle ()
   "Server identity includes every managed-process lifecycle option."
   (let* ((proofread-languagetool-auto-start t)
          (base (proofread-languagetool--server-session-snapshot)))
@@ -1211,7 +1251,8 @@ CALLBACK-STATUS is the status plist passed to the URL callback."
      (should (= armed-delay 7.5))
      (proofread-languagetool--kill-url-buffer buffer))))
 
-(ert-deftest proofread-languagetool-test-probe-schedule-error-is-atomic ()
+(ert-deftest
+    proofread-languagetool-test-probe-schedule-error-is-atomic ()
   "A timer error cannot publish half of a scheduled health probe."
   (proofread-languagetool-test--with-state
    (let* ((session
@@ -1228,7 +1269,8 @@ CALLBACK-STATUS is the status plist passed to the URL callback."
      (should-not proofread-languagetool--probe-retry-timer)
      (should-not proofread-languagetool--probe-retry-token))))
 
-(ert-deftest proofread-languagetool-test-probe-schedule-error-rolls-back ()
+(ert-deftest
+    proofread-languagetool-test-probe-schedule-error-rolls-back ()
   "A probe scheduling error leaves readiness retryable."
   (proofread-languagetool-test--with-state
    (let* ((session
@@ -1268,7 +1310,8 @@ CALLBACK-STATUS is the status plist passed to the URL callback."
              (list proofread-languagetool--server-generation
                    'external session 0))))))
 
-(ert-deftest proofread-languagetool-test-probe-timeout-setup-cleans-buffer ()
+(ert-deftest
+    proofread-languagetool-test-probe-timeout-setup-cleans-buffer ()
   "A probe timeout timer error cannot leak its retrieval buffer."
   (proofread-languagetool-test--with-state
    (let* ((proofread-languagetool-auto-start nil)
@@ -1295,7 +1338,8 @@ CALLBACK-STATUS is the status plist passed to the URL callback."
      (proofread-languagetool-test--assert-no-readiness-work)
      (should-not (buffer-live-p buffer)))))
 
-(ert-deftest proofread-languagetool-test-probe-timeout-cleans-attempt ()
+(ert-deftest
+    proofread-languagetool-test-probe-timeout-cleans-attempt ()
   "A current health-probe timeout releases and fails its attempt."
   (proofread-languagetool-test--with-state
    (let* ((proofread-languagetool-auto-start nil)
@@ -1324,7 +1368,8 @@ CALLBACK-STATUS is the status plist passed to the URL callback."
      (should (eq (plist-get result :error)
                  'languagetool-unavailable)))))
 
-(ert-deftest proofread-languagetool-test-rejects-buffer-local-session-option ()
+(ert-deftest
+    proofread-languagetool-test-rejects-buffer-local-session-option ()
   "The server manager rejects buffer-local settings when they apply."
   (proofread-languagetool-test--with-state
    (with-temp-buffer
@@ -1358,7 +1403,8 @@ CALLBACK-STATUS is the status plist passed to the URL callback."
       (should-error
        (proofread-languagetool--server-session-snapshot)))))
 
-(ert-deftest proofread-languagetool-test-snapshots-in-request-buffer ()
+(ert-deftest
+    proofread-languagetool-test-snapshots-in-request-buffer ()
   "Request-local options are captured from the request's buffer."
   (proofread-languagetool-test--with-state
    (let ((source (generate-new-buffer " *proofread-lt-source*"))
@@ -1409,7 +1455,8 @@ CALLBACK-STATUS is the status plist passed to the URL callback."
        (when (buffer-live-p source) (kill-buffer source))
        (when (buffer-live-p caller) (kill-buffer caller))))))
 
-(ert-deftest proofread-languagetool-test-manual-start-forces-active-probe ()
+(ert-deftest
+    proofread-languagetool-test-manual-start-forces-active-probe ()
   "Manual start replaces an external probe with a managed snapshot."
   (proofread-languagetool-test--with-state
    (let* ((proofread-languagetool-auto-start nil)
@@ -1438,8 +1485,8 @@ CALLBACK-STATUS is the status plist passed to the URL callback."
        (should
         (proofread-languagetool--same-session-p
          session proofread-languagetool--server-session))
-       (dolist (key '(:command :config-file :startup-timeout
-                               :managed-identity))
+       (dolist (key '( :command :config-file :startup-timeout
+                       :managed-identity))
          (should (plist-member proofread-languagetool--server-session
                                key)))
        (should
@@ -1457,7 +1504,8 @@ CALLBACK-STATUS is the status plist passed to the URL callback."
 
 (ert-deftest
     proofread-languagetool-test-manual-start-replaces-changed-owned-process ()
-  "Manual start replaces an owned process with changed managed settings."
+  "Manual start replaces an owned process.
+Replacement occurs when managed settings have changed."
   (proofread-languagetool-test--with-state
    (let* ((proofread-languagetool-auto-start nil)
           (proofread-languagetool-config-file nil)
@@ -1500,7 +1548,8 @@ CALLBACK-STATUS is the status plist passed to the URL callback."
              (list 1 'external
                    proofread-languagetool--server-session 0))))))
 
-(ert-deftest proofread-languagetool-test-repeated-manual-start-is-idempotent ()
+(ert-deftest
+    proofread-languagetool-test-repeated-manual-start-is-idempotent ()
   "Repeated manual start keeps an equivalent managed probe in flight."
   (proofread-languagetool-test--with-state
    (let* ((proofread-languagetool-auto-start nil)
@@ -1513,7 +1562,8 @@ CALLBACK-STATUS is the status plist passed to the URL callback."
           (proofread-languagetool--server-generation 1)
           (proofread-languagetool--server-state 'probing))
      (cl-letf
-         (((symbol-function 'proofread-languagetool--begin-readiness-check)
+         (((symbol-function
+            'proofread-languagetool--begin-readiness-check)
            (lambda (&rest _ignored)
              (ert-fail "Equivalent managed probe was restarted"))))
        (proofread-languagetool-start-server))
@@ -1521,7 +1571,8 @@ CALLBACK-STATUS is the status plist passed to the URL callback."
      (should (= proofread-languagetool--server-generation 1))
      (should (eq proofread-languagetool--server-session session)))))
 
-(ert-deftest proofread-languagetool-test-stale-probe-keeps-current-timer ()
+(ert-deftest
+    proofread-languagetool-test-stale-probe-keeps-current-timer ()
   "A stale probe callback cannot clear a newer probe's resources."
   (proofread-languagetool-test--with-state
    (let* ((session
@@ -1546,8 +1597,10 @@ CALLBACK-STATUS is the status plist passed to the URL callback."
                  current-timer))
      (should (eq proofread-languagetool--server-state 'probing)))))
 
-(ert-deftest proofread-languagetool-test-malformed-probe-is-contained ()
-  "Malformed probe bodies fail once without escaping or leaking state."
+(ert-deftest
+    proofread-languagetool-test-malformed-probe-is-contained ()
+  "A malformed probe body fails once.
+The failure does not escape or leak state."
   (proofread-languagetool-test--with-state
    (let* ((session
            (proofread-languagetool--server-session-snapshot))
@@ -1559,7 +1612,8 @@ CALLBACK-STATUS is the status plist passed to the URL callback."
           (timer (run-at-time 60 nil #'ignore))
           (failures 0))
      (with-current-buffer buffer
-       (setq-local url-http-end-of-headers (+ (point-max) 100)))
+       (set (make-local-variable 'url-http-end-of-headers)
+            (+ (point-max) 100)))
      (setq proofread-languagetool--probe-buffer buffer)
      (setq proofread-languagetool--probe-timeout-timer timer)
      (cl-letf
@@ -1574,7 +1628,8 @@ CALLBACK-STATUS is the status plist passed to the URL callback."
      (should-not proofread-languagetool--probe-buffer)
      (should-not proofread-languagetool--probe-timeout-timer))))
 
-(ert-deftest proofread-languagetool-test-health-probe-requires-exact-ok ()
+(ert-deftest
+    proofread-languagetool-test-health-probe-requires-exact-ok ()
   "A successful health probe requires the complete trimmed body `OK'."
   (proofread-languagetool-test--with-state
    (let* ((session
@@ -1604,7 +1659,8 @@ CALLBACK-STATUS is the status plist passed to the URL callback."
      (should-not proofread-languagetool--probe-buffer)
      (should-not proofread-languagetool--probe-timeout-timer))))
 
-(ert-deftest proofread-languagetool-test-malformed-check-is-contained ()
+(ert-deftest
+    proofread-languagetool-test-malformed-check-is-contained ()
   "Malformed check responses clean resources and deliver one error."
   (proofread-languagetool-test--with-state
    (with-temp-buffer
@@ -1629,8 +1685,10 @@ CALLBACK-STATUS is the status plist passed to the URL callback."
                    (cl-incf callbacks)
                    (setq result value)))))
            (with-current-buffer (plist-get call :buffer)
-             (setq-local url-http-response-status 200)
-             (setq-local url-http-end-of-headers (+ (point-max) 100))
+             (set (make-local-variable 'url-http-response-status)
+                  200)
+             (set (make-local-variable 'url-http-end-of-headers)
+                  (+ (point-max) 100))
              (apply (plist-get call :callback)
                     (cons nil (plist-get call :arguments))))
            (should (= callbacks 1))
@@ -1649,15 +1707,16 @@ CALLBACK-STATUS is the status plist passed to the URL callback."
            (proofread-languagetool--request-timeout handle)
            (should (= callbacks 1))))))))
 
-(ert-deftest proofread-languagetool-test-url-rejects-secrets-and-controls ()
+(ert-deftest
+    proofread-languagetool-test-url-rejects-secrets-and-controls ()
   "Unsafe URLs are rejected without exposing them through identity."
   (dolist (url
-           '("http://secret-user:hunter2@127.0.0.1:8081/v2"
-             "http://:hunter2@127.0.0.1:8081/v2"
-             "http://127.0.0.1:8081/v2\nAuthorization:hunter2"
-             "http://127.0.0.1:8081/v2\t"
-             "http://127.0.0.1:8081/%0d%0a/v2"
-             "http://127.0.0.1:99999/v2"))
+           '( "http://secret-user:hunter2@127.0.0.1:8081/v2"
+              "http://:hunter2@127.0.0.1:8081/v2"
+              "http://127.0.0.1:8081/v2\nAuthorization:hunter2"
+              "http://127.0.0.1:8081/v2\t"
+              "http://127.0.0.1:8081/%0d%0a/v2"
+              "http://127.0.0.1:99999/v2"))
     (let ((proofread-languagetool-server-url url))
       (should-error
        (proofread-languagetool--normalized-server-url))
@@ -1671,8 +1730,10 @@ CALLBACK-STATUS is the status plist passed to the URL callback."
           (prin1-to-string (proofread-languagetool--identity))))
     (should-not (string-match-p "private-token" printed))))
 
-(ert-deftest proofread-languagetool-test-transport-reprobes-owned-process ()
-  "Transport failure reprobes, but never overwrites, an owned process."
+(ert-deftest
+    proofread-languagetool-test-transport-reprobes-owned-process ()
+  "A transport failure reprobes an owned process.
+The reprobe never overwrites the process."
   (proofread-languagetool-test--with-state
    (with-temp-buffer
      (let* ((session
@@ -1700,14 +1761,15 @@ CALLBACK-STATUS is the status plist passed to the URL callback."
                                            :callback callback
                                            :arguments arguments
                                            :buffer buffer
-                                           :method url-request-method))))
+                                           :method
+                                           url-request-method))))
                  buffer))))
          (proofread-languagetool--check
           (proofread-languagetool-test--request)
           (lambda (value) (setq first-result value)))
          (with-current-buffer (plist-get (car calls) :buffer)
            (apply (plist-get (car calls) :callback)
-                  (cons '(:error (error connection-refused))
+                  (cons '( :error (error connection-refused))
                         (plist-get (car calls) :arguments))))
          (should (eq (plist-get first-result :error)
                      'languagetool-transport-error))
@@ -1727,7 +1789,8 @@ CALLBACK-STATUS is the status plist passed to the URL callback."
          (should (eq proofread-languagetool--server-state
                      'starting)))))))
 
-(ert-deftest proofread-languagetool-test-startup-timeout-clears-retry ()
+(ert-deftest
+    proofread-languagetool-test-startup-timeout-clears-retry ()
   "Startup timeout invalidates every outstanding readiness resource."
   (proofread-languagetool-test--with-state
    (let* ((session
@@ -1751,7 +1814,7 @@ CALLBACK-STATUS is the status plist passed to the URL callback."
           deleted)
      (setq proofread-languagetool--startup-timer startup)
      (setq proofread-languagetool--probe-retry-timer retry)
-     (setq proofread-languagetool--probe-retry-token '(retry))
+     (setq proofread-languagetool--probe-retry-token '( retry))
      (setq proofread-languagetool--probe-timeout-timer probe-timeout)
      (setq proofread-languagetool--probe-buffer probe-buffer)
      (setq proofread-languagetool--server-waiters (list waiter))
@@ -1773,7 +1836,8 @@ CALLBACK-STATUS is the status plist passed to the URL callback."
      (should (eq (plist-get result :error)
                  'languagetool-startup-timeout)))))
 
-(ert-deftest proofread-languagetool-test-start-error-cleans-lifecycle ()
+(ert-deftest
+    proofread-languagetool-test-start-error-cleans-lifecycle ()
   "A synchronous managed-start error releases its entire attempt."
   (proofread-languagetool-test--with-state
    (let* ((session
@@ -1792,7 +1856,7 @@ CALLBACK-STATUS is the status plist passed to the URL callback."
      (setq proofread-languagetool--server-waiters (list waiter))
      (cl-letf
          (((symbol-function 'proofread-languagetool--server-command)
-           (lambda (_session) '("languagetool-http-server")))
+           (lambda (_session) '( "languagetool-http-server")))
           ((symbol-function 'proofread-languagetool--server-arguments)
            (lambda (_session) nil))
           ((symbol-function 'get-buffer-create) (lambda (_name) nil))
@@ -1820,7 +1884,8 @@ CALLBACK-STATUS is the status plist passed to the URL callback."
      (should (eq (plist-get result :error)
                  'languagetool-startup-error)))))
 
-(ert-deftest proofread-languagetool-test-dead-startup-process-is-forgotten ()
+(ert-deftest
+    proofread-languagetool-test-dead-startup-process-is-forgotten ()
   "A failed startup probe immediately forgets its dead owned process."
   (proofread-languagetool-test--with-state
    (let* ((session
@@ -1851,8 +1916,11 @@ CALLBACK-STATUS is the status plist passed to the URL callback."
      (should (eq (plist-get result :error)
                  'languagetool-startup-failed)))))
 
+;;;; Process and cancellation lifecycle
+
 (ert-deftest
-    proofread-languagetool-test-starting-process-exit-cleans-lifecycle ()
+    proofread-languagetool-test-starting-process-exit-cleans-lifecycle
+    ()
   "A starting process exit invalidates and settles its whole attempt."
   (proofread-languagetool-test--with-state
    (let* ((session
@@ -1867,7 +1935,7 @@ CALLBACK-STATUS is the status plist passed to the URL callback."
            (run-at-time 60 nil #'ignore))
           (proofread-languagetool--probe-retry-timer
            (run-at-time 60 nil #'ignore))
-          (proofread-languagetool--probe-retry-token '(retry))
+          (proofread-languagetool--probe-retry-token '( retry))
           (proofread-languagetool--probe-timeout-timer
            (run-at-time 60 nil #'ignore))
           (probe-buffer
@@ -1897,7 +1965,8 @@ CALLBACK-STATUS is the status plist passed to the URL callback."
 
 (ert-deftest
     proofread-languagetool-test-probing-process-exit-restarts-readiness ()
-  "A probing process exit invalidates and restarts its readiness attempt."
+  "A probing process exit invalidates its readiness attempt.
+It then restarts readiness for the current session."
   (proofread-languagetool-test--with-state
    (let* ((proofread-languagetool-auto-start nil)
           (session
@@ -1985,8 +2054,11 @@ CALLBACK-STATUS is the status plist passed to the URL callback."
                       (cons nil (plist-get call :arguments)))))
            (should-not result)))))))
 
+;;;; External and managed server integration
+
 (ert-deftest
-    proofread-languagetool-test-external-check-ignores-managed-options ()
+    proofread-languagetool-test-external-check-ignores-managed-options
+    ()
   "A healthy external server needs no valid managed startup settings."
   (proofread-languagetool-test--with-state
    (with-temp-buffer
@@ -2008,11 +2080,13 @@ CALLBACK-STATUS is the status plist passed to the URL callback."
                                            :callback callback
                                            :arguments arguments
                                            :buffer buffer
-                                           :method url-request-method))))
+                                           :method
+                                           url-request-method))))
                  buffer)))
             ((symbol-function 'make-process)
              (lambda (&rest _ignored)
-               (ert-fail "External check attempted managed startup"))))
+               (ert-fail
+                "External check attempted managed startup"))))
          (proofread-languagetool--check
           (proofread-languagetool-test--request)
           (lambda (value) (setq result value)))
@@ -2029,8 +2103,10 @@ CALLBACK-STATUS is the status plist passed to the URL callback."
          (should (eq (plist-get result :status) 'ok)))))))
 
 (ert-deftest
-    proofread-languagetool-test-external-failure-skips-managed-startup ()
-  "An unavailable external server does not validate or start a process."
+    proofread-languagetool-test-external-failure-skips-managed-startup
+    ()
+  "An unavailable external server does not start a process.
+It also does not validate managed settings."
   (proofread-languagetool-test--with-state
    (with-temp-buffer
      (let ((proofread-languagetool-auto-start nil)
@@ -2053,7 +2129,8 @@ CALLBACK-STATUS is the status plist passed to the URL callback."
                  buffer)))
             ((symbol-function 'make-process)
              (lambda (&rest _ignored)
-               (ert-fail "External failure attempted managed startup"))))
+               (ert-fail
+                "External failure attempted managed startup"))))
          (proofread-languagetool--check
           (proofread-languagetool-test--request)
           (lambda (value) (setq result value)))
@@ -2062,10 +2139,12 @@ CALLBACK-STATUS is the status plist passed to the URL callback."
          (proofread-languagetool-test--complete-call call 200 "DOWN")
          (should (eq (plist-get result :error)
                      'languagetool-unavailable))
-         (should (eq proofread-languagetool--server-state 'unknown)))))))
+         (should
+          (eq proofread-languagetool--server-state 'unknown)))))))
 
 (ert-deftest
-    proofread-languagetool-test-external-ready-ignores-managed-changes ()
+    proofread-languagetool-test-external-ready-ignores-managed-changes
+    ()
   "An external check does not disturb a ready manually owned session."
   (proofread-languagetool-test--with-state
    (with-temp-buffer
@@ -2084,12 +2163,16 @@ CALLBACK-STATUS is the status plist passed to the URL callback."
        (setq proofread-languagetool-config-file "relative.properties")
        (setq proofread-languagetool-startup-timeout 0)
        (cl-letf
-           (((symbol-function 'proofread-languagetool--begin-readiness-check)
+           (((symbol-function
+              'proofread-languagetool--begin-readiness-check)
              (lambda (&rest _ignored)
-               (ert-fail "Managed changes restarted external readiness")))
-            ((symbol-function 'proofread-languagetool--stop-owned-process)
+               (ert-fail
+                "Managed changes restarted external readiness")))
+            ((symbol-function
+              'proofread-languagetool--stop-owned-process)
              (lambda ()
-               (ert-fail "Managed changes stopped the owned process")))
+               (ert-fail
+                "Managed changes stopped the owned process")))
             ((symbol-function 'url-retrieve)
              (lambda (_url _callback _arguments &rest _ignored)
                (should (equal url-request-method "POST"))
@@ -2119,7 +2202,8 @@ CALLBACK-STATUS is the status plist passed to the URL callback."
                                            :callback callback
                                            :arguments arguments
                                            :buffer buffer
-                                           :method url-request-method))))
+                                           :method
+                                           url-request-method))))
                  buffer)))
             ((symbol-function 'make-process)
              (lambda (&rest _ignored)
@@ -2152,26 +2236,30 @@ CALLBACK-STATUS is the status plist passed to the URL callback."
        (cl-letf
            (((symbol-function 'proofread-languagetool--server-command)
              (lambda (_session)
-               '("/opt/languagetool/bin/languagetool-http-server"
-                 "--fixed" "argument")))
+               '( "/opt/languagetool/bin/languagetool-http-server"
+                  "--fixed" "argument")))
             ((symbol-function 'make-process)
              (lambda (&rest arguments)
                (setq command (plist-get arguments :command))
                'proofread-languagetool-test-process))
             ((symbol-function 'process-put) #'ignore)
-            ((symbol-function 'set-process-query-on-exit-flag) #'ignore)
+            ((symbol-function
+              'set-process-query-on-exit-flag)
+             #'ignore)
             ((symbol-function 'process-live-p)
              (lambda (process) (and process t))))
          (proofread-languagetool--start-managed-server
           1 proofread-languagetool--server-session)
          (should
           (equal command
-                 '("/opt/languagetool/bin/languagetool-http-server"
-                   "--fixed" "argument"
-                   "--port" "18081")))
+                 '( "/opt/languagetool/bin/languagetool-http-server"
+                    "--fixed" "argument"
+                    "--port" "18081")))
          (should-not (member "--public" command))
          (should-not (member "--allow-origin" command))
          (setq proofread-languagetool--server-process nil))))))
+
+;;;; Live integration
 
 (ert-deftest proofread-languagetool-test-live-local-server ()
   "Check one sentence with a real local LanguageTool when requested."

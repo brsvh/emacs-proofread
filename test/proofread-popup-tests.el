@@ -15,6 +15,8 @@
 (require 'proofread)
 (require 'proofread-popup)
 
+;;;; Test support
+
 (defun proofread-popup-test--diagnostic
     (beg end text &optional suggestions message)
   "Return a sample diagnostic for BEG, END, and TEXT.
@@ -34,7 +36,7 @@ SUGGESTIONS and MESSAGE supply the optional field values."
   (mapcar #'proofread--create-overlay diagnostics))
 
 (defmacro proofread-popup-test--with-posframe-recorder (&rest body)
-  "Run BODY while recording calls to the Posframe frontend."
+  "Run BODY and record invocations of the Posframe frontend."
   (declare (indent 0) (debug (body)))
   `(let (proofread-popup-test--shows
          proofread-popup-test--hides
@@ -59,6 +61,8 @@ SUGGESTIONS and MESSAGE supply the optional field values."
                         proofread-popup-test--deletes))))
        ,@body)))
 
+;;;; Configuration and messages
+
 (ert-deftest proofread-popup-test-faces-have-package-defaults ()
   "Proofread popup faces use the package defaults."
   (should (equal (face-default-spec 'proofread-popup-face)
@@ -71,27 +75,28 @@ SUGGESTIONS and MESSAGE supply the optional field values."
     proofread-popup-test-max-width-rejects-zero-in-customize ()
   "Customize rejects a nonpositive popup width."
   (should (eq (get 'proofread-popup-max-width 'custom-set)
-              #'proofread--set-positive-integer-option))
+              #'proofread-set-positive-integer-option))
   (should-error
    (funcall (get 'proofread-popup-max-width 'custom-set)
             'proofread-popup-max-width 0)))
 
 (ert-deftest proofread-popup-test-blank-message-falls-back-to-text ()
   "A blank diagnostic message falls back to the diagnostic text."
-  (dolist (message '("" " \t\n"))
+  (dolist (message '( "" " \t\n"))
     (let ((diagnostic
            (proofread-popup-test--diagnostic 1 5 "helo" nil message)))
       (should (equal (proofread-popup--message diagnostic)
                      "Proofread: helo")))))
 
-(ert-deftest proofread-popup-test-uses-shared-diagnostic-field-formatter ()
+(ert-deftest
+    proofread-popup-test-uses-shared-diagnostic-field-formatter ()
   "Popup messages delegate non-string fields to the core formatter."
   (let ((message-diagnostic
          (proofread-popup-test--diagnostic
           1 5 "helo" nil 'misspelling))
         (text-diagnostic
          (proofread-popup-test--diagnostic
-          1 5 '(bad "text") nil ""))
+          1 5 '( bad "text") nil ""))
         fields)
     (cl-letf (((symbol-function 'proofread-format-diagnostic-field)
                (lambda (value)
@@ -102,7 +107,9 @@ SUGGESTIONS and MESSAGE supply the optional field values."
       (should (equal (proofread-popup--message text-diagnostic)
                      "Proofread: <formatted>")))
     (should (equal (nreverse fields)
-                   '(misspelling (bad "text"))))))
+                   '( misspelling ( bad "text"))))))
+
+;;;; Core integration
 
 (ert-deftest proofread-popup-test-mode-follows-proofread-mode ()
   "The popup frontend follows the core minor mode automatically."
@@ -138,7 +145,10 @@ SUGGESTIONS and MESSAGE supply the optional field values."
          (should (eq proofread-popup--diagnostic
                      (car proofread--diagnostics))))))))
 
-(ert-deftest proofread-popup-test-update-captures-render-inputs-once ()
+;;;; Rendering
+
+(ert-deftest
+    proofread-popup-test-update-captures-render-inputs-once ()
   "One popup update captures each render input exactly once."
   (proofread-popup-test--with-posframe-recorder
    (save-window-excursion
@@ -178,12 +188,14 @@ SUGGESTIONS and MESSAGE supply the optional field values."
                     (lambda (&rest args)
                       (setq diagnostic-calls (1+ diagnostic-calls))
                       (apply diagnostic-function args)))
-                   ((symbol-function 'proofread-popup--anchor-position)
+                   ((symbol-function
+                     'proofread-popup--anchor-position)
                     (lambda (value window)
                       (setq anchor-calls (1+ anchor-calls))
                       (setq anchor-window window)
                       (funcall anchor-function value window)))
-                   ((symbol-function 'proofread-popup--render-snapshot)
+                   ((symbol-function
+                     'proofread-popup--render-snapshot)
                     (lambda (window)
                       (setq snapshot-calls (1+ snapshot-calls))
                       (setq snapshot-window window)
@@ -216,7 +228,7 @@ SUGGESTIONS and MESSAGE supply the optional field values."
        (proofread-mode 1)
        (let ((diagnostic
               (proofread-popup-test--diagnostic
-               4 8 "helo" '("hello"))))
+               4 8 "helo" '( "hello"))))
          (proofread-popup-test--install-diagnostics (list diagnostic))
          (goto-char 5)
          (proofread-popup--update)
@@ -239,9 +251,9 @@ SUGGESTIONS and MESSAGE supply the optional field values."
            (should (= (plist-get args :left-fringe) 3))
            (should (= (plist-get args :right-fringe) 3))
            (should (eq (plist-get args :accept-focus) nil))
-           (should (member '(no-accept-focus . t)
+           (should (member '( no-accept-focus . t)
                            (plist-get args :override-parameters)))
-           (should (member '(no-focus-on-map . t)
+           (should (member '( no-focus-on-map . t)
                            (plist-get
                             args :override-parameters)))))))))
 
@@ -262,11 +274,11 @@ SUGGESTIONS and MESSAGE supply the optional field values."
                     (lambda (face attribute &rest _args)
                       (push (list face attribute) face-attributes)
                       (pcase (list face attribute)
-                        (`(proofread-popup-face :foreground)
+                        (`( proofread-popup-face :foreground)
                          "theme-foreground")
-                        (`(proofread-popup-face :background)
+                        (`( proofread-popup-face :background)
                          "theme-background")
-                        (`(proofread-popup-border-face :background)
+                        (`( proofread-popup-border-face :background)
                          "theme-border")))))
            (proofread-popup--update))
          (let* ((call (car proofread-popup-test--shows))
@@ -278,9 +290,10 @@ SUGGESTIONS and MESSAGE supply the optional field values."
            (should (equal (plist-get args :internal-border-color)
                           "theme-border"))
            (should (= (length face-attributes) 3))
-           (dolist (field '((proofread-popup-face :foreground)
-                            (proofread-popup-face :background)
-                            (proofread-popup-border-face :background)))
+           (dolist (field
+                    '( (proofread-popup-face :foreground)
+                       (proofread-popup-face :background)
+                       (proofread-popup-border-face :background)))
              (should (= (cl-count field face-attributes :test #'equal)
                         1)))))))))
 
@@ -364,7 +377,8 @@ SUGGESTIONS and MESSAGE supply the optional field values."
          (should proofread-popup-test--hides)
          (should-not proofread-popup--diagnostic))))))
 
-(ert-deftest proofread-popup-test-hide-and-delete-reset-display-state ()
+(ert-deftest
+    proofread-popup-test-hide-and-delete-reset-display-state ()
   "Hide and delete reset display state without duplicate cleanup."
   (proofread-popup-test--with-posframe-recorder
    (save-window-excursion
@@ -410,7 +424,7 @@ SUGGESTIONS and MESSAGE supply the optional field values."
            (should (= (length proofread-popup-test--deletes) 1))))))))
 
 (ert-deftest
-    proofread-popup-test-hidehandler-allows-reshow-after-switch ()
+    proofread-popup-test-hide-handler-allows-reshow-after-switch ()
   "The popup returns after Posframe's hide handler runs."
   (proofread-popup-test--with-posframe-recorder
    (save-window-excursion
@@ -428,12 +442,13 @@ SUGGESTIONS and MESSAGE supply the optional field values."
                (goto-char 2)
                (proofread-popup--update)
                (let* ((args (cdar proofread-popup-test--shows))
-                      (hidehandler (plist-get args :hidehandler))
-                      (popup-buffer-name proofread-popup--buffer-name))
+                      (hide-handler (plist-get args :hidehandler))
+                      (popup-buffer-name
+                       proofread-popup--buffer-name))
                  (switch-to-buffer other)
                  (should
                   (funcall
-                   hidehandler
+                   hide-handler
                    (list :posframe-parent-buffer
                          (cons nil source))))
                  (with-current-buffer source
@@ -451,6 +466,8 @@ SUGGESTIONS and MESSAGE supply the optional field values."
            (kill-buffer source))
          (when (buffer-live-p other)
            (kill-buffer other)))))))
+
+;;;; Availability and lifecycle
 
 (ert-deftest proofread-popup-test-disabled-does-not-show ()
   "Disabling popup display prevents child frame creation."
@@ -593,7 +610,7 @@ SUGGESTIONS and MESSAGE supply the optional field values."
        (proofread-mode 1)
        (let ((diagnostic
               (proofread-popup-test--diagnostic
-               4 8 "helo" '("hello"))))
+               4 8 "helo" '( "hello"))))
          (proofread-popup-test--install-diagnostics (list diagnostic))
          (goto-char 5)
          (proofread-popup--update)

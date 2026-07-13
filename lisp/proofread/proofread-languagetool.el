@@ -25,8 +25,8 @@
 ;; This library implements a local LanguageTool backend for Proofread.
 ;; It reuses a server already listening on the configured loopback URL
 ;; and can start `languagetool-http-server' lazily when no server is
-;; available.  One managed server is shared by all Proofread buffers in
-;; the Emacs session.
+;; available.  One managed server is shared by all Proofread buffers
+;; in the Emacs session.
 
 ;;; Code:
 
@@ -39,10 +39,7 @@
 (require 'url-parse)
 (require 'url-util)
 
-;; External dynamic variables from the URL library.
-(defvar url-http-end-of-headers)
-(defvar url-http-response-status)
-(defvar url-max-redirections)
+;;;; Options
 
 (defgroup proofread-languagetool nil
   "Local LanguageTool backend for Proofread."
@@ -78,20 +75,20 @@ fixed arguments.  The executable may be found through variable
 arguments are visible in operating-system process listings and must
 not contain credentials; use a protected config file or environment
 variable for secrets."
-  :type '(choice
-          (string :tag "Executable")
-          (repeat :tag "Executable and fixed arguments" string))
+  :type '( choice
+           (string :tag "Executable")
+           (repeat :tag "Executable and fixed arguments" string))
   :group 'proofread-languagetool)
 
 (defcustom proofread-languagetool-config-file
   (let ((file (getenv "PROOFREAD_LANGUAGETOOL_CONFIG")))
     (and file (not (string-empty-p file)) file))
-  "Optional local absolute Java properties file passed to LanguageTool.
+  "Specify an optional absolute Java properties file for LanguageTool.
 The environment variable `PROOFREAD_LANGUAGETOOL_CONFIG' supplies the
 initial value.  Avoid placing credentials in a properties file that
 is readable by other local users."
-  :type '(choice (const :tag "Server defaults" nil)
-                 (file :must-match t))
+  :type '( choice (const :tag "Server defaults" nil)
+           (file :must-match t))
   :group 'proofread-languagetool)
 
 (defcustom proofread-languagetool-startup-timeout 15.0
@@ -113,47 +110,47 @@ is readable by other local users."
 (defcustom proofread-languagetool-level 'default
   "LanguageTool checking level used for requests.
 The value `picky' enables additional style rules."
-  :type '(choice (const :tag "Default" default)
-                 (const :tag "Picky" picky))
+  :type '( choice (const :tag "Default" default)
+           (const :tag "Picky" picky))
   :local t
   :group 'proofread-languagetool)
 
 (defcustom proofread-languagetool-preferred-variants nil
-  "Preferred language variants used when language detection is automatic.
+  "Specify preferred variants for automatic language detection.
 Each value is a LanguageTool long language code such as `en-US' or
-`de-DE'.  These values are sent only when `proofread-language' is nil."
-  :type '(repeat string)
+`de-DE'.  Send these values only when `proofread-language' is nil."
+  :type '( repeat string)
   :local t
   :group 'proofread-languagetool)
 
 (defcustom proofread-languagetool-mother-tongue nil
   "Optional mother-tongue language code for false-friend checks."
-  :type '(choice (const :tag "Unspecified" nil)
-                 string)
+  :type '( choice (const :tag "Unspecified" nil)
+           string)
   :local t
   :group 'proofread-languagetool)
 
 (defcustom proofread-languagetool-enabled-rules nil
   "LanguageTool rule identifiers enabled for each check."
-  :type '(repeat string)
+  :type '( repeat string)
   :local t
   :group 'proofread-languagetool)
 
 (defcustom proofread-languagetool-disabled-rules nil
   "LanguageTool rule identifiers disabled for each check."
-  :type '(repeat string)
+  :type '( repeat string)
   :local t
   :group 'proofread-languagetool)
 
 (defcustom proofread-languagetool-enabled-categories nil
   "LanguageTool category identifiers enabled for each check."
-  :type '(repeat string)
+  :type '( repeat string)
   :local t
   :group 'proofread-languagetool)
 
 (defcustom proofread-languagetool-disabled-categories nil
   "LanguageTool category identifiers disabled for each check."
-  :type '(repeat string)
+  :type '( repeat string)
   :local t
   :group 'proofread-languagetool)
 
@@ -164,6 +161,8 @@ rule or category may be disabled."
   :type 'boolean
   :local t
   :group 'proofread-languagetool)
+
+;;;; Constants and state
 
 (defconst proofread-languagetool--contract-version 1
   "Version of the LanguageTool backend request contract.")
@@ -179,15 +178,15 @@ rule or category may be disabled."
   "Name of the managed LanguageTool server log buffer.")
 
 (defconst proofread-languagetool--transport-session-global-options
-  '(proofread-languagetool-server-url
-    proofread-languagetool-auto-start
-    proofread-languagetool-health-timeout)
+  '( proofread-languagetool-server-url
+     proofread-languagetool-auto-start
+     proofread-languagetool-health-timeout)
   "Transport options that must remain global for the server manager.")
 
 (defconst proofread-languagetool--managed-session-global-options
-  '(proofread-languagetool-command
-    proofread-languagetool-config-file
-    proofread-languagetool-startup-timeout)
+  '( proofread-languagetool-command
+     proofread-languagetool-config-file
+     proofread-languagetool-startup-timeout)
   "Managed-startup options that must remain global when used.")
 
 (defconst proofread-languagetool--json-missing
@@ -244,11 +243,18 @@ rule or category may be disabled."
 (defvar proofread-languagetool--force-start-p nil
   "Non-nil when an interactive command requested managed startup.")
 
+;;;; Configuration and identity
+
 (defun proofread-languagetool--positive-timeout (value option)
   "Return positive numeric VALUE for OPTION, or signal an error."
   (unless (and (numberp value) (> value 0))
     (error "%s must be a positive number" option))
   value)
+
+(defun proofread-languagetool--loopback-host-p (host)
+  "Return non-nil when HOST names a loopback interface."
+  (member (downcase (or host ""))
+          '( "127.0.0.1" "::1" "[::1]" "localhost")))
 
 (defun proofread-languagetool--normalize-server-url (value)
   "Return safe LanguageTool base URL VALUE without trailing slashes."
@@ -256,18 +262,21 @@ rule or category may be disabled."
                (not (string-empty-p (string-trim value))))
     (error "LanguageTool server URL must be a nonempty string"))
   (when (string-match-p "[[:space:][:cntrl:]]" value)
-    (error "LanguageTool server URL cannot contain whitespace or control characters"))
+    (error
+     (concat "LanguageTool server URL cannot contain whitespace "
+             "or control characters")))
   (when (string-match-p
          "%\\(?:0[0-9A-Fa-f]\\|1[0-9A-Fa-f]\\|7[Ff]\\)"
          value)
-    (error "LanguageTool server URL cannot contain encoded control characters"))
+    (error (concat "LanguageTool server URL cannot contain encoded "
+                   "control characters")))
   (let* ((url (replace-regexp-in-string
                "/+\\'" "" value))
          (parsed (url-generic-parse-url url))
          (type (downcase (or (url-type parsed) "")))
          (host (url-host parsed))
          (port (url-port parsed)))
-    (unless (member type '("http" "https"))
+    (unless (member type '( "http" "https"))
       (error "LanguageTool server URL must use HTTP or HTTPS"))
     (when (or (url-user parsed) (url-password parsed))
       (error "LanguageTool server URL cannot contain credentials"))
@@ -275,12 +284,14 @@ rule or category may be disabled."
       (error "LanguageTool server URL must contain a host"))
     (when (and (equal type "http")
                (not (proofread-languagetool--loopback-host-p host)))
-      (error "LanguageTool server URL requires HTTPS outside the loopback interface"))
+      (error (concat "LanguageTool server URL requires HTTPS outside "
+                     "the loopback interface")))
     (unless (and (integerp port) (> port 0) (< port 65536))
       (error "LanguageTool server URL contains an invalid port"))
     (when (or (url-target parsed)
               (string-match-p "[?#]" url))
-      (error "LanguageTool server URL cannot contain a query or fragment"))
+      (error (concat "LanguageTool server URL cannot contain a query "
+                     "or fragment")))
     (unless (string-suffix-p "/v2" (url-filename parsed))
       (error "LanguageTool server URL must end in /v2"))
     url))
@@ -297,11 +308,6 @@ When BASE-URL is nil, validate and use the configured server URL."
               (proofread-languagetool--normalized-server-url))
           "/" action))
 
-(defun proofread-languagetool--loopback-host-p (host)
-  "Return non-nil when HOST names a loopback interface."
-  (member (downcase (or host ""))
-          '("127.0.0.1" "::1" "[::1]" "localhost")))
-
 (defun proofread-languagetool--managed-port (session)
   "Return managed startup port for SESSION, or signal an error."
   (let* ((url (url-generic-parse-url
@@ -314,9 +320,11 @@ When BASE-URL is nil, validate and use the configured server URL."
     (unless (proofread-languagetool--loopback-host-p host)
       (error "Managed LanguageTool startup requires a loopback URL"))
     (unless (equal (url-filename url) "/v2")
-      (error "Managed LanguageTool startup requires the direct /v2 path"))
+      (error (concat "Managed LanguageTool startup requires the "
+                     "direct /v2 path")))
     (unless (and (integerp port) (> port 0) (< port 65536))
-      (error "Managed LanguageTool startup requires an explicit port"))
+      (error (concat "Managed LanguageTool startup requires an "
+                     "explicit port")))
     port))
 
 (defun proofread-languagetool--normalized-identifiers (values option)
@@ -337,13 +345,15 @@ When BASE-URL is nil, validate and use the configured server URL."
 (defun proofread-languagetool--safe-identifiers (values)
   "Return a stable identity value for identifier VALUES."
   (condition-case nil
-      (proofread-languagetool--normalized-identifiers values 'identity)
+      (proofread-languagetool--normalized-identifiers
+       values 'identity)
     (error (format "%S" values))))
 
 (defun proofread-languagetool--normalized-preferred-variants (values)
   "Return preferred language variant VALUES in user order."
   (unless (listp values)
-    (error "LanguageTool preferred variants must be a list of strings"))
+    (error (concat "LanguageTool preferred variants must be a list "
+                   "of strings")))
   (let ((bases (make-hash-table :test #'equal))
         result)
     (dolist (value values)
@@ -352,9 +362,11 @@ When BASE-URL is nil, validate and use the configured server URL."
       (let ((variant (string-trim value)))
         (when (or (string-empty-p variant)
                   (string-match-p "," variant))
-          (error "LanguageTool contains an invalid preferred variant"))
+          (error (concat "LanguageTool contains an invalid preferred "
+                         "variant")))
         (unless (string-match "\\`\\([^-]+\\)-\\(.+\\)\\'" variant)
-          (error "LanguageTool preferred variants require a long language code"))
+          (error (concat "LanguageTool preferred variants require a "
+                         "long language code")))
         (let* ((base (downcase (match-string 1 variant)))
                (existing (gethash base bases)))
           (when (and existing (not (equal existing variant)))
@@ -394,7 +406,9 @@ When BASE-URL is nil, validate and use the configured server URL."
          (cond
           ((stringp command) (list command))
           ((listp command) command)
-          (t (error "LanguageTool command must be a string or list of strings")))))
+          (t
+           (error (concat "LanguageTool command must be a string or "
+                          "list of strings"))))))
     (unless (and prefix
                  (cl-every #'stringp prefix)
                  (not (string-empty-p (string-trim (car prefix)))))
@@ -416,8 +430,9 @@ When BASE-URL is nil, validate and use the configured server URL."
             absolute)))))
 
 (defun proofread-languagetool--command-snapshot ()
-  "Return the configured command with its executable resolved if possible."
-  (let* ((string-form (stringp proofread-languagetool-command))
+  "Return the configured command with its executable resolved."
+  (let* ((string-command-p
+          (stringp proofread-languagetool-command))
          (prefix
           (proofread-languagetool--command-prefix
            proofread-languagetool-command))
@@ -426,7 +441,7 @@ When BASE-URL is nil, validate and use the configured server URL."
            (car prefix))))
     (when resolved
       (setcar prefix resolved))
-    (if string-form (car prefix) prefix)))
+    (if string-command-p (car prefix) prefix)))
 
 (defun proofread-languagetool--safe-command-snapshot ()
   "Return a non-secret cache identity for the configured command."
@@ -484,8 +499,9 @@ When MANAGED is non-nil, also reject managed-startup options."
           (option
            (append
             proofread-languagetool--transport-session-global-options
-            (and managed
-                 proofread-languagetool--managed-session-global-options)))
+            (and
+             managed
+             proofread-languagetool--managed-session-global-options)))
         (when (local-variable-p option buffer)
           (error "%s must not be buffer-local" option))))))
 
@@ -547,7 +563,7 @@ startup even when automatic startup is disabled."
               (plist-get second :identity))))
 
 (defun proofread-languagetool--same-managed-session-p (first second)
-  "Return non-nil when FIRST and SECOND use the same managed settings."
+  "Return non-nil when FIRST and SECOND share managed settings."
   (let ((identity (and first
                        (plist-get first :managed-identity))))
     (and identity second
@@ -594,6 +610,8 @@ startup even when automatic startup is disabled."
          :enabled-only proofread-languagetool-enabled-only
          :contract-version proofread-languagetool--contract-version)))
 
+;;;; Request encoding and response parsing
+
 (defun proofread-languagetool--request-language (request)
   "Return the LanguageTool language code for REQUEST."
   (let ((language (plist-get request :language)))
@@ -602,7 +620,9 @@ startup even when automatic startup is disabled."
      ((and (stringp language)
            (not (string-empty-p (string-trim language))))
       (string-trim language))
-     (t (error "Proofread language must be nil or a nonempty string")))))
+     (t
+      (error
+       "Proofread language must be nil or a nonempty string")))))
 
 (defun proofread-languagetool--form-encode (parameters)
   "Return application/x-www-form-urlencoded PARAMETERS."
@@ -638,7 +658,7 @@ startup even when automatic startup is disabled."
          parameters)
     (unless (and (stringp before) (stringp text) (stringp after))
       (error "LanguageTool request text and context must be strings"))
-    (unless (memq proofread-languagetool-level '(default picky))
+    (unless (memq proofread-languagetool-level '( default picky))
       (error "Invalid LanguageTool checking level: %S"
              proofread-languagetool-level))
     (when (and proofread-languagetool-enabled-only
@@ -657,18 +677,20 @@ startup even when automatic startup is disabled."
                       (symbol-name proofread-languagetool-level))))
     (when (and (equal language "auto")
                proofread-languagetool-preferred-variants)
-      (push (cons "preferredVariants"
-                  (string-join
-                   (proofread-languagetool--normalized-preferred-variants
-                    proofread-languagetool-preferred-variants)
-                   ","))
+      (push (cons
+             "preferredVariants"
+             (string-join
+              (proofread-languagetool--normalized-preferred-variants
+               proofread-languagetool-preferred-variants)
+              ","))
             parameters))
     (when proofread-languagetool-mother-tongue
       (unless (and (stringp proofread-languagetool-mother-tongue)
                    (not (string-empty-p
                          (string-trim
                           proofread-languagetool-mother-tongue))))
-        (error "LanguageTool mother tongue must be a nonempty string"))
+        (error (concat "LanguageTool mother tongue must be a "
+                       "nonempty string")))
       (push (cons "motherTongue"
                   (string-trim proofread-languagetool-mother-tongue))
             parameters))
@@ -768,16 +790,19 @@ FULL-TEXT and the target within it.  Return nil for a valid match that
 does not stay wholly inside the target."
   (unless (hash-table-p match)
     (error "LanguageTool match must be a JSON object"))
-  (let* ((offset (proofread-languagetool--json-value match "offset"))
-         (length (proofread-languagetool--json-value match "length"))
-         (message (proofread-languagetool--json-value match "message"))
+  (let* ((offset
+          (proofread-languagetool--json-value match "offset"))
+         (match-length
+          (proofread-languagetool--json-value match "length"))
+         (message
+          (proofread-languagetool--json-value match "message"))
          (rule (proofread-languagetool--json-value match "rule"))
          (issue-type (and (hash-table-p rule)
                           (proofread-languagetool--json-value
                            rule "issueType")))
          start end)
     (unless (and (integerp offset) (>= offset 0)
-                 (integerp length) (>= length 0)
+                 (integerp match-length) (>= match-length 0)
                  (stringp message))
       (error "LanguageTool returned an invalid match"))
     (setq start
@@ -785,7 +810,7 @@ does not stay wholly inside the target."
            full-text offset))
     (setq end
           (proofread-languagetool--utf16-offset-to-index
-           full-text (+ offset length)))
+           full-text (+ offset match-length)))
     (unless (and start end (<= start end))
       (error "LanguageTool returned an invalid UTF-16 range"))
     (when (and (<= (plist-get request-data :target-beg) start)
@@ -827,6 +852,8 @@ REQUEST-DATA describes the submitted text and target range."
         (push diagnostic diagnostics)))
     (nreverse diagnostics)))
 
+;;;; Request handles and HTTP transport
+
 (defun proofread-languagetool--new-handle (request callback)
   "Return a backend handle for REQUEST and CALLBACK."
   (let ((handle
@@ -859,7 +886,7 @@ REQUEST-DATA describes the submitted text and target range."
        (memq handle proofread-languagetool--live-handles)))
 
 (defun proofread-languagetool--kill-url-buffer (buffer)
-  "Kill retrieval BUFFER and its process without signaling or querying."
+  "Kill retrieval BUFFER and its process without prompting."
   (when (buffer-live-p buffer)
     (when-let* ((process (ignore-errors
                            (get-buffer-process buffer))))
@@ -893,9 +920,17 @@ REQUEST-DATA describes the submitted text and target range."
      :result result)
     (funcall (plist-get handle :callback) result)))
 
+(defun proofread-languagetool--deliver-error
+    (handle error-symbol message)
+  "Deliver ERROR-SYMBOL with MESSAGE through HANDLE."
+  (proofread-languagetool--deliver
+   handle
+   (proofread--backend-error-result
+    (plist-get handle :request) error-symbol message)))
+
 (defun proofread-languagetool--deliver-error-later
-    (handle error message)
-  "Deliver ERROR and MESSAGE through HANDLE on the next timer turn."
+    (handle error-symbol message)
+  "Deliver ERROR-SYMBOL and MESSAGE through HANDLE on the next turn."
   (unless (or (plist-get handle :cancelled)
               (plist-get handle :delivered))
     (proofread-languagetool--cancel-handle-timer handle)
@@ -903,14 +938,7 @@ REQUEST-DATA describes the submitted text and target range."
           (run-at-time
            0 nil
            #'proofread-languagetool--deliver-error
-           handle error message))))
-
-(defun proofread-languagetool--deliver-error (handle error message)
-  "Deliver ERROR with MESSAGE through HANDLE."
-  (proofread-languagetool--deliver
-   handle
-   (proofread--backend-error-result
-    (plist-get handle :request) error message)))
+           handle error-symbol message))))
 
 (defun proofread-languagetool--cancel (handle)
   "Cancel the LanguageTool request represented by HANDLE."
@@ -926,30 +954,35 @@ REQUEST-DATA describes the submitted text and target range."
       (proofread-languagetool--kill-url-buffer buffer))))
 
 (defun proofread-languagetool--settle-live-handles
-    (error message)
-  "Deliver ERROR and MESSAGE to all live handles, including reentry."
+    (error-symbol message)
+  "Settle all live handles, including handles added by callbacks.
+Use ERROR-SYMBOL and MESSAGE for each result."
   (while proofread-languagetool--live-handles
     (let ((handles
            (copy-sequence proofread-languagetool--live-handles)))
       (dolist (handle handles)
         (condition-case nil
             (proofread-languagetool--deliver-error
-             handle error message)
+             handle error-symbol message)
           (error nil))))))
 
 (defun proofread-languagetool--http-body ()
   "Return the decoded body in the current URL response buffer."
-  (let* ((start
+  (let* ((end-of-headers
+          (and (boundp 'url-http-end-of-headers)
+               (symbol-value 'url-http-end-of-headers)))
+         (start
           (cond
-           ((markerp url-http-end-of-headers)
-            (marker-position url-http-end-of-headers))
-           ((integerp url-http-end-of-headers)
-            url-http-end-of-headers)
+           ((markerp end-of-headers)
+            (marker-position end-of-headers))
+           ((integerp end-of-headers)
+            end-of-headers)
            (t (error "Malformed HTTP response headers"))))
-         (_
-          (unless (<= (point-min) start (point-max))
-            (error "Malformed HTTP response body range")))
-         (raw (buffer-substring-no-properties start (point-max))))
+         (raw
+          (progn
+            (unless (<= (point-min) start (point-max))
+              (error "Malformed HTTP response body range"))
+            (buffer-substring-no-properties start (point-max)))))
     (string-trim-left
      (if (multibyte-string-p raw)
          raw
@@ -973,10 +1006,12 @@ Signal an error when STATUS is not a URL callback status plist."
 
 (defun proofread-languagetool--http-response-status ()
   "Return the current integer HTTP response status, or nil."
-  (unless (or (null url-http-response-status)
-              (integerp url-http-response-status))
-    (error "Malformed HTTP response status"))
-  url-http-response-status)
+  (let ((status
+         (and (boundp 'url-http-response-status)
+              (symbol-value 'url-http-response-status))))
+    (unless (or (null status) (integerp status))
+      (error "Malformed HTTP response status"))
+    status))
 
 (defun proofread-languagetool--record-response
     (handle &rest properties)
@@ -1006,12 +1041,13 @@ Signal an error when STATUS is not a URL callback status plist."
 (defun proofread-languagetool--check-response (status handle)
   "Handle LanguageTool check response STATUS for HANDLE."
   (let* ((buffer (current-buffer))
-         (active (eq buffer (plist-get handle :http-buffer))))
-    (when active
+         (active-p
+          (eq buffer (plist-get handle :http-buffer))))
+    (when active-p
       (setf (plist-get handle :http-buffer) nil)
       (proofread-languagetool--cancel-handle-timer handle))
     (unwind-protect
-        (when (and active
+        (when (and active-p
                    (proofread-languagetool--handle-live-p handle))
           (let ((status-result
                  (condition-case err
@@ -1077,11 +1113,11 @@ Signal an error when STATUS is not a URL callback status plist."
                            message))
                       (let* ((http-status (nth 1 decoded))
                              (body (nth 2 decoded))
-                             (error
+                             (response-error
                               (unless (eq http-status 200)
                                 'languagetool-http-error))
                              (message
-                              (and error
+                              (and response-error
                                    (proofread-languagetool--bounded-message
                                     (format
                                      "LanguageTool HTTP status %s: %s"
@@ -1091,11 +1127,11 @@ Signal an error when STATUS is not a URL callback status plist."
                          handle
                          :http-status http-status
                          :response body
-                         :error error
+                         :error response-error
                          :message message)
-                        (if error
+                        (if response-error
                             (proofread-languagetool--deliver-error
-                             handle error message)
+                             handle response-error message)
                           (condition-case err
                               (proofread-languagetool--deliver
                                handle
@@ -1128,7 +1164,6 @@ Signal an error when STATUS is not a URL callback status plist."
                 '(("Content-Type" .
                    "application/x-www-form-urlencoded; charset=utf-8")
                   ("Accept" . "application/json")))
-               (url-max-redirections 0)
                (url-proxy-services
                 (if (proofread-languagetool--loopback-host-p
                      (plist-get session :host))
@@ -1146,14 +1181,16 @@ Signal an error when STATUS is not a URL callback status plist."
            :parameters (plist-get request-data :parameters))
           (when (proofread-languagetool--handle-live-p handle)
             (setq buffer
-                  (url-retrieve
-                   check-url
-                   #'proofread-languagetool--check-response
-                   (list handle) t t))
+                  (cl-progv '( url-max-redirections) '( 0)
+                    (url-retrieve
+                     check-url
+                     #'proofread-languagetool--check-response
+                     (list handle) t t)))
             (unless (buffer-live-p buffer)
-              (error "LanguageTool request did not return a live buffer"))
+              (error
+               "LanguageTool request did not return a live buffer"))
             (with-current-buffer buffer
-              (setq-local url-max-redirections 0))
+              (set (make-local-variable 'url-max-redirections) 0))
             (if (proofread-languagetool--handle-live-p handle)
                 (progn
                   (setf (plist-get handle :http-buffer) buffer)
@@ -1172,6 +1209,8 @@ Signal an error when STATUS is not a URL callback status plist."
             :message message))
          (proofread-languagetool--deliver-error-later
           handle 'languagetool-request-error message))))))
+
+;;;; Server readiness and managed process lifecycle
 
 (defun proofread-languagetool--cancel-global-timer (symbol)
   "Cancel the timer stored in variable SYMBOL and set it to nil."
@@ -1215,14 +1254,15 @@ Signal an error when STATUS is not a URL callback status plist."
       (set-process-query-on-exit-flag process nil)
       (delete-process process))))
 
-(defun proofread-languagetool--defer-waiters (error message)
-  "Asynchronously fail current server waiters with ERROR and MESSAGE."
+(defun proofread-languagetool--defer-waiters
+    (error-symbol message)
+  "Fail current server waiters later with ERROR-SYMBOL and MESSAGE."
   (let ((waiters (nreverse proofread-languagetool--server-waiters)))
     (setq proofread-languagetool--server-waiters nil)
     (dolist (handle waiters)
       (condition-case nil
           (proofread-languagetool--deliver-error-later
-           handle error message)
+           handle error-symbol message)
         (error nil)))))
 
 (defun proofread-languagetool--drain-waiters (session)
@@ -1237,23 +1277,25 @@ Signal an error when STATUS is not a URL callback status plist."
          handle 'languagetool-session-changed
          "LanguageTool server configuration changed")))))
 
-(defun proofread-languagetool--fail-waiters (error message)
-  "Fail server waiters with ERROR and MESSAGE."
+(defun proofread-languagetool--fail-waiters
+    (error-symbol message)
+  "Fail server waiters with ERROR-SYMBOL and MESSAGE."
   (let ((waiters (nreverse proofread-languagetool--server-waiters)))
     (setq proofread-languagetool--server-waiters nil)
     (dolist (handle waiters)
       (condition-case nil
           (proofread-languagetool--deliver-error
-           handle error message)
+           handle error-symbol message)
         (error nil)))))
 
-(defun proofread-languagetool--fail-readiness (error message)
-  "End the current readiness attempt with ERROR and MESSAGE."
+(defun proofread-languagetool--fail-readiness
+    (error-symbol message)
+  "End the readiness attempt with ERROR-SYMBOL and MESSAGE."
   (cl-incf proofread-languagetool--server-generation)
   (setq proofread-languagetool--server-state 'unknown)
   (setq proofread-languagetool--force-start-p nil)
   (proofread-languagetool--cancel-readiness-work)
-  (proofread-languagetool--fail-waiters error message))
+  (proofread-languagetool--fail-waiters error-symbol message))
 
 (defun proofread-languagetool--server-ready (generation session)
   "Mark server GENERATION and SESSION ready and submit waiters."
@@ -1299,21 +1341,21 @@ Signal an error when STATUS is not a URL callback status plist."
               ((buffer-live-p buffer)))
     (with-current-buffer buffer
       (let ((inhibit-read-only t)
-            (moving (= (point) (point-max))))
+            (at-end-p (= (point) (point-max))))
         (goto-char (point-max))
         (insert output)
         (when (> (buffer-size) proofread-languagetool--log-limit)
           (delete-region
            (point-min)
            (- (point-max) proofread-languagetool--log-limit)))
-        (when moving
+        (when at-end-p
           (goto-char (point-max)))))))
 
 (defun proofread-languagetool--process-sentinel (process _event)
   "Update managed server state when PROCESS exits."
   (when (and (eq process proofread-languagetool--server-process)
              (memq (process-status process)
-                   '(exit signal closed failed)))
+                   '( exit signal closed failed)))
     (let ((state proofread-languagetool--server-state))
       (proofread-languagetool--forget-owned-process)
       (unless proofread-languagetool--shutting-down-p
@@ -1360,15 +1402,17 @@ Signal an error when STATUS is not a URL callback status plist."
          generation session)
     (let (new-process)
       (condition-case err
-          (let ((existing proofread-languagetool--server-process))
+          (let ((existing proofread-languagetool--server-process)
+                (existing-session
+                 proofread-languagetool--server-process-session))
             (when (and (process-live-p existing)
                        (not
                         (and
                          (proofread-languagetool--same-session-p
-                          proofread-languagetool--server-process-session
+                          existing-session
                           session)
                          (proofread-languagetool--same-managed-session-p
-                          proofread-languagetool--server-process-session
+                          existing-session
                           session))))
               (proofread-languagetool--stop-owned-process)
               (setq existing nil))
@@ -1379,9 +1423,11 @@ Signal an error when STATUS is not a URL callback status plist."
                 (proofread-languagetool--schedule-probe
                  generation 'startup session 0)
               (let* ((command-prefix
-                      (proofread-languagetool--server-command session))
+                      (proofread-languagetool--server-command
+                       session))
                      (arguments
-                      (proofread-languagetool--server-arguments session))
+                      (proofread-languagetool--server-arguments
+                       session))
                      (buffer
                       (get-buffer-create
                        proofread-languagetool--server-buffer-name))
@@ -1390,7 +1436,8 @@ Signal an error when STATUS is not a URL callback status plist."
                             (make-process
                              :name "proofread-languagetool-server"
                              :buffer buffer
-                             :command (append command-prefix arguments)
+                             :command
+                             (append command-prefix arguments)
                              :connection-type 'pipe
                              :filter
                              #'proofread-languagetool--process-filter
@@ -1431,13 +1478,13 @@ Signal an error when STATUS is not a URL callback status plist."
           "No LanguageTool server is available")))
       ('startup
        (let* ((process proofread-languagetool--server-process)
-              (live (process-live-p process)))
+              (live-p (process-live-p process)))
          (if (and (eq proofread-languagetool--server-state 'starting)
-                  live)
+                  live-p)
              (proofread-languagetool--schedule-probe
               generation 'startup session
               proofread-languagetool--probe-delay)
-           (unless live
+           (unless live-p
              (proofread-languagetool--forget-owned-process))
            (proofread-languagetool--fail-readiness
             'languagetool-startup-failed
@@ -1493,26 +1540,27 @@ Signal an error when STATUS is not a URL callback status plist."
              (proofread-languagetool--current-session-p
               generation session))
     (proofread-languagetool--cancel-probe-retry)
-    (let (buffer timeout-timer published)
+    (let (buffer timeout-timer published-p)
       (condition-case nil
           (let* ((url-request-method "GET")
                  (url-request-data nil)
                  (url-request-extra-headers nil)
-                 (url-max-redirections 0)
                  (url-proxy-services
                   (if (plist-get session :loopback)
                       nil
                     url-proxy-services))
                  (retrieved
-                  (url-retrieve
-                   (plist-get session :health-url)
-                   #'proofread-languagetool--probe-response
-                   (list generation phase session) t t)))
+                  (cl-progv '( url-max-redirections) '( 0)
+                    (url-retrieve
+                     (plist-get session :health-url)
+                     #'proofread-languagetool--probe-response
+                     (list generation phase session) t t))))
             (setq buffer retrieved)
             (unless (buffer-live-p buffer)
-              (error "LanguageTool probe did not return a live buffer"))
+              (error
+               "LanguageTool probe did not return a live buffer"))
             (with-current-buffer buffer
-              (setq-local url-max-redirections 0))
+              (set (make-local-variable 'url-max-redirections) 0))
             (when (and
                    (proofread-languagetool--current-session-p
                     generation session)
@@ -1531,8 +1579,8 @@ Signal an error when STATUS is not a URL callback status plist."
                 (setq proofread-languagetool--probe-buffer buffer)
                 (setq proofread-languagetool--probe-timeout-timer
                       timeout-timer)
-                (setq published t)))
-            (unless published
+                (setq published-p t)))
+            (unless published-p
               (when (timerp timeout-timer)
                 (cancel-timer timeout-timer))
               (proofread-languagetool--kill-url-buffer buffer)))
@@ -1599,7 +1647,7 @@ Signal an error when STATUS is not a URL callback status plist."
      ((eq proofread-languagetool--server-state 'ready)
       (proofread-languagetool--submit handle))
      ((memq proofread-languagetool--server-state
-            '(probing starting))
+            '( probing starting))
       (push handle proofread-languagetool--server-waiters))
      (t
       (proofread-languagetool--begin-readiness-check session)
@@ -1635,6 +1683,8 @@ Return a cancellable LanguageTool backend handle."
           (error-message-string err)))))
     handle))
 
+;;;; Commands and feature lifecycle
+
 ;;;###autoload
 (defun proofread-languagetool-start-server ()
   "Reuse or asynchronously start the configured LanguageTool server."
@@ -1643,38 +1693,40 @@ Return a cancellable LanguageTool backend handle."
       (message "LanguageTool backend is stopping")
     (let ((session
            (proofread-languagetool--server-session-snapshot nil t)))
-      (let* ((replace-owned
+      (let* ((replace-owned-p
               (and
                (process-live-p proofread-languagetool--server-process)
                (not
                 (proofread-languagetool--same-managed-session-p
                  proofread-languagetool--server-process-session
                  session))))
-             (same-session
+             (same-session-p
               (proofread-languagetool--same-session-p
                session proofread-languagetool--server-session))
-             (same-managed-session
+             (same-managed-session-p
               (proofread-languagetool--same-managed-session-p
                session proofread-languagetool--server-session)))
-        (when replace-owned
+        (when replace-owned-p
           (proofread-languagetool--stop-owned-process))
         (cond
-         ((and (not replace-owned)
-               same-session
+         ((and (not replace-owned-p)
+               same-session-p
                (eq proofread-languagetool--server-state 'ready)))
-         ((and (not replace-owned)
-               same-session
-               same-managed-session
+         ((and (not replace-owned-p)
+               same-session-p
+               same-managed-session-p
                (memq proofread-languagetool--server-state
-                     '(probing starting)))
+                     '( probing starting)))
           (setq proofread-languagetool--force-start-p t))
          (t
           (proofread-languagetool--begin-readiness-check session)
           (setq proofread-languagetool--force-start-p t)))))
     (message "LanguageTool server readiness check started")))
 
-(defun proofread-languagetool--teardown (error message)
-  "Release backend resources and settle handles with ERROR and MESSAGE."
+(defun proofread-languagetool--teardown
+    (error-symbol message)
+  "Release resources and settle every live handle.
+Use ERROR-SYMBOL and MESSAGE for each result."
   (let ((proofread-languagetool--shutting-down-p t))
     (cl-incf proofread-languagetool--server-generation)
     (setq proofread-languagetool--server-state 'unknown)
@@ -1682,7 +1734,8 @@ Return a cancellable LanguageTool backend handle."
     (setq proofread-languagetool--force-start-p nil)
     (proofread-languagetool--cancel-readiness-work)
     (setq proofread-languagetool--server-waiters nil)
-    (proofread-languagetool--settle-live-handles error message)
+    (proofread-languagetool--settle-live-handles
+     error-symbol message)
     (proofread-languagetool--stop-owned-process)))
 
 ;;;###autoload
@@ -1696,7 +1749,7 @@ An external server reused by this backend is never stopped."
     (message "Managed LanguageTool server stopped")))
 
 (defun proofread-languagetool--kill-emacs ()
-  "Stop resources owned by the LanguageTool backend before Emacs exits."
+  "Stop owned LanguageTool resources before Emacs exits."
   (proofread-languagetool-stop-server))
 
 (defun proofread-languagetool-unload-function ()
@@ -1709,13 +1762,16 @@ An external server reused by this backend is never stopped."
    (get-buffer proofread-languagetool--server-buffer-name))
   nil)
 
-(add-hook 'kill-emacs-hook #'proofread-languagetool--kill-emacs)
+;;;; Runtime setup
 
-(proofread--register-backend
- 'languagetool
- :check #'proofread-languagetool--check
- :identity #'proofread-languagetool--identity
- :cancel #'proofread-languagetool--cancel)
+(progn
+  (add-hook 'kill-emacs-hook
+            #'proofread-languagetool--kill-emacs)
+  (proofread--register-backend
+   'languagetool
+   :check #'proofread-languagetool--check
+   :identity #'proofread-languagetool--identity
+   :cancel #'proofread-languagetool--cancel))
 
 (provide 'proofread-languagetool)
 ;;; proofread-languagetool.el ends here
