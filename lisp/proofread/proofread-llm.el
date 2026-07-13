@@ -595,37 +595,32 @@ state."
 
 (defun proofread-llm--backend-check (request callback)
   "Submit REQUEST asynchronously and invoke CALLBACK with its result."
-  (cond
-   ((not proofread-llm-provider)
-    (let ((timer
-           (proofread--defer-backend-callback
-            callback
-            (proofread--backend-error-result
-             request 'llm-provider-unavailable
-             "No proofread llm provider is configured"))))
-      (list :backend 'llm
-            :request nil
-            :timer timer)))
-   ((not (proofread-llm--response-strategy proofread-llm-provider))
-    (let ((timer
-           (proofread--defer-backend-callback
-            callback
-            (proofread--backend-error-result
-             request 'llm-structured-output-unavailable
-             "The configured llm response strategy is unavailable"))))
-      (list :backend 'llm
-            :request nil
-            :timer timer)))
-   (t
-    (let* ((provider proofread-llm-provider)
-           (strategy (proofread-llm--response-strategy provider))
-           (handle (list :backend 'llm
-                         :requests nil
-                         :timer nil
-                         :delivered nil
-                         :cancelled nil)))
+  (let* ((provider proofread-llm-provider)
+         (strategy
+          (and provider
+               (proofread-llm--response-strategy provider)))
+         (handle (list :backend 'llm
+                       :requests nil
+                       :timer nil
+                       :delivered nil
+                       :cancelled nil)))
+    (cond
+     ((not provider)
+      (proofread-llm--deliver-result
+       handle callback
+       (proofread--backend-error-result
+        request 'llm-provider-unavailable
+        "No proofread llm provider is configured")))
+     ((not strategy)
+      (proofread-llm--deliver-result
+       handle callback
+       (proofread--backend-error-result
+        request 'llm-structured-output-unavailable
+        "The configured llm response strategy is unavailable")))
+     (t
       (proofread-llm--submit-passes
-       provider strategy request callback handle)))))
+       provider strategy request callback handle)))
+    handle))
 
 (defvar proofread-llm--provider-identity-sequence 0
   "Sequence for session-local LLM provider identities.")
@@ -678,10 +673,7 @@ state."
   "Cancel the LLM requests recorded in backend HANDLE."
   (let ((warning-minimum-level :error)
         (warning-minimum-log-level :error))
-    (dolist (request-handle
-             (or (plist-get handle :requests)
-                 (and (plist-get handle :request)
-                      (list (plist-get handle :request)))))
+    (dolist (request-handle (plist-get handle :requests))
       (ignore-errors
         (llm-cancel-request request-handle)))))
 

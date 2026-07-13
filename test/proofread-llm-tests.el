@@ -56,6 +56,13 @@
       (accept-process-output nil 0.01))
     result))
 
+(defun proofread-llm-test--assert-handle-shape (handle)
+  "Assert that HANDLE has the canonical LLM backend shape."
+  (should (eq (plist-get handle :backend) 'llm))
+  (dolist (key '(:requests :timer :delivered :cancelled))
+    (should (plist-member handle key)))
+  (should-not (plist-member handle :request)))
+
 (defconst proofread-llm-test--provider 'proofread-llm-test-provider
   "Provider object used for local LLM backend tests.")
 
@@ -217,11 +224,13 @@
                         (list (cons (point-min) (point-max))))))
            (request (proofread--make-backend-request chunk 'llm))
            result)
-      (should (proofread--backend-check
-               request
-               (lambda (backend-result)
-                 (setq result backend-result))
-               'llm))
+      (let ((handle
+             (proofread--backend-check
+              request
+              (lambda (backend-result)
+                (setq result backend-result))
+              'llm)))
+        (proofread-llm-test--assert-handle-shape handle))
       (should-not result)
       (should (proofread-llm-test--wait-for (lambda () result)))
       (should (eq (plist-get result :status) 'error))
@@ -246,16 +255,79 @@
                 ((symbol-function 'llm-chat-async)
                  (lambda (&rest _)
                    (error "Unexpected llm-chat-async call"))))
-        (should (proofread--backend-check
-                 request
-                 (lambda (backend-result)
-                   (setq result backend-result))
-                 'llm))
+        (let ((handle
+               (proofread--backend-check
+                request
+                (lambda (backend-result)
+                  (setq result backend-result))
+                'llm)))
+          (proofread-llm-test--assert-handle-shape handle))
         (should-not result)
         (should (proofread-llm-test--wait-for (lambda () result)))
         (should (eq (plist-get result :status) 'error))
         (should (eq (plist-get result :error)
                     'llm-structured-output-unavailable))))))
+
+(ert-deftest proofread-llm-test-check-resolves-response-strategy-once ()
+  "Resolve one response strategy snapshot for each LLM check."
+  (with-temp-buffer
+    (insert "helo")
+    (let* ((proofread-llm-provider proofread-llm-test--provider)
+           (proofread-llm-response-strategy 'provider-json)
+           (chunk (car (proofread--request-ready-chunks-for-ranges
+                        (list (cons (point-min) (point-max))))))
+           request
+           (capability-calls 0))
+      (proofread-llm-test--with-capabilities
+       (setq request (proofread--make-backend-request chunk 'llm)))
+      (cl-letf
+          (((symbol-function 'llm-capabilities)
+            (lambda (_provider)
+              (cl-incf capability-calls)
+              '(json-response)))
+           ((symbol-function 'llm-chat-async)
+            (lambda (&rest _ignored)
+              'proofread-llm-test-request)))
+        (let ((handle
+               (proofread-llm--backend-check request #'ignore)))
+          (proofread-llm-test--assert-handle-shape handle)
+          (should (= capability-calls 1))
+          (should (equal (plist-get handle :requests)
+                         '(proofread-llm-test-request))))))))
+
+(ert-deftest proofread-llm-test-cancel-handle-cancels-all-work ()
+  "Cancel both deferred and provider work recorded by an LLM handle."
+  (with-temp-buffer
+    (insert "helo")
+    (let* ((proofread-llm-provider nil)
+           (chunk (car (proofread--request-ready-chunks-for-ranges
+                        (list (cons (point-min) (point-max))))))
+           (request (proofread--make-backend-request chunk 'llm))
+           result
+           (handle
+            (proofread-llm--backend-check
+             request (lambda (value) (setq result value)))))
+      (proofread-llm-test--assert-handle-shape handle)
+      (proofread--cancel-request-handle handle)
+      (should (plist-get handle :cancelled))
+      (accept-process-output nil 0.02)
+      (should-not result)))
+  (let ((handle (list :backend 'llm
+                      :requests '(provider-request-a
+                                  provider-request-b)
+                      :timer nil
+                      :delivered nil
+                      :cancelled nil))
+        cancelled)
+    (cl-letf (((symbol-function 'llm-cancel-request)
+               (lambda (request-handle)
+                 (push request-handle cancelled)
+                 (when (eq request-handle 'provider-request-a)
+                   (error "Cancellation failed")))))
+      (proofread--cancel-request-handle handle))
+    (should (plist-get handle :cancelled))
+    (should (equal (nreverse cancelled)
+                   '(provider-request-a provider-request-b)))))
 
 (ert-deftest
     proofread-llm-test-deepseek-v4-flash-uses-prompt-json-fallback ()
@@ -319,7 +391,8 @@
                      "secret-token"
                      (prin1-to-string identity)))
         (dolist (volatile-key
-                 '(:id :buffer :callback :timer :process :request))
+                 '(:id :buffer :callback :timer :process
+                       :request :requests))
           (should-not (plist-member identity volatile-key)))))))
 
 (ert-deftest proofread-llm-test-provider-identity-cache-miss ()
@@ -405,6 +478,7 @@
                 (lambda (backend-result)
                   (setq result backend-result))
                 'llm)))
+          (proofread-llm-test--assert-handle-shape handle)
           (should (equal (plist-get handle :requests)
                          '(proofread-llm-test-handle)))
           (should (eq captured-provider proofread-llm-provider))
