@@ -1747,15 +1747,11 @@ When BACKEND is non-nil, store its canonical identity in the request."
   "Return a successful backend result for REQUEST and DIAGNOSTICS.
 When CANDIDATE-ISSUES or REPAIRS are non-nil, include them as
 diagnostic response metadata."
-  (let ((result (list :status 'ok
-                      :request request
-                      :diagnostics diagnostics)))
-    (when candidate-issues
-      (setq result
-            (plist-put result :candidate-issues candidate-issues)))
-    (when repairs
-      (setq result (plist-put result :repairs repairs)))
-    result))
+  (proofread--backend-result-with-diagnostic-metadata
+   (list :status 'ok
+         :request request
+         :diagnostics diagnostics)
+   candidate-issues repairs))
 
 (defun proofread--backend-partial-success-result
     (request diagnostics &optional candidate-issues repairs)
