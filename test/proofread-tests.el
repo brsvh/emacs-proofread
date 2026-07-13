@@ -129,6 +129,35 @@
           (lambda ()
             (reverse callbacks)))))
 
+(defun proofread-test--lifecycle-request
+    (id beg end &optional handle)
+  "Return a minimal lifecycle request named ID from BEG to END.
+When HANDLE is non-nil, attach it as the backend handle."
+  (list :id id
+        :log-id id
+        :buffer (current-buffer)
+        :generation 1
+        :beg beg
+        :end end
+        :accessible-beg 1
+        :accessible-end 100
+        :cache-key id
+        :handle handle
+        :state (list :superseded nil
+                     :invalidated nil
+                     :cancelled nil
+                     :batch nil
+                     :batch-settled nil)))
+
+(defun proofread-test--pending-request-table (requests)
+  "Return a pending-work table containing REQUESTS."
+  (let ((table (make-hash-table :test #'equal)))
+    (dolist (request requests)
+      (puthash (proofread--request-work-key request)
+               (plist-get request :log-id)
+               table))
+    table))
+
 (defun proofread-test--window-state (buffer window)
   "Return point and window state for BUFFER and WINDOW."
   (list :selected-window (selected-window)
@@ -366,6 +395,165 @@
     (should-not (gethash adjacent-left table))
     (should-not (gethash adjacent-right table))
     (should (= (hash-table-count table) 6))))
+
+(ert-deftest
+    proofread-test-partition-pending-requests-preserves-state
+    ()
+  "Partition all pending states without lifecycle side effects."
+  (let* ((active-first
+          (proofread-test--lifecycle-request 'active-first 1 2))
+         (active-retained
+          (proofread-test--lifecycle-request 'active-retained 2 3))
+         (active-last
+          (proofread-test--lifecycle-request 'active-last 3 4))
+         (claimed-retained-first
+          (proofread-test--lifecycle-request
+           'claimed-retained-first 4 5))
+         (claimed-selected
+          (proofread-test--lifecycle-request 'claimed-selected 5 6))
+         (claimed-retained-last
+          (proofread-test--lifecycle-request
+           'claimed-retained-last 6 7))
+         (queued-first
+          (proofread-test--lifecycle-request 'queued-first 7 8))
+         (queued-retained-first
+          (proofread-test--lifecycle-request
+           'queued-retained-first 8 9))
+         (queued-retained-last
+          (proofread-test--lifecycle-request
+           'queued-retained-last 9 10))
+         (queued-last
+          (proofread-test--lifecycle-request 'queued-last 10 11))
+         (queued-first-entry
+          (list :request queued-first :backend 'first-backend))
+         (queued-retained-first-entry
+          (list :request queued-retained-first
+                :backend 'retained-first-backend))
+         (queued-retained-last-entry
+          (list :request queued-retained-last
+                :backend 'retained-last-backend))
+         (queued-last-entry
+          (list :request queued-last :backend 'last-backend))
+         (active-input
+          (list active-first active-retained active-last))
+         (claimed-input
+          (list claimed-retained-first claimed-selected
+                claimed-retained-last))
+         (queue-input
+          (list queued-first-entry queued-retained-first-entry
+                queued-retained-last-entry queued-last-entry))
+         (active-snapshot (copy-sequence active-input))
+         (claimed-snapshot (copy-sequence claimed-input))
+         (queue-snapshot (copy-sequence queue-input))
+         (all-requests
+          (append active-input claimed-input
+                  (mapcar (lambda (entry)
+                            (plist-get entry :request))
+                          queue-input)))
+         (request-value-snapshot (copy-tree all-requests))
+         (queue-value-snapshot (copy-tree queue-input))
+         (selected
+          (list active-first active-last claimed-selected
+                queued-first queued-last))
+         (expected-visits all-requests)
+         (proofread--active-requests active-input)
+         (proofread--claimed-requests claimed-input)
+         (proofread--request-queue queue-input)
+         (original-tail (last queue-input))
+         (proofread--request-queue-tail original-tail)
+         (proofread--pending-request-keys
+          (proofread-test--pending-request-table all-requests))
+         (unpublished t)
+         visits
+         events
+         cancelled-handles
+         result)
+    (should-error
+     (proofread--partition-pending-requests
+      (lambda (request)
+        (when (eq request claimed-selected)
+          (error "Simulated predicate failure"))
+        (memq request selected))))
+    (should (eq proofread--active-requests active-input))
+    (should (eq proofread--claimed-requests claimed-input))
+    (should (eq proofread--request-queue queue-input))
+    (should (eq proofread--request-queue-tail original-tail))
+    (let ((proofread-request-log-hook
+           (list (lambda (event)
+                   (push event events)))))
+      (cl-letf (((symbol-function 'proofread--cancel-request-handle)
+                 (lambda (handle)
+                   (push handle cancelled-handles))))
+        (setq result
+              (proofread--partition-pending-requests
+               (lambda (request)
+                 (setq visits (append visits (list request)))
+                 (unless (and (eq proofread--active-requests
+                                  active-input)
+                              (eq proofread--claimed-requests
+                                  claimed-input)
+                              (eq proofread--request-queue queue-input)
+                              (eq proofread--request-queue-tail
+                                  original-tail))
+                   (setq unpublished nil))
+                 (memq request selected))))))
+    (should unpublished)
+    (should (equal visits expected-visits))
+    (should (cl-every #'eq visits expected-visits))
+    (should
+     (equal result
+            (list :active (list active-first active-last)
+                  :claimed (list claimed-selected)
+                  :queued (list queued-first queued-last))))
+    (should
+     (cl-every #'eq (plist-get result :active)
+               (list active-first active-last)))
+    (should
+     (cl-every #'eq (plist-get result :claimed)
+               (list claimed-selected)))
+    (should
+     (cl-every #'eq (plist-get result :queued)
+               (list queued-first queued-last)))
+    (should (equal proofread--active-requests
+                   (list active-retained)))
+    (should (eq (car proofread--active-requests) active-retained))
+    (should
+     (equal proofread--claimed-requests
+            (list claimed-retained-first claimed-retained-last)))
+    (should
+     (cl-every #'eq proofread--claimed-requests
+               (list claimed-retained-first claimed-retained-last)))
+    (should
+     (equal proofread--request-queue
+            (list queued-retained-first-entry
+                  queued-retained-last-entry)))
+    (should
+     (cl-every #'eq proofread--request-queue
+               (list queued-retained-first-entry
+                     queued-retained-last-entry)))
+    (should (eq proofread--request-queue-tail
+                (last proofread--request-queue)))
+    (should (eq (car proofread--request-queue-tail)
+                queued-retained-last-entry))
+    (should (equal active-input active-snapshot))
+    (should (cl-every #'eq active-input active-snapshot))
+    (should (equal claimed-input claimed-snapshot))
+    (should (cl-every #'eq claimed-input claimed-snapshot))
+    (should (equal queue-input queue-snapshot))
+    (should (cl-every #'eq queue-input queue-snapshot))
+    (should (equal all-requests request-value-snapshot))
+    (should (equal queue-input queue-value-snapshot))
+    (dolist (request all-requests)
+      (should (equal (proofread--request-work-pending-p request)
+                     (plist-get request :log-id)))
+      (should-not
+       (proofread--request-state-flag-p request :superseded))
+      (should-not
+       (proofread--request-state-flag-p request :invalidated))
+      (should-not
+       (proofread--request-state-flag-p request :cancelled)))
+    (should-not events)
+    (should-not cancelled-handles)))
 
 (ert-deftest
     proofread-test-edit-affected-state-preserves-edit-boundaries ()
@@ -6090,6 +6278,306 @@ This covers URLs, email, invisible text, faces, and properties."
                 (plist-get request :beg) (plist-get request :end))
                (plist-get request :text)))
       (should-not (proofread--fresh-request-p request)))))
+
+(ert-deftest
+    proofread-test-supersede-partitions-before-lifecycle-effects
+    ()
+  "Publish every superseded partition before hooks and cancellation."
+  (with-temp-buffer
+    (let* ((active-first
+            (proofread-test--lifecycle-request
+             'active-first 12 14 'active-first-handle))
+           (active-retained
+            (proofread-test--lifecycle-request
+             'active-retained 1 4 'active-retained-handle))
+           (active-last
+            (proofread-test--lifecycle-request
+             'active-last 16 18 'active-last-handle))
+           (claimed-retained
+            (proofread-test--lifecycle-request
+             'claimed-retained 30 32))
+           (claimed-selected
+            (proofread-test--lifecycle-request
+             'claimed-selected 10 20 'claimed-selected-handle))
+           (queued-selected
+            (proofread-test--lifecycle-request
+             'queued-selected 11 13 'queued-selected-handle))
+           (queued-retained
+            (proofread-test--lifecycle-request
+             'queued-retained 40 42))
+           (replacement
+            (proofread-test--lifecycle-request 'replacement 10 20))
+           (queued-selected-entry
+            (list :request queued-selected
+                  :backend proofread-test--backend))
+           (queued-retained-entry
+            (list :request queued-retained
+                  :backend proofread-test--backend))
+           (selected
+            (list active-first active-last claimed-selected
+                  queued-selected))
+           (retained
+            (list active-retained claimed-retained queued-retained))
+           (old-requests (append selected retained))
+           (proofread--active-requests
+            (list active-first active-retained active-last))
+           (proofread--claimed-requests
+            (list claimed-retained claimed-selected))
+           (proofread--request-queue
+            (list queued-selected-entry queued-retained-entry))
+           (proofread--request-queue-tail
+            (last proofread--request-queue))
+           (proofread--pending-request-keys
+            (proofread-test--pending-request-table old-requests))
+           (original-partition
+            (symbol-function
+             'proofread--partition-pending-requests))
+           (partition-calls 0)
+           (all-events-before-cancel t)
+           event-trace
+           cancelled-handles
+           first-hook-state
+           superseded)
+      (let ((proofread-request-log-hook
+             (list
+              (lambda (event)
+                (when (eq (plist-get event :type) 'cancelled)
+                  (unless event-trace
+                    (setq first-hook-state
+                          (and
+                           (equal proofread--active-requests
+                                  (list active-retained))
+                           (equal proofread--claimed-requests
+                                  (list claimed-retained))
+                           (equal
+                            (mapcar
+                             (lambda (entry)
+                               (plist-get entry :request))
+                             proofread--request-queue)
+                            (list queued-retained replacement))
+                           (eq proofread--request-queue-tail
+                               (last proofread--request-queue))
+                           (cl-every
+                            (lambda (request)
+                              (and
+                               (proofread--request-state-flag-p
+                                request :superseded)
+                               (not
+                                (proofread--request-work-pending-p
+                                 request))))
+                            selected)
+                           (cl-every
+                            #'proofread--request-work-pending-p
+                            (append retained
+                                    (list replacement))))))
+                  (setq event-trace
+                        (append
+                         event-trace
+                         (list
+                          (list
+                           (plist-get
+                            (plist-get event :request) :id)
+                           (plist-get event :reason))))))))))
+        (cl-letf
+            (((symbol-function
+               'proofread--partition-pending-requests)
+              (lambda (predicate)
+                (setq partition-calls (1+ partition-calls))
+                (funcall original-partition predicate)))
+             ((symbol-function 'proofread--cancel-request-handle)
+              (lambda (handle)
+                (unless (= (length event-trace) 4)
+                  (setq all-events-before-cancel nil))
+                (setq cancelled-handles
+                      (append cancelled-handles (list handle))))))
+          (setq superseded
+                (proofread--supersede-conflicting-requests
+                 (list replacement)))
+          (should (= partition-calls 1))
+          (should
+           (equal superseded
+                  (list :active (list active-first active-last)
+                        :claimed (list claimed-selected)
+                        :queued (list queued-selected))))
+          (dolist (request selected)
+            (should
+             (proofread--request-state-flag-p
+              request :superseded))
+            (should-not
+             (proofread--request-state-flag-p request :cancelled))
+            (should-not
+             (proofread--request-work-pending-p request)))
+          (dolist (request retained)
+            (should-not
+             (proofread--request-state-flag-p
+              request :superseded))
+            (should
+             (proofread--request-work-pending-p request)))
+          (should (eq (car proofread--request-queue)
+                      queued-retained-entry))
+          (should (eq proofread--request-queue-tail
+                      (last proofread--request-queue)))
+          (should-not event-trace)
+          (should-not cancelled-handles)
+          (proofread--enqueue-requests
+           (list replacement) proofread-test--backend)
+          (proofread--finish-superseded-requests superseded)))
+      (should first-hook-state)
+      (should all-events-before-cancel)
+      (should
+       (equal event-trace
+              '((active-first superseded)
+                (active-last superseded)
+                (claimed-selected superseded)
+                (queued-selected superseded))))
+      (should (equal cancelled-handles
+                     '(active-first-handle active-last-handle)))
+      (dolist (request selected)
+        (should
+         (proofread--request-state-flag-p request :cancelled))))))
+
+(ert-deftest
+    proofread-test-position-shift-partitions-before-lifecycle-effects
+    ()
+  "Finish shifted-request hooks before cancellation and scheduling."
+  (with-temp-buffer
+    (let* ((active-first
+            (proofread-test--lifecycle-request
+             'active-first 1 12 'active-first-handle))
+           (active-retained
+            (proofread-test--lifecycle-request
+             'active-retained 1 10 'active-retained-handle))
+           (active-last
+            (proofread-test--lifecycle-request
+             'active-last 20 22 'active-last-handle))
+           (claimed-retained
+            (proofread-test--lifecycle-request
+             'claimed-retained 2 9))
+           (claimed-selected
+            (proofread-test--lifecycle-request
+             'claimed-selected 2 11 'claimed-selected-handle))
+           (queued-selected
+            (proofread-test--lifecycle-request
+             'queued-selected 5 15 'queued-selected-handle))
+           (late
+            (proofread-test--lifecycle-request 'late 50 52))
+           (queued-selected-entry
+            (list :request queued-selected
+                  :backend proofread-test--backend))
+           (selected
+            (list active-first active-last claimed-selected
+                  queued-selected))
+           (retained
+            (list active-retained claimed-retained))
+           (all-requests (append selected retained))
+           (proofread--active-requests
+            (list active-first active-retained active-last))
+           (proofread--claimed-requests
+            (list claimed-retained claimed-selected))
+           (proofread--request-queue
+            (list queued-selected-entry))
+           (proofread--request-queue-tail
+            (last proofread--request-queue))
+           (proofread--pending-request-keys
+            (proofread-test--pending-request-table all-requests))
+           (original-partition
+            (symbol-function
+             'proofread--partition-pending-requests))
+           (partition-calls 0)
+           (all-events-before-cancel t)
+           (schedule-calls 0)
+           event-trace
+           cancelled-handles
+           first-hook-state
+           schedule-state)
+      (let ((proofread-request-log-hook
+             (list
+              (lambda (event)
+                (when (eq (plist-get event :type) 'cancelled)
+                  (unless event-trace
+                    (setq first-hook-state
+                          (and
+                           (equal proofread--active-requests
+                                  (list active-retained))
+                           (equal proofread--claimed-requests
+                                  (list claimed-retained))
+                           (null proofread--request-queue)
+                           (null proofread--request-queue-tail)
+                           (cl-every
+                            (lambda (request)
+                              (and
+                               (proofread--request-invalidated-p
+                                request)
+                               (not
+                                (proofread--request-work-pending-p
+                                 request))))
+                            selected)
+                           (cl-every
+                            #'proofread--request-work-pending-p
+                            retained)))
+                    (proofread--enqueue-requests
+                     (list late) proofread-test--backend))
+                  (setq event-trace
+                        (append
+                         event-trace
+                         (list
+                          (list
+                           (plist-get
+                            (plist-get event :request) :id)
+                           (plist-get event :reason))))))))))
+        (cl-letf
+            (((symbol-function
+               'proofread--partition-pending-requests)
+              (lambda (predicate)
+                (setq partition-calls (1+ partition-calls))
+                (funcall original-partition predicate)))
+             ((symbol-function 'proofread--cancel-request-handle)
+              (lambda (handle)
+                (unless (= (length event-trace) 4)
+                  (setq all-events-before-cancel nil))
+                (setq cancelled-handles
+                      (append cancelled-handles (list handle)))))
+             ((symbol-function 'proofread--schedule-queue-dispatch)
+              (lambda ()
+                (setq schedule-calls (1+ schedule-calls))
+                (setq schedule-state
+                      (and
+                       (equal cancelled-handles
+                              '(active-first-handle
+                                active-last-handle))
+                       (equal
+                        (mapcar
+                         (lambda (entry)
+                           (plist-get entry :request))
+                         proofread--request-queue)
+                        (list late))
+                       (eq proofread--request-queue-tail
+                           (last proofread--request-queue))))
+                'scheduled)))
+          (proofread--invalidate-position-shifted-requests 10)))
+      (should (= partition-calls 1))
+      (should first-hook-state)
+      (should all-events-before-cancel)
+      (should
+       (equal event-trace
+              '((active-first stale)
+                (active-last stale)
+                (claimed-selected stale)
+                (queued-selected stale))))
+      (should (equal cancelled-handles
+                     '(active-first-handle active-last-handle)))
+      (should (= schedule-calls 1))
+      (should schedule-state)
+      (dolist (request selected)
+        (should (proofread--request-invalidated-p request))
+        (should
+         (proofread--request-state-flag-p request :cancelled)))
+      (dolist (request retained)
+        (should-not (proofread--request-invalidated-p request))
+        (should
+         (proofread--request-work-pending-p request)))
+      (should
+       (proofread--request-work-pending-p late)))))
 
 (ert-deftest
     proofread-test-newer-overlapping-result-wins-out-of-order ()

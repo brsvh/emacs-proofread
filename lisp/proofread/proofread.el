@@ -2614,6 +2614,48 @@ Return one of the symbols `sent', `cached', `full', `stale', or
       (puthash (car entry) t table))
     table))
 
+(defun proofread--partition-pending-requests (predicate)
+  "Remove pending requests matching PREDICATE and group them by state.
+Call PREDICATE with each active, claimed, then queued request.  It must
+not mutate request lifecycle state or invoke user callbacks.  Publish
+all retained state only after every predicate call finishes, preserving
+request order and queued entry identity.  Return selected requests in
+a plist with the keys :active, :claimed, and :queued.
+
+This function updates `proofread--request-queue-tail', but it does not
+change request flags or pending-work identity, run lifecycle hooks,
+cancel handles, or schedule work."
+  (let (selected-active
+        selected-claimed
+        selected-queued
+        retained-active
+        retained-claimed
+        retained-queue)
+    (dolist (request proofread--active-requests)
+      (if (funcall predicate request)
+          (push request selected-active)
+        (push request retained-active)))
+    (dolist (request proofread--claimed-requests)
+      (if (funcall predicate request)
+          (push request selected-claimed)
+        (push request retained-claimed)))
+    (dolist (entry proofread--request-queue)
+      (let ((request (plist-get entry :request)))
+        (if (funcall predicate request)
+            (push request selected-queued)
+          (push entry retained-queue))))
+    (setq selected-active (nreverse selected-active))
+    (setq selected-claimed (nreverse selected-claimed))
+    (setq selected-queued (nreverse selected-queued))
+    (setq proofread--active-requests (nreverse retained-active))
+    (setq proofread--claimed-requests (nreverse retained-claimed))
+    (setq proofread--request-queue (nreverse retained-queue))
+    (setq proofread--request-queue-tail
+          (last proofread--request-queue))
+    (list :active selected-active
+          :claimed selected-claimed
+          :queued selected-queued)))
+
 (defun proofread--supersede-conflicting-requests (requests)
   "Remove older work that conflicts with REQUESTS.
 Return the removed requests grouped by their previous lifecycle state.
@@ -2628,42 +2670,17 @@ hooks or call backend cancellation functions."
            (append proofread--active-requests
                    proofread--claimed-requests
                    queued-requests)))
-         superseded-active
-         superseded-claimed
-         superseded-queued
-         retained-active
-         retained-claimed
-         retained-queue)
-    (dolist (candidate proofread--active-requests)
-      (if (gethash candidate conflicts)
-          (push candidate superseded-active)
-        (push candidate retained-active)))
-    (dolist (candidate proofread--claimed-requests)
-      (if (gethash candidate conflicts)
-          (push candidate superseded-claimed)
-        (push candidate retained-claimed)))
-    (dolist (entry proofread--request-queue)
-      (let ((candidate (plist-get entry :request)))
-        (if (gethash candidate conflicts)
-            (push candidate superseded-queued)
-          (push entry retained-queue))))
-    (setq superseded-active (nreverse superseded-active))
-    (setq superseded-claimed (nreverse superseded-claimed))
-    (setq superseded-queued (nreverse superseded-queued))
-    (setq proofread--active-requests (nreverse retained-active))
-    (setq proofread--claimed-requests (nreverse retained-claimed))
-    (setq proofread--request-queue (nreverse retained-queue))
-    (setq proofread--request-queue-tail
-          (last proofread--request-queue))
+         (superseded
+          (proofread--partition-pending-requests
+           (lambda (candidate)
+             (gethash candidate conflicts)))))
     (dolist (candidate
-             (append superseded-active
-                     superseded-claimed
-                     superseded-queued))
+             (append (plist-get superseded :active)
+                     (plist-get superseded :claimed)
+                     (plist-get superseded :queued)))
       (proofread--set-request-state-flag candidate :superseded)
       (proofread--forget-request-work candidate))
-    (list :active superseded-active
-          :claimed superseded-claimed
-          :queued superseded-queued)))
+    superseded))
 
 (defun proofread--finish-superseded-requests (superseded)
   "Finish lifecycle handling for requests in SUPERSEDED."
@@ -2693,44 +2710,22 @@ hooks or call backend cancellation functions."
 
 (defun proofread--invalidate-position-shifted-requests (change-beg)
   "Invalidate pending requests that an edit at CHANGE-BEG may shift."
-  (let (invalid-active
-        invalid-claimed
-        invalid-queued
-        retained-active
-        retained-claimed
-        retained-queue)
-    (cl-labels
-        ((shifted-p (request)
-           (when-let* ((request-end
-                        (proofread--position-integer
-                         (plist-get request :end))))
-             (< change-beg request-end))))
-      (dolist (request proofread--active-requests)
-        (if (shifted-p request)
-            (push request invalid-active)
-          (push request retained-active)))
-      (dolist (request proofread--claimed-requests)
-        (if (shifted-p request)
-            (push request invalid-claimed)
-          (push request retained-claimed)))
-      (dolist (entry proofread--request-queue)
-        (if (shifted-p (plist-get entry :request))
-            (push (plist-get entry :request) invalid-queued)
-          (push entry retained-queue))))
-    (setq invalid-active (nreverse invalid-active))
-    (setq invalid-claimed (nreverse invalid-claimed))
-    (setq invalid-queued (nreverse invalid-queued))
-    (setq proofread--active-requests (nreverse retained-active))
-    (setq proofread--claimed-requests (nreverse retained-claimed))
-    (setq proofread--request-queue (nreverse retained-queue))
-    (setq proofread--request-queue-tail
-          (last proofread--request-queue))
-    (dolist (request
-             (append invalid-active invalid-claimed invalid-queued))
+  (let* ((invalid
+          (proofread--partition-pending-requests
+           (lambda (request)
+             (when-let* ((request-end
+                          (proofread--position-integer
+                           (plist-get request :end))))
+               (< change-beg request-end)))))
+         (invalid-active (plist-get invalid :active))
+         (invalid-requests
+          (append invalid-active
+                  (plist-get invalid :claimed)
+                  (plist-get invalid :queued))))
+    (dolist (request invalid-requests)
       (proofread--invalidate-request request))
     (let ((proofread--inhibit-queue-dispatch (current-buffer)))
-      (dolist (request
-               (append invalid-active invalid-claimed invalid-queued))
+      (dolist (request invalid-requests)
         (proofread--record-request-cancellation request 'stale))
       (dolist (request invalid-active)
         (proofread--cancel-request-handle
