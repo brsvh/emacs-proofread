@@ -586,6 +586,22 @@ The returned plist contains the keys in `proofread--diagnostic-keys'."
       (and (markerp position)
            (eq (marker-buffer position) (current-buffer)))))
 
+(defun proofread--normalize-region-range (beg end)
+  "Return an ordered range from current-buffer positions BEG and END.
+Signal a `user-error' when either position is missing, is neither an
+integer nor a marker in the current buffer, or makes the range empty.
+Do not clip the returned range to the accessible portion of the buffer."
+  (unless (and beg end)
+    (user-error "No active region"))
+  (unless (and (proofread--current-buffer-position-p beg)
+               (proofread--current-buffer-position-p end))
+    (user-error "Region boundaries are not in the current buffer"))
+  (let ((beg (proofread--position-integer beg))
+        (end (proofread--position-integer end)))
+    (when (= beg end)
+      (user-error "The region is empty"))
+    (cons (min beg end) (max beg end))))
+
 (defun proofread--normalize-ranges (ranges)
   "Return sorted, deduplicated RANGES.
 Each range is a cons cell of the form (BEG . END).  Empty or invalid
@@ -5643,19 +5659,10 @@ feedback even when routine progress messages are inhibited."
    (if (use-region-p)
        (list (region-beginning) (region-end) t)
      (list nil nil t)))
-  (unless (and beg end)
-    (user-error "No active region"))
-  (unless (and (proofread--current-buffer-position-p beg)
-               (proofread--current-buffer-position-p end))
-    (user-error "Region boundaries are not in the current buffer"))
-  (let ((beg (proofread--position-integer beg))
-        (end (proofread--position-integer end)))
-    (when (= beg end)
-      (user-error "The region is empty"))
-    (proofread--check-ranges
-     (list (cons beg end))
-     "selected"
-     force-feedback)))
+  (proofread--check-ranges
+   (list (proofread--normalize-region-range beg end))
+   "selected"
+   force-feedback))
 
 ;;;###autoload
 (defun proofread-check-at-point (&optional force-feedback)
@@ -5825,17 +5832,9 @@ in either order."
    (if (use-region-p)
        (list (region-beginning) (region-end))
      (list nil nil)))
-  (unless (and beg end)
-    (user-error "No active region"))
-  (unless (and (proofread--current-buffer-position-p beg)
-               (proofread--current-buffer-position-p end))
-    (user-error "Region boundaries are not in the current buffer"))
-  (let ((beg (proofread--position-integer beg))
-        (end (proofread--position-integer end)))
-    (when (= beg end)
-      (user-error "The region is empty"))
-    (proofread--correct-ranges
-     (list (cons beg end)) "the selected region")))
+  (proofread--correct-ranges
+   (list (proofread--normalize-region-range beg end))
+   "the selected region"))
 
 ;;;###autoload
 (defun proofread-correct-buffer ()

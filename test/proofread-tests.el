@@ -235,6 +235,32 @@
                     (20 . 30)))
                  '((10 . 35)))))
 
+(ert-deftest proofread-test-normalize-region-range-preserves-bounds ()
+  "Normalize region order without clipping accessible bounds."
+  (with-temp-buffer
+    (insert "abc")
+    (let ((end (copy-marker 3)))
+      (should
+       (equal (proofread--normalize-region-range end 0)
+              '(0 . 3))))))
+
+(ert-deftest proofread-test-region-commands-preserve-boundary-errors ()
+  "Preserve region argument errors before mode validation."
+  (with-temp-buffer
+    (insert "abc")
+    (dolist (command '(proofread-check-region proofread-correct-region))
+      (dolist (case '((nil invalid "No active region")
+                      (invalid
+                       2
+                       "Region boundaries are not in the current buffer")
+                      (20 20 "The region is empty")))
+        (let ((condition
+               (should-error
+                (funcall command (nth 0 case) (nth 1 case))
+                :type 'user-error)))
+          (should (equal (error-message-string condition)
+                         (nth 2 case))))))))
+
 (ert-deftest proofread-test-new-diagnostics-preserves-input-order ()
   "Keep only first unseen diagnostics in input order."
   (let* ((existing
@@ -586,9 +612,14 @@
                  (with-current-buffer other
                    (insert "Beta")
                    (copy-marker (point-min)))))
-            (should-error
-             (proofread-check-region foreign (point-max))
-             :type 'user-error)
+            (let ((condition
+                   (should-error
+                    (proofread-check-region foreign (point-max))
+                    :type 'user-error)))
+              (should
+               (equal
+                (error-message-string condition)
+                "Region boundaries are not in the current buffer")))
             (should-not proofread--active-requests))
         (kill-buffer other)))))
 
@@ -3979,9 +4010,14 @@ This covers URLs, email, invisible text, faces, and properties."
                  (with-current-buffer other
                    (insert "wrld")
                    (copy-marker (point-min)))))
-            (should-error
-             (proofread-correct-region foreign (point-max))
-             :type 'user-error))
+            (let ((condition
+                   (should-error
+                    (proofread-correct-region foreign (point-max))
+                    :type 'user-error)))
+              (should
+               (equal
+                (error-message-string condition)
+                "Region boundaries are not in the current buffer"))))
         (kill-buffer other)))))
 
 (ert-deftest proofread-test-correct-buffer-respects-narrowing ()
