@@ -1068,7 +1068,7 @@ domain."
               (end (window-end window t)))
           (when end
             (push (cons beg end) ranges)))))
-    (nreverse ranges)))
+    ranges))
 
 (defun proofread--visible-ranges ()
   "Return normalized visible ranges for the current buffer."
@@ -2551,18 +2551,6 @@ Return one of the symbols `sent', `cached', `full', `stale', or
        (gethash (proofread--request-work-key request)
                 proofread--pending-request-keys)))
 
-(defun proofread--requests-conflict-p (left right)
-  "Return non-nil when LEFT and RIGHT cover conflicting ranges."
-  (let ((left-beg (proofread--position-integer (plist-get left :beg)))
-        (left-end (proofread--position-integer (plist-get left :end)))
-        (right-beg
-         (proofread--position-integer (plist-get right :beg)))
-        (right-end
-         (proofread--position-integer (plist-get right :end))))
-    (and left-beg left-end right-beg right-end
-         (proofread--ranges-conflict-p
-          left-beg left-end right-beg right-end))))
-
 (defun proofread--request-state-flag-p (request property)
   "Return non-nil when REQUEST lifecycle PROPERTY is set."
   (plist-get (plist-get request :state) property))
@@ -3436,8 +3424,6 @@ requests."
     (dolist (request requests)
       (proofread--forget-request-work request)
       (proofread--record-request-cancellation request)))
-  (setq proofread--request-queue nil)
-  (setq proofread--request-queue-tail nil)
   (when (hash-table-p proofread--pending-request-keys)
     (clrhash proofread--pending-request-keys))
   (proofread--cancel-idle-timer)
@@ -3725,8 +3711,7 @@ restriction."
           (push (list diagnostic (car range) (cdr range) index)
                 entries)))
       (setq index (1+ index)))
-    (sort (nreverse entries)
-          #'proofread--navigation-entry<)))
+    (sort entries #'proofread--navigation-entry<)))
 
 (defun proofread--navigation-diagnostics (&optional accessible-only)
   "Return live diagnostics sorted for navigation.
