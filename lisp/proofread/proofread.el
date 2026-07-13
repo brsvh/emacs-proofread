@@ -4895,36 +4895,6 @@ occurrences, and object identity."
           (push entry conflicts))))
     (nreverse conflicts)))
 
-(defun proofread--overlays-affected-by-range (beg end)
-  "Return proofread overlays affected by changing BEG to END."
-  (let (overlays)
-    (proofread--prune-overlays)
-    (dolist (overlay proofread--overlays)
-      (let ((overlay-beg (overlay-start overlay))
-            (overlay-end (overlay-end overlay)))
-        (when (and overlay-beg
-                   overlay-end
-                   (proofread--ranges-conflict-p
-                    beg end overlay-beg overlay-end))
-          (push overlay overlays))))
-    (nreverse overlays)))
-
-(defun proofread--diagnostic-affected-by-range-p (diagnostic beg end)
-  "Return non-nil if a change from BEG to END affects DIAGNOSTIC."
-  (let ((range (proofread--diagnostic-range diagnostic)))
-    (and range
-         (proofread--ranges-conflict-p
-          beg end (car range) (cdr range)))))
-
-(defun proofread--diagnostics-affected-by-range (beg end)
-  "Return proofread diagnostics affected by a change from BEG to END."
-  (let (diagnostics)
-    (dolist (diagnostic proofread--diagnostics)
-      (when (proofread--diagnostic-affected-by-range-p
-             diagnostic beg end)
-        (push diagnostic diagnostics)))
-    (nreverse diagnostics)))
-
 (defun proofread--remove-diagnostics (diagnostics)
   "Remove DIAGNOSTICS from current buffer proofread state."
   (let ((removed (make-hash-table :test #'eq)))
@@ -5033,55 +5003,6 @@ an atomic rollback."
                   (proofread--run-diagnostics-changed-hook)))))
           (proofread--mark-pending-work))))))
 
-(defun proofread--apply-suggestion-to-diagnostic
-    (diagnostic suggestion)
-  "Replace DIAGNOSTIC with SUGGESTION and invalidate stale state."
-  (let* ((range
-          (proofread--validate-suggestion-application diagnostic))
-         (beg (car range))
-         (end (cdr range))
-         (container
-          (proofread--diagnostic-correction-container
-           diagnostic range))
-         (affected-overlays
-          (proofread--overlays-affected-by-range beg end))
-         (affected-diagnostics
-          (proofread--diagnostics-affected-by-range beg end))
-         (buffer-ticks (proofread--mode-buffer-character-ticks))
-         (source (current-buffer)))
-    (undo-boundary)
-    (let ((proofread--inhibit-overlay-invalidation (current-buffer))
-          (proofread--deferred-correction-overlays nil)
-          (proofread--deferred-correction-diagnostics nil)
-          correction-committed)
-      (unwind-protect
-          (progn
-            (atomic-change-group
-              (delete-region beg end)
-              (goto-char beg)
-              (insert suggestion)
-              (proofread--validate-correction-container
-               container beg (point)
-               (- (length suggestion) (- end beg))))
-            (setq correction-committed t)
-            (proofread--invalidate-affected-diagnostics
-             (cl-delete-duplicates
-              (append proofread--deferred-correction-overlays
-                      affected-overlays)
-              :test #'eq)
-             (cl-delete-duplicates
-              (append proofread--deferred-correction-diagnostics
-                      affected-diagnostics)
-              :test #'eq)
-             t)
-            (proofread--synchronize-live-diagnostic-ranges))
-        (proofread--repair-correction-time-buffer-changes
-         buffer-ticks source correction-committed)))
-    (proofread--run-diagnostics-changed-hook)
-    (undo-boundary)
-    (message "proofread: applied suggestion")
-    'applied))
-
 (defun proofread--prepare-diagnostic-corrections (diagnostics)
   "Return selected nonoverlapping corrections for DIAGNOSTICS.
 Each returned element is a cons cell of the form (DIAGNOSTIC
@@ -5104,14 +5025,18 @@ overlaps it."
             (push (cons diagnostic suggestion) corrections)))))
     (nreverse corrections)))
 
-(defun proofread--corrections-affected-state (corrections)
+(defun proofread--corrections-affected-state
+    (corrections &optional correction-ranges)
   "Return overlays and diagnostics affected by CORRECTIONS.
 The return value is a cons cell whose car contains overlays and whose
-cdr contains diagnostics."
+cdr contains diagnostics.  When CORRECTION-RANGES is non-nil, use
+those validated live ranges instead of the diagnostics' stored ranges."
   (let* ((ranges
-          (mapcar (lambda (correction)
-                    (proofread--diagnostic-range (car correction)))
-                  corrections))
+          (or correction-ranges
+              (mapcar
+               (lambda (correction)
+                 (proofread--diagnostic-range (car correction)))
+               corrections)))
          (entries
           (delq nil
                 (mapcar
@@ -5136,57 +5061,116 @@ cdr contains diagnostics."
         (push overlay overlays)))
     (cons overlays diagnostics)))
 
-(defun proofread--apply-diagnostic-corrections (corrections)
-  "Apply prepared CORRECTIONS atomically from end to beginning."
-  (dolist (correction corrections)
-    (proofread--validate-suggestion-application (car correction)))
-  (let* ((affected-state
-          (proofread--corrections-affected-state corrections))
+(defun proofread--run-correction-transaction
+    (corrections &optional preserve-excursion)
+  "Apply CORRECTIONS in one atomic correction transaction.
+Each element of CORRECTIONS has the form (DIAGNOSTIC . SUGGESTION).
+Validate every diagnostic before editing, then apply the corrections
+from end to beginning.  When PRESERVE-EXCURSION is non-nil, restore
+point, mark, and mark activation before notifying diagnostics hooks."
+  (let* ((validated-corrections
+          (mapcar
+           (lambda (correction)
+             (let* ((diagnostic (car correction))
+                    (range
+                     (proofread--validate-suggestion-application
+                      diagnostic)))
+               (list
+                correction
+                range
+                ;; A single correction validates its container before
+                ;; opening an undo transaction.  A batch must instead
+                ;; snapshot each updated container immediately before
+                ;; its reverse-order edit.
+                (unless preserve-excursion
+                  (cons
+                   t
+                   (proofread--diagnostic-correction-container
+                    diagnostic range))))))
+           corrections))
+         (affected-state
+          (proofread--corrections-affected-state
+           corrections
+           (mapcar (lambda (validated-correction)
+                     (nth 1 validated-correction))
+                   validated-corrections)))
          (affected-overlays (car affected-state))
          (affected-diagnostics (cdr affected-state))
          (buffer-ticks (proofread--mode-buffer-character-ticks))
          (source (current-buffer)))
-    (save-mark-and-excursion
-      (undo-boundary)
-      (let ((proofread--inhibit-overlay-invalidation (current-buffer))
-            (proofread--deferred-correction-overlays nil)
-            (proofread--deferred-correction-diagnostics nil)
-            correction-committed)
-        (unwind-protect
-            (progn
-              (atomic-change-group
-                (dolist (correction (reverse corrections))
-                  (let* ((diagnostic (car correction))
-                         (suggestion (cdr correction))
-                         (range
-                          (proofread--diagnostic-range diagnostic))
-                         (beg (car range))
-                         (end (cdr range))
-                         (container
-                          (proofread--diagnostic-correction-container
-                           diagnostic range)))
-                    (goto-char beg)
-                    (delete-region beg end)
-                    (insert suggestion)
-                    (proofread--validate-correction-container
-                     container beg (point)
-                     (- (length suggestion) (- end beg))))))
-              (setq correction-committed t)
-              (proofread--invalidate-affected-diagnostics
-               (cl-delete-duplicates
-                (append proofread--deferred-correction-overlays
-                        affected-overlays)
-                :test #'eq)
-               (cl-delete-duplicates
-                (append proofread--deferred-correction-diagnostics
-                        affected-diagnostics)
-                :test #'eq)
-               t)
-              (proofread--synchronize-live-diagnostic-ranges))
-          (proofread--repair-correction-time-buffer-changes
-           buffer-ticks source correction-committed)))
-      (undo-boundary))
-    (proofread--run-diagnostics-changed-hook)))
+    (cl-labels
+        ((run-transaction
+           ()
+           (undo-boundary)
+           (let ((proofread--inhibit-overlay-invalidation
+                  (current-buffer))
+                 (proofread--deferred-correction-overlays nil)
+                 (proofread--deferred-correction-diagnostics nil)
+                 correction-committed)
+             (unwind-protect
+                 (progn
+                   (atomic-change-group
+                     (dolist (validated-correction
+                              (reverse validated-corrections))
+                       (let* ((correction
+                               (car validated-correction))
+                              (diagnostic (car correction))
+                              (suggestion (cdr correction))
+                              (range (nth 1 validated-correction))
+                              (beg (car range))
+                              (end (cdr range))
+                              (container-state
+                               (nth 2 validated-correction))
+                              (container
+                               (if container-state
+                                   (cdr container-state)
+                                 (proofread--diagnostic-correction-container
+                                  diagnostic range))))
+                         (if preserve-excursion
+                             (progn
+                               (goto-char beg)
+                               (delete-region beg end))
+                           (delete-region beg end)
+                           (goto-char beg))
+                         (insert suggestion)
+                         (proofread--validate-correction-container
+                          container beg (point)
+                          (- (length suggestion) (- end beg))))))
+                   (setq correction-committed t)
+                   (proofread--invalidate-affected-diagnostics
+                    (cl-delete-duplicates
+                     (append proofread--deferred-correction-overlays
+                             affected-overlays)
+                     :test #'eq)
+                    (cl-delete-duplicates
+                     (append proofread--deferred-correction-diagnostics
+                             affected-diagnostics)
+                     :test #'eq)
+                    t)
+                   (proofread--synchronize-live-diagnostic-ranges))
+               (proofread--repair-correction-time-buffer-changes
+                buffer-ticks source correction-committed)))
+           (unless preserve-excursion
+             (proofread--run-diagnostics-changed-hook))
+           (undo-boundary)))
+      (if preserve-excursion
+          (save-mark-and-excursion
+            (run-transaction))
+        (run-transaction)))
+    (when preserve-excursion
+      (proofread--run-diagnostics-changed-hook))))
+
+(defun proofread--apply-suggestion-to-diagnostic
+    (diagnostic suggestion)
+  "Replace DIAGNOSTIC with SUGGESTION and invalidate stale state."
+  (proofread--run-correction-transaction
+   (list (cons diagnostic suggestion)))
+  (message "proofread: applied suggestion")
+  'applied)
+
+(defun proofread--apply-diagnostic-corrections (corrections)
+  "Apply prepared CORRECTIONS atomically from end to beginning."
+  (proofread--run-correction-transaction corrections t))
 
 (defun proofread--correct-diagnostics (diagnostics)
   "Apply selected suggestions to DIAGNOSTICS as one command.

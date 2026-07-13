@@ -4228,6 +4228,147 @@ This covers URLs, email, invisible text, faces, and properties."
         (should (eq (proofread-correct-at-point) 'applied)))
       (should (equal (buffer-string) "aa hello zz")))))
 
+(ert-deftest
+    proofread-test-correction-entry-points-use-transaction-runner ()
+  "Run single and batch corrections through one transaction runner."
+  (let ((original-runner
+         (symbol-function 'proofread--run-correction-transaction))
+        entry-point
+        calls)
+    (cl-letf
+        (((symbol-function 'proofread--run-correction-transaction)
+          (lambda (&rest arguments)
+            (push entry-point calls)
+            (apply original-runner arguments))))
+      (with-temp-buffer
+        (insert "helo")
+        (proofread-mode 1)
+        (proofread-test--install-diagnostics
+         (list
+          (proofread-test--diagnostic-with-suggestions
+           1 5 "helo" '("hello"))))
+        (goto-char 2)
+        (setq entry-point 'single)
+        (proofread-correct-at-point))
+      (with-temp-buffer
+        (insert "helo wrld")
+        (proofread-mode 1)
+        (proofread-test--install-diagnostics
+         (list
+          (proofread-test--diagnostic-with-suggestions
+           1 5 "helo" '("hello"))
+          (proofread-test--diagnostic-with-suggestions
+           6 10 "wrld" '("world"))))
+        (setq entry-point 'batch)
+        (proofread-correct-buffer)))
+    (should (equal (nreverse calls) '(single batch)))))
+
+(ert-deftest
+    proofread-test-single-correction-preserves-transaction-order ()
+  "Keep single-correction point, mark, hook, and undo ordering."
+  (with-temp-buffer
+    (insert "aa helo zz")
+    (proofread-mode 1)
+    (proofread-test--install-diagnostics
+     (list
+      (proofread-test--diagnostic-with-suggestions
+       4 8 "helo" '("hello"))))
+    (goto-char 5)
+    (set-mark (point-max))
+    (setq mark-active t)
+    (let ((original-boundary (symbol-function 'undo-boundary))
+          events)
+      (add-hook
+       'proofread-diagnostics-changed-hook
+       (lambda ()
+         (push (list 'hook (point) (mark) mark-active) events))
+       nil t)
+      (cl-letf (((symbol-function 'undo-boundary)
+                 (lambda ()
+                   (push 'boundary events)
+                   (funcall original-boundary))))
+        (proofread-correct-at-point))
+      (should (equal (nreverse events)
+                     '(boundary (hook 9 12 t) boundary)))
+      (should (= (point) 9))
+      (should (= (mark) 12))
+      (should mark-active))))
+
+(ert-deftest
+    proofread-test-single-correction-validates-container-before-undo ()
+  "Reject a stale source container before opening an undo transaction."
+  (with-temp-buffer
+    (emacs-lisp-mode)
+    (insert "helo")
+    (proofread-mode 1)
+    (let ((diagnostic
+           (proofread--make-diagnostic
+            :beg 1 :end 5 :text "helo" :kind 'spelling
+            :suggestions '("hello") :source 'test
+            :target-kind 'docstring))
+          (original-boundary (symbol-function 'undo-boundary))
+          (boundaries 0))
+      (proofread-test--install-diagnostics (list diagnostic))
+      (goto-char 2)
+      (cl-letf (((symbol-function 'undo-boundary)
+                 (lambda ()
+                   (setq boundaries (1+ boundaries))
+                   (funcall original-boundary))))
+        (should-error (proofread-correct-at-point) :type 'user-error))
+      (should (= boundaries 0))
+      (should (equal (buffer-string) "helo"))
+      (should (equal proofread--diagnostics (list diagnostic))))))
+
+(ert-deftest
+    proofread-test-single-correction-keeps-delete-hook-point ()
+  "Run the single-correction delete hook at the command's point."
+  (with-temp-buffer
+    (insert "aa helo zz")
+    (proofread-mode 1)
+    (proofread-test--install-diagnostics
+     (list
+      (proofread-test--diagnostic-with-suggestions
+       4 8 "helo" '("hello"))))
+    (goto-char 5)
+    (let (change-points)
+      (add-hook 'before-change-functions
+                (lambda (&rest _)
+                  (push (point) change-points))
+                nil t)
+      (proofread-correct-at-point)
+      (should (equal (nreverse change-points) '(5 4))))))
+
+(ert-deftest
+    proofread-test-batch-correction-preserves-transaction-order ()
+  "Keep batch point, mark, hook, and undo ordering."
+  (with-temp-buffer
+    (insert "aa helo zz")
+    (proofread-mode 1)
+    (proofread-test--install-diagnostics
+     (list
+      (proofread-test--diagnostic-with-suggestions
+       4 8 "helo" '("hello"))))
+    (goto-char 5)
+    (set-mark (point-max))
+    (setq mark-active t)
+    (let ((original-boundary (symbol-function 'undo-boundary))
+          events)
+      (add-hook
+       'proofread-diagnostics-changed-hook
+       (lambda ()
+         (push (list 'hook (point) (mark) mark-active) events))
+       nil t)
+      (cl-letf (((symbol-function 'undo-boundary)
+                 (lambda ()
+                   (push 'boundary events)
+                   (funcall original-boundary))))
+        (proofread-correct-buffer))
+      (should (equal (nreverse events)
+                     '(boundary boundary (hook 4 12 t))))
+      (should (= (point) 4))
+      (should (= (mark) 12))
+      (should mark-active))))
+
 (ert-deftest proofread-test-correct-at-point-multiple-suggestions ()
   "Preserve suggestion order during point correction."
   (with-temp-buffer
@@ -4609,6 +4750,40 @@ This covers URLs, email, invisible text, faces, and properties."
       (should-not proofread--overlays))))
 
 (ert-deftest
+    proofread-test-correction-uses-revalidated-range-for-state ()
+  "Use the validated live range when stored state misses an edit."
+  (with-temp-buffer
+    (insert "ahelo")
+    (proofread-mode 1)
+    (let ((survivor
+           (proofread-test--diagnostic-for-range 2 2 ""))
+          (target
+           (proofread-test--diagnostic-with-suggestions
+            2 6 "helo" '("hello" "hullo"))))
+      (proofread-test--install-diagnostics (list survivor target))
+      (goto-char 3)
+      (cl-letf
+          (((symbol-function 'completing-read)
+            (lambda (&rest _)
+              (let ((failing-hook
+                     (lambda (&rest _)
+                       (error "Stop range synchronization"))))
+                (add-hook 'after-change-functions failing-hook nil t)
+                (unwind-protect
+                    (condition-case nil
+                        (progn
+                          (goto-char 2)
+                          (insert "q"))
+                      (error nil))
+                  (remove-hook 'after-change-functions
+                               failing-hook t)))
+              "hello")))
+        (should (eq (proofread-correct-at-point) 'applied)))
+      (should (equal (buffer-string) "aqhello"))
+      (should (equal proofread--diagnostics (list survivor)))
+      (should (proofread--overlay-for-diagnostic survivor)))))
+
+(ert-deftest
     proofread-test-correction-rejects-source-delimiter-suggestions ()
   "Corrections cannot introduce comment or string delimiters."
   (dolist (spec '((c-mode "/*helo*/" comment 2 6 "helo" "*/")
@@ -4671,6 +4846,62 @@ This covers URLs, email, invisible text, faces, and properties."
       (goto-char (plist-get diagnostic :beg))
       (should (eq (proofread-correct-at-point) 'applied))
       (should (equal (buffer-string) "/*hello!*/")))))
+
+(ert-deftest
+    proofread-test-batch-correction-validates-shared-container ()
+  "Validate each batch replacement against the updated container."
+  (with-temp-buffer
+    (emacs-lisp-mode)
+    (insert "\"helo wrld\"")
+    (syntax-propertize (point-max))
+    (proofread-mode 1)
+    (let ((first
+           (proofread--make-diagnostic
+            :beg 2 :end 6 :text "helo" :kind 'spelling
+            :suggestions '("hello") :source 'test
+            :target-kind 'docstring))
+          (second
+           (proofread--make-diagnostic
+            :beg 7 :end 11 :text "wrld" :kind 'spelling
+            :suggestions '("world") :source 'test
+            :target-kind 'docstring)))
+      (proofread-test--install-diagnostics (list first second))
+      (should (eq (proofread-correct-buffer) 'applied))
+      (should (equal (buffer-string) "\"hello world\"")))))
+
+(ert-deftest
+    proofread-test-batch-container-error-rolls-back-transaction ()
+  "Roll back earlier batch edits when a source delimiter becomes unsafe."
+  (with-temp-buffer
+    (emacs-lisp-mode)
+    (insert "\"helo wrld\"")
+    (syntax-propertize (point-max))
+    (proofread-mode 1)
+    (let* ((first
+            (proofread--make-diagnostic
+             :beg 2 :end 6 :text "helo" :kind 'spelling
+             :suggestions '("\"") :source 'test
+             :target-kind 'docstring))
+           (second
+            (proofread--make-diagnostic
+             :beg 7 :end 11 :text "wrld" :kind 'spelling
+             :suggestions '("world") :source 'test
+             :target-kind 'docstring))
+           (diagnostics (list first second))
+           (overlays
+            (proofread-test--install-diagnostics diagnostics))
+           (calls 0))
+      (add-hook 'proofread-diagnostics-changed-hook
+                (lambda ()
+                  (setq calls (1+ calls)))
+                nil t)
+      (goto-char 5)
+      (should-error (proofread-correct-buffer) :type 'user-error)
+      (should (equal (buffer-string) "\"helo wrld\""))
+      (should (equal proofread--diagnostics diagnostics))
+      (should (cl-every #'overlay-buffer overlays))
+      (should (= calls 0))
+      (should (= (point) 5)))))
 
 (ert-deftest
     proofread-test-narrowed-correction-uses-full-source-container ()
