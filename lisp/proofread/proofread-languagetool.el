@@ -62,7 +62,9 @@ explicit port."
 (defcustom proofread-languagetool-auto-start t
   "Whether to start a local LanguageTool server when none responds.
 When nil, Proofread only uses a server already available at
-`proofread-languagetool-server-url'."
+`proofread-languagetool-server-url'.  Ordinary checks then ignore
+managed-startup options, while explicit server startup still uses and
+validates them."
   :type 'boolean
   :group 'proofread-languagetool)
 
@@ -176,14 +178,17 @@ rule or category may be disabled."
   " *proofread-languagetool-server*"
   "Name of the managed LanguageTool server log buffer.")
 
-(defconst proofread-languagetool--session-global-options
+(defconst proofread-languagetool--transport-session-global-options
   '(proofread-languagetool-server-url
     proofread-languagetool-auto-start
-    proofread-languagetool-command
-    proofread-languagetool-config-file
-    proofread-languagetool-startup-timeout
     proofread-languagetool-health-timeout)
-  "Options that must remain global for the single server manager.")
+  "Transport options that must remain global for the server manager.")
+
+(defconst proofread-languagetool--managed-session-global-options
+  '(proofread-languagetool-command
+    proofread-languagetool-config-file
+    proofread-languagetool-startup-timeout)
+  "Managed-startup options that must remain global when used.")
 
 (defconst proofread-languagetool--json-missing
   (make-symbol "proofread-languagetool-json-missing")
@@ -450,73 +455,103 @@ When BASE-URL is nil, validate and use the configured server URL."
        (proofread-languagetool--normalized-config-file))
     (error 'invalid)))
 
+(defun proofread-languagetool--managed-session-snapshot ()
+  "Return validated settings used only for managed server startup."
+  (let ((config-file
+         (proofread-languagetool--normalized-config-file))
+        (command (proofread-languagetool--command-snapshot))
+        (startup-timeout
+         (proofread-languagetool--positive-timeout
+          proofread-languagetool-startup-timeout
+          'proofread-languagetool-startup-timeout)))
+    (list :config-file config-file
+          :command command
+          :startup-timeout startup-timeout
+          :managed-identity
+          (list :server-config
+                (proofread-languagetool--config-identity-for-file
+                 config-file)
+                :command command
+                :startup-timeout startup-timeout))))
+
 (defun proofread-languagetool--reject-local-session-options
-    (&optional buffer)
-  "Reject session-global options made local in BUFFER."
+    (&optional buffer managed)
+  "Reject session-global options made local in BUFFER.
+When MANAGED is non-nil, also reject managed-startup options."
   (let ((buffer (or buffer (current-buffer))))
     (when (buffer-live-p buffer)
-      (dolist (option proofread-languagetool--session-global-options)
+      (dolist
+          (option
+           (append
+            proofread-languagetool--transport-session-global-options
+            (and managed
+                 proofread-languagetool--managed-session-global-options)))
         (when (local-variable-p option buffer)
           (error "%s must not be buffer-local" option))))))
 
 (defun proofread-languagetool--server-session-snapshot
-    (&optional buffer)
-  "Return a validated server session snapshot for BUFFER."
-  (proofread-languagetool--reject-local-session-options buffer)
-  (let* ((base-url
-          (proofread-languagetool--normalized-server-url))
-         (parsed (url-generic-parse-url base-url))
-         (config-file
-          (proofread-languagetool--normalized-config-file))
-         (command (proofread-languagetool--command-snapshot))
-         (request-timeout
-          (proofread-languagetool--positive-timeout
-           proofread-languagetool-request-timeout
-           'proofread-languagetool-request-timeout))
-         (startup-timeout
-          (proofread-languagetool--positive-timeout
-           proofread-languagetool-startup-timeout
-           'proofread-languagetool-startup-timeout))
-         (health-timeout
-          (proofread-languagetool--positive-timeout
-           proofread-languagetool-health-timeout
-           'proofread-languagetool-health-timeout))
-         (auto-start (and proofread-languagetool-auto-start t))
-         (identity
-          (list :server-url base-url
-                :server-config
-                (proofread-languagetool--config-identity-for-file
-                 config-file)
-                :command command
-                :auto-start auto-start
-                :startup-timeout startup-timeout
-                :health-timeout health-timeout))
-         (session
-          (list :identity identity
-                :base-url base-url
-                :check-url
-                (proofread-languagetool--endpoint "check" base-url)
-                :health-url
-                (proofread-languagetool--endpoint "healthcheck" base-url)
-                :host (url-host parsed)
-                :loopback
-                (proofread-languagetool--loopback-host-p
-                 (url-host parsed))
-                :config-file config-file
-                :command command
-                :auto-start auto-start
-                :request-timeout request-timeout
-                :startup-timeout startup-timeout
-                :health-timeout health-timeout)))
-    (when auto-start
-      (proofread-languagetool--managed-port session))
-    session))
+    (&optional buffer managed)
+  "Return a validated server session snapshot for BUFFER.
+When MANAGED is non-nil, include settings required for managed
+startup even when automatic startup is disabled."
+  (let* ((auto-start (and proofread-languagetool-auto-start t))
+         (managed-session-p (or auto-start managed)))
+    (proofread-languagetool--reject-local-session-options
+     buffer managed-session-p)
+    (let* ((base-url
+            (proofread-languagetool--normalized-server-url))
+           (parsed (url-generic-parse-url base-url))
+           (managed-snapshot
+            (and managed-session-p
+                 (proofread-languagetool--managed-session-snapshot)))
+           (request-timeout
+            (proofread-languagetool--positive-timeout
+             proofread-languagetool-request-timeout
+             'proofread-languagetool-request-timeout))
+           (health-timeout
+            (proofread-languagetool--positive-timeout
+             proofread-languagetool-health-timeout
+             'proofread-languagetool-health-timeout))
+           (identity
+            (append
+             (list :server-url base-url)
+             (when auto-start
+               (plist-get managed-snapshot :managed-identity))
+             (list :auto-start auto-start
+                   :health-timeout health-timeout)))
+           (session
+            (append
+             (list :identity identity
+                   :base-url base-url
+                   :check-url
+                   (proofread-languagetool--endpoint "check" base-url)
+                   :health-url
+                   (proofread-languagetool--endpoint
+                    "healthcheck" base-url)
+                   :host (url-host parsed)
+                   :loopback
+                   (proofread-languagetool--loopback-host-p
+                    (url-host parsed)))
+             managed-snapshot
+             (list :auto-start auto-start
+                   :request-timeout request-timeout
+                   :health-timeout health-timeout))))
+      (when managed-session-p
+        (proofread-languagetool--managed-port session))
+      session)))
 
 (defun proofread-languagetool--same-session-p (first second)
   "Return non-nil when FIRST and SECOND identify the same server."
   (and first second
        (equal (plist-get first :identity)
               (plist-get second :identity))))
+
+(defun proofread-languagetool--same-managed-session-p (first second)
+  "Return non-nil when FIRST and SECOND use the same managed settings."
+  (let ((identity (and first
+                       (plist-get first :managed-identity))))
+    (and identity second
+         (equal identity (plist-get second :managed-identity)))))
 
 (defun proofread-languagetool--current-session-p
     (generation session)
@@ -529,33 +564,35 @@ When BASE-URL is nil, validate and use the configured server URL."
 
 (defun proofread-languagetool--identity ()
   "Return the stable, non-secret LanguageTool backend identity."
-  (list :backend 'languagetool
-        :server-url
-        (condition-case nil
-            (proofread-languagetool--normalized-server-url)
-          (error "Invalid"))
-        :server-config (proofread-languagetool--config-identity)
-        :server-command
-        (proofread-languagetool--safe-command-snapshot)
-        :level proofread-languagetool-level
-        :preferred-variants
-        (proofread-languagetool--safe-preferred-variants
-         proofread-languagetool-preferred-variants)
-        :mother-tongue proofread-languagetool-mother-tongue
-        :enabled-rules
-        (proofread-languagetool--safe-identifiers
-         proofread-languagetool-enabled-rules)
-        :disabled-rules
-        (proofread-languagetool--safe-identifiers
-         proofread-languagetool-disabled-rules)
-        :enabled-categories
-        (proofread-languagetool--safe-identifiers
-         proofread-languagetool-enabled-categories)
-        :disabled-categories
-        (proofread-languagetool--safe-identifiers
-         proofread-languagetool-disabled-categories)
-        :enabled-only proofread-languagetool-enabled-only
-        :contract-version proofread-languagetool--contract-version))
+  (append
+   (list :backend 'languagetool
+         :server-url
+         (condition-case nil
+             (proofread-languagetool--normalized-server-url)
+           (error "Invalid")))
+   (when proofread-languagetool-auto-start
+     (list :server-config (proofread-languagetool--config-identity)
+           :server-command
+           (proofread-languagetool--safe-command-snapshot)))
+   (list :level proofread-languagetool-level
+         :preferred-variants
+         (proofread-languagetool--safe-preferred-variants
+          proofread-languagetool-preferred-variants)
+         :mother-tongue proofread-languagetool-mother-tongue
+         :enabled-rules
+         (proofread-languagetool--safe-identifiers
+          proofread-languagetool-enabled-rules)
+         :disabled-rules
+         (proofread-languagetool--safe-identifiers
+          proofread-languagetool-disabled-rules)
+         :enabled-categories
+         (proofread-languagetool--safe-identifiers
+          proofread-languagetool-enabled-categories)
+         :disabled-categories
+         (proofread-languagetool--safe-identifiers
+          proofread-languagetool-disabled-categories)
+         :enabled-only proofread-languagetool-enabled-only
+         :contract-version proofread-languagetool--contract-version)))
 
 (defun proofread-languagetool--request-language (request)
   "Return the LanguageTool language code for REQUEST."
@@ -1326,9 +1363,11 @@ Signal an error when STATUS is not a URL callback status plist."
           (let ((existing proofread-languagetool--server-process))
             (when (and (process-live-p existing)
                        (not
-                        (or
-                         (null proofread-languagetool--server-process-session)
+                        (and
                          (proofread-languagetool--same-session-p
+                          proofread-languagetool--server-process-session
+                          session)
+                         (proofread-languagetool--same-managed-session-p
                           proofread-languagetool--server-process-session
                           session))))
               (proofread-languagetool--stop-owned-process)
@@ -1597,22 +1636,35 @@ Return a cancellable LanguageTool backend handle."
   (if proofread-languagetool--shutting-down-p
       (message "LanguageTool backend is stopping")
     (let ((session
-           (proofread-languagetool--server-session-snapshot)))
-      (proofread-languagetool--managed-port session)
-      (cond
-       ((and
-         (proofread-languagetool--same-session-p
-          session proofread-languagetool--server-session)
-         (eq proofread-languagetool--server-state 'ready)))
-       ((and
-         (proofread-languagetool--same-session-p
-          session proofread-languagetool--server-session)
-         (memq proofread-languagetool--server-state
-               '(probing starting)))
-        (setq proofread-languagetool--force-start-p t))
-       (t
-        (proofread-languagetool--begin-readiness-check session)
-        (setq proofread-languagetool--force-start-p t))))
+           (proofread-languagetool--server-session-snapshot nil t)))
+      (let* ((replace-owned
+              (and
+               (process-live-p proofread-languagetool--server-process)
+               (not
+                (proofread-languagetool--same-managed-session-p
+                 proofread-languagetool--server-process-session
+                 session))))
+             (same-session
+              (proofread-languagetool--same-session-p
+               session proofread-languagetool--server-session))
+             (same-managed-session
+              (proofread-languagetool--same-managed-session-p
+               session proofread-languagetool--server-session)))
+        (when replace-owned
+          (proofread-languagetool--stop-owned-process))
+        (cond
+         ((and (not replace-owned)
+               same-session
+               (eq proofread-languagetool--server-state 'ready)))
+         ((and (not replace-owned)
+               same-session
+               same-managed-session
+               (memq proofread-languagetool--server-state
+                     '(probing starting)))
+          (setq proofread-languagetool--force-start-p t))
+         (t
+          (proofread-languagetool--begin-readiness-check session)
+          (setq proofread-languagetool--force-start-p t)))))
     (message "LanguageTool server readiness check started")))
 
 (defun proofread-languagetool--teardown (error message)

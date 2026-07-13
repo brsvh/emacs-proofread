@@ -136,8 +136,11 @@ to become healthy. Emacs stops only the process that it owns. Set
 `proofread-languagetool-auto-start` to `nil` when an external service manages
 the endpoint. The commands `proofread-languagetool-start-server` and
 `proofread-languagetool-stop-server` control the managed process explicitly.
-Plain HTTP endpoints are accepted only on the loopback interface; use HTTPS for
-any non-loopback service.
+With automatic startup disabled, ordinary checks ignore the managed command,
+properties file, and startup timeout; explicit startup still validates them.
+Those settings do not affect the external backend cache identity. Plain HTTP
+endpoints are accepted only on the loopback interface; use HTTPS for any
+non-loopback service.
 
 When `proofread-language` is `nil`, the backend sends `language=auto`. Set
 `proofread-languagetool-preferred-variants` in that case so variant-dependent
@@ -158,12 +161,13 @@ Proofread starts its managed process and cannot configure an already-running
 external server. Keep checking policy under Emacs control rather than placing it
 in the server properties file.
 
-The server URL, automatic-start flag, command, properties file, startup timeout,
-and health-probe timeout are session-global because one managed process is
-shared by all buffers; buffer-local bindings for those options are rejected.
-Request timeout, checking level, variants, mother tongue, and rule/category
-controls become buffer-local when set. A managed-server properties file must be
-a local absolute path.
+The server URL, automatic-start flag, and health-probe timeout are always
+session-global. The command, properties file, and startup timeout are also
+session-global whenever automatic or explicit managed startup uses them;
+ordinary external-only checks ignore those settings. Buffer-local bindings are
+rejected when the corresponding setting applies. Request timeout, checking
+level, variants, mother tongue, and rule/category controls become buffer-local
+when set. A managed-server properties file must be a local absolute path.
 
 The local open-source server keeps checked text on the local machine, but it
 does not include LanguageTool's cloud-only AI rules. Automatic language

@@ -140,6 +140,7 @@ CALLBACK-STATUS is the status plist passed to the URL callback."
   "Cache identity includes every response-affecting request option."
   (let ((proofread-languagetool-server-url
          "http://127.0.0.1:8081/v2/")
+        (proofread-languagetool-auto-start t)
         (proofread-languagetool-level 'picky)
         (proofread-languagetool-preferred-variants
          '("de-DE" "en-US" "de-DE"))
@@ -226,7 +227,8 @@ CALLBACK-STATUS is the status plist passed to the URL callback."
   (dolist (path '("languagetool.properties"
                   "../languagetool.properties"
                   "/ssh:user@example.test:/etc/languagetool.properties"))
-    (let ((proofread-languagetool-config-file path))
+    (let ((proofread-languagetool-auto-start t)
+          (proofread-languagetool-config-file path))
       (should-error
        (proofread-languagetool--server-session-snapshot)))))
 
@@ -241,7 +243,8 @@ CALLBACK-STATUS is the status plist passed to the URL callback."
           (write-region "key=first\n" nil first nil 'silent)
           (write-region "key=second\n" nil second nil 'silent)
           (make-symbolic-link first link)
-          (let ((proofread-languagetool-config-file link)
+          (let ((proofread-languagetool-auto-start t)
+                (proofread-languagetool-config-file link)
                 first-session)
             (setq first-session
                   (proofread-languagetool--server-session-snapshot))
@@ -261,6 +264,7 @@ CALLBACK-STATUS is the status plist passed to the URL callback."
 (ert-deftest proofread-languagetool-test-snapshots-resolved-command ()
   "A resolvable managed command is fixed in the server session."
   (let ((executable (make-temp-file "proofread-lt-command-"))
+        (proofread-languagetool-auto-start t)
         (proofread-languagetool-command
          '("test-languagetool" "--fixed" "argument")))
     (unwind-protect
@@ -287,6 +291,7 @@ CALLBACK-STATUS is the status plist passed to the URL callback."
   "Command changes invalidate cache identity without exposing arguments."
   (cl-letf (((symbol-function 'executable-find) (lambda (_command) nil)))
     (let* ((secret "proofread-languagetool-test-secret")
+           (proofread-languagetool-auto-start t)
            (proofread-languagetool-command
             (list "missing-languagetool" (concat "--token=" secret)))
            (first (proofread-languagetool--identity)))
@@ -295,6 +300,77 @@ CALLBACK-STATUS is the status plist passed to the URL callback."
             '("different-missing-languagetool" "--fixed"))
       (should-not
        (equal first (proofread-languagetool--identity))))))
+
+(ert-deftest
+    proofread-languagetool-test-external-identity-ignores-managed-options ()
+  "External identities ignore settings used only for managed startup."
+  (let ((proofread-languagetool-auto-start nil)
+        (proofread-languagetool-command "first-command")
+        (proofread-languagetool-config-file
+         "/tmp/first-languagetool.properties")
+        (proofread-languagetool-startup-timeout 10)
+        (proofread-languagetool-health-timeout 3.0))
+    (let ((backend-identity (proofread-languagetool--identity))
+          (session (proofread-languagetool--server-session-snapshot)))
+      (should-not (plist-member backend-identity :server-config))
+      (should-not (plist-member backend-identity :server-command))
+      (dolist (key '(:server-config :command :startup-timeout))
+        (should-not (plist-member (plist-get session :identity) key)))
+      (setq proofread-languagetool-command 42)
+      (setq proofread-languagetool-config-file "relative.properties")
+      (setq proofread-languagetool-startup-timeout 0)
+      (should (equal backend-identity
+                     (proofread-languagetool--identity)))
+      (should
+       (proofread-languagetool--same-session-p
+        session (proofread-languagetool--server-session-snapshot)))
+      (let ((proofread-languagetool-health-timeout 7.5))
+        (should-not
+         (proofread-languagetool--same-session-p
+          session (proofread-languagetool--server-session-snapshot))))
+      (let ((proofread-languagetool-health-timeout 0))
+        (should-error
+         (proofread-languagetool--server-session-snapshot))))))
+
+(ert-deftest
+    proofread-languagetool-test-managed-start-validates-managed-options ()
+  "Automatic and explicit managed startup validate managed settings."
+  (proofread-languagetool-test--with-state
+   (let ((proofread-languagetool-server-url
+          "http://127.0.0.1:8081/v2")
+         (proofread-languagetool-auto-start nil)
+         (proofread-languagetool-command "languagetool-http-server")
+         (proofread-languagetool-config-file nil)
+         (proofread-languagetool-startup-timeout 15.0))
+     (let ((proofread-languagetool-command 42))
+       (let ((err (should-error
+                   (proofread-languagetool-start-server))))
+         (should (string-match-p "command must"
+                                 (error-message-string err)))))
+     (let ((proofread-languagetool-config-file "relative.properties"))
+       (let ((err (should-error
+                   (proofread-languagetool-start-server))))
+         (should (string-match-p "must be an absolute path"
+                                 (error-message-string err)))))
+     (let ((proofread-languagetool-startup-timeout 0))
+       (let ((err (should-error
+                   (proofread-languagetool-start-server))))
+         (should (string-match-p "must be a positive number"
+                                 (error-message-string err)))))
+     (with-temp-buffer
+       (let ((proofread-languagetool-auto-start t)
+             (proofread-languagetool-command 42)
+             result)
+         (proofread-languagetool--check
+          (proofread-languagetool-test--request)
+          (lambda (value) (setq result value)))
+         (should-not result)
+         (should
+          (proofread-languagetool-test--wait-for (lambda () result)))
+         (should (eq (plist-get result :error)
+                     'languagetool-configuration-error))
+         (should (string-match-p "command must"
+                                 (plist-get result :message))))))))
 
 (ert-deftest proofread-languagetool-test-request-parameters ()
   "Request data contains context, language, and rule controls."
@@ -907,6 +983,7 @@ CALLBACK-STATUS is the status plist passed to the URL callback."
    (with-temp-buffer
      (let* ((proofread-languagetool-server-url
              "http://127.0.0.1:18081/v2")
+            (proofread-languagetool-auto-start t)
             (old-session
              (proofread-languagetool--server-session-snapshot))
             (proofread-languagetool--server-state 'ready)
@@ -974,7 +1051,8 @@ CALLBACK-STATUS is the status plist passed to the URL callback."
 
 (ert-deftest proofread-languagetool-test-session-identity-covers-lifecycle ()
   "Server identity includes every managed-process lifecycle option."
-  (let ((base (proofread-languagetool--server-session-snapshot)))
+  (let* ((proofread-languagetool-auto-start t)
+         (base (proofread-languagetool--server-session-snapshot)))
     (let ((proofread-languagetool-server-url
            "http://127.0.0.1:18082/v2"))
       (should-not
@@ -1042,7 +1120,7 @@ CALLBACK-STATUS is the status plist passed to the URL callback."
      (proofread-languagetool--kill-url-buffer buffer))))
 
 (ert-deftest proofread-languagetool-test-rejects-buffer-local-session-option ()
-  "The single server manager rejects buffer-local server settings."
+  "The server manager rejects buffer-local settings when they apply."
   (proofread-languagetool-test--with-state
    (with-temp-buffer
      (setq-local proofread-languagetool-server-url
@@ -1064,7 +1142,16 @@ CALLBACK-STATUS is the status plist passed to the URL callback."
   (with-temp-buffer
     (setq-local proofread-languagetool-health-timeout 7.5)
     (should-error
-     (proofread-languagetool--server-session-snapshot))))
+     (proofread-languagetool--server-session-snapshot)))
+  (with-temp-buffer
+    (setq-local proofread-languagetool-command 42)
+    (let ((proofread-languagetool-auto-start nil))
+      (should (proofread-languagetool--server-session-snapshot))
+      (should-error
+       (proofread-languagetool--server-session-snapshot nil t)))
+    (let ((proofread-languagetool-auto-start t))
+      (should-error
+       (proofread-languagetool--server-session-snapshot)))))
 
 (ert-deftest proofread-languagetool-test-snapshots-in-request-buffer ()
   "Request-local options are captured from the request's buffer."
@@ -1118,25 +1205,116 @@ CALLBACK-STATUS is the status plist passed to the URL callback."
        (when (buffer-live-p caller) (kill-buffer caller))))))
 
 (ert-deftest proofread-languagetool-test-manual-start-forces-active-probe ()
-  "Manual start upgrades an existing no-auto-start probe."
+  "Manual start replaces an external probe with a managed snapshot."
   (proofread-languagetool-test--with-state
    (let* ((proofread-languagetool-auto-start nil)
+          (proofread-languagetool-config-file nil)
+          (proofread-languagetool-command "languagetool-http-server")
+          (proofread-languagetool-startup-timeout 15.0)
           (session
            (proofread-languagetool--server-session-snapshot))
           (proofread-languagetool--server-session session)
           (proofread-languagetool--server-generation 1)
           (proofread-languagetool--server-state 'probing)
+          scheduled
           started)
      (cl-letf
          (((symbol-function
             'proofread-languagetool--start-managed-server)
            (lambda (generation candidate)
-             (setq started (list generation candidate)))))
+             (setq started (list generation candidate))))
+          ((symbol-function 'proofread-languagetool--schedule-probe)
+           (lambda (generation phase candidate delay)
+             (setq scheduled
+                   (list generation phase candidate delay)))))
        (proofread-languagetool-start-server)
        (should proofread-languagetool--force-start-p)
+       (should (= proofread-languagetool--server-generation 2))
+       (should
+        (proofread-languagetool--same-session-p
+         session proofread-languagetool--server-session))
+       (dolist (key '(:command :config-file :startup-timeout
+                               :managed-identity))
+         (should (plist-member proofread-languagetool--server-session
+                               key)))
+       (should
+        (equal scheduled
+               (list 2 'external
+                     proofread-languagetool--server-session 0)))
        (proofread-languagetool--probe-failed
         1 'external session)
-       (should (equal started (list 1 session)))))))
+       (should-not started)
+       (proofread-languagetool--probe-failed
+        2 'external proofread-languagetool--server-session)
+       (should
+        (equal started
+               (list 2 proofread-languagetool--server-session)))))))
+
+(ert-deftest
+    proofread-languagetool-test-manual-start-replaces-changed-owned-process ()
+  "Manual start replaces an owned process with changed managed settings."
+  (proofread-languagetool-test--with-state
+   (let* ((proofread-languagetool-auto-start nil)
+          (proofread-languagetool-config-file nil)
+          (proofread-languagetool-command "old-command")
+          (proofread-languagetool-startup-timeout 15.0)
+          (old-session
+           (proofread-languagetool--server-session-snapshot nil t))
+          (proofread-languagetool--server-state 'ready)
+          (proofread-languagetool--server-session old-session)
+          (proofread-languagetool--server-process 'owned-process)
+          (proofread-languagetool--server-process-session old-session)
+          deleted
+          scheduled)
+     (setq proofread-languagetool-command "new-command")
+     (cl-letf
+         (((symbol-function 'process-live-p)
+           (lambda (process) (eq process 'owned-process)))
+          ((symbol-function 'set-process-query-on-exit-flag) #'ignore)
+          ((symbol-function 'delete-process)
+           (lambda (process) (setq deleted process)))
+          ((symbol-function 'proofread-languagetool--schedule-probe)
+           (lambda (generation phase session delay)
+             (setq scheduled
+                   (list generation phase session delay)))))
+       (proofread-languagetool-start-server))
+     (should (eq deleted 'owned-process))
+     (should-not proofread-languagetool--server-process)
+     (should-not proofread-languagetool--server-process-session)
+     (should proofread-languagetool--force-start-p)
+     (should (eq proofread-languagetool--server-state 'probing))
+     (should (= proofread-languagetool--server-generation 1))
+     (should
+      (proofread-languagetool--same-session-p
+       old-session proofread-languagetool--server-session))
+     (should-not
+      (proofread-languagetool--same-managed-session-p
+       old-session proofread-languagetool--server-session))
+     (should
+      (equal scheduled
+             (list 1 'external
+                   proofread-languagetool--server-session 0))))))
+
+(ert-deftest proofread-languagetool-test-repeated-manual-start-is-idempotent ()
+  "Repeated manual start keeps an equivalent managed probe in flight."
+  (proofread-languagetool-test--with-state
+   (let* ((proofread-languagetool-auto-start nil)
+          (proofread-languagetool-config-file nil)
+          (proofread-languagetool-command "languagetool-http-server")
+          (proofread-languagetool-startup-timeout 15.0)
+          (session
+           (proofread-languagetool--server-session-snapshot nil t))
+          (proofread-languagetool--server-session session)
+          (proofread-languagetool--server-generation 1)
+          (proofread-languagetool--server-state 'probing))
+     (cl-letf
+         (((symbol-function 'proofread-languagetool--begin-readiness-check)
+           (lambda (&rest _ignored)
+             (ert-fail "Equivalent managed probe was restarted"))))
+       (proofread-languagetool-start-server))
+     (should proofread-languagetool--force-start-p)
+     (should (= proofread-languagetool--server-generation 1))
+     (should (eq proofread-languagetool--server-session session)))))
 
 (ert-deftest proofread-languagetool-test-stale-probe-keeps-current-timer ()
   "A stale probe callback cannot clear a newer probe's resources."
@@ -1403,6 +1581,124 @@ CALLBACK-STATUS is the status plist passed to the URL callback."
                (apply (plist-get call :callback)
                       (cons nil (plist-get call :arguments)))))
            (should-not result)))))))
+
+(ert-deftest
+    proofread-languagetool-test-external-check-ignores-managed-options ()
+  "A healthy external server needs no valid managed startup settings."
+  (proofread-languagetool-test--with-state
+   (with-temp-buffer
+     (let ((proofread-languagetool-auto-start nil)
+           (proofread-languagetool-command 42)
+           (proofread-languagetool-config-file "relative.properties")
+           (proofread-languagetool-startup-timeout 0)
+           calls
+           result)
+       (cl-letf
+           (((symbol-function 'url-retrieve)
+             (lambda (url callback arguments &rest _ignored)
+               (let ((buffer
+                      (generate-new-buffer
+                       " *proofread-lt-external-only*")))
+                 (setq calls
+                       (append calls
+                               (list (list :url url
+                                           :callback callback
+                                           :arguments arguments
+                                           :buffer buffer
+                                           :method url-request-method))))
+                 buffer)))
+            ((symbol-function 'make-process)
+             (lambda (&rest _ignored)
+               (ert-fail "External check attempted managed startup"))))
+         (proofread-languagetool--check
+          (proofread-languagetool-test--request)
+          (lambda (value) (setq result value)))
+         (should proofread-languagetool--probe-retry-token)
+         (proofread-languagetool-test--run-scheduled-probe)
+         (should (= (length calls) 1))
+         (should (equal (plist-get (car calls) :method) "GET"))
+         (proofread-languagetool-test--complete-call
+          (car calls) 200 "OK")
+         (should (= (length calls) 2))
+         (should (equal (plist-get (cadr calls) :method) "POST"))
+         (proofread-languagetool-test--complete-call
+          (cadr calls) 200 "{\"matches\":[]}")
+         (should (eq (plist-get result :status) 'ok)))))))
+
+(ert-deftest
+    proofread-languagetool-test-external-failure-skips-managed-startup ()
+  "An unavailable external server does not validate or start a process."
+  (proofread-languagetool-test--with-state
+   (with-temp-buffer
+     (let ((proofread-languagetool-auto-start nil)
+           (proofread-languagetool-command 42)
+           (proofread-languagetool-config-file "relative.properties")
+           (proofread-languagetool-startup-timeout 0)
+           call
+           result)
+       (cl-letf
+           (((symbol-function 'url-retrieve)
+             (lambda (url callback arguments &rest _ignored)
+               (let ((buffer
+                      (generate-new-buffer
+                       " *proofread-lt-external-failure*")))
+                 (setq call (list :url url
+                                  :callback callback
+                                  :arguments arguments
+                                  :buffer buffer
+                                  :method url-request-method))
+                 buffer)))
+            ((symbol-function 'make-process)
+             (lambda (&rest _ignored)
+               (ert-fail "External failure attempted managed startup"))))
+         (proofread-languagetool--check
+          (proofread-languagetool-test--request)
+          (lambda (value) (setq result value)))
+         (proofread-languagetool-test--run-scheduled-probe)
+         (should (equal (plist-get call :method) "GET"))
+         (proofread-languagetool-test--complete-call call 200 "DOWN")
+         (should (eq (plist-get result :error)
+                     'languagetool-unavailable))
+         (should (eq proofread-languagetool--server-state 'unknown)))))))
+
+(ert-deftest
+    proofread-languagetool-test-external-ready-ignores-managed-changes ()
+  "An external check does not disturb a ready manually owned session."
+  (proofread-languagetool-test--with-state
+   (with-temp-buffer
+     (let* ((proofread-languagetool-auto-start nil)
+            (proofread-languagetool-command "old-command")
+            (proofread-languagetool-config-file nil)
+            (proofread-languagetool-startup-timeout 15.0)
+            (session
+             (proofread-languagetool--server-session-snapshot nil t))
+            (proofread-languagetool--server-state 'ready)
+            (proofread-languagetool--server-session session)
+            (proofread-languagetool--server-process 'owned-process)
+            (proofread-languagetool--server-process-session session)
+            request-buffer)
+       (setq proofread-languagetool-command 42)
+       (setq proofread-languagetool-config-file "relative.properties")
+       (setq proofread-languagetool-startup-timeout 0)
+       (cl-letf
+           (((symbol-function 'proofread-languagetool--begin-readiness-check)
+             (lambda (&rest _ignored)
+               (ert-fail "Managed changes restarted external readiness")))
+            ((symbol-function 'proofread-languagetool--stop-owned-process)
+             (lambda ()
+               (ert-fail "Managed changes stopped the owned process")))
+            ((symbol-function 'url-retrieve)
+             (lambda (_url _callback _arguments &rest _ignored)
+               (should (equal url-request-method "POST"))
+               (setq request-buffer
+                     (generate-new-buffer
+                      " *proofread-lt-external-ready*")))))
+         (let ((handle
+                (proofread-languagetool--check
+                 (proofread-languagetool-test--request)
+                 #'ignore)))
+           (should (buffer-live-p request-buffer))
+           (proofread-languagetool--cancel handle)))))))
 
 (ert-deftest proofread-languagetool-test-reuses-healthy-server ()
   "The first request reuses a healthy server without spawning Java."
