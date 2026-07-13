@@ -110,6 +110,12 @@
   (proofread--request-ready-chunks-for-islands
    (proofread--target-islands-for-ranges ranges)))
 
+(defun proofread-test--flush-request-log-refresh (source)
+  "Refresh pending request list updates for SOURCE immediately."
+  (with-current-buffer source
+    (proofread--cancel-request-log-refresh-timer)
+    (proofread--refresh-request-log-list-buffers)))
+
 (defun proofread-test--wait-for (predicate &optional timeout)
   "Wait until PREDICATE returns non-nil or TIMEOUT seconds pass."
   (let ((deadline (+ (float-time) (or timeout 1.0)))
@@ -3073,6 +3079,7 @@ This covers URLs, email, invisible text, faces, and properties."
                             2))
                  (should (= (length proofread--active-requests) 2))
                  (should (= (length proofread--request-queue) 1))
+                 (proofread-test--flush-request-log-refresh buffer)
                  (with-current-buffer name
                    (let ((statuses (mapcar (lambda (entry)
                                              (aref (cadr entry) 1))
@@ -3106,6 +3113,7 @@ This covers URLs, email, invisible text, faces, and properties."
                      (should (= (length proofread--active-requests)
                                 2))
                      (should-not proofread--request-queue)
+                     (proofread-test--flush-request-log-refresh buffer)
                      (with-current-buffer name
                        (let ((statuses
                               (mapcar (lambda (entry)
@@ -5524,6 +5532,7 @@ This covers URLs, email, invisible text, faces, and properties."
                            :end 8
                            :request request
                            :chunk request))
+                    (proofread-test--flush-request-log-refresh source)
                     (with-current-buffer name
                       (should (eq major-mode
                                   'proofread-requests-buffer-mode))
@@ -5546,6 +5555,105 @@ This covers URLs, email, invisible text, faces, and properties."
                   (kill-buffer buffer)))))
         (when (buffer-live-p source)
           (kill-buffer source))))))
+
+(ert-deftest
+    proofread-test-request-log-list-registry-coalesces-refresh ()
+  "Coalesce list refreshes without scanning unrelated buffers."
+  (let ((proofread--request-log-sources nil)
+        (proofread-request-log-hook nil)
+        (source (generate-new-buffer
+                 " *proofread-request-registry-source*"))
+        list-buffer)
+    (unwind-protect
+        (save-window-excursion
+          (with-current-buffer source
+            (insert "helo")
+            (proofread-mode 1))
+          (setq list-buffer
+                (proofread-show-buffer-requests source))
+          (proofread-show-buffer-requests source)
+          (with-current-buffer source
+            (should (equal proofread--request-log-list-buffers
+                           (list list-buffer))))
+          (should (= (cl-count source proofread--request-log-sources)
+                     1))
+          (let ((refreshes 0)
+                (schedules 0)
+                refresh-function
+                refresh-arguments
+                (request (list :log-id 9002
+                               :id 8
+                               :buffer source
+                               :beg 1
+                               :end 5
+                               :text "helo"
+                               :backend proofread-test--backend)))
+            (cl-letf (((symbol-function 'buffer-list)
+                       (lambda (&optional _frame)
+                         (error "Unexpected global buffer scan")))
+                      ((symbol-function 'run-at-time)
+                       (lambda (_time _repeat function &rest arguments)
+                         (setq schedules (1+ schedules))
+                         (setq refresh-function function)
+                         (setq refresh-arguments arguments)
+                         'proofread-test-request-log-timer))
+                      ((symbol-function
+                        'proofread--request-log-list-refresh)
+                       (lambda ()
+                         (setq refreshes (1+ refreshes)))))
+              (proofread--request-log-record-event
+               (list :type 'chunk-request
+                     :time (current-time)
+                     :log-id 9002
+                     :request-id 8
+                     :buffer source
+                     :beg 1
+                     :end 5
+                     :request request
+                     :chunk request))
+              (proofread--request-log-record-event
+               (list :type 'queued-request
+                     :time (current-time)
+                     :log-id 9002
+                     :request-id 8
+                     :buffer source
+                     :beg 1
+                     :end 5
+                     :request request
+                     :backend proofread-test--backend))
+              (should (= schedules 1))
+              (should (= refreshes 0))
+              (apply refresh-function refresh-arguments))
+            (should (= refreshes 1))))
+      (dolist (buffer (list list-buffer source))
+        (when (buffer-live-p buffer)
+          (kill-buffer buffer))))))
+
+(ert-deftest
+    proofread-test-request-log-list-registry-prunes-dead-buffers ()
+  "Prune dead request list buffers from their source registry."
+  (let ((proofread--request-log-sources nil)
+        (proofread-request-log-hook nil)
+        (source (generate-new-buffer
+                 " *proofread-request-prune-source*"))
+        list-buffer)
+    (unwind-protect
+        (save-window-excursion
+          (with-current-buffer source
+            (insert "helo")
+            (proofread-mode 1))
+          (setq list-buffer
+                (proofread-show-buffer-requests source))
+          (with-current-buffer list-buffer
+            (let ((kill-buffer-hook nil))
+              (kill-buffer list-buffer)))
+          (with-current-buffer source
+            (should proofread--request-log-list-buffers)
+            (proofread--refresh-request-log-list-buffers)
+            (should-not proofread--request-log-list-buffers))
+          (proofread--request-log-disable-source source))
+      (when (buffer-live-p source)
+        (kill-buffer source)))))
 
 (ert-deftest
     proofread-test-request-log-buffer-follows-visible-requests ()
@@ -5578,6 +5686,7 @@ This covers URLs, email, invisible text, faces, and properties."
                               (plist-get recorder :function)))
                      (proofread-show-buffer-requests source)
                      (proofread-check-visible-range)
+                     (proofread-test--flush-request-log-refresh source)
                      (with-current-buffer name
                        (should (= (length tabulated-list-entries) 2))
                        (let ((statuses
@@ -5601,6 +5710,7 @@ This covers URLs, email, invisible text, faces, and properties."
                           (proofread--backend-success-result
                            first-request nil))
                          'applied)))
+                     (proofread-test--flush-request-log-refresh source)
                      (with-current-buffer name
                        (let ((statuses
                               (mapcar (lambda (entry)
@@ -5612,6 +5722,50 @@ This covers URLs, email, invisible text, faces, and properties."
                   (kill-buffer buffer)))))
         (when (buffer-live-p source)
           (kill-buffer source))))))
+
+(ert-deftest
+    proofread-test-request-log-registry-preserves-other-sources ()
+  "Keep monitoring other sources when one source or list closes."
+  (let ((proofread--request-log-sources nil)
+        (proofread-request-log-hook nil)
+        (source-a (generate-new-buffer
+                   " *proofread-request-source-a*"))
+        (source-b (generate-new-buffer
+                   " *proofread-request-source-b*"))
+        list-a
+        list-b)
+    (unwind-protect
+        (save-window-excursion
+          (dolist (source (list source-a source-b))
+            (with-current-buffer source
+              (insert "helo")
+              (proofread-mode 1)))
+          (setq list-a (proofread-show-buffer-requests source-a))
+          (setq list-b (proofread-show-buffer-requests source-b))
+          (should (= (length proofread--request-log-sources) 2))
+          (should (memq #'proofread--request-log-record-event
+                        proofread-request-log-hook))
+          (kill-buffer source-a)
+          (should-not (buffer-live-p list-a))
+          (should (buffer-live-p list-b))
+          (should (equal proofread--request-log-sources
+                         (list source-b)))
+          (with-current-buffer source-b
+            (should proofread--request-log-enabled)
+            (should (equal proofread--request-log-list-buffers
+                           (list list-b))))
+          (should (memq #'proofread--request-log-record-event
+                        proofread-request-log-hook))
+          (kill-buffer list-b)
+          (with-current-buffer source-b
+            (should-not proofread--request-log-enabled)
+            (should-not proofread--request-log-list-buffers))
+          (should-not proofread--request-log-sources)
+          (should-not (memq #'proofread--request-log-record-event
+                            proofread-request-log-hook)))
+      (dolist (buffer (list list-a list-b source-a source-b))
+        (when (buffer-live-p buffer)
+          (kill-buffer buffer))))))
 
 (ert-deftest
     proofread-test-source-kill-closes-associated-list-buffers ()
@@ -5646,6 +5800,106 @@ This covers URLs, email, invisible text, faces, and properties."
         (dolist (name (list diagnostics-name requests-name))
           (when-let* ((buffer (and name (get-buffer name))))
             (kill-buffer buffer)))))))
+
+(ert-deftest
+    proofread-test-request-log-source-kill-after-mode-disable-cleans-up ()
+  "Keep source kill cleanup after `proofread-mode' is disabled."
+  (let ((proofread--request-log-sources nil)
+        (proofread-request-log-hook nil)
+        (source (generate-new-buffer
+                 " *proofread-request-disabled-source*"))
+        list-buffer)
+    (unwind-protect
+        (save-window-excursion
+          (with-current-buffer source
+            (insert "helo")
+            (proofread-mode 1))
+          (setq list-buffer
+                (proofread-show-buffer-requests source))
+          (with-current-buffer source
+            (proofread-mode -1))
+          (should (buffer-live-p list-buffer))
+          (kill-buffer source)
+          (should-not (buffer-live-p list-buffer))
+          (should-not proofread--request-log-sources)
+          (should-not (memq #'proofread--request-log-record-event
+                            proofread-request-log-hook)))
+      (dolist (buffer (list list-buffer source))
+        (when (buffer-live-p buffer)
+          (kill-buffer buffer))))))
+
+(ert-deftest
+    proofread-test-source-major-mode-change-closes-associated-lists ()
+  "Close source-owned lists before a source changes major mode."
+  (let ((proofread--request-log-sources nil)
+        (proofread-request-log-hook nil)
+        (source (generate-new-buffer
+                 " *proofread-list-source-mode-change*"))
+        diagnostics-buffer
+        requests-buffer)
+    (unwind-protect
+        (save-window-excursion
+          (switch-to-buffer source)
+          (insert "helo")
+          (proofread-mode 1)
+          (proofread-show-buffer-diagnostics)
+          (setq diagnostics-buffer
+                (get-buffer (proofread--diagnostics-buffer-name)))
+          (setq requests-buffer
+                (proofread-show-buffer-requests source))
+          (fundamental-mode)
+          (should-not (buffer-live-p diagnostics-buffer))
+          (should-not (buffer-live-p requests-buffer))
+          (should-not proofread--request-log-sources)
+          (should-not (memq #'proofread--request-log-record-event
+                            proofread-request-log-hook)))
+      (dolist (buffer (list diagnostics-buffer requests-buffer source))
+        (when (buffer-live-p buffer)
+          (kill-buffer buffer))))))
+
+(ert-deftest
+    proofread-test-diagnostics-source-kill-after-mode-disable-cleans-up ()
+  "Keep diagnostics-list cleanup after `proofread-mode' is disabled."
+  (let ((source (generate-new-buffer
+                 " *proofread-diagnostics-disabled-source*"))
+        list-buffer)
+    (unwind-protect
+        (save-window-excursion
+          (switch-to-buffer source)
+          (insert "helo")
+          (proofread-mode 1)
+          (proofread-show-buffer-diagnostics)
+          (setq list-buffer
+                (get-buffer (proofread--diagnostics-buffer-name)))
+          (proofread-mode -1)
+          (should (buffer-live-p list-buffer))
+          (should (memq #'proofread--source-list-cleanup
+                        kill-buffer-hook))
+          (kill-buffer source)
+          (should-not (buffer-live-p list-buffer)))
+      (dolist (buffer (list list-buffer source))
+        (when (buffer-live-p buffer)
+          (kill-buffer buffer))))))
+
+(ert-deftest
+    proofread-test-diagnostics-source-major-mode-change-cleans-up ()
+  "Close a diagnostics-only list before its source changes mode."
+  (let ((source (generate-new-buffer
+                 " *proofread-diagnostics-source-mode-change*"))
+        list-buffer)
+    (unwind-protect
+        (save-window-excursion
+          (switch-to-buffer source)
+          (insert "helo")
+          (proofread-mode 1)
+          (proofread-show-buffer-diagnostics)
+          (setq list-buffer
+                (get-buffer (proofread--diagnostics-buffer-name)))
+          (fundamental-mode)
+          (should-not (buffer-live-p list-buffer)))
+      (dolist (buffer (list list-buffer source))
+        (when (buffer-live-p buffer)
+          (kill-buffer buffer))))))
 
 (ert-deftest
     proofread-test-list-major-mode-change-releases-source-hooks ()

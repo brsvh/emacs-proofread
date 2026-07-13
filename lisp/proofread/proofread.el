@@ -3661,6 +3661,9 @@ the current buffer."
 
 ;;; Per-buffer request listings
 
+(defvar proofread--request-log-sources nil
+  "Live source buffers currently recording proofread request events.")
+
 (defvar-local proofread--request-log-enabled nil
   "Non-nil when the current buffer records proofread request events.")
 
@@ -3669,6 +3672,12 @@ the current buffer."
 
 (defvar-local proofread--request-log-order nil
   "Request record keys in oldest-to-newest order.")
+
+(defvar-local proofread--request-log-list-buffers nil
+  "Live request list buffers for the current source buffer.")
+
+(defvar-local proofread--request-log-refresh-timer nil
+  "Timer for coalescing request list refreshes for the current source.")
 
 (defvar-local proofread--request-log-list-source nil
   "Source buffer monitored by the current proofread requests buffer.")
@@ -3821,8 +3830,8 @@ the current buffer."
                   (append proofread--request-log-order (list key))))
           (let ((limit (max 0 proofread-request-log-max-records)))
             (while (> (length proofread--request-log-order) limit)
-              (remhash (pop proofread--request-log-order) records)))))
-      (proofread--request-log-refresh-open-buffers source))))
+              (remhash (pop proofread--request-log-order) records))))
+        (proofread--schedule-request-log-refresh)))))
 
 (defun proofread--request-log-record-list (&optional source)
   "Return proofread request records for SOURCE or the current buffer."
@@ -4044,72 +4053,140 @@ the current buffer."
                :request request
                :backend (plist-get entry :backend)))))))
 
+(defun proofread--install-source-list-cleanup ()
+  "Install lifecycle cleanup for lists owned by the current source."
+  (add-hook 'kill-buffer-hook #'proofread--source-list-cleanup nil t)
+  (add-hook 'change-major-mode-hook
+            #'proofread--source-list-cleanup nil t))
+
+(defun proofread--uninstall-source-list-cleanup-if-unused ()
+  "Remove source cleanup when the current buffer owns no live lists."
+  (unless (or proofread--request-log-list-buffers
+              proofread--diagnostics-list-buffers)
+    (remove-hook 'kill-buffer-hook #'proofread--source-list-cleanup t)
+    (remove-hook 'change-major-mode-hook
+                 #'proofread--source-list-cleanup t)))
+
+(defun proofread--source-list-cleanup ()
+  "Close auxiliary lists before their source loses local state."
+  (proofread--close-source-list-buffers (current-buffer)))
+
 (defun proofread--request-log-enable-source (source)
   "Enable proofread request recording for SOURCE."
-  (with-current-buffer source
-    (setq proofread--request-log-enabled t)
-    (proofread--request-log-ensure-records))
-  (proofread--request-log-ensure-hook)
-  (proofread--request-log-seed-active-requests source)
-  (proofread--request-log-seed-queued-requests source))
+  (let (newly-enabled)
+    (with-current-buffer source
+      (setq newly-enabled (not proofread--request-log-enabled))
+      (setq proofread--request-log-enabled t)
+      (proofread--request-log-ensure-records)
+      (proofread--install-source-list-cleanup))
+    (cl-pushnew source proofread--request-log-sources)
+    (proofread--request-log-ensure-hook)
+    (when newly-enabled
+      (proofread--request-log-seed-active-requests source)
+      (proofread--request-log-seed-queued-requests source))))
 
-(defun proofread--request-log-source-has-list-p
-    (source &optional except)
-  "Return non-nil when SOURCE has a request list other than EXCEPT."
-  (cl-some
-   (lambda (buffer)
-     (and (not (eq buffer except))
-          (buffer-live-p buffer)
-          (with-current-buffer buffer
-            (and (eq major-mode 'proofread-requests-buffer-mode)
-                 (eq proofread--request-log-list-source source)))))
-   (buffer-list)))
+(defun proofread--prune-request-log-sources ()
+  "Remove sources that no longer record request events."
+  (setq proofread--request-log-sources
+        (cl-remove-if-not #'proofread--request-log-source-enabled-p
+                          proofread--request-log-sources)))
 
-(defun proofread--request-log-any-source-enabled-p ()
-  "Return non-nil when a live buffer is recording request events."
-  (cl-some #'proofread--request-log-source-enabled-p (buffer-list)))
+(defun proofread--request-log-disable-source (source)
+  "Stop recording proofread request events for SOURCE."
+  (when (buffer-live-p source)
+    (with-current-buffer source
+      (setq proofread--request-log-enabled nil)
+      (proofread--cancel-request-log-refresh-timer)
+      (proofread--uninstall-source-list-cleanup-if-unused)))
+  (setq proofread--request-log-sources
+        (delq source proofread--request-log-sources))
+  (proofread--prune-request-log-sources)
+  (unless proofread--request-log-sources
+    (remove-hook 'proofread-request-log-hook
+                 #'proofread--request-log-record-event)))
+
+(defun proofread--request-log-list-buffer-p (buffer source)
+  "Return non-nil when BUFFER is a live request list for SOURCE."
+  (and (buffer-live-p buffer)
+       (with-current-buffer buffer
+         (and (eq major-mode 'proofread-requests-buffer-mode)
+              (eq proofread--request-log-list-source source)))))
+
+(defun proofread--prune-request-log-list-buffers ()
+  "Remove stale request lists owned by the current source buffer."
+  (let ((source (current-buffer)))
+    (setq proofread--request-log-list-buffers
+          (cl-remove-if-not
+           (lambda (buffer)
+             (proofread--request-log-list-buffer-p buffer source))
+           proofread--request-log-list-buffers))))
 
 (defun proofread--request-log-list-cleanup ()
   "Stop source monitoring when its last request list closes."
-  (let ((source proofread--request-log-list-source))
-    (when (and (buffer-live-p source)
-               (not (proofread--request-log-source-has-list-p
-                     source (current-buffer))))
-      (with-current-buffer source
-        (setq proofread--request-log-enabled nil)))
-    (unless (proofread--request-log-any-source-enabled-p)
-      (remove-hook 'proofread-request-log-hook
-                   #'proofread--request-log-record-event))))
+  (let ((list-buffer (current-buffer))
+        (source proofread--request-log-list-source))
+    (if (buffer-live-p source)
+        (with-current-buffer source
+          (setq proofread--request-log-list-buffers
+                (delq list-buffer proofread--request-log-list-buffers))
+          (proofread--prune-request-log-list-buffers)
+          (unless proofread--request-log-list-buffers
+            (proofread--request-log-disable-source source)))
+      (proofread--request-log-disable-source source))))
 
 (defun proofread--close-source-list-buffers (source)
   "Close auxiliary list buffers associated with SOURCE."
   (let (buffers)
     (when (buffer-live-p source)
       (with-current-buffer source
-        (setq proofread--request-log-enabled nil)))
-    (dolist (buffer (buffer-list))
-      (unless (eq buffer source)
-        (with-current-buffer buffer
-          (when (or (and (eq major-mode 'proofread-requests-buffer-mode)
-                         (eq proofread--request-log-list-source source))
-                    (and (eq major-mode 'proofread-diagnostics-buffer-mode)
-                         (eq proofread--diagnostics-buffer-source source)))
-            (push buffer buffers)))))
+        (setq buffers
+              (delete-dups
+               (append proofread--request-log-list-buffers
+                       proofread--diagnostics-list-buffers nil)))
+        (setq proofread--request-log-list-buffers nil)
+        (setq proofread--diagnostics-list-buffers nil)
+        (proofread--request-log-disable-source source)))
     (dolist (buffer buffers)
-      (when (buffer-live-p buffer)
+      (when (and (not (eq buffer source))
+                 (buffer-live-p buffer))
         (kill-buffer buffer)))
-    (unless (proofread--request-log-any-source-enabled-p)
-      (remove-hook 'proofread-request-log-hook
-                   #'proofread--request-log-record-event))))
+    buffers))
 
-(defun proofread--request-log-refresh-open-buffers (source)
-  "Refresh open proofread request list buffers for SOURCE."
-  (dolist (buffer (buffer-list))
-    (when (buffer-live-p buffer)
-      (with-current-buffer buffer
-        (when (and (eq major-mode 'proofread-requests-buffer-mode)
-                   (eq proofread--request-log-list-source source))
-          (proofread--request-log-list-refresh))))))
+(defun proofread--cancel-request-log-refresh-timer ()
+  "Cancel the current source's scheduled request list refresh."
+  (when (timerp proofread--request-log-refresh-timer)
+    (cancel-timer proofread--request-log-refresh-timer))
+  (setq proofread--request-log-refresh-timer nil))
+
+(defun proofread--refresh-request-log-list-buffers ()
+  "Refresh request lists owned by the current source buffer."
+  (proofread--prune-request-log-list-buffers)
+  (dolist (buffer proofread--request-log-list-buffers)
+    (with-current-buffer buffer
+      (proofread--request-log-list-refresh))))
+
+(defun proofread--request-log-refresh-timer-run (source)
+  "Refresh request list buffers scheduled for SOURCE."
+  (when (buffer-live-p source)
+    (with-current-buffer source
+      (setq proofread--request-log-refresh-timer nil)
+      (condition-case err
+          (proofread--refresh-request-log-list-buffers)
+        (error
+         (proofread--report-warning-without-window
+          (format "Proofread request list refresh error: %s"
+                  (error-message-string err))
+          "request list refresh failed; see *Warnings*"))))))
+
+(defun proofread--schedule-request-log-refresh ()
+  "Schedule one request list refresh for the current source buffer."
+  (proofread--prune-request-log-list-buffers)
+  (when (and proofread--request-log-list-buffers
+             (null proofread--request-log-refresh-timer))
+    (setq proofread--request-log-refresh-timer
+          (run-at-time
+           0 nil #'proofread--request-log-refresh-timer-run
+           (current-buffer)))))
 
 (defun proofread--request-log-backend-request-details (event)
   "Return printable backend request details for EVENT."
@@ -4225,6 +4302,8 @@ events."
            window)
       (with-current-buffer target
         (setq proofread--request-log-list-source source)
+        (with-current-buffer source
+          (cl-pushnew target proofread--request-log-list-buffers))
         (revert-buffer)
         (setq window
               (display-buffer
@@ -4398,7 +4477,8 @@ events."
         (unless proofread--diagnostics-list-buffers
           (remove-hook
            'proofread-diagnostics-changed-hook
-           #'proofread--refresh-diagnostics-list-buffers t))))))
+           #'proofread--refresh-diagnostics-list-buffers t))
+        (proofread--uninstall-source-list-cleanup-if-unused)))))
 
 (defun proofread-show-diagnostic (pos &optional other-window)
   "From a diagnostics buffer, show the source diagnostic at POS.
@@ -5459,6 +5539,7 @@ This function does not move point in the source buffer."
                     (point) 'highlight)))))
     (with-current-buffer source
       (cl-pushnew target proofread--diagnostics-list-buffers)
+      (proofread--install-source-list-cleanup)
       (add-hook 'proofread-diagnostics-changed-hook
                 #'proofread--refresh-diagnostics-list-buffers nil t))
     target))
@@ -5618,8 +5699,11 @@ buffer."
   (remove-hook 'window-scroll-functions #'proofread--window-scroll)
   (remove-hook 'window-configuration-change-hook
                #'proofread--window-configuration-change)
+  (dolist (source (copy-sequence proofread--request-log-sources))
+    (proofread--request-log-disable-source source))
   (remove-hook 'proofread-request-log-hook
                #'proofread--request-log-record-event)
+  (setq proofread--request-log-sources nil)
   (setq proofread--mode-buffers nil)
   (setq proofread--window-hooks-installed nil)
   nil)
