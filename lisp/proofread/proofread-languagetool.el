@@ -1193,6 +1193,12 @@ Signal an error when STATUS is not a URL callback status plist."
     (cancel-timer timer))
   (set symbol nil))
 
+(defun proofread-languagetool--cancel-probe-retry ()
+  "Cancel the scheduled LanguageTool health-probe retry."
+  (proofread-languagetool--cancel-global-timer
+   'proofread-languagetool--probe-retry-timer)
+  (setq proofread-languagetool--probe-retry-token nil))
+
 (defun proofread-languagetool--clear-probe ()
   "Cancel the active LanguageTool health probe."
   (proofread-languagetool--cancel-global-timer
@@ -1201,12 +1207,23 @@ Signal an error when STATUS is not a URL callback status plist."
     (setq proofread-languagetool--probe-buffer nil)
     (proofread-languagetool--kill-url-buffer buffer)))
 
+(defun proofread-languagetool--cancel-readiness-work ()
+  "Cancel all asynchronous LanguageTool server-readiness work."
+  (proofread-languagetool--cancel-global-timer
+   'proofread-languagetool--startup-timer)
+  (proofread-languagetool--cancel-probe-retry)
+  (proofread-languagetool--clear-probe))
+
+(defun proofread-languagetool--forget-owned-process ()
+  "Forget and return the LanguageTool process owned by this session."
+  (prog1 proofread-languagetool--server-process
+    (setq proofread-languagetool--server-process nil)
+    (setq proofread-languagetool--server-process-session nil)))
+
 (defun proofread-languagetool--stop-owned-process ()
   "Stop and forget the LanguageTool process owned by this session."
-  (let ((process proofread-languagetool--server-process)
+  (let ((process (proofread-languagetool--forget-owned-process))
         (proofread-languagetool--shutting-down-p t))
-    (setq proofread-languagetool--server-process nil)
-    (setq proofread-languagetool--server-process-session nil)
     (when (process-live-p process)
       (set-process-query-on-exit-flag process nil)
       (delete-process process))))
@@ -1243,14 +1260,19 @@ Signal an error when STATUS is not a URL callback status plist."
            handle error message)
         (error nil)))))
 
+(defun proofread-languagetool--fail-readiness (error message)
+  "End the current readiness attempt with ERROR and MESSAGE."
+  (cl-incf proofread-languagetool--server-generation)
+  (setq proofread-languagetool--server-state 'unknown)
+  (setq proofread-languagetool--force-start-p nil)
+  (proofread-languagetool--cancel-readiness-work)
+  (proofread-languagetool--fail-waiters error message))
+
 (defun proofread-languagetool--server-ready (generation session)
   "Mark server GENERATION and SESSION ready and submit waiters."
   (when (proofread-languagetool--current-session-p
          generation session)
-    (proofread-languagetool--cancel-global-timer
-     'proofread-languagetool--startup-timer)
-    (proofread-languagetool--cancel-global-timer
-     'proofread-languagetool--probe-retry-timer)
+    (proofread-languagetool--cancel-readiness-work)
     (setq proofread-languagetool--server-state 'ready)
     (setq proofread-languagetool--force-start-p nil)
     (proofread-languagetool--drain-waiters session)))
@@ -1305,25 +1327,22 @@ Signal an error when STATUS is not a URL callback status plist."
   (when (and (eq process proofread-languagetool--server-process)
              (memq (process-status process)
                    '(exit signal closed failed)))
-    (setq proofread-languagetool--server-process nil)
-    (setq proofread-languagetool--server-process-session nil)
-    (unless proofread-languagetool--shutting-down-p
-      (let ((starting
-             (eq proofread-languagetool--server-state 'starting)))
-        (setq proofread-languagetool--server-state 'unknown)
-        (when starting
-          (cl-incf proofread-languagetool--server-generation)
-          (setq proofread-languagetool--force-start-p nil)
-          (proofread-languagetool--cancel-global-timer
-           'proofread-languagetool--startup-timer)
-          (proofread-languagetool--cancel-global-timer
-           'proofread-languagetool--probe-retry-timer)
-          (setq proofread-languagetool--probe-retry-token nil)
-          (proofread-languagetool--clear-probe)
-          (proofread-languagetool--fail-waiters
-           'languagetool-startup-failed
-           (format "LanguageTool server exited with status %d"
-                   (process-exit-status process))))))))
+    (let ((state proofread-languagetool--server-state))
+      (proofread-languagetool--forget-owned-process)
+      (unless proofread-languagetool--shutting-down-p
+        (pcase state
+          ('starting
+           (proofread-languagetool--fail-readiness
+            'languagetool-startup-failed
+            (format "LanguageTool server exited with status %d"
+                    (process-exit-status process))))
+          ('probing
+           (condition-case nil
+               (proofread-languagetool--begin-readiness-check
+                proofread-languagetool--server-session)
+             (error nil)))
+          (_
+           (setq proofread-languagetool--server-state 'unknown)))))))
 
 (defun proofread-languagetool--startup-timeout
     (generation session)
@@ -1331,14 +1350,8 @@ Signal an error when STATUS is not a URL callback status plist."
   (when (and (proofread-languagetool--current-session-p
               generation session)
              (eq proofread-languagetool--server-state 'starting))
-    (setq proofread-languagetool--server-state 'unknown)
-    (setq proofread-languagetool--force-start-p nil)
-    (proofread-languagetool--cancel-global-timer
-     'proofread-languagetool--probe-retry-timer)
-    (setq proofread-languagetool--probe-retry-token nil)
-    (proofread-languagetool--clear-probe)
     (proofread-languagetool--stop-owned-process)
-    (proofread-languagetool--fail-waiters
+    (proofread-languagetool--fail-readiness
      'languagetool-startup-timeout
      "LanguageTool server did not become ready in time")))
 
@@ -1406,17 +1419,12 @@ Signal an error when STATUS is not a URL callback status plist."
         (error
          (when (eq new-process
                    proofread-languagetool--server-process)
-           (setq proofread-languagetool--server-process nil)
-           (setq proofread-languagetool--server-process-session nil))
+           (proofread-languagetool--forget-owned-process))
          (when (process-live-p new-process)
            (let ((proofread-languagetool--shutting-down-p t))
              (set-process-query-on-exit-flag new-process nil)
              (delete-process new-process)))
-         (setq proofread-languagetool--server-state 'unknown)
-         (setq proofread-languagetool--force-start-p nil)
-         (proofread-languagetool--cancel-global-timer
-          'proofread-languagetool--startup-timer)
-         (proofread-languagetool--fail-waiters
+         (proofread-languagetool--fail-readiness
           'languagetool-startup-error
           (error-message-string err)))))))
 
@@ -1431,25 +1439,22 @@ Signal an error when STATUS is not a URL callback status plist."
                proofread-languagetool--force-start-p)
            (proofread-languagetool--start-managed-server
             generation session)
-         (setq proofread-languagetool--server-state 'unknown)
-         (setq proofread-languagetool--force-start-p nil)
-         (proofread-languagetool--fail-waiters
+         (proofread-languagetool--fail-readiness
           'languagetool-unavailable
           "No LanguageTool server is available")))
       ('startup
-       (if (and (eq proofread-languagetool--server-state 'starting)
-                (process-live-p
-                 proofread-languagetool--server-process))
-           (proofread-languagetool--schedule-probe
-            generation 'startup session
-            proofread-languagetool--probe-delay)
-         (setq proofread-languagetool--server-state 'unknown)
-         (setq proofread-languagetool--force-start-p nil)
-         (proofread-languagetool--cancel-global-timer
-          'proofread-languagetool--startup-timer)
-         (proofread-languagetool--fail-waiters
-          'languagetool-startup-failed
-          "LanguageTool server exited before becoming ready"))))))
+       (let* ((process proofread-languagetool--server-process)
+              (live (process-live-p process)))
+         (if (and (eq proofread-languagetool--server-state 'starting)
+                  live)
+             (proofread-languagetool--schedule-probe
+              generation 'startup session
+              proofread-languagetool--probe-delay)
+           (unless live
+             (proofread-languagetool--forget-owned-process))
+           (proofread-languagetool--fail-readiness
+            'languagetool-startup-failed
+            "LanguageTool server exited before becoming ready")))))))
 
 (defun proofread-languagetool--probe-timeout
     (generation phase session buffer)
@@ -1457,9 +1462,7 @@ Signal an error when STATUS is not a URL callback status plist."
   (when (and (proofread-languagetool--current-session-p
               generation session)
              (eq buffer proofread-languagetool--probe-buffer))
-    (setq proofread-languagetool--probe-buffer nil)
-    (setq proofread-languagetool--probe-timeout-timer nil)
-    (proofread-languagetool--kill-url-buffer buffer)
+    (proofread-languagetool--clear-probe)
     (proofread-languagetool--probe-failed
      generation phase session)))
 
@@ -1502,56 +1505,70 @@ Signal an error when STATUS is not a URL callback status plist."
   (when (and (eq token proofread-languagetool--probe-retry-token)
              (proofread-languagetool--current-session-p
               generation session))
-    (setq proofread-languagetool--probe-retry-timer nil)
-    (setq proofread-languagetool--probe-retry-token nil)
-    (condition-case nil
-        (let* ((url-request-method "GET")
-               (url-request-data nil)
-               (url-request-extra-headers nil)
-               (url-max-redirections 0)
-               (url-proxy-services
-                (if (plist-get session :loopback)
-                    nil
-                  url-proxy-services))
-               (buffer
-                (url-retrieve
-                 (plist-get session :health-url)
-                 #'proofread-languagetool--probe-response
-                 (list generation phase session) t t)))
-          (unless (buffer-live-p buffer)
-            (error "LanguageTool probe did not return a live buffer"))
-          (with-current-buffer buffer
-            (setq-local url-max-redirections 0))
-          (if (and
-               (proofread-languagetool--current-session-p
-                generation session)
-               (null proofread-languagetool--probe-buffer)
-               (null proofread-languagetool--probe-retry-token))
-              (progn
+    (proofread-languagetool--cancel-probe-retry)
+    (let (buffer timeout-timer published)
+      (condition-case nil
+          (let* ((url-request-method "GET")
+                 (url-request-data nil)
+                 (url-request-extra-headers nil)
+                 (url-max-redirections 0)
+                 (url-proxy-services
+                  (if (plist-get session :loopback)
+                      nil
+                    url-proxy-services))
+                 (retrieved
+                  (url-retrieve
+                   (plist-get session :health-url)
+                   #'proofread-languagetool--probe-response
+                   (list generation phase session) t t)))
+            (setq buffer retrieved)
+            (unless (buffer-live-p buffer)
+              (error "LanguageTool probe did not return a live buffer"))
+            (with-current-buffer buffer
+              (setq-local url-max-redirections 0))
+            (when (and
+                   (proofread-languagetool--current-session-p
+                    generation session)
+                   (null proofread-languagetool--probe-buffer)
+                   (null proofread-languagetool--probe-retry-token))
+              (setq timeout-timer
+                    (run-at-time
+                     (plist-get session :health-timeout) nil
+                     #'proofread-languagetool--probe-timeout
+                     generation phase session buffer))
+              (when (and
+                     (proofread-languagetool--current-session-p
+                      generation session)
+                     (null proofread-languagetool--probe-buffer)
+                     (null proofread-languagetool--probe-retry-token))
                 (setq proofread-languagetool--probe-buffer buffer)
                 (setq proofread-languagetool--probe-timeout-timer
-                      (run-at-time
-                       (plist-get session :health-timeout) nil
-                       #'proofread-languagetool--probe-timeout
-                       generation phase session buffer)))
-            (proofread-languagetool--kill-url-buffer buffer)))
-      (error
-       (proofread-languagetool--probe-failed
-        generation phase session)))))
+                      timeout-timer)
+                (setq published t)))
+            (unless published
+              (when (timerp timeout-timer)
+                (cancel-timer timeout-timer))
+              (proofread-languagetool--kill-url-buffer buffer)))
+        (error
+         (when (timerp timeout-timer)
+           (cancel-timer timeout-timer))
+         (proofread-languagetool--kill-url-buffer buffer)
+         (proofread-languagetool--probe-failed
+          generation phase session))))))
 
 (defun proofread-languagetool--schedule-probe
     (generation phase session delay)
   "Schedule a probe for GENERATION, PHASE, and SESSION after DELAY."
   (when (proofread-languagetool--current-session-p
          generation session)
-    (proofread-languagetool--cancel-global-timer
-     'proofread-languagetool--probe-retry-timer)
-    (let ((token (list generation phase session)))
-      (setq proofread-languagetool--probe-retry-token token)
-      (setq proofread-languagetool--probe-retry-timer
+    (proofread-languagetool--cancel-probe-retry)
+    (let* ((token (list generation phase session))
+           (timer
             (run-at-time delay nil
                          #'proofread-languagetool--run-probe
-                         generation phase session token)))))
+                         generation phase session token)))
+      (setq proofread-languagetool--probe-retry-token token)
+      (setq proofread-languagetool--probe-retry-timer timer))))
 
 (defun proofread-languagetool--begin-readiness-check (session)
   "Probe an existing server described by SESSION."
@@ -1560,12 +1577,7 @@ Signal an error when STATUS is not a URL callback status plist."
            (proofread-languagetool--same-session-p
             session proofread-languagetool--server-session)))
       (cl-incf proofread-languagetool--server-generation)
-      (proofread-languagetool--cancel-global-timer
-       'proofread-languagetool--startup-timer)
-      (proofread-languagetool--cancel-global-timer
-       'proofread-languagetool--probe-retry-timer)
-      (setq proofread-languagetool--probe-retry-token nil)
-      (proofread-languagetool--clear-probe)
+      (proofread-languagetool--cancel-readiness-work)
       (unless same-session
         (setq proofread-languagetool--force-start-p nil)
         (proofread-languagetool--defer-waiters
@@ -1574,9 +1586,16 @@ Signal an error when STATUS is not a URL callback status plist."
         (proofread-languagetool--stop-owned-process))
       (setq proofread-languagetool--server-session session)
       (setq proofread-languagetool--server-state 'probing)
-      (proofread-languagetool--schedule-probe
-       proofread-languagetool--server-generation
-       'external session 0))))
+      (condition-case err
+          (proofread-languagetool--schedule-probe
+           proofread-languagetool--server-generation
+           'external session 0)
+        (error
+         (proofread-languagetool--fail-readiness
+          'languagetool-unavailable
+          (format "Cannot schedule LanguageTool health probe: %s"
+                  (error-message-string err)))
+         (signal (car err) (cdr err)))))))
 
 (defun proofread-languagetool--ensure-server (handle)
   "Submit HANDLE when the configured LanguageTool server is ready."
@@ -1674,12 +1693,7 @@ Return a cancellable LanguageTool backend handle."
     (setq proofread-languagetool--server-state 'unknown)
     (setq proofread-languagetool--server-session nil)
     (setq proofread-languagetool--force-start-p nil)
-    (proofread-languagetool--cancel-global-timer
-     'proofread-languagetool--startup-timer)
-    (proofread-languagetool--cancel-global-timer
-     'proofread-languagetool--probe-retry-timer)
-    (setq proofread-languagetool--probe-retry-token nil)
-    (proofread-languagetool--clear-probe)
+    (proofread-languagetool--cancel-readiness-work)
     (setq proofread-languagetool--server-waiters nil)
     (proofread-languagetool--settle-live-handles error message)
     (proofread-languagetool--stop-owned-process)))

@@ -104,6 +104,14 @@ CALLBACK-STATUS is the status plist passed to the URL callback."
                    proofread-languagetool--live-handles))
     (proofread-languagetool--cancel handle)))
 
+(defun proofread-languagetool-test--assert-no-readiness-work ()
+  "Assert that no LanguageTool readiness resource remains published."
+  (should-not proofread-languagetool--startup-timer)
+  (should-not proofread-languagetool--probe-retry-timer)
+  (should-not proofread-languagetool--probe-retry-token)
+  (should-not proofread-languagetool--probe-timeout-timer)
+  (should-not proofread-languagetool--probe-buffer))
+
 (defmacro proofread-languagetool-test--with-state (&rest body)
   "Run BODY with isolated LanguageTool session state."
   (declare (indent 0) (debug (body)))
@@ -879,6 +887,56 @@ CALLBACK-STATUS is the status plist passed to the URL callback."
            (should-not proofread-languagetool--server-waiters)
            (should-not (buffer-live-p (plist-get call :buffer)))))))))
 
+(ert-deftest proofread-languagetool-test-teardown-clears-lifecycle ()
+  "Teardown releases every readiness and owned-process resource."
+  (proofread-languagetool-test--with-state
+   (let* ((session
+           (proofread-languagetool--server-session-snapshot))
+          (proofread-languagetool--server-session session)
+          (proofread-languagetool--server-generation 4)
+          (proofread-languagetool--server-state 'starting)
+          (proofread-languagetool--server-process 'owned-process)
+          (proofread-languagetool--server-process-session session)
+          (proofread-languagetool--force-start-p t)
+          (proofread-languagetool--startup-timer
+           (run-at-time 60 nil #'ignore))
+          (proofread-languagetool--probe-retry-timer
+           (run-at-time 60 nil #'ignore))
+          (proofread-languagetool--probe-retry-token '(retry))
+          (proofread-languagetool--probe-timeout-timer
+           (run-at-time 60 nil #'ignore))
+          (probe-buffer
+           (generate-new-buffer " *proofread-lt-teardown*"))
+          result
+          (waiter
+           (proofread-languagetool--new-handle
+            (proofread-languagetool-test--request)
+            (lambda (value) (setq result value))))
+          deleted)
+     (setq proofread-languagetool--probe-buffer probe-buffer)
+     (setq proofread-languagetool--server-waiters (list waiter))
+     (cl-letf
+         (((symbol-function 'process-live-p)
+           (lambda (process) (eq process 'owned-process)))
+          ((symbol-function 'set-process-query-on-exit-flag) #'ignore)
+          ((symbol-function 'delete-process)
+           (lambda (process) (setq deleted process))))
+       (proofread-languagetool--teardown
+        'languagetool-test-stop "Test stop"))
+     (should (= proofread-languagetool--server-generation 5))
+     (proofread-languagetool-test--assert-no-readiness-work)
+     (should-not (buffer-live-p probe-buffer))
+     (should (eq deleted 'owned-process))
+     (should-not proofread-languagetool--server-process)
+     (should-not proofread-languagetool--server-process-session)
+     (should-not proofread-languagetool--server-session)
+     (should-not proofread-languagetool--force-start-p)
+     (should-not proofread-languagetool--server-waiters)
+     (should-not proofread-languagetool--live-handles)
+     (should (eq proofread-languagetool--server-state 'unknown))
+     (should (eq (plist-get result :error)
+                 'languagetool-test-stop)))))
+
 (ert-deftest proofread-languagetool-test-unload-kills-server-log ()
   "Unloading kills the managed log despite buffer kill hooks."
   (let ((buffer
@@ -1118,6 +1176,119 @@ CALLBACK-STATUS is the status plist passed to the URL callback."
         1 'external session token))
      (should (= armed-delay 7.5))
      (proofread-languagetool--kill-url-buffer buffer))))
+
+(ert-deftest proofread-languagetool-test-probe-schedule-error-is-atomic ()
+  "A timer error cannot publish half of a scheduled health probe."
+  (proofread-languagetool-test--with-state
+   (let* ((session
+           (proofread-languagetool--server-session-snapshot))
+          (proofread-languagetool--server-session session)
+          (proofread-languagetool--server-generation 1)
+          (proofread-languagetool--server-state 'probing))
+     (cl-letf (((symbol-function 'run-at-time)
+                (lambda (&rest _ignored)
+                  (error "Timer creation failed"))))
+       (should-error
+        (proofread-languagetool--schedule-probe
+         1 'external session 0)))
+     (should-not proofread-languagetool--probe-retry-timer)
+     (should-not proofread-languagetool--probe-retry-token))))
+
+(ert-deftest proofread-languagetool-test-probe-schedule-error-rolls-back ()
+  "A probe scheduling error leaves readiness retryable."
+  (proofread-languagetool-test--with-state
+   (let* ((session
+           (proofread-languagetool--server-session-snapshot))
+          (proofread-languagetool--server-session session)
+          (proofread-languagetool--server-generation 1)
+          (proofread-languagetool--server-state 'unknown)
+          (proofread-languagetool--force-start-p t)
+          result
+          scheduled
+          (waiter
+           (proofread-languagetool--new-handle
+            (proofread-languagetool-test--request)
+            (lambda (value) (setq result value)))))
+     (setq proofread-languagetool--server-waiters (list waiter))
+     (cl-letf
+         (((symbol-function 'proofread-languagetool--schedule-probe)
+           (lambda (&rest _ignored)
+             (error "Timer creation failed"))))
+       (should-error
+        (proofread-languagetool--begin-readiness-check session)))
+     (should (eq proofread-languagetool--server-state 'unknown))
+     (should-not proofread-languagetool--force-start-p)
+     (should-not proofread-languagetool--server-waiters)
+     (should (eq (plist-get result :error)
+                 'languagetool-unavailable))
+     (proofread-languagetool-test--assert-no-readiness-work)
+     (cl-letf
+         (((symbol-function 'proofread-languagetool--schedule-probe)
+           (lambda (generation phase candidate delay)
+             (setq scheduled
+                   (list generation phase candidate delay)))))
+       (proofread-languagetool--begin-readiness-check session))
+     (should (eq proofread-languagetool--server-state 'probing))
+     (should
+      (equal scheduled
+             (list proofread-languagetool--server-generation
+                   'external session 0))))))
+
+(ert-deftest proofread-languagetool-test-probe-timeout-setup-cleans-buffer ()
+  "A probe timeout timer error cannot leak its retrieval buffer."
+  (proofread-languagetool-test--with-state
+   (let* ((proofread-languagetool-auto-start nil)
+          (session
+           (proofread-languagetool--server-session-snapshot))
+          (proofread-languagetool--server-session session)
+          (proofread-languagetool--server-generation 1)
+          (proofread-languagetool--server-state 'probing)
+          (token (list 'probe-token))
+          buffer)
+     (setq proofread-languagetool--probe-retry-token token)
+     (cl-letf
+         (((symbol-function 'url-retrieve)
+           (lambda (&rest _ignored)
+             (setq buffer
+                   (generate-new-buffer
+                    " *proofread-lt-probe-timer-error*"))))
+          ((symbol-function 'run-at-time)
+           (lambda (&rest _ignored)
+             (error "Timer creation failed"))))
+       (proofread-languagetool--run-probe
+        1 'external session token))
+     (should (eq proofread-languagetool--server-state 'unknown))
+     (proofread-languagetool-test--assert-no-readiness-work)
+     (should-not (buffer-live-p buffer)))))
+
+(ert-deftest proofread-languagetool-test-probe-timeout-cleans-attempt ()
+  "A current health-probe timeout releases and fails its attempt."
+  (proofread-languagetool-test--with-state
+   (let* ((proofread-languagetool-auto-start nil)
+          (session
+           (proofread-languagetool--server-session-snapshot))
+          (proofread-languagetool--server-session session)
+          (proofread-languagetool--server-generation 1)
+          (proofread-languagetool--server-state 'probing)
+          (proofread-languagetool--probe-timeout-timer
+           (run-at-time 60 nil #'ignore))
+          (buffer
+           (generate-new-buffer " *proofread-lt-probe-timeout*"))
+          result
+          (waiter
+           (proofread-languagetool--new-handle
+            (proofread-languagetool-test--request)
+            (lambda (value) (setq result value)))))
+     (setq proofread-languagetool--probe-buffer buffer)
+     (setq proofread-languagetool--server-waiters (list waiter))
+     (proofread-languagetool--probe-timeout
+      1 'external session buffer)
+     (should (= proofread-languagetool--server-generation 2))
+     (proofread-languagetool-test--assert-no-readiness-work)
+     (should-not (buffer-live-p buffer))
+     (should (eq proofread-languagetool--server-state 'unknown))
+     (should (eq (plist-get result :error)
+                 'languagetool-unavailable)))))
 
 (ert-deftest proofread-languagetool-test-rejects-buffer-local-session-option ()
   "The server manager rejects buffer-local settings when they apply."
@@ -1523,7 +1694,7 @@ CALLBACK-STATUS is the status plist passed to the URL callback."
                      'starting)))))))
 
 (ert-deftest proofread-languagetool-test-startup-timeout-clears-retry ()
-  "Startup timeout invalidates every outstanding retry resource."
+  "Startup timeout invalidates every outstanding readiness resource."
   (proofread-languagetool-test--with-state
    (let* ((session
            (proofread-languagetool--server-session-snapshot))
@@ -1532,10 +1703,24 @@ CALLBACK-STATUS is the status plist passed to the URL callback."
           (proofread-languagetool--server-state 'starting)
           (proofread-languagetool--server-process 'owned-process)
           (proofread-languagetool--server-process-session session)
+          (proofread-languagetool--force-start-p t)
+          (startup (run-at-time 60 nil #'ignore))
           (retry (run-at-time 60 nil #'ignore))
+          (probe-timeout (run-at-time 60 nil #'ignore))
+          (probe-buffer
+           (generate-new-buffer " *proofread-lt-startup-timeout*"))
+          result
+          (waiter
+           (proofread-languagetool--new-handle
+            (proofread-languagetool-test--request)
+            (lambda (value) (setq result value))))
           deleted)
+     (setq proofread-languagetool--startup-timer startup)
      (setq proofread-languagetool--probe-retry-timer retry)
      (setq proofread-languagetool--probe-retry-token '(retry))
+     (setq proofread-languagetool--probe-timeout-timer probe-timeout)
+     (setq proofread-languagetool--probe-buffer probe-buffer)
+     (setq proofread-languagetool--server-waiters (list waiter))
      (cl-letf
          (((symbol-function 'process-live-p)
            (lambda (process) (eq process 'owned-process)))
@@ -1545,10 +1730,194 @@ CALLBACK-STATUS is the status plist passed to the URL callback."
            (lambda (process) (setq deleted process))))
        (proofread-languagetool--startup-timeout 1 session))
      (should (eq deleted 'owned-process))
-     (should-not proofread-languagetool--probe-retry-timer)
-     (should-not proofread-languagetool--probe-retry-token)
+     (proofread-languagetool-test--assert-no-readiness-work)
+     (should-not (buffer-live-p probe-buffer))
      (should-not proofread-languagetool--server-process)
-     (should (eq proofread-languagetool--server-state 'unknown)))))
+     (should-not proofread-languagetool--server-process-session)
+     (should-not proofread-languagetool--force-start-p)
+     (should (eq proofread-languagetool--server-state 'unknown))
+     (should (eq (plist-get result :error)
+                 'languagetool-startup-timeout)))))
+
+(ert-deftest proofread-languagetool-test-start-error-cleans-lifecycle ()
+  "A synchronous managed-start error releases its entire attempt."
+  (proofread-languagetool-test--with-state
+   (let* ((session
+           (proofread-languagetool--server-session-snapshot))
+          (proofread-languagetool--server-session session)
+          (proofread-languagetool--server-generation 1)
+          (proofread-languagetool--server-state 'probing)
+          (proofread-languagetool--force-start-p t)
+          (timer-calls 0)
+          deleted
+          result
+          (waiter
+           (proofread-languagetool--new-handle
+            (proofread-languagetool-test--request)
+            (lambda (value) (setq result value)))))
+     (setq proofread-languagetool--server-waiters (list waiter))
+     (cl-letf
+         (((symbol-function 'proofread-languagetool--server-command)
+           (lambda (_session) '("languagetool-http-server")))
+          ((symbol-function 'proofread-languagetool--server-arguments)
+           (lambda (_session) nil))
+          ((symbol-function 'get-buffer-create) (lambda (_name) nil))
+          ((symbol-function 'make-process)
+           (lambda (&rest _ignored) 'new-process))
+          ((symbol-function 'process-live-p)
+           (lambda (process) (eq process 'new-process)))
+          ((symbol-function 'set-process-query-on-exit-flag) #'ignore)
+          ((symbol-function 'delete-process)
+           (lambda (process) (setq deleted process)))
+          ((symbol-function 'run-at-time)
+           (lambda (&rest _ignored)
+             (cl-incf timer-calls)
+             (if (= timer-calls 1)
+                 'startup-timer
+               (error "Timer creation failed")))))
+       (proofread-languagetool--start-managed-server 1 session))
+     (should (= timer-calls 2))
+     (should (eq deleted 'new-process))
+     (proofread-languagetool-test--assert-no-readiness-work)
+     (should-not proofread-languagetool--server-process)
+     (should-not proofread-languagetool--server-process-session)
+     (should-not proofread-languagetool--force-start-p)
+     (should (eq proofread-languagetool--server-state 'unknown))
+     (should (eq (plist-get result :error)
+                 'languagetool-startup-error)))))
+
+(ert-deftest proofread-languagetool-test-dead-startup-process-is-forgotten ()
+  "A failed startup probe immediately forgets its dead owned process."
+  (proofread-languagetool-test--with-state
+   (let* ((session
+           (proofread-languagetool--server-session-snapshot))
+          (proofread-languagetool--server-session session)
+          (proofread-languagetool--server-generation 1)
+          (proofread-languagetool--server-state 'starting)
+          (proofread-languagetool--server-process 'dead-process)
+          (proofread-languagetool--server-process-session session)
+          (proofread-languagetool--force-start-p t)
+          (proofread-languagetool--startup-timer
+           (run-at-time 60 nil #'ignore))
+          result
+          (waiter
+           (proofread-languagetool--new-handle
+            (proofread-languagetool-test--request)
+            (lambda (value) (setq result value)))))
+     (setq proofread-languagetool--server-waiters (list waiter))
+     (cl-letf (((symbol-function 'process-live-p)
+                (lambda (_process) nil)))
+       (proofread-languagetool--probe-failed
+        1 'startup session))
+     (proofread-languagetool-test--assert-no-readiness-work)
+     (should-not proofread-languagetool--server-process)
+     (should-not proofread-languagetool--server-process-session)
+     (should-not proofread-languagetool--force-start-p)
+     (should (eq proofread-languagetool--server-state 'unknown))
+     (should (eq (plist-get result :error)
+                 'languagetool-startup-failed)))))
+
+(ert-deftest
+    proofread-languagetool-test-starting-process-exit-cleans-lifecycle ()
+  "A starting process exit invalidates and settles its whole attempt."
+  (proofread-languagetool-test--with-state
+   (let* ((session
+           (proofread-languagetool--server-session-snapshot))
+          (proofread-languagetool--server-session session)
+          (proofread-languagetool--server-generation 1)
+          (proofread-languagetool--server-state 'starting)
+          (proofread-languagetool--server-process 'owned-process)
+          (proofread-languagetool--server-process-session session)
+          (proofread-languagetool--force-start-p t)
+          (proofread-languagetool--startup-timer
+           (run-at-time 60 nil #'ignore))
+          (proofread-languagetool--probe-retry-timer
+           (run-at-time 60 nil #'ignore))
+          (proofread-languagetool--probe-retry-token '(retry))
+          (proofread-languagetool--probe-timeout-timer
+           (run-at-time 60 nil #'ignore))
+          (probe-buffer
+           (generate-new-buffer " *proofread-lt-process-exit*"))
+          result
+          (waiter
+           (proofread-languagetool--new-handle
+            (proofread-languagetool-test--request)
+            (lambda (value) (setq result value)))))
+     (setq proofread-languagetool--probe-buffer probe-buffer)
+     (setq proofread-languagetool--server-waiters (list waiter))
+     (cl-letf (((symbol-function 'process-status)
+                (lambda (_process) 'exit))
+               ((symbol-function 'process-exit-status)
+                (lambda (_process) 23)))
+       (proofread-languagetool--process-sentinel
+        'owned-process "exited"))
+     (should (= proofread-languagetool--server-generation 2))
+     (proofread-languagetool-test--assert-no-readiness-work)
+     (should-not (buffer-live-p probe-buffer))
+     (should-not proofread-languagetool--server-process)
+     (should-not proofread-languagetool--server-process-session)
+     (should-not proofread-languagetool--force-start-p)
+     (should (eq proofread-languagetool--server-state 'unknown))
+     (should (eq (plist-get result :error)
+                 'languagetool-startup-failed)))))
+
+(ert-deftest
+    proofread-languagetool-test-probing-process-exit-restarts-readiness ()
+  "A probing process exit invalidates and restarts its readiness attempt."
+  (proofread-languagetool-test--with-state
+   (let* ((proofread-languagetool-auto-start nil)
+          (session
+           (proofread-languagetool--server-session-snapshot nil t))
+          (proofread-languagetool--server-session session)
+          (proofread-languagetool--server-generation 1)
+          (proofread-languagetool--server-state 'probing)
+          (proofread-languagetool--server-process 'owned-process)
+          (proofread-languagetool--server-process-session session)
+          (proofread-languagetool--force-start-p t)
+          (proofread-languagetool--probe-timeout-timer
+           (run-at-time 60 nil #'ignore))
+          (probe-buffer
+           (generate-new-buffer " *proofread-lt-probing-exit*"))
+          result
+          scheduled
+          started
+          (waiter
+           (proofread-languagetool--new-handle
+            (proofread-languagetool-test--request)
+            (lambda (value) (setq result value)))))
+     (setq proofread-languagetool--probe-buffer probe-buffer)
+     (setq proofread-languagetool--server-waiters (list waiter))
+     (cl-letf
+         (((symbol-function 'process-status)
+           (lambda (_process) 'exit))
+          ((symbol-function 'proofread-languagetool--schedule-probe)
+           (lambda (generation phase candidate delay)
+             (setq scheduled
+                   (list generation phase candidate delay))))
+          ((symbol-function
+            'proofread-languagetool--start-managed-server)
+           (lambda (generation candidate)
+             (setq started (list generation candidate)))))
+       (proofread-languagetool--process-sentinel
+        'owned-process "exited")
+       (should (= proofread-languagetool--server-generation 2))
+       (proofread-languagetool-test--assert-no-readiness-work)
+       (should-not (buffer-live-p probe-buffer))
+       (should-not proofread-languagetool--server-process)
+       (should-not proofread-languagetool--server-process-session)
+       (should (eq proofread-languagetool--server-state 'probing))
+       (should proofread-languagetool--force-start-p)
+       (should-not result)
+       (should (memq waiter proofread-languagetool--server-waiters))
+       (should (equal scheduled (list 2 'external session 0)))
+       (proofread-languagetool--server-ready 1 session)
+       (should (eq proofread-languagetool--server-state 'probing))
+       (proofread-languagetool--probe-failed
+        1 'external session)
+       (should-not started)
+       (proofread-languagetool--probe-failed
+        2 'external session)
+       (should (equal started (list 2 session)))))))
 
 (ert-deftest proofread-languagetool-test-cancel-suppresses-callback ()
   "Cancelling a request kills retrieval and suppresses its callback."
