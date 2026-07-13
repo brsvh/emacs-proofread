@@ -313,40 +313,26 @@ default overlay. For example, a NixOS configuration can use:
 
 ```nix
 {
-  inputs.emacs-proofread.url =
-    "git+https://github.com/brsvh/emacs-proofread.git";
-  inputs.nixpkgs.url =
-    "git+https://github.com/NixOS/nixpkgs?ref=nixos-unstable";
+  inputs.emacs-proofread.url = "git+https://github.com/brsvh/emacs-proofread.git";
+  inputs.nixpkgs.url = "git+https://github.com/NixOS/nixpkgs?ref=nixos-unstable";
 
   outputs =
-    {
-      emacs-proofread,
-      nixpkgs,
-      ...
-    }:
+    { emacs-proofread, nixpkgs, ... }:
     {
       nixosConfigurations.HOSTNAME =
-        nixpkgs.lib.nixosSystem {
-          system = "x86_64-linux";
-          modules = [
-            (
-              { pkgs, ... }:
-              {
-                nixpkgs.overlays = [
-                  emacs-proofread.overlays.default
-                ];
-
-                environment.systemPackages = [
-                  ((pkgs.emacsPackagesFor pkgs.emacs-pgtk).emacsWithPackages
-                    (epkgs: [
-                      epkgs.proofread
-                      epkgs.proofread-popup
-                    ]))
-                ];
-              }
-            )
-          ];
-        };
+        nixpkgs.lib.nixosSystem
+          {
+            modules = [
+              (
+                { pkgs, ... }:
+                {
+                  environment.systemPackages = [((with pkgs; emacsPackagesFor emacs-pgtk).emacsWithPackages(epkgs: with epkgs; [ proofread proofread-popup]))];
+                  nixpkgs.overlays = [ emacs-proofread.overlays.default ];
+                }
+              )
+            ];
+            system = "x86_64-linux";
+          };
     };
 }
 ```
