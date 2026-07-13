@@ -280,6 +280,55 @@
     (should (eq (car result) later-range))
     (should (eq (cadr result) earlier-range))))
 
+(ert-deftest
+    proofread-test-edit-affected-state-preserves-edit-boundaries ()
+  "Collect edit-affected state in source order without copying it."
+  (with-temp-buffer
+    (insert "abcdefghijk")
+    (proofread-mode 1)
+    (let* ((left
+            (proofread-test--diagnostic-for-range 1 3 "ab"))
+           (interior
+            (proofread-test--diagnostic-for-range 2 5 "bcd"))
+           (interior-copy (copy-sequence interior))
+           (zero
+            (proofread-test--diagnostic-for-range 3 3 ""))
+           (right
+            (proofread-test--diagnostic-for-range 3 6 "cde"))
+           (covered
+            (proofread-test--diagnostic-for-range 7 8 "g"))
+           (end-zero
+            (proofread-test--diagnostic-for-range 9 9 ""))
+           (after
+            (proofread-test--diagnostic-for-range 9 11 "ij"))
+           (diagnostics
+            (list left interior interior-copy zero right covered
+                  end-zero after))
+           (overlays (proofread-test--install-diagnostics diagnostics))
+           (interior-overlay (nth 1 overlays))
+           (interior-copy-overlay (nth 2 overlays))
+           (zero-overlay (nth 3 overlays))
+           (covered-overlay (nth 5 overlays))
+           (end-zero-overlay (nth 6 overlays)))
+      (should (equal interior interior-copy))
+      (should-not (eq interior interior-copy))
+      (let ((affected (proofread--edit-affected-state 3 3))
+            (expected-overlays
+             (list zero-overlay interior-copy-overlay interior-overlay))
+            (expected-diagnostics (list interior interior-copy zero)))
+        (should (equal (car affected) expected-overlays))
+        (should (cl-every #'eq (car affected) expected-overlays))
+        (should (equal (cdr affected) expected-diagnostics))
+        (should (cl-every #'eq (cdr affected) expected-diagnostics)))
+      (let ((affected (proofread--edit-affected-state 6 9))
+            (expected-overlays
+             (list end-zero-overlay covered-overlay))
+            (expected-diagnostics (list covered end-zero)))
+        (should (equal (car affected) expected-overlays))
+        (should (cl-every #'eq (car affected) expected-overlays))
+        (should (equal (cdr affected) expected-diagnostics))
+        (should (cl-every #'eq (cdr affected) expected-diagnostics))))))
+
 (ert-deftest proofread-test-face-defaults-avoid-fixed-colors ()
   "Proofread faces are defined without fixed color attributes."
   (dolist (face '(proofread-face proofread-current-face))
@@ -348,6 +397,43 @@
       (should-not (overlay-buffer proofread-overlay))
       (should (overlay-buffer foreign-overlay))
       (should-not proofread--diagnostics))))
+
+(ert-deftest proofread-test-before-change-paths-select-same-state ()
+  "Select the same objects for ordinary and deferred invalidation."
+  (with-temp-buffer
+    (insert "abcdef")
+    (proofread-mode 1)
+    (let* ((first
+            (proofread-test--diagnostic-for-range 2 5 "bcd"))
+           (same (copy-sequence first))
+           (outside
+            (proofread-test--diagnostic-for-range 5 7 "ef")))
+      (should (equal first same))
+      (should-not (eq first same))
+      (proofread-test--install-diagnostics (list first same outside))
+      (proofread--before-change 3 3)
+      (let ((ordinary-overlays
+             (copy-sequence proofread--pending-invalidated-overlays))
+            (ordinary-diagnostics
+             (copy-sequence proofread--pending-invalidated-diagnostics)))
+        (setq proofread--pending-invalidated-overlays nil)
+        (setq proofread--pending-invalidated-diagnostics nil)
+        (let ((proofread--inhibit-overlay-invalidation (current-buffer))
+              (proofread--deferred-correction-overlays nil)
+              (proofread--deferred-correction-diagnostics nil))
+          (proofread--before-change 3 3)
+          (proofread--before-change 3 3)
+          (should (= (length proofread--deferred-correction-overlays)
+                     (length ordinary-overlays)))
+          (should (= (length proofread--deferred-correction-diagnostics)
+                     (length ordinary-diagnostics)))
+          (dolist (overlay ordinary-overlays)
+            (should (memq overlay
+                          proofread--deferred-correction-overlays)))
+          (dolist (diagnostic ordinary-diagnostics)
+            (should
+             (memq diagnostic
+                   proofread--deferred-correction-diagnostics))))))))
 
 (ert-deftest proofread-test-disable-mode-clears-proofread-overlays ()
   "Disabling `proofread-mode' deletes proofread overlays only."

@@ -3491,22 +3491,36 @@ invalidated at its exact position."
     (proofread--ranges-conflict-p
      beg end (car range) (cdr range))))
 
+(defun proofread--edit-affected-state (beg end)
+  "Return overlays and diagnostics affected by editing BEG through END.
+The car of the result contains overlays in tracked order.  The cdr
+contains diagnostics in diagnostic order.  Preserve the identity of
+every collected object."
+  (cons
+   (cl-remove-if-not
+    (lambda (overlay)
+      (let ((range (cons (overlay-start overlay)
+                         (overlay-end overlay))))
+        (proofread--range-affected-by-edit-p range beg end)))
+    proofread--overlays)
+   (cl-remove-if-not
+    (lambda (diagnostic)
+      (when-let* ((range
+                   (proofread--diagnostic-live-range diagnostic)))
+        (proofread--range-affected-by-edit-p range beg end)))
+    proofread--diagnostics)))
+
 (defun proofread--defer-correction-invalidation (beg end)
   "Remember diagnostics affected by a correction-time change.
 BEG and END delimit the changed text."
   (proofread--prune-overlays)
-  (dolist (overlay proofread--overlays)
-    (let ((range (cons (overlay-start overlay)
-                       (overlay-end overlay))))
-      (when (proofread--range-affected-by-edit-p range beg end)
-        (cl-pushnew overlay proofread--deferred-correction-overlays
-                    :test #'eq))))
-  (dolist (diagnostic proofread--diagnostics)
-    (when-let* ((range (proofread--diagnostic-live-range diagnostic)))
-      (when (proofread--range-affected-by-edit-p range beg end)
-        (cl-pushnew diagnostic
-                    proofread--deferred-correction-diagnostics
-                    :test #'eq)))))
+  (let ((affected-state (proofread--edit-affected-state beg end)))
+    (dolist (overlay (car affected-state))
+      (cl-pushnew overlay proofread--deferred-correction-overlays
+                  :test #'eq))
+    (dolist (diagnostic (cdr affected-state))
+      (cl-pushnew diagnostic proofread--deferred-correction-diagnostics
+                  :test #'eq))))
 
 (defun proofread--before-change (beg end)
   "Capture diagnostics affected by a change from BEG to END."
@@ -3514,21 +3528,11 @@ BEG and END delimit the changed text."
   (if (proofread--overlay-invalidation-inhibited-p)
       (proofread--defer-correction-invalidation beg end)
     (proofread--prune-overlays)
-    (setq proofread--pending-invalidated-overlays
-          (cl-remove-if-not
-           (lambda (overlay)
-             (let ((range (cons (overlay-start overlay)
-                                (overlay-end overlay))))
-               (proofread--range-affected-by-edit-p range beg end)))
-           proofread--overlays))
-    (setq proofread--pending-invalidated-diagnostics
-          (cl-remove-if-not
-           (lambda (diagnostic)
-             (when-let*
-                 ((range
-                   (proofread--diagnostic-live-range diagnostic)))
-               (proofread--range-affected-by-edit-p range beg end)))
-           proofread--diagnostics))))
+    (let ((affected-state (proofread--edit-affected-state beg end)))
+      (setq proofread--pending-invalidated-overlays
+            (car affected-state))
+      (setq proofread--pending-invalidated-diagnostics
+            (cdr affected-state)))))
 
 (defun proofread--after-change (_beg _end _length)
   "Invalidate changed diagnostics and schedule proofreading."
