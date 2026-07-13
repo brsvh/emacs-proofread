@@ -2599,39 +2599,19 @@ Return one of the symbols `sent', `cached', `full', `stale', or
 (defun proofread--conflicting-request-table (requests candidates)
   "Return an eq table of CANDIDATES conflicting with REQUESTS."
   (let ((ranges
-         (sort (delq nil (mapcar #'proofread--request-range requests))
-               (lambda (left right)
-                 (or (< (car left) (car right))
-                     (and (= (car left) (car right))
-                          (< (cdr left) (cdr right)))))))
+         (delq nil (mapcar #'proofread--request-range requests)))
         (entries
-         (sort
-          (delq nil
-                (mapcar
-                 (lambda (candidate)
-                   (when-let*
-                       ((range
-                         (proofread--request-range candidate)))
-                     (cons candidate range)))
-                 candidates))
-          (lambda (left right)
-            (let ((left-range (cdr left))
-                  (right-range (cdr right)))
-              (or (< (car left-range) (car right-range))
-                  (and (= (car left-range) (car right-range))
-                       (< (cdr left-range) (cdr right-range))))))))
+         (delq nil
+               (mapcar
+                (lambda (candidate)
+                  (when-let* ((range
+                               (proofread--request-range candidate)))
+                    (cons candidate range)))
+                candidates)))
         (table (make-hash-table :test #'eq)))
-    (dolist (entry entries)
-      (let ((range (cdr entry)))
-        (while (and ranges
-                    (proofread--range-precedes-without-conflict-p
-                     (car ranges) range))
-          (setq ranges (cdr ranges)))
-        (when (and ranges
-                   (proofread--ranges-conflict-p
-                    (car range) (cdr range)
-                    (caar ranges) (cdar ranges)))
-          (puthash (car entry) t table))))
+    (dolist (entry
+             (proofread--range-conflicting-entries ranges entries))
+      (puthash (car entry) t table))
     table))
 
 (defun proofread--supersede-conflicting-requests (requests)
@@ -4887,6 +4867,39 @@ position."
        (not (proofread--ranges-conflict-p
              (car left) (cdr left) (car right) (cdr right)))))
 
+(defun proofread--range-conflicting-entries (ranges entries)
+  "Return ENTRIES whose ranges conflict with one of RANGES.
+Each element of ENTRIES must have the form (OBJECT . RANGE).  RANGE
+and every element of RANGES must be valid integer ranges of the form
+(BEG . END).  Inputs may be unsorted and are not modified.  The return
+value is ordered by range, retaining original entries, duplicate
+occurrences, and object identity."
+  (let* ((range-less-p
+          (lambda (left right)
+            (or (< (car left) (car right))
+                (and (= (car left) (car right))
+                     (< (cdr left) (cdr right))))))
+         (remaining-ranges
+          (sort (copy-sequence ranges) range-less-p))
+         (sorted-entries
+          (sort (copy-sequence entries)
+                (lambda (left right)
+                  (funcall range-less-p (cdr left) (cdr right)))))
+         conflicts)
+    (dolist (entry sorted-entries)
+      (let ((range (cdr entry)))
+        (while (and remaining-ranges
+                    (proofread--range-precedes-without-conflict-p
+                     (car remaining-ranges) range))
+          (setq remaining-ranges (cdr remaining-ranges)))
+        (when (and remaining-ranges
+                   (proofread--ranges-conflict-p
+                    (car range) (cdr range)
+                    (caar remaining-ranges)
+                    (cdar remaining-ranges)))
+          (push entry conflicts))))
+    (nreverse conflicts)))
+
 (defun proofread--overlays-affected-by-range (beg end)
   "Return proofread overlays affected by changing BEG to END."
   (let (overlays)
@@ -5101,43 +5114,25 @@ overlaps it."
 The return value is a cons cell whose car contains overlays and whose
 cdr contains diagnostics."
   (let* ((ranges
-          (sort
-           (mapcar (lambda (correction)
-                     (proofread--diagnostic-range (car correction)))
-                   corrections)
-           (lambda (left right) (< (car left) (car right)))))
+          (mapcar (lambda (correction)
+                    (proofread--diagnostic-range (car correction)))
+                  corrections))
          (entries
-          (sort
-           (delq nil
-                 (mapcar
-                  (lambda (diagnostic)
-                    (when-let* ((range
-                                 (proofread--diagnostic-range
-                                  diagnostic)))
-                      (cons diagnostic range)))
-                  proofread--diagnostics))
-           (lambda (left right)
-             (let ((left-range (cdr left))
-                   (right-range (cdr right)))
-               (or (< (car left-range) (car right-range))
-                   (and (= (car left-range) (car right-range))
-                        (< (cdr left-range) (cdr right-range))))))))
-         (remaining-ranges ranges)
+          (delq nil
+                (mapcar
+                 (lambda (diagnostic)
+                   (when-let* ((range
+                                (proofread--diagnostic-range
+                                 diagnostic)))
+                     (cons diagnostic range)))
+                 proofread--diagnostics)))
          (affected (make-hash-table :test #'eq))
          overlays
          diagnostics)
-    (dolist (entry entries)
-      (let ((range (cdr entry)))
-        (while (and remaining-ranges
-                    (proofread--range-precedes-without-conflict-p
-                     (car remaining-ranges) range))
-          (setq remaining-ranges (cdr remaining-ranges)))
-        (when (and remaining-ranges
-                   (proofread--ranges-conflict-p
-                    (car range) (cdr range)
-                    (caar remaining-ranges) (cdar remaining-ranges)))
-          (puthash (car entry) t affected)
-          (push (car entry) diagnostics))))
+    (dolist (entry
+             (proofread--range-conflicting-entries ranges entries))
+      (puthash (car entry) t affected)
+      (push (car entry) diagnostics))
     (proofread--prune-overlays)
     (dolist (overlay proofread--overlays)
       (when (gethash

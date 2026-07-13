@@ -281,6 +281,93 @@
     (should (eq (cadr result) earlier-range))))
 
 (ert-deftest
+    proofread-test-range-conflicting-entries-orders-and-preserves-items
+    ()
+  "Scan unsorted conflicts without deduplicating or copying entries."
+  (let* ((duplicate (list 'duplicate))
+         (adjacent-left (cons 'adjacent-left '(1 . 4)))
+         (contains (cons 'contains '(2 . 8)))
+         (overlap (cons 'overlap '(3 . 5)))
+         (zero-left (cons 'zero-left '(4 . 4)))
+         (contained (cons 'contained '(5 . 6)))
+         (zero-right (cons 'zero-right '(7 . 7)))
+         (adjacent-right (cons 'adjacent-right '(7 . 9)))
+         (zero-query-left (cons 'zero-query-left '(9 . 10)))
+         (zero-query-right (cons 'zero-query-right '(10 . 12)))
+         (duplicate-first (cons duplicate '(15 . 16)))
+         (duplicate-second (cons duplicate '(17 . 19)))
+         (adjacent-late (cons 'adjacent-late '(18 . 20)))
+         (ranges (list '(14 . 18) '(10 . 10) '(4 . 7)))
+         (entries
+          (list duplicate-second adjacent-left zero-right contained
+                zero-query-right contains adjacent-late overlap
+                duplicate-first adjacent-right zero-left
+                zero-query-left))
+         (original-ranges (copy-sequence ranges))
+         (original-entries (copy-sequence entries))
+         (expected
+          (list contains overlap zero-left contained zero-right
+                zero-query-left zero-query-right duplicate-first
+                duplicate-second))
+         (result
+          (proofread--range-conflicting-entries ranges entries)))
+    (should (equal ranges original-ranges))
+    (should (equal entries original-entries))
+    (should (equal result expected))
+    (should (cl-every #'eq result expected))
+    (should (= (cl-count duplicate result :key #'car :test #'eq) 2))))
+
+(ert-deftest
+    proofread-test-range-conflicting-entries-sorts-equal-starts-by-end
+    ()
+  "Find zero-width conflicts behind equal-start nonconflicts."
+  (let* ((range-entry (cons 'range-candidate '(1 . 2)))
+         (zero-entry (cons 'zero-candidate '(2 . 2)))
+         (nonconflicting-entry
+          (cons 'nonconflicting-candidate '(2 . 4)))
+         (range-result
+          (proofread--range-conflicting-entries
+           '((2 . 4) (2 . 2))
+           (list range-entry)))
+         (entry-result
+          (proofread--range-conflicting-entries
+           '((1 . 2))
+           (list nonconflicting-entry zero-entry))))
+    (should (equal range-result (list range-entry)))
+    (should (eq (car range-result) range-entry))
+    (should (equal entry-result (list zero-entry)))
+    (should (eq (car entry-result) zero-entry))))
+
+(ert-deftest proofread-test-conflicting-request-table-uses-eq-keys ()
+  "Fold repeated conflicting candidate identities into an eq table."
+  (let* ((main (list :beg 4 :end 7))
+         (zero (list :beg 10 :end 10))
+         (overlap (list :beg 3 :end 5))
+         (contains (list :beg 2 :end 8))
+         (zero-right (list :beg 7 :end 7))
+         (zero-query-left (list :beg 9 :end 10))
+         (contained (list :beg 5 :end 6))
+         (contained-copy (copy-sequence contained))
+         (adjacent-left (list :beg 1 :end 4))
+         (adjacent-right (list :beg 7 :end 9))
+         (table
+          (proofread--conflicting-request-table
+           (list zero main)
+           (list adjacent-right contained overlap contained-copy
+                 zero-query-left contains contained zero-right
+                 adjacent-left contained))))
+    (should-not (eq contained contained-copy))
+    (should (equal contained contained-copy))
+    (should (eq (hash-table-test table) #'eq))
+    (dolist (candidate
+             (list overlap contains zero-right zero-query-left
+                   contained contained-copy))
+      (should (gethash candidate table)))
+    (should-not (gethash adjacent-left table))
+    (should-not (gethash adjacent-right table))
+    (should (= (hash-table-count table) 6))))
+
+(ert-deftest
     proofread-test-edit-affected-state-preserves-edit-boundaries ()
   "Collect edit-affected state in source order without copying it."
   (with-temp-buffer
@@ -4187,6 +4274,51 @@ This covers URLs, email, invisible text, faces, and properties."
       (should (equal proofread--diagnostics (list adjacent)))
       (should (equal (proofread-diagnostic-range adjacent) '(6 . 10)))
       (should (equal (buffer-substring-no-properties 6 10) "wrld")))))
+
+(ert-deftest
+    proofread-test-corrections-affected-state-preserves-adapter-order
+    ()
+  "Keep correction affected-state ordering around the shared scan."
+  (with-temp-buffer
+    (insert "abcdefghijkl")
+    (proofread-mode 1)
+    (let* ((right-adjacent
+            (proofread-test--diagnostic-for-range 7 9 "gh"))
+           (zero-right
+            (proofread-test--diagnostic-for-range 7 7 ""))
+           (contains
+            (proofread-test--diagnostic-for-range 2 8 "bcdefg"))
+           (zero-correction
+            (proofread-test--diagnostic-for-range 10 10 ""))
+           (overlap
+            (proofread-test--diagnostic-for-range 3 5 "cd"))
+           (main
+            (proofread-test--diagnostic-for-range 4 7 "def"))
+           (left-adjacent
+            (proofread-test--diagnostic-for-range 1 4 "abc"))
+           (diagnostics
+            (list right-adjacent zero-right contains zero-correction
+                  overlap main left-adjacent))
+           (installed-overlays
+            (proofread-test--install-diagnostics diagnostics))
+           (expected-overlays
+            (list (nth 1 installed-overlays)
+                  (nth 2 installed-overlays)
+                  (nth 3 installed-overlays)
+                  (nth 4 installed-overlays)
+                  (nth 5 installed-overlays)))
+           (expected-diagnostics
+            (list zero-correction zero-right main overlap contains))
+           (affected-state
+            (proofread--corrections-affected-state
+             (list (cons zero-correction "X")
+                   (cons main "Y")))))
+      (should (equal (car affected-state) expected-overlays))
+      (should (cl-every #'eq (car affected-state)
+                        expected-overlays))
+      (should (equal (cdr affected-state) expected-diagnostics))
+      (should (cl-every #'eq (cdr affected-state)
+                        expected-diagnostics)))))
 
 (ert-deftest proofread-test-correct-buffer-prefers-navigation-order ()
   "Skip overlapping diagnostics after the first correction."
