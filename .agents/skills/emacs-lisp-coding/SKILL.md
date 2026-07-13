@@ -45,7 +45,8 @@ byte-compilation and natural for Emacs users to customize.
   `;;; package.el --- Summary  -*- lexical-binding: t; -*-`.
 - Keep conventional file structure for packages: header, `;;; Commentary:`,
   `;;; Code:`, explicit `require` forms, definitions, `(provide 'feature)`, and
-  `;;; package.el ends here`.
+  `;;; package.el ends here`. Put the footer immediately after the `provide`
+  form, with no intervening blank line.
 - Prefix public symbols with the package or feature name. Prefix private helpers
   with `package--`. Keep face names, groups, variables, functions, commands,
   keymaps, hooks, and tests in the same namespace.

@@ -560,7 +560,7 @@ Returns the processed result."
 - [ ] Custom variables use `defcustom` not `defvar`
 - [ ] Hooks use function quotes (`#'function`)
 - [ ] Predicates end in `p` or `-p`
-- [ ] File ends with `(provide 'package-name)` and footer
+- [ ] Footer immediately follows `(provide 'package-name)`, with no blank line
 - [ ] No hard tabs, only spaces
 - [ ] Line length under 80 characters where reasonable
 - [ ] All closing parens on same line
