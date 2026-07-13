@@ -10,7 +10,6 @@ permissions: {}
 concurrency:
   group: emacs-proofread-release
   cancel-in-progress: false
-  queue: max
 
 env:
   GITHUB_API_VERSION: "2026-03-10"
@@ -115,6 +114,7 @@ jobs:
 
             mkdir release-input/previous-release-assets
             gh release download "$ledger_tag" \
+              --repo "$GITHUB_REPOSITORY" \
               --pattern manifest.json \
               --dir release-input/previous-release-assets
             cmp \
@@ -155,6 +155,7 @@ jobs:
 
               mkdir release-input/current-release-assets
               gh release download "$RELEASE_TAG" \
+                --repo "$GITHUB_REPOSITORY" \
                 --pattern manifest.json \
                 --dir release-input/current-release-assets
               cmp \
@@ -349,11 +350,23 @@ jobs:
             sha256sum --check --strict SHA256SUMS
           )
 
+      - name: Check immutable releases
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.IMMUTABLE_RELEASES_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          test -n "$GH_TOKEN"
+          gh api \
+            -H "X-GitHub-Api-Version: ${GITHUB_API_VERSION}" \
+            "repos/${GITHUB_REPOSITORY}/immutable-releases" \
+            | jq -e '.enabled == true'
+
       - name: Publish or resume immutable release
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
-          RELEASE_SHA: ${{ github.sha }}
           RELEASE_TAG: ${{ github.ref_name }}
         run: |
           set -euo pipefail
@@ -364,23 +377,37 @@ jobs:
               "$@"
           }
 
-          api "repos/${GITHUB_REPOSITORY}/immutable-releases" \
-            | jq -e '.enabled == true'
+          release_by_tag() {
+            api --paginate --slurp \
+              "repos/${GITHUB_REPOSITORY}/releases?per_page=100" \
+              | jq -e --arg tag "$RELEASE_TAG" '
+                  [.[][] | select(.tag_name == $tag)]
+                  | if length == 1 then
+                      .[0]
+                    elif length == 0 then
+                      empty
+                    else
+                      error("multiple releases found for tag")
+                    end
+                '
+          }
 
           release_json=release-handoff/release.json
-          if api \
-            "repos/${GITHUB_REPOSITORY}/releases/tags/${RELEASE_TAG}" \
-            > "$release_json" 2>/dev/null; then
+          if release_by_tag > "$release_json"; then
             :
           else
-            gh release create "$RELEASE_TAG" \
-              --draft \
-              --verify-tag \
-              --target "$RELEASE_SHA" \
-              --title "$RELEASE_TAG" \
-              --notes-file release-handoff/release-notes.md
-            api \
-              "repos/${GITHUB_REPOSITORY}/releases/tags/${RELEASE_TAG}" \
+            jq -n \
+              --arg tag "$RELEASE_TAG" \
+              --rawfile body release-handoff/release-notes.md \
+              '{
+                tag_name: $tag,
+                name: $tag,
+                body: $body,
+                draft: true
+              }' > release-handoff/create-release.json
+            api --method POST \
+              --input release-handoff/create-release.json \
+              "repos/${GITHUB_REPOSITORY}/releases" \
               > "$release_json"
           fi
 
@@ -399,6 +426,7 @@ jobs:
             rm -rf release-handoff/remote-asset
             mkdir release-handoff/remote-asset
             gh release download "$RELEASE_TAG" \
+              --repo "$GITHUB_REPOSITORY" \
               --pattern "$name" \
               --dir release-handoff/remote-asset
             cmp \
@@ -411,13 +439,12 @@ jobs:
               if ! grep -Fqx \
                 "$name" release-handoff/remote-assets.txt; then
                 gh release upload "$RELEASE_TAG" \
+                  --repo "$GITHUB_REPOSITORY" \
                   "release-handoff/assets/${name}"
               fi
             done < release-handoff/expected-assets.txt
 
-            api \
-              "repos/${GITHUB_REPOSITORY}/releases/tags/${RELEASE_TAG}" \
-              > "$release_json"
+            release_by_tag > "$release_json"
             jq -r '.assets[].name' "$release_json" \
               | sort > release-handoff/remote-assets.txt
             cmp \
@@ -425,14 +452,13 @@ jobs:
               release-handoff/remote-assets.txt
 
             gh release edit "$RELEASE_TAG" \
+              --repo "$GITHUB_REPOSITORY" \
               --draft=false \
               --latest
           fi
 
           for _attempt in 1 2 3 4 5; do
-            api \
-              "repos/${GITHUB_REPOSITORY}/releases/tags/${RELEASE_TAG}" \
-              > "$release_json"
+            release_by_tag > "$release_json"
             if jq -e \
               '.draft == false and .immutable == true' \
               "$release_json" >/dev/null; then
@@ -448,6 +474,7 @@ jobs:
           mkdir published-assets
           while IFS= read -r name; do
             gh release download "$RELEASE_TAG" \
+              --repo "$GITHUB_REPOSITORY" \
               --pattern "$name" \
               --dir published-assets
             cmp \
