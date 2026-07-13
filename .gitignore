@@ -14,6 +14,7 @@
 *-pkg.el
 *.elc
 /.dir-locals.el
+/TAGS
 /dist
 
 # nix

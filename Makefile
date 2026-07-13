@@ -6,12 +6,15 @@ SHELL := /bin/sh
 # Tools and paths.
 EMACS ?= emacs
 EMACS_BATCH := $(EMACS) -Q --batch
+ETAGS ?= etags
 
 BUILD_FILE := Makefile
 DIST_DIR := dist
 LISP_DIR := lisp
 PROOFREAD_DIR := $(LISP_DIR)/proofread
 PROOFREAD_POPUP_DIR := $(LISP_DIR)/proofread-popup
+TAGS_FILE := TAGS
+TEST_DIR := test
 RELEASE_PACKAGES := proofread proofread-popup
 RELEASE_ARCHIVE_TARGETS := \
 	$(addsuffix -archive,$(RELEASE_PACKAGES))
@@ -41,6 +44,13 @@ PROOFREAD_POPUP_AUTOLOADS := \
 PROOFREAD_POPUP_ARCHIVE_STAMP := \
 	$(DIST_DIR)/.proofread-popup-archive
 
+# TAGS source files.
+TAGS_ELISP_FILES := \
+	$(sort $(shell find $(LISP_DIR) $(TEST_DIR) \
+	-type f -name '*.el' \
+	! -name '*-autoloads.el' \
+	! -name '*-pkg.el' -print))
+
 # Generated files.
 PKG_FILES := $(PROOFREAD_PKG) $(PROOFREAD_POPUP_PKG)
 AUTOLOAD_FILES := \
@@ -52,7 +62,11 @@ ELC_FILES := \
 ARCHIVE_STAMPS := \
 	$(addprefix $(DIST_DIR)/., \
 	$(addsuffix -archive,$(RELEASE_PACKAGES)))
-GENERATED_FILES := $(PKG_FILES) $(AUTOLOAD_FILES) $(ELC_FILES)
+GENERATED_FILES := \
+	$(PKG_FILES) \
+	$(AUTOLOAD_FILES) \
+	$(ELC_FILES) \
+	$(TAGS_FILE)
 
 # Batch Emacs expressions.
 # bake-format off
@@ -122,9 +136,13 @@ endef
 	proofread-popup-compile \
 	proofread-popup-archive \
 	release-archives \
-	release-artifacts
+	release-artifacts \
+	tags
 
 all: proofread proofread-popup
+
+tags:
+	$(ETAGS) --output="$(TAGS_FILE)" $(TAGS_ELISP_FILES)
 
 proofread: \
 	proofread-pkg \
