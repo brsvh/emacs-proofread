@@ -1,5 +1,38 @@
 # README for Agents
 
+## Architecture and Design
+
+- Keep exactly two first-party packages: `lisp/proofread/` contains the core and
+  every first-party backend feature, while `lisp/proofread-popup/` contains the
+  optional frontend. Add first-party backends as `proofread-<backend>.el`
+  features inside `proofread`; they share one distribution and release boundary.
+- Keep dependencies directed toward the core. The core owns provider-neutral
+  processing, orchestration, state, and aggregation; backends own options,
+  identity, external I/O, parsing, and resources. Backends must not depend on
+  one another, and the popup may depend only on the core. Keep shared invariants
+  in the core instead of copying them, importing sibling private
+  implementations, or storing derived state.
+- Model a backend profile as an ordered collection of bindings. Each binding
+  selects a registered backend and carries opaque backend-local options; an
+  empty profile disables dispatch. Do not assume one binding per backend
+  implementation. Snapshot the active profile per check, derive identity per
+  binding, construct chunks once, and fan them out through the core scheduler.
+- Give each scheduled item one binding owner and preserve that provenance in
+  queues, caches, cancellation, results, diagnostics, and logs. Work owned by
+  one binding must not cancel or supersede another binding's work. Failures are
+  isolated, and core aggregation is deterministic regardless of completion
+  order.
+- Use registration and unregistration as the only dispatch seam; third-party
+  backends require no core conditional or first-party loading metadata. Keep the
+  shared contract public, and do not add cross-package `proofread--`
+  dependencies. Submission is non-blocking and settles at most once; handles are
+  opaque, cleanup is idempotent, and per-binding identities are stable,
+  non-secret, and complete for cache compatibility.
+- Test generic registration and multi-backend behavior with provider-neutral
+  fake backends in the core suite; keep implementation tests with their backend.
+  Update build, test, packaging, documentation, and release metadata together
+  when source membership changes.
+
 ## Commits
 
 When creating a commit, use the `commit` skill. Load
