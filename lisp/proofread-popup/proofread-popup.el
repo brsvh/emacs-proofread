@@ -81,11 +81,8 @@
 (defvar-local proofread-popup--window nil
   "Window where the Proofread child frame was last positioned.")
 
-(defvar-local proofread-popup--visible-p nil
-  "Non-nil when the current Proofread child frame should be visible.")
-
 (defvar-local proofread-popup--render-state nil
-  "Window and appearance state used for the current child frame.")
+  "Render snapshot used for the current Proofread child frame.")
 
 (defvar-local proofread-popup--user-disabled-p nil
   "Non-nil when the user disabled popup integration in this buffer.")
@@ -95,7 +92,6 @@
   (setq proofread-popup--diagnostic nil)
   (setq proofread-popup--position nil)
   (setq proofread-popup--window nil)
-  (setq proofread-popup--visible-p nil)
   (setq proofread-popup--render-state nil))
 
 (defun proofread-popup--ensure-buffer-name ()
@@ -110,9 +106,9 @@
   (and proofread-popup-enabled
        (posframe-workable-p)))
 
-(defun proofread-popup--selected-buffer-p ()
-  "Return non-nil when the selected window displays this buffer."
-  (eq (window-buffer (selected-window))
+(defun proofread-popup--selected-buffer-p (window)
+  "Return non-nil when WINDOW displays the current buffer."
+  (eq (window-buffer window)
       (current-buffer)))
 
 (defun proofread-popup--message (diagnostic)
@@ -136,34 +132,38 @@
     (unless (eq value 'unspecified)
       value)))
 
-(defun proofread-popup--current-render-state ()
-  "Return state that affects child-frame placement and appearance."
-  (list (window-start)
-        (window-hscroll)
-        (window-body-width)
-        (window-body-height)
-        (window-edges)
-        (bound-and-true-p text-scale-mode-amount)
-        proofread-popup-max-width
+(defun proofread-popup--render-snapshot (window)
+  "Return the child-frame render snapshot for WINDOW."
+  (list :window-start (window-start window)
+        :window-hscroll (window-hscroll window)
+        :window-body-width (window-body-width window)
+        :window-body-height (window-body-height window)
+        :window-edges (window-edges window)
+        :text-scale (bound-and-true-p text-scale-mode-amount)
+        :max-width (max 1 proofread-popup-max-width)
+        :foreground-color
         (proofread-popup--face-color
          'proofread-popup-face :foreground)
+        :background-color
         (proofread-popup--face-color
          'proofread-popup-face :background)
+        :border-color
         (proofread-popup--face-color
          'proofread-popup-border-face :background)))
 
-(defun proofread-popup--needs-refresh-p (diagnostic position)
-  "Return non-nil when the child frame needs DIAGNOSTIC at POSITION."
+(defun proofread-popup--needs-refresh-p
+    (diagnostic position window snapshot)
+  "Return non-nil when DIAGNOSTIC needs rendering at POSITION.
+WINDOW and SNAPSHOT describe the selected display target."
   (not (and (eq diagnostic proofread-popup--diagnostic)
             (equal position proofread-popup--position)
-            (eq (selected-window) proofread-popup--window)
-            (equal (proofread-popup--current-render-state)
-                   proofread-popup--render-state))))
+            (eq window proofread-popup--window)
+            (equal snapshot proofread-popup--render-state))))
 
 (defun proofread-popup--hide ()
   "Hide the current Proofread child frame."
   (when (and proofread-popup--buffer-name
-             proofread-popup--visible-p)
+             proofread-popup--diagnostic)
     (posframe-hide proofread-popup--buffer-name))
   (proofread-popup--reset-state))
 
@@ -191,72 +191,67 @@
         (proofread-popup--reset-state)))
     t))
 
-(defun proofread-popup--anchor-position (diagnostic)
-  "Return a visible, accessible anchor position for DIAGNOSTIC."
+(defun proofread-popup--anchor-position (diagnostic window)
+  "Return DIAGNOSTIC's visible, accessible anchor in WINDOW."
   (when-let* ((range (proofread-diagnostic-range diagnostic)))
     (if (and (<= (point-min) (car range))
              (<= (car range) (point-max))
-             (pos-visible-in-window-p (car range)))
+             (pos-visible-in-window-p (car range) window))
         (car range)
       (point))))
 
-(defun proofread-popup--show (diagnostic)
-  "Show DIAGNOSTIC's message in a child frame."
-  (let ((position (proofread-popup--anchor-position diagnostic)))
-    (if (and position
-             (proofread-popup--selected-buffer-p)
-             (proofread-popup--available-p))
-        (let ((message (proofread-popup--message diagnostic)))
-          (posframe-show
-           (proofread-popup--ensure-buffer-name)
-           :string (propertize message 'face 'proofread-popup-face)
-           :position position
-           :poshandler
-           #'posframe-poshandler-point-bottom-left-corner-upward
-           :foreground-color
-           (proofread-popup--face-color
-            'proofread-popup-face :foreground)
-           :background-color
-           (proofread-popup--face-color
-            'proofread-popup-face :background)
-           :max-width (max 1 proofread-popup-max-width)
-           :min-width 1
-           :internal-border-width 1
-           :internal-border-color
-           (proofread-popup--face-color
-            'proofread-popup-border-face :background)
-           :left-fringe 3
-           :right-fringe 3
-           :accept-focus nil
-           :override-parameters
-           '((no-accept-focus . t)
-             (no-focus-on-map . t)
-             (cursor-type . nil)
-             (no-special-glyphs . t)
-             (desktop-dont-save . t))
-           :hidehandler #'proofread-popup--hidehandler)
-          (setq proofread-popup--diagnostic diagnostic)
-          (setq proofread-popup--position position)
-          (setq proofread-popup--window (selected-window))
-          (setq proofread-popup--render-state
-                (proofread-popup--current-render-state))
-          (setq proofread-popup--visible-p t))
-      (proofread-popup--hide))))
+(defun proofread-popup--show (diagnostic position window snapshot)
+  "Show DIAGNOSTIC at POSITION in WINDOW using SNAPSHOT."
+  (let ((message (proofread-popup--message diagnostic)))
+    (posframe-show
+     (proofread-popup--ensure-buffer-name)
+     :string (propertize message 'face 'proofread-popup-face)
+     :position position
+     :poshandler
+     #'posframe-poshandler-point-bottom-left-corner-upward
+     :foreground-color (plist-get snapshot :foreground-color)
+     :background-color (plist-get snapshot :background-color)
+     :max-width (plist-get snapshot :max-width)
+     :min-width 1
+     :internal-border-width 1
+     :internal-border-color (plist-get snapshot :border-color)
+     :left-fringe 3
+     :right-fringe 3
+     :accept-focus nil
+     :override-parameters
+     '((no-accept-focus . t)
+       (no-focus-on-map . t)
+       (cursor-type . nil)
+       (no-special-glyphs . t)
+       (desktop-dont-save . t))
+     :hidehandler #'proofread-popup--hidehandler)
+    (setq proofread-popup--diagnostic diagnostic)
+    (setq proofread-popup--position position)
+    (setq proofread-popup--window window)
+    (setq proofread-popup--render-state snapshot)))
 
 (defun proofread-popup--update ()
   "Update the child frame for the Proofread diagnostic at point."
   (if (and proofread-popup-mode
            proofread-mode
-           proofread-popup-enabled
-           (proofread-popup--selected-buffer-p))
-      (let* ((diagnostic (proofread-diagnostic-at-point))
-             (position
-              (and diagnostic
-                   (proofread-popup--anchor-position diagnostic))))
-        (if (and diagnostic position)
-            (when (proofread-popup--needs-refresh-p
-                   diagnostic position)
-              (proofread-popup--show diagnostic))
+           proofread-popup-enabled)
+      (let ((window (selected-window)))
+        (if (proofread-popup--selected-buffer-p window)
+            (let* ((diagnostic (proofread-diagnostic-at-point))
+                   (position
+                    (and diagnostic
+                         (proofread-popup--anchor-position
+                          diagnostic window))))
+              (if (and diagnostic position)
+                  (let ((snapshot
+                         (proofread-popup--render-snapshot window)))
+                    (when (proofread-popup--needs-refresh-p
+                           diagnostic position window snapshot)
+                      (if (proofread-popup--available-p)
+                          (proofread-popup--show
+                           diagnostic position window snapshot)
+                        (proofread-popup--hide))))
+                (proofread-popup--hide)))
           (proofread-popup--hide)))
     (proofread-popup--hide)))
 

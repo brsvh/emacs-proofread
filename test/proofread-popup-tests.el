@@ -138,6 +138,73 @@ SUGGESTIONS and MESSAGE supply the optional field values."
          (should (eq proofread-popup--diagnostic
                      (car proofread--diagnostics))))))))
 
+(ert-deftest proofread-popup-test-update-captures-render-inputs-once ()
+  "One popup update captures each render input exactly once."
+  (proofread-popup-test--with-posframe-recorder
+   (save-window-excursion
+     (with-temp-buffer
+       (switch-to-buffer (current-buffer))
+       (insert "helo")
+       (proofread-mode 1)
+       (let* ((diagnostic
+               (proofread-popup-test--diagnostic 1 5 "helo"))
+              (selected-window-function
+               (symbol-function 'selected-window))
+              (diagnostic-function
+               (symbol-function 'proofread-diagnostic-at-point))
+              (anchor-function
+               (symbol-function 'proofread-popup--anchor-position))
+              (snapshot-function
+               (symbol-function 'proofread-popup--render-snapshot))
+              (available-function
+               (symbol-function 'proofread-popup--available-p))
+              (selection-calls 0)
+              (diagnostic-calls 0)
+              (anchor-calls 0)
+              (snapshot-calls 0)
+              (available-calls 0)
+              selected-window-value
+              anchor-window
+              snapshot-window
+              snapshot)
+         (proofread-popup-test--install-diagnostics (list diagnostic))
+         (goto-char 2)
+         (cl-letf (((symbol-function 'selected-window)
+                    (lambda ()
+                      (setq selection-calls (1+ selection-calls))
+                      (setq selected-window-value
+                            (funcall selected-window-function))))
+                   ((symbol-function 'proofread-diagnostic-at-point)
+                    (lambda (&rest args)
+                      (setq diagnostic-calls (1+ diagnostic-calls))
+                      (apply diagnostic-function args)))
+                   ((symbol-function 'proofread-popup--anchor-position)
+                    (lambda (value window)
+                      (setq anchor-calls (1+ anchor-calls))
+                      (setq anchor-window window)
+                      (funcall anchor-function value window)))
+                   ((symbol-function 'proofread-popup--render-snapshot)
+                    (lambda (window)
+                      (setq snapshot-calls (1+ snapshot-calls))
+                      (setq snapshot-window window)
+                      (setq snapshot
+                            (funcall snapshot-function window))))
+                   ((symbol-function 'proofread-popup--available-p)
+                    (lambda ()
+                      (setq available-calls (1+ available-calls))
+                      (funcall available-function))))
+           (proofread-popup--update))
+         (should (= (length proofread-popup-test--shows) 1))
+         (should (= selection-calls 1))
+         (should (= diagnostic-calls 1))
+         (should (= anchor-calls 1))
+         (should (= snapshot-calls 1))
+         (should (= available-calls 1))
+         (should (eq anchor-window selected-window-value))
+         (should (eq snapshot-window selected-window-value))
+         (should (eq proofread-popup--window selected-window-value))
+         (should (eq proofread-popup--render-state snapshot)))))))
+
 (ert-deftest
     proofread-popup-test-shows-message-above-diagnostic-start ()
   "The child frame uses the diagnostic message and range start."
@@ -187,11 +254,13 @@ SUGGESTIONS and MESSAGE supply the optional field values."
        (insert "helo")
        (proofread-mode 1)
        (let ((diagnostic
-              (proofread-popup-test--diagnostic 1 5 "helo")))
+              (proofread-popup-test--diagnostic 1 5 "helo"))
+             face-attributes)
          (proofread-popup-test--install-diagnostics (list diagnostic))
          (goto-char 2)
          (cl-letf (((symbol-function 'face-attribute)
                     (lambda (face attribute &rest _args)
+                      (push (list face attribute) face-attributes)
                       (pcase (list face attribute)
                         (`(proofread-popup-face :foreground)
                          "theme-foreground")
@@ -207,7 +276,13 @@ SUGGESTIONS and MESSAGE supply the optional field values."
            (should (equal (plist-get args :background-color)
                           "theme-background"))
            (should (equal (plist-get args :internal-border-color)
-                          "theme-border"))))))))
+                          "theme-border"))
+           (should (= (length face-attributes) 3))
+           (dolist (field '((proofread-popup-face :foreground)
+                            (proofread-popup-face :background)
+                            (proofread-popup-border-face :background)))
+             (should (= (cl-count field face-attributes :test #'equal)
+                        1)))))))))
 
 (ert-deftest proofread-popup-test-does-not-refresh-same-diagnostic ()
   "Movement within one diagnostic does not redraw the child frame."
@@ -289,6 +364,51 @@ SUGGESTIONS and MESSAGE supply the optional field values."
          (should proofread-popup-test--hides)
          (should-not proofread-popup--diagnostic))))))
 
+(ert-deftest proofread-popup-test-hide-and-delete-reset-display-state ()
+  "Hide and delete reset display state without duplicate cleanup."
+  (proofread-popup-test--with-posframe-recorder
+   (save-window-excursion
+     (with-temp-buffer
+       (switch-to-buffer (current-buffer))
+       (insert "helo")
+       (proofread-mode 1)
+       (let ((diagnostic
+              (proofread-popup-test--diagnostic 1 5 "helo")))
+         (proofread-popup-test--install-diagnostics (list diagnostic))
+         (goto-char 2)
+         (proofread-popup--update)
+         (let ((popup-buffer-name proofread-popup--buffer-name))
+           (should popup-buffer-name)
+           (should (eq proofread-popup--diagnostic diagnostic))
+           (should (= proofread-popup--position 1))
+           (should (eq proofread-popup--window (selected-window)))
+           (should proofread-popup--render-state)
+           (proofread-popup--hide)
+           (should (equal proofread-popup-test--hides
+                          (list popup-buffer-name)))
+           (should (equal proofread-popup--buffer-name
+                          popup-buffer-name))
+           (should-not proofread-popup--diagnostic)
+           (should-not proofread-popup--position)
+           (should-not proofread-popup--window)
+           (should-not proofread-popup--render-state)
+           (proofread-popup--hide)
+           (should (= (length proofread-popup-test--hides) 1))
+           (proofread-popup--update)
+           (should (= (length proofread-popup-test--shows) 2))
+           (should (equal (caar proofread-popup-test--shows)
+                          popup-buffer-name))
+           (proofread-popup--delete)
+           (should (equal proofread-popup-test--deletes
+                          (list popup-buffer-name)))
+           (should-not proofread-popup--buffer-name)
+           (should-not proofread-popup--diagnostic)
+           (should-not proofread-popup--position)
+           (should-not proofread-popup--window)
+           (should-not proofread-popup--render-state)
+           (proofread-popup--delete)
+           (should (= (length proofread-popup-test--deletes) 1))))))))
+
 (ert-deftest
     proofread-popup-test-hidehandler-allows-reshow-after-switch ()
   "The popup returns after Posframe's hide handler runs."
@@ -308,13 +428,21 @@ SUGGESTIONS and MESSAGE supply the optional field values."
                (goto-char 2)
                (proofread-popup--update)
                (let* ((args (cdar proofread-popup-test--shows))
-                      (hidehandler (plist-get args :hidehandler)))
+                      (hidehandler (plist-get args :hidehandler))
+                      (popup-buffer-name proofread-popup--buffer-name))
                  (switch-to-buffer other)
                  (should
                   (funcall
                    hidehandler
                    (list :posframe-parent-buffer
                          (cons nil source))))
+                 (with-current-buffer source
+                   (should (equal proofread-popup--buffer-name
+                                  popup-buffer-name))
+                   (should-not proofread-popup--diagnostic)
+                   (should-not proofread-popup--position)
+                   (should-not proofread-popup--window)
+                   (should-not proofread-popup--render-state))
                  (switch-to-buffer source)
                  (proofread-popup--update)
                  (should
@@ -339,6 +467,32 @@ SUGGESTIONS and MESSAGE supply the optional field values."
          (goto-char 2)
          (proofread-popup--update)
          (should-not proofread-popup-test--shows))))))
+
+(ert-deftest proofread-popup-test-unavailable-refresh-hides-frame ()
+  "An unavailable Posframe hides a popup that needs refreshing."
+  (proofread-popup-test--with-posframe-recorder
+   (save-window-excursion
+     (with-temp-buffer
+       (switch-to-buffer (current-buffer))
+       (insert "helo")
+       (proofread-mode 1)
+       (let ((diagnostic
+              (proofread-popup-test--diagnostic 1 5 "helo")))
+         (proofread-popup-test--install-diagnostics (list diagnostic))
+         (goto-char 2)
+         (proofread-popup--update)
+         (let ((proofread-popup-max-width
+                (1+ proofread-popup-max-width)))
+           (cl-letf (((symbol-function 'posframe-workable-p)
+                      (lambda ()
+                        nil)))
+             (proofread-popup--update)))
+         (should (= (length proofread-popup-test--shows) 1))
+         (should (= (length proofread-popup-test--hides) 1))
+         (should-not proofread-popup--diagnostic)
+         (should-not proofread-popup--position)
+         (should-not proofread-popup--window)
+         (should-not proofread-popup--render-state))))))
 
 (ert-deftest proofread-popup-test-manual-opt-out-persists ()
   "A manual popup opt-out survives core mode disable and re-enable."
