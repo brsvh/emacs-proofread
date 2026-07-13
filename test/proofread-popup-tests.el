@@ -294,7 +294,7 @@ SUGGESTIONS and MESSAGE supply the optional field values."
                   (funcall
                    hidehandler
                    (list :posframe-parent-buffer
-			 (cons nil source))))
+                         (cons nil source))))
                  (switch-to-buffer source)
                  (proofread-popup--update)
                  (should

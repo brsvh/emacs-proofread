@@ -27,6 +27,15 @@
         (proofread-llm-test--tree-member-p needle (cdr tree))))
    (t nil)))
 
+(defun proofread-llm-test--schema-property-names (schema)
+  "Return the property names declared by object SCHEMA."
+  (let ((properties (plist-get schema :properties))
+        names)
+    (while properties
+      (push (substring (symbol-name (car properties)) 1) names)
+      (setq properties (cddr properties)))
+    (nreverse names)))
+
 (defun proofread-llm-test--diagnostic-for-range (beg end text)
   "Return a sample diagnostic for BEG, END, and TEXT."
   (proofread--make-diagnostic
@@ -160,7 +169,7 @@
                                 ,proofread-llm-test--provider-identity
                                 :response-strategy prompt-json
                                 :diagnostic-passes 3
-                                :contract-version 2)))
+                                :contract-version 3)))
       (should (proofread--backend-identity-p
                (plist-get request :backend-identity)))
       (proofread--cache-write-request request (list diagnostic))
@@ -305,7 +314,7 @@
           (should (integerp (plist-get provider :session))))
         (should (eq (plist-get identity :response-strategy)
                     'prompt-json))
-        (should (= (plist-get identity :contract-version) 2))
+        (should (= (plist-get identity :contract-version) 3))
         (should-not (string-match-p
                      "secret-token"
                      (prin1-to-string identity)))
@@ -815,39 +824,40 @@
           (should-not proofread--overlays))))))
 
 (ert-deftest proofread-llm-test-invalid-success-response-is-error ()
-  "Turn unparsable LLM success responses into errors."
-  (with-temp-buffer
-    (insert "helo")
-    (proofread-mode 1)
-    (let ((proofread-llm-provider 'proofread-llm-test-provider)
-          calls
-          result)
-      (cl-letf (((symbol-function 'llm-chat-async)
-                 (lambda (_provider _prompt success _error
-                                    &optional _multi-output)
-                   (setq calls (1+ (or calls 0)))
-                   (funcall success "not json")
-                   'proofread-llm-test-handle))
-                ((symbol-function 'llm-capabilities)
-                 #'proofread-llm-test--capabilities))
-        (let* ((chunk (car (proofread--request-ready-chunks-for-ranges
-                            (list (cons (point-min) (point-max))))))
-               (request (proofread--make-backend-request chunk 'llm)))
-          (should (proofread--dispatch-backend-request
-                   request
-                   (lambda (backend-result)
-                     (setq result backend-result)
-                     (proofread--handle-backend-result
-                      backend-result))
-                   'llm))
-          (should (proofread-llm-test--wait-for (lambda () result)))
-          (should (= calls 1))
-          (should (eq (plist-get result :status) 'error))
-          (should (eq (plist-get result :error)
-                      'llm-invalid-response))
-          (should-not proofread--active-requests)
-          (should-not proofread--overlays)
-          (should (= (hash-table-count proofread--cache) 0)))))))
+  "Turn malformed and non-string LLM success responses into errors."
+  (dolist (response '("not json" (:diagnostics nil)))
+    (with-temp-buffer
+      (insert "helo")
+      (proofread-mode 1)
+      (let ((proofread-llm-provider 'proofread-llm-test-provider)
+            calls
+            result)
+        (cl-letf (((symbol-function 'llm-chat-async)
+                   (lambda (_provider _prompt success _error
+                                      &optional _multi-output)
+                     (setq calls (1+ (or calls 0)))
+                     (funcall success response)
+                     'proofread-llm-test-handle))
+                  ((symbol-function 'llm-capabilities)
+                   #'proofread-llm-test--capabilities))
+          (let* ((chunk (car (proofread--request-ready-chunks-for-ranges
+                              (list (cons (point-min) (point-max))))))
+                 (request (proofread--make-backend-request chunk 'llm)))
+            (should (proofread--dispatch-backend-request
+                     request
+                     (lambda (backend-result)
+                       (setq result backend-result)
+                       (proofread--handle-backend-result
+                        backend-result))
+                     'llm))
+            (should (proofread-llm-test--wait-for (lambda () result)))
+            (should (= calls 1))
+            (should (eq (plist-get result :status) 'error))
+            (should (eq (plist-get result :error)
+                        'llm-invalid-response))
+            (should-not proofread--active-requests)
+            (should-not proofread--overlays)
+            (should (= (hash-table-count proofread--cache) 0))))))))
 
 (ert-deftest proofread-llm-test-stale-results-are-dropped ()
   "Cancel or stale LLM results after invalidating their source."
@@ -954,13 +964,38 @@
       (should-not (string-match-p "absolute buffer" prompt)))))
 
 (ert-deftest
-    proofread-llm-test-structured-response-schema-encodes-json-false ()
-  "Structured response schema encodes false as a JSON boolean."
-  (let ((schema (proofread-llm--structured-response-schema-text)))
-    (should (string-match-p "\"additionalProperties\":false" schema))
-    (should-not (string-match-p "\"source\"" schema))
-    (should-not
-     (string-match-p "\"additionalProperties\":\"false\"" schema))))
+    proofread-llm-test-structured-response-schema-matches-parser-contract ()
+  "Keep every response object closed under the parser contract."
+  (let* ((root proofread-llm--structured-response-schema)
+         (diagnostics
+          (plist-get (plist-get root :properties) :diagnostics))
+         (candidate (plist-get diagnostics :items))
+         (range
+          (plist-get (plist-get candidate :properties) :range)))
+    (dolist
+        (entry
+         (list (list root '("diagnostics"))
+               (list candidate
+                     '("kind" "message" "text" "range" "suggestions"))
+               (list range '("beg" "end"))))
+      (let ((schema (car entry))
+            (fields (cadr entry)))
+        (should (equal (plist-get schema :type) "object"))
+        (should (equal (proofread-llm-test--schema-property-names schema)
+                       fields))
+        (should (equal (append (plist-get schema :required) nil)
+                       fields))
+        (should (plist-member schema :additionalProperties))
+        (should (eq (plist-get schema :additionalProperties)
+                    json-false))))
+    (should-not (proofread-llm--json-schema-property root "source"))
+    (let ((schema-text (proofread-llm--structured-response-schema-text)))
+      (should (string-match-p "\"additionalProperties\":false"
+                              schema-text))
+      (should-not (string-match-p "\"source\"" schema-text))
+      (should-not
+       (string-match-p "\"additionalProperties\":\"false\""
+                       schema-text)))))
 
 (ert-deftest
     proofread-llm-test-structured-response-extra-text-around-payload-is-error
@@ -1262,7 +1297,7 @@
 
 (ert-deftest
     proofread-llm-test-structured-response-unknown-fields-are-scoped ()
-  "Unknown root fields are fatal while candidate fields are isolated."
+  "Reject root fields while isolating candidate and range fields."
   (with-temp-buffer
     (insert "helo")
     (let* ((chunk (car (proofread--request-ready-chunks-for-ranges

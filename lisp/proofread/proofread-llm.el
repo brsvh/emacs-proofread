@@ -71,7 +71,7 @@ of 1 uses a single LLM call."
   :set #'proofread--set-positive-integer-option
   :group 'proofread)
 
-(defconst proofread-llm--contract-version 2
+(defconst proofread-llm--contract-version 3
   "Version of the LLM prompt, response, and cache identity contract.")
 
 (defconst proofread-llm--diagnostic-kind-names
@@ -118,36 +118,30 @@ of 1 uses a single LLM call."
   "Provider-independent instructions for structured responses.")
 
 (defconst proofread-llm--structured-response-schema
-  `(:type "object"
-	  :properties
-	  (:diagnostics
-	   (:type "array"
-		  :items
-		  (:type "object"
-			 :properties
-			 (:kind
-			  (:type "string"
-				 :enum
-				 ,proofread-llm--diagnostic-kind-names)
-			  :message (:type "string")
-			  :text (:type "string")
-			  :range
-			  (:type "object"
-				 :properties
-				 (:beg
-				  (:type "integer")
-				  :end
-				  (:type "integer"))
-				 :required ["beg" "end"]
-				 :additionalProperties ,json-false)
-			  :suggestions
-			  (:type "array"
-				 :items
-				 (:type "string")))
-			 :required ["kind" "message" "text" "range"
-				    "suggestions"]
-			 :additionalProperties ,json-false)))
-	  :required ["diagnostics"])
+  `( :type "object"
+     :properties
+     ( :diagnostics
+       ( :type "array"
+         :items
+         ( :type "object"
+           :properties
+           ( :kind ( :type "string"
+                     :enum ,proofread-llm--diagnostic-kind-names)
+             :message ( :type "string")
+             :text ( :type "string")
+             :range
+             ( :type "object"
+               :properties ( :beg ( :type "integer")
+                             :end ( :type "integer"))
+               :required ["beg" "end"]
+               :additionalProperties ,json-false)
+             :suggestions
+             ( :type "array"
+               :items ( :type "string")))
+           :required ["kind" "message" "text" "range" "suggestions"]
+           :additionalProperties ,json-false)))
+     :required ["diagnostics"]
+     :additionalProperties ,json-false)
   "JSON schema for structured LLM responses.")
 
 (defun proofread-llm--backend-invalid-diagnostics-result
@@ -241,17 +235,6 @@ them."
    (or (plist-get request :text) "")
    (or (plist-get request :context-after) "")))
 
-(defconst proofread-llm--json-keywords
-  '(("diagnostics" . :diagnostics)
-    ("kind" . :kind)
-    ("message" . :message)
-    ("text" . :text)
-    ("range" . :range)
-    ("beg" . :beg)
-    ("end" . :end)
-    ("suggestions" . :suggestions))
-  "Known structured-response JSON keys and their Lisp keywords.")
-
 (defconst proofread-llm--empty-json-object 'proofread-llm--empty-json-object
   "Sentinel preserving an empty JSON object's type.")
 
@@ -261,23 +244,22 @@ them."
 (defconst proofread-llm--json-null 'proofread-llm--json-null
   "Sentinel preserving a JSON null value's type.")
 
-(defun proofread-llm--json-object-keys (context)
-  "Return allowed JSON object keys for CONTEXT."
-  (pcase context
-    ('root '("diagnostics"))
-    ('candidate '("kind" "message" "text" "range" "suggestions"))
-    ('range '("beg" "end"))
-    (_ nil)))
+(defun proofread-llm--json-schema-property (schema key)
+  "Return the property entry for string KEY in SCHEMA, or nil.
+The entry is a cons whose car is the known keyword and whose cdr is
+the child schema.  Unknown keys are not interned."
+  (let ((properties (plist-get schema :properties))
+        property)
+    (while (and properties (not property))
+      (let ((keyword (pop properties))
+            (child-schema (pop properties)))
+        (when (equal key (substring (symbol-name keyword) 1))
+          (setq property (cons keyword child-schema)))))
+    property))
 
-(defun proofread-llm--json-child-context (context key)
-  "Return child JSON context below CONTEXT at KEY."
-  (pcase (cons context key)
-    (`(root . "diagnostics") 'diagnostics)
-    (`(candidate . "range") 'range)
-    (`(candidate . "suggestions") 'suggestions)))
-
-(defun proofread-llm--normalize-json-value (value context)
-  "Return VALUE converted from JSON data for CONTEXT."
+(defun proofread-llm--normalize-json-value (value schema &optional context)
+  "Return VALUE normalized according to SCHEMA.
+CONTEXT names the containing object for error messages."
   (cond
    ((listp value)
     (if (null value)
@@ -285,36 +267,36 @@ them."
       (let ((seen (make-hash-table :test #'equal))
             plist)
         (dolist (field value)
-          (let ((key (car field))
-                (item (cdr field)))
-            (unless (member key (proofread-llm--json-object-keys context))
+          (let* ((key (car field))
+                 (item (cdr field))
+                 (property
+                  (proofread-llm--json-schema-property schema key)))
+            (unless property
               (error "Unexpected %s field: %s" context key))
             (when (gethash key seen)
               (error "Duplicate %s field: %s" context key))
             (puthash key t seen)
             (setq plist
                   (plist-put
-                   plist (cdr (assoc key proofread-llm--json-keywords))
+                   plist (car property)
                    (proofread-llm--normalize-json-value
-                    item
-                    (proofread-llm--json-child-context context key))))))
+                    item (cdr property) key)))))
         (or plist proofread-llm--empty-json-object))))
    ((vectorp value)
-    (let ((child-context
-           (pcase context
-             ('diagnostics 'candidate)
-             ('suggestions 'suggestion))))
+    (let* ((child-schema (plist-get schema :items))
+           (candidate-items-p
+            (equal (plist-get child-schema :type) "object")))
       (vconcat
        (mapcar (lambda (item)
-                 (if (eq child-context 'candidate)
+                 (if candidate-items-p
                      (condition-case err
                          (proofread-llm--normalize-json-value
-                          item child-context)
+                          item child-schema 'candidate)
                        (error
                         (list :candidate-error
                               (error-message-string err))))
                    (proofread-llm--normalize-json-value
-                    item child-context)))
+                    item child-schema context)))
                value))))
    (t value)))
 
@@ -339,7 +321,8 @@ them."
           (json-key-type 'string)
           (json-null proofread-llm--json-null)
           (json-false proofread-llm--json-false))
-      (proofread-llm--normalize-json-value (json-read) 'root))))
+      (proofread-llm--normalize-json-value
+       (json-read) proofread-llm--structured-response-schema 'root))))
 
 (defun proofread-llm--structured-response-payload (content)
   "Return structured response payload from CONTENT."
@@ -381,12 +364,6 @@ REPORTED-DIAGNOSTICS are included to avoid duplicates across passes."
        request t reported-diagnostics)))
     (_ (error "Unsupported llm response strategy: %S" strategy))))
 
-(defun proofread-llm--response-content (response)
-  "Return structured response content from LLM RESPONSE."
-  (unless (stringp response)
-    (error "Invalid llm structured response"))
-  response)
-
 (defun proofread-llm--diagnostic-metadata-for-pass (items pass)
   "Return copies of diagnostic metadata ITEMS annotated with PASS."
   (mapcar (lambda (item)
@@ -407,9 +384,7 @@ PASS identifies the diagnostic pass for request logging."
             (let*
                 ((batch
                   (proofread-llm--diagnostic-batch-from-structured-response
-                   request
-                   (proofread-llm--response-content response)
-                   'llm))
+                   request response 'llm))
                  (diagnostics (plist-get batch :diagnostics))
                  (issues
                   (proofread-llm--diagnostic-metadata-for-pass
