@@ -105,6 +105,11 @@
                 (equal (plist-get chunk :text) text))
               chunks))
 
+(defun proofread-test--request-ready-chunks-for-ranges (ranges)
+  "Return request-ready chunks from target islands selected by RANGES."
+  (proofread--request-ready-chunks-for-islands
+   (proofread--target-islands-for-ranges ranges)))
+
 (defun proofread-test--wait-for (predicate &optional timeout)
   "Wait until PREDICATE returns non-nil or TIMEOUT seconds pass."
   (let ((deadline (+ (float-time) (or timeout 1.0)))
@@ -1866,7 +1871,7 @@ range; no available backend"))))))
                            '(face proofread-test-ignore))
       (add-text-properties drop-beg drop-end
                            '(proofread-test-ignore t))
-      (let* ((chunks (proofread--request-ready-chunks-for-ranges
+      (let* ((chunks (proofread-test--request-ready-chunks-for-ranges
                       (list (cons (point-min) (point-max)))))
              (text (mapconcat #'identity
                               (proofread-test--chunk-texts chunks)
@@ -1917,7 +1922,7 @@ range; no available backend"))))))
   (with-temp-buffer
     (insert "Alpha http://example.com/path Beta")
     (let* ((proofread-context-size 0)
-           (chunks (proofread--request-ready-chunks-for-ranges
+           (chunks (proofread-test--request-ready-chunks-for-ranges
                     (list (cons (point-min) (point-max)))))
            (texts (proofread-test--chunk-texts chunks)))
       (should (equal texts '("Alpha " " Beta")))
@@ -1929,7 +1934,7 @@ range; no available backend"))))))
   (with-temp-buffer
     (insert "Alpha user@example.com Beta")
     (let* ((proofread-context-size 0)
-           (chunks (proofread--request-ready-chunks-for-ranges
+           (chunks (proofread-test--request-ready-chunks-for-ranges
                     (list (cons (point-min) (point-max)))))
            (texts (proofread-test--chunk-texts chunks)))
       (should (equal texts '("Alpha " " Beta")))
@@ -1952,7 +1957,7 @@ range; no available backend"))))))
                            '(face (bold proofread-test-ignore)))
       (should (equal
                (proofread-test--chunk-texts
-                (proofread--request-ready-chunks-for-ranges
+                (proofread-test--request-ready-chunks-for-ranges
                  (list (cons (point-min) (point-max)))))
                '("Alpha " " Beta"))))))
 
@@ -1972,7 +1977,7 @@ range; no available backend"))))))
                            '(proofread-test-ignore t))
       (should (equal
                (proofread-test--chunk-texts
-                (proofread--request-ready-chunks-for-ranges
+                (proofread-test--request-ready-chunks-for-ranges
                  (list (cons (point-min) (point-max)))))
                '("Alpha " " Beta"))))))
 
@@ -1989,7 +1994,7 @@ range; no available backend"))))))
       (add-text-properties hidden-beg hidden-end '(invisible t))
       (should (equal
                (proofread-test--chunk-texts
-                (proofread--request-ready-chunks-for-ranges
+                (proofread-test--request-ready-chunks-for-ranges
                  (list (cons (point-min) (point-max)))))
                '("Alpha " " Beta"))))))
 
@@ -2000,7 +2005,7 @@ range; no available backend"))))))
     (let ((proofread-language "en")
           (proofread-context-size 80))
       (insert "Keep http://example.com TARGET tail")
-      (let ((chunks (proofread--request-ready-chunks-for-ranges
+      (let ((chunks (proofread-test--request-ready-chunks-for-ranges
                      (list (cons (point-min) (point-max))))))
         (should (equal (proofread-test--chunk-texts chunks)
                        '("Keep " " TARGET tail")))
@@ -2028,7 +2033,7 @@ range; no available backend"))))))
     (insert "前文。目标句。后文。")
     (let* ((proofread-language "zh")
            (proofread-context-size 300)
-           (chunks (proofread--request-ready-chunks-for-ranges
+           (chunks (proofread-test--request-ready-chunks-for-ranges
                     (list (cons (point-min) (point-max)))))
            (chunk (proofread-test--chunk-with-text chunks
                                                    "目标句。")))
@@ -2044,7 +2049,7 @@ range; no available backend"))))))
            (proofread-context-size 300)
            (proofread-context-sentences-before 2)
            (proofread-context-sentences-after 2)
-           (chunks (proofread--request-ready-chunks-for-ranges
+           (chunks (proofread-test--request-ready-chunks-for-ranges
                     (list (cons (point-min) (point-max)))))
            (chunk (proofread-test--chunk-with-text chunks "目标。")))
       (should chunk)
@@ -2059,7 +2064,7 @@ range; no available backend"))))))
            (proofread-context-size 300)
            (proofread-context-sentences-before 0)
            (proofread-context-sentences-after 0)
-           (chunks (proofread--request-ready-chunks-for-ranges
+           (chunks (proofread-test--request-ready-chunks-for-ranges
                     (list (cons (point-min) (point-max)))))
            (chunk (proofread-test--chunk-with-text chunks
                                                    "目标句。")))
@@ -2074,7 +2079,7 @@ range; no available backend"))))))
     (insert "前半句\n后半句。目标句。")
     (let* ((proofread-language "zh")
            (proofread-context-size 300)
-           (chunks (proofread--request-ready-chunks-for-ranges
+           (chunks (proofread-test--request-ready-chunks-for-ranges
                     (list (cons (point-min) (point-max)))))
            (chunk (proofread-test--chunk-with-text chunks
                                                    "目标句。")))
@@ -2094,9 +2099,9 @@ range; no available backend"))))))
     (let* ((proofread-language "zh")
            (proofread-context-size 300)
            (range (list (cons (point-min) (point-max))))
-           (plain (proofread--request-ready-chunks-for-ranges range)))
+           (plain (proofread-test--request-ready-chunks-for-ranges range)))
       (visual-line-mode 1)
-      (let ((wrapped (proofread--request-ready-chunks-for-ranges
+      (let ((wrapped (proofread-test--request-ready-chunks-for-ranges
                       range)))
         (should (equal (proofread-test--chunk-texts wrapped)
                        (proofread-test--chunk-texts plain)))
@@ -2115,7 +2120,7 @@ range; no available backend"))))))
     (insert "前文。\n\n目标句。\n\n后文。")
     (let* ((proofread-language "zh")
            (proofread-context-size 300)
-           (chunks (proofread--request-ready-chunks-for-ranges
+           (chunks (proofread-test--request-ready-chunks-for-ranges
                     (list (cons (point-min) (point-max)))))
            (chunk (proofread-test--chunk-with-text chunks
                                                    "目标句。")))
@@ -2141,7 +2146,7 @@ range; no available backend"))))))
       (insert text)
       (let* ((proofread-language "zh")
              (proofread-context-size 300)
-             (chunks (proofread--request-ready-chunks-for-ranges
+             (chunks (proofread-test--request-ready-chunks-for-ranges
                       (list (cons (point-min) (point-max)))))
              (chunk (proofread-test--chunk-with-text chunks
                                                      "目标句。")))
@@ -2181,7 +2186,7 @@ This covers URLs, email, invisible text, faces, and properties."
                            '(face proofread-test-ignore))
       (add-text-properties drop-beg drop-end
                            '(proofread-test-ignore t))
-      (let* ((chunks (proofread--request-ready-chunks-for-ranges
+      (let* ((chunks (proofread-test--request-ready-chunks-for-ranges
                       (list (cons (point-min) (point-max)))))
              (chunk (proofread-test--chunk-with-text chunks
                                                      "目标句。"))
@@ -2201,7 +2206,7 @@ This covers URLs, email, invisible text, faces, and properties."
     (insert "很长很长的前置句子。目标句。")
     (let* ((proofread-language "zh")
            (proofread-context-size 4)
-           (chunks (proofread--request-ready-chunks-for-ranges
+           (chunks (proofread-test--request-ready-chunks-for-ranges
                     (list (cons (point-min) (point-max)))))
            (chunk (proofread-test--chunk-with-text chunks "目标句。"))
            (beg (plist-get chunk :beg))
@@ -2234,7 +2239,7 @@ This covers URLs, email, invisible text, faces, and properties."
     (let ((proofread-language "en")
           (proofread-test--backend-identity-token "identity-a"))
       (insert "Alpha")
-      (let* ((chunk (car (proofread--request-ready-chunks-for-ranges
+      (let* ((chunk (car (proofread-test--request-ready-chunks-for-ranges
                           (list (cons (point-min) (point-max))))))
              (base-key (proofread--cache-key chunk proofread-test--backend)))
         (let ((proofread-test--backend-identity-token "identity-b"))
@@ -2495,7 +2500,7 @@ This covers URLs, email, invisible text, faces, and properties."
     (insert "helo wrld")
     (proofread-mode 1)
     (let* ((chunk
-            (car (proofread--request-ready-chunks-for-ranges
+            (car (proofread-test--request-ready-chunks-for-ranges
                   (list (cons (point-min) (point-max))))))
            (request (proofread--make-backend-request
                      chunk proofread-test--backend))
@@ -2526,7 +2531,7 @@ This covers URLs, email, invisible text, faces, and properties."
     (insert "helo bad wrld")
     (proofread-mode 1)
     (let* ((chunk
-            (car (proofread--request-ready-chunks-for-ranges
+            (car (proofread-test--request-ready-chunks-for-ranges
                   (list (cons (point-min) (point-max))))))
            (request (proofread--make-backend-request
                      chunk proofread-test--backend))
@@ -2615,7 +2620,7 @@ This covers URLs, email, invisible text, faces, and properties."
             (proofread-mode 1)
             (let* ((proofread-backend proofread-test--backend)
                    (proofread-context-size 0)
-                   (chunks (proofread--request-ready-chunks-for-ranges
+                   (chunks (proofread-test--request-ready-chunks-for-ranges
                             (list (cons (point-min) (point-max)))))
                    (cached-request
                     (proofread--make-backend-request (car chunks)
@@ -2653,7 +2658,7 @@ This covers URLs, email, invisible text, faces, and properties."
     (proofread-mode 1)
     (let* ((proofread-backend proofread-test--backend)
            (proofread-test--backend-identity-token "identity-a")
-           (chunk (car (proofread--request-ready-chunks-for-ranges
+           (chunk (car (proofread-test--request-ready-chunks-for-ranges
                         (list (cons (point-min) (point-max))))))
            (request (proofread--make-backend-request
                      chunk proofread-test--backend))
@@ -2674,7 +2679,7 @@ This covers URLs, email, invisible text, faces, and properties."
   (with-temp-buffer
     (insert "helo")
     (proofread-mode 1)
-    (let* ((chunk (car (proofread--request-ready-chunks-for-ranges
+    (let* ((chunk (car (proofread-test--request-ready-chunks-for-ranges
                         (list (cons (point-min) (point-max))))))
            (request (proofread--make-backend-request
                      chunk proofread-test--backend))
@@ -2688,7 +2693,7 @@ This covers URLs, email, invisible text, faces, and properties."
       (should (= (hash-table-count proofread--cache) 0))
       (let ((fresh-request
              (proofread--make-backend-request
-              (car (proofread--request-ready-chunks-for-ranges
+              (car (proofread-test--request-ready-chunks-for-ranges
                     (list (cons (point-min) (point-max)))))
               proofread-test--backend)))
         (should (eq (proofread--handle-backend-result
@@ -2703,7 +2708,7 @@ This covers URLs, email, invisible text, faces, and properties."
   (with-temp-buffer
     (insert "helo")
     (proofread-mode 1)
-    (let* ((chunk (car (proofread--request-ready-chunks-for-ranges
+    (let* ((chunk (car (proofread-test--request-ready-chunks-for-ranges
                         (list (cons (point-min) (point-max))))))
            (request (proofread--make-backend-request chunk))
            (diagnostic
@@ -2799,7 +2804,7 @@ This covers URLs, email, invisible text, faces, and properties."
   (with-temp-buffer
     (insert "helo")
     (let* ((proofread-backend 'unknown-backend)
-           (chunk (car (proofread--request-ready-chunks-for-ranges
+           (chunk (car (proofread-test--request-ready-chunks-for-ranges
                         (list (cons (point-min) (point-max))))))
            (request
             (proofread--make-backend-request
@@ -2843,7 +2848,7 @@ This covers URLs, email, invisible text, faces, and properties."
     (let ((proofread-language "en")
           (proofread-context-size 3))
       (insert "abcTARGETxyz")
-      (let* ((chunk (car (proofread--request-ready-chunks-for-ranges
+      (let* ((chunk (car (proofread-test--request-ready-chunks-for-ranges
                           '((4 . 10)))))
              (request (proofread--make-backend-request chunk)))
         (dolist (key proofread--backend-request-keys)
@@ -2863,7 +2868,7 @@ This covers URLs, email, invisible text, faces, and properties."
   "Unsupported backends report an asynchronous protocol error."
   (with-temp-buffer
     (insert "Alpha")
-    (let* ((chunk (car (proofread--request-ready-chunks-for-ranges
+    (let* ((chunk (car (proofread-test--request-ready-chunks-for-ranges
                         (list (cons (point-min) (point-max))))))
            (request (proofread--make-backend-request chunk))
            result)
@@ -2886,7 +2891,7 @@ This covers URLs, email, invisible text, faces, and properties."
     (proofread-test--with-backend-success
      nil
      (let* ((buffer (current-buffer))
-            (chunk (car (proofread--request-ready-chunks-for-ranges
+            (chunk (car (proofread-test--request-ready-chunks-for-ranges
                          (list (cons (point-min) (point-max))))))
             (request (proofread--make-backend-request chunk))
             result
@@ -2915,7 +2920,7 @@ This covers URLs, email, invisible text, faces, and properties."
     (let* ((proofread-backend proofread-test--backend)
            (buffer (current-buffer))
            (before-text (buffer-string))
-           (chunk (car (proofread--request-ready-chunks-for-ranges
+           (chunk (car (proofread-test--request-ready-chunks-for-ranges
                         (list (cons (point-min) (point-max))))))
            (request (proofread--make-backend-request chunk))
            result
@@ -3140,13 +3145,13 @@ This covers URLs, email, invisible text, faces, and properties."
                (insert "Alpha")
                (proofread-mode 1)
                (proofread--dispatch-request-ready-chunks
-                (proofread--request-ready-chunks-for-ranges
+                (proofread-test--request-ready-chunks-for-ranges
                  (list (cons (point-min) (point-max))))))
              (with-current-buffer second-buffer
                (insert "Beta")
                (proofread-mode 1)
                (proofread--dispatch-request-ready-chunks
-                (proofread--request-ready-chunks-for-ranges
+                (proofread-test--request-ready-chunks-for-ranges
                  (list (cons (point-min) (point-max))))))
              (with-current-buffer first-buffer
                (should (= (length proofread--active-requests) 1))
@@ -3216,7 +3221,7 @@ This covers URLs, email, invisible text, faces, and properties."
     (insert "helo")
     (proofread-mode 1)
     (let* ((chunk
-            (car (proofread--request-ready-chunks-for-ranges
+            (car (proofread-test--request-ready-chunks-for-ranges
                   (list (cons (point-min) (point-max))))))
            (request (proofread--make-backend-request
                      chunk proofread-test--backend))
@@ -3247,7 +3252,7 @@ This covers URLs, email, invisible text, faces, and properties."
            (proofread-backend proofread-test--backend)
            (proofread-context-size 300)
            (chunk (proofread-test--chunk-with-text
-                   (proofread--request-ready-chunks-for-ranges
+                   (proofread-test--request-ready-chunks-for-ranges
                     (list (cons (point-min) (point-max))))
                    "目标句。"))
            (request (proofread--make-backend-request chunk))
@@ -3517,7 +3522,7 @@ This covers URLs, email, invisible text, faces, and properties."
               (chunks
                (mapcar
                 (lambda (range)
-                  (car (proofread--request-ready-chunks-for-ranges
+                  (car (proofread-test--request-ready-chunks-for-ranges
                         (list range))))
                 ranges))
               (recorder (proofread-test--make-backend-recorder)))
@@ -5444,7 +5449,7 @@ This covers URLs, email, invisible text, faces, and properties."
       (insert "helo")
       (proofread-mode 1)
       (let* ((chunk
-              (car (proofread--request-ready-chunks-for-ranges
+              (car (proofread-test--request-ready-chunks-for-ranges
                     (list (cons (point-min) (point-max))))))
              (request (proofread--make-backend-request
                        chunk proofread-test--backend))
@@ -5801,7 +5806,7 @@ This covers URLs, email, invisible text, faces, and properties."
             "  \"Docstring prose token.\"\n"
             "  code-token)\n")
     (let* ((chunks
-            (proofread--request-ready-chunks-for-ranges
+            (proofread-test--request-ready-chunks-for-ranges
              (list (cons (point-min) (point-max)))))
            (text (proofread-test--combined-chunk-text chunks)))
       (should (eq proofread-targets 'auto))
@@ -5821,7 +5826,7 @@ This covers URLs, email, invisible text, faces, and properties."
     (text-mode)
     (insert "Plain prose sentence. Another sentence.")
     (let ((chunks
-           (proofread--request-ready-chunks-for-ranges
+           (proofread-test--request-ready-chunks-for-ranges
             (list (cons (point-min) (point-max))))))
       (should (string-match-p
                "Plain prose sentence"
@@ -5848,7 +5853,7 @@ This covers URLs, email, invisible text, faces, and properties."
                     (comments-and-docstrings t t nil)))
       (setq-local proofread-targets (car case))
       (let* ((chunks
-              (proofread--request-ready-chunks-for-ranges
+              (proofread-test--request-ready-chunks-for-ranges
                (list (cons (point-min) (point-max)))))
              (text (proofread-test--combined-chunk-text chunks)))
         (should (eq (not (null (string-match-p
@@ -5870,7 +5875,7 @@ This covers URLs, email, invisible text, faces, and properties."
             "char *ordinary = \"not // comment prose\";\n"
             "/* C block comment prose. */\n")
     (let* ((chunks
-            (proofread--request-ready-chunks-for-ranges
+            (proofread-test--request-ready-chunks-for-ranges
              (list (cons (point-min) (point-max)))))
            (text (proofread-test--combined-chunk-text chunks)))
       (should (string-match-p "C line comment prose" text))
@@ -5889,7 +5894,7 @@ This covers URLs, email, invisible text, faces, and properties."
             "    return value\n")
     (python-mode)
     (let* ((chunks
-            (proofread--request-ready-chunks-for-ranges
+            (proofread-test--request-ready-chunks-for-ranges
              (list (cons (point-min) (point-max)))))
            (text (proofread-test--combined-chunk-text chunks)))
       (should (string-match-p "Python docstring prose" text))
@@ -5917,7 +5922,7 @@ This covers URLs, email, invisible text, faces, and properties."
           (let ((narrow-end (match-beginning 0)))
             (narrow-to-region narrow-beg narrow-end)
             (let* ((chunks
-                    (proofread--request-ready-chunks-for-ranges
+                    (proofread-test--request-ready-chunks-for-ranges
                      (list (cons selected-beg selected-end))))
                    (chunk (car chunks))
                    (payload
@@ -5975,7 +5980,7 @@ This covers URLs, email, invisible text, faces, and properties."
             "(defun sample ()\n  \"Docstring metadata prose.\")\n")
     (setq-local proofread-targets 'comments-and-docstrings)
     (let* ((chunks
-            (proofread--request-ready-chunks-for-ranges
+            (proofread-test--request-ready-chunks-for-ranges
              (list (cons (point-min) (point-max)))))
            (comment
             (cl-find 'comment chunks
@@ -6022,7 +6027,7 @@ This covers URLs, email, invisible text, faces, and properties."
     (setq-local proofread-targets 'comments)
     (proofread-mode 1)
     (let* ((chunk
-            (car (proofread--request-ready-chunks-for-ranges
+            (car (proofread-test--request-ready-chunks-for-ranges
                   (list (cons (point-min) (point-max))))))
            (request (proofread--make-backend-request
                      chunk proofread-test--backend))
@@ -6051,7 +6056,7 @@ This covers URLs, email, invisible text, faces, and properties."
     (proofread-mode 1)
     (let* ((proofread-context-size 0)
            (chunk
-            (car (proofread--request-ready-chunks-for-ranges
+            (car (proofread-test--request-ready-chunks-for-ranges
                   (list (cons (point-min) (point-max))))))
            (request (proofread--make-backend-request
                      chunk proofread-test--backend)))
@@ -6163,10 +6168,10 @@ This covers URLs, email, invisible text, faces, and properties."
                  (proofread-context-sentences-before 1)
                  (proofread-context-sentences-after 1)
                  (later-chunk
-                  (car (proofread--request-ready-chunks-for-ranges
+                  (car (proofread-test--request-ready-chunks-for-ranges
                         (list (cons later-beg later-end)))))
                  (isolated-chunk
-                  (car (proofread--request-ready-chunks-for-ranges
+                  (car (proofread-test--request-ready-chunks-for-ranges
                         (list (cons isolated-beg isolated-end))))))
             (should (= (length domains) 2))
             (should (< (car first-domain) later-beg))
@@ -6266,7 +6271,7 @@ This covers URLs, email, invisible text, faces, and properties."
       (setq-local proofread-targets 'comments)
       (insert (nth 1 case))
       (let* ((chunks
-              (proofread--request-ready-chunks-for-ranges
+              (proofread-test--request-ready-chunks-for-ranges
                (list (cons (point-min) (point-max)))))
              (chunk (car chunks)))
         (should (= (length chunks) 1))
@@ -6296,7 +6301,7 @@ This covers URLs, email, invisible text, faces, and properties."
            (proofread-context-sentences-before 1)
            (proofread-context-sentences-after 0)
            (chunk
-            (car (proofread--request-ready-chunks-for-ranges
+            (car (proofread-test--request-ready-chunks-for-ranges
                   (list (cons (match-beginning 0) (match-end 0))))))
            (context (plist-get chunk :context-before)))
       (should (string-match-p "First hard-wrapped part" context))
@@ -6310,7 +6315,7 @@ This covers URLs, email, invisible text, faces, and properties."
     (setq-local proofread-ignored-properties '(proofread-test-ignore))
     (proofread-mode 1)
     (let* ((chunk
-            (car (proofread--request-ready-chunks-for-ranges
+            (car (proofread-test--request-ready-chunks-for-ranges
                   (list (cons (point-min) (point-max))))))
            (request (proofread--make-backend-request
                      chunk proofread-test--backend))
@@ -6326,7 +6331,7 @@ This covers URLs, email, invisible text, faces, and properties."
     (setq-local proofread-auto-check nil)
     (proofread-mode 1)
     (let* ((chunk
-            (car (proofread--request-ready-chunks-for-ranges
+            (car (proofread-test--request-ready-chunks-for-ranges
                   (list (cons (point-min) (point-max))))))
            (request (proofread--make-backend-request
                      chunk proofread-test--backend)))
@@ -6382,7 +6387,7 @@ This covers URLs, email, invisible text, faces, and properties."
                   (plist-get recorder :function)))
          (let* ((old-request
                  (car (proofread--dispatch-request-ready-chunks
-                       (proofread--request-ready-chunks-for-ranges
+                       (proofread-test--request-ready-chunks-for-ranges
                         (list (cons (point-min) (point-max))))
                        proofread-test--backend)))
                 (old-callback
@@ -6392,7 +6397,7 @@ This covers URLs, email, invisible text, faces, and properties."
            (proofread-mode 1)
            (let* ((new-request
                    (car (proofread--dispatch-request-ready-chunks
-                         (proofread--request-ready-chunks-for-ranges
+                         (proofread-test--request-ready-chunks-for-ranges
                           (list (cons (point-min) (point-max))))
                          proofread-test--backend)))
                   (new-log-id (plist-get new-request :log-id)))
@@ -6417,7 +6422,7 @@ This covers URLs, email, invisible text, faces, and properties."
   (with-temp-buffer
     (insert "Alpha")
     (proofread-mode 1)
-    (let* ((chunk (car (proofread--request-ready-chunks-for-ranges
+    (let* ((chunk (car (proofread-test--request-ready-chunks-for-ranges
                         (list (cons (point-min) (point-max))))))
            (request (proofread--make-backend-request
                      chunk proofread-test--backend))
@@ -6502,7 +6507,7 @@ This covers URLs, email, invisible text, faces, and properties."
   (with-temp-buffer
     (insert "helo helo")
     (proofread-mode 1)
-    (let* ((chunk (car (proofread--request-ready-chunks-for-ranges
+    (let* ((chunk (car (proofread-test--request-ready-chunks-for-ranges
                         '((6 . 10)))))
            (request (proofread--make-backend-request
                      chunk proofread-test--backend)))
@@ -6522,7 +6527,7 @@ This covers URLs, email, invisible text, faces, and properties."
     (proofread-mode 1)
     (let* ((proofread-backend proofread-test--backend)
            (proofread-test--backend-identity-token "identity-a")
-           (chunk (car (proofread--request-ready-chunks-for-ranges
+           (chunk (car (proofread-test--request-ready-chunks-for-ranges
                         (list (cons (point-min) (point-max))))))
            (request (proofread--make-backend-request
                      chunk proofread-test--backend))
@@ -6543,7 +6548,7 @@ This covers URLs, email, invisible text, faces, and properties."
            (proofread-backend proofread-test--backend)
            (proofread-test--backend-identity-token (list :name name))
            (chunk
-            (car (proofread--request-ready-chunks-for-ranges
+            (car (proofread-test--request-ready-chunks-for-ranges
                   (list (cons (point-min) (point-max))))))
            (request (proofread--make-backend-request
                      chunk proofread-test--backend))
@@ -6569,7 +6574,7 @@ This covers URLs, email, invisible text, faces, and properties."
     (proofread-mode 1)
     (let* ((proofread-backend proofread-test--backend)
            (proofread-test--backend-identity-token "identity-a")
-           (chunk (car (proofread--request-ready-chunks-for-ranges
+           (chunk (car (proofread-test--request-ready-chunks-for-ranges
                         (list (cons (point-min) (point-max))))))
            (request (proofread--make-backend-request
                      chunk proofread-test--backend)))
@@ -6585,7 +6590,7 @@ This covers URLs, email, invisible text, faces, and properties."
     (search-forward "Target.")
     (let* ((beg (match-beginning 0))
            (end (match-end 0))
-           (chunk (car (proofread--request-ready-chunks-for-ranges
+           (chunk (car (proofread-test--request-ready-chunks-for-ranges
                         (list (cons beg end)))))
            (request (proofread--make-backend-request
                      chunk proofread-test--backend)))
@@ -6904,7 +6909,7 @@ This covers URLs, email, invisible text, faces, and properties."
   (with-temp-buffer
     (insert "helo")
     (proofread-mode 1)
-    (let* ((chunk (car (proofread--request-ready-chunks-for-ranges
+    (let* ((chunk (car (proofread-test--request-ready-chunks-for-ranges
                         (list (cons (point-min) (point-max))))))
            (older (proofread--make-backend-request
                    chunk proofread-test--backend))
@@ -6949,7 +6954,7 @@ This covers URLs, email, invisible text, faces, and properties."
   (with-temp-buffer
     (insert "One. Two. Three.")
     (proofread-mode 1)
-    (let* ((chunks (proofread--request-ready-chunks-for-ranges
+    (let* ((chunks (proofread-test--request-ready-chunks-for-ranges
                     (list (cons (point-min) (point-max)))))
            (requests
             (mapcar (lambda (chunk)
@@ -7321,7 +7326,7 @@ This covers URLs, email, invisible text, faces, and properties."
       (proofread-mode 1)
       (proofread-test--with-backend
        (let* ((chunks
-               (proofread--request-ready-chunks-for-ranges
+               (proofread-test--request-ready-chunks-for-ranges
                 '((1 . 4) (5 . 8))))
               (active
                (proofread--make-backend-request
@@ -7373,10 +7378,10 @@ This covers URLs, email, invisible text, faces, and properties."
       (proofread-mode 1)
       (proofread-test--with-backend
        (let* ((waiting-chunk
-               (car (proofread--request-ready-chunks-for-ranges
+               (car (proofread-test--request-ready-chunks-for-ranges
                      '((1 . 5)))))
               (active-chunk
-               (car (proofread--request-ready-chunks-for-ranges
+               (car (proofread-test--request-ready-chunks-for-ranges
                      '((6 . 10)))))
               (waiting
                (proofread--make-backend-request
@@ -7590,7 +7595,7 @@ This covers URLs, email, invisible text, faces, and properties."
                     (list :backend 'test
                           :request-id (plist-get request :id)))))
          (let* ((old-chunks
-                 (proofread--request-ready-chunks-for-ranges
+                 (proofread-test--request-ready-chunks-for-ranges
                   (list (cons (point-min) (point-max)))))
                 (old
                  (car (proofread--dispatch-request-ready-chunks
@@ -7603,7 +7608,7 @@ This covers URLs, email, invisible text, faces, and properties."
            (should (proofread--request-invalidated-p old))
            (should-not (proofread--request-work-pending-p old))
            (let* ((new-chunks
-                   (proofread--request-ready-chunks-for-ranges
+                   (proofread-test--request-ready-chunks-for-ranges
                     (list (cons (point-min) (point-max)))))
                   (new
                    (car (proofread--dispatch-request-ready-chunks
@@ -7623,7 +7628,7 @@ This covers URLs, email, invisible text, faces, and properties."
     (insert "abcdef")
     (proofread-mode 1)
     (let* ((full-chunk
-            (car (proofread--request-ready-chunks-for-ranges
+            (car (proofread-test--request-ready-chunks-for-ranges
                   (list (cons (point-min) (point-max))))))
            (full-request
             (proofread--make-backend-request
@@ -7632,7 +7637,7 @@ This covers URLs, email, invisible text, faces, and properties."
       (narrow-to-region 2 6)
       (setq narrowed-request
             (proofread--make-backend-request
-             (car (proofread--request-ready-chunks-for-ranges
+             (car (proofread-test--request-ready-chunks-for-ranges
                    (list (cons (point-min) (point-max)))))
              proofread-test--backend))
       (should-not (equal (proofread--request-work-key full-request)
@@ -7656,10 +7661,10 @@ This covers URLs, email, invisible text, faces, and properties."
       (proofread-mode 1)
       (proofread-test--with-backend
        (let* ((first
-               (car (proofread--request-ready-chunks-for-ranges
+               (car (proofread-test--request-ready-chunks-for-ranges
                      '((1 . 4)))))
               (second
-               (car (proofread--request-ready-chunks-for-ranges
+               (car (proofread-test--request-ready-chunks-for-ranges
                      '((5 . 8)))))
               (preview (proofread--make-backend-request
                         first proofread-test--backend)))
@@ -7697,17 +7702,17 @@ This covers URLs, email, invisible text, faces, and properties."
       (proofread-test--with-backend
        (let* ((active
                (proofread--make-backend-request
-                (car (proofread--request-ready-chunks-for-ranges
+                (car (proofread-test--request-ready-chunks-for-ranges
                       '((1 . 3))))
                 proofread-test--backend))
               (waiting
                (proofread--make-backend-request
-                (car (proofread--request-ready-chunks-for-ranges
+                (car (proofread-test--request-ready-chunks-for-ranges
                       '((4 . 6))))
                 proofread-test--backend))
               (cached
                (proofread--make-backend-request
-                (car (proofread--request-ready-chunks-for-ranges
+                (car (proofread-test--request-ready-chunks-for-ranges
                       '((7 . 9))))
                 proofread-test--backend)))
          (proofread--register-active-request active)
@@ -7752,10 +7757,10 @@ This covers URLs, email, invisible text, faces, and properties."
                   (lambda (handle)
                     (push handle cancelled-handles))))
          (let* ((older-chunk
-                 (car (proofread--request-ready-chunks-for-ranges
+                 (car (proofread-test--request-ready-chunks-for-ranges
                        '((1 . 7)))))
                 (newer-chunk
-                 (car (proofread--request-ready-chunks-for-ranges
+                 (car (proofread-test--request-ready-chunks-for-ranges
                        '((2 . 6)))))
                 (older
                  (car (proofread--dispatch-request-ready-chunks
@@ -7801,13 +7806,13 @@ This covers URLs, email, invisible text, faces, and properties."
                   (lambda (handle)
                     (push handle cancelled-handles))))
          (let* ((older-chunk
-                 (car (proofread--request-ready-chunks-for-ranges
+                 (car (proofread-test--request-ready-chunks-for-ranges
                        '((1 . 4)))))
                 (cached-chunk
-                 (car (proofread--request-ready-chunks-for-ranges
+                 (car (proofread-test--request-ready-chunks-for-ranges
                        '((1 . 5)))))
                 (unrelated-chunk
-                 (car (proofread--request-ready-chunks-for-ranges
+                 (car (proofread-test--request-ready-chunks-for-ranges
                        '((5 . 8)))))
                 (cached-preview
                  (proofread--make-backend-request
@@ -7850,7 +7855,7 @@ This covers URLs, email, invisible text, faces, and properties."
           submitted-log-ids)
       (proofread-mode 1)
       (let* ((chunks
-              (proofread--request-ready-chunks-for-ranges
+              (proofread-test--request-ready-chunks-for-ranges
                (list (cons (point-min) (point-max)))))
              (requests
               (mapcar (lambda (chunk)
@@ -7898,10 +7903,10 @@ This covers URLs, email, invisible text, faces, and properties."
               (proofread-cache-max-entries 0))
           (proofread-mode 1)
           (let* ((left-chunk
-                  (car (proofread--request-ready-chunks-for-ranges
+                  (car (proofread-test--request-ready-chunks-for-ranges
                         '((1 . 4)))))
                  (right-chunk
-                  (car (proofread--request-ready-chunks-for-ranges
+                  (car (proofread-test--request-ready-chunks-for-ranges
                         '((4 . 7)))))
                  (left-request
                   (proofread--make-backend-request

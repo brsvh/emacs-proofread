@@ -47,6 +47,11 @@
    :suggestions '("hello")
    :source 'proofread-llm-test-source))
 
+(defun proofread-llm-test--request-ready-chunks-for-ranges (ranges)
+  "Return request-ready chunks from target islands selected by RANGES."
+  (proofread--request-ready-chunks-for-islands
+   (proofread--target-islands-for-ranges ranges)))
+
 (defun proofread-llm-test--wait-for (predicate &optional timeout)
   "Wait until PREDICATE returns non-nil or TIMEOUT seconds pass."
   (let ((deadline (+ (float-time) (or timeout 1.0)))
@@ -165,7 +170,7 @@
            (proofread-llm-provider proofread-llm-test--provider)
            (proofread-llm-provider-identity
             proofread-llm-test--provider-identity)
-           (chunk (car (proofread--request-ready-chunks-for-ranges
+           (chunk (car (proofread-llm-test--request-ready-chunks-for-ranges
                         (list (cons (point-min) (point-max))))))
            (request (proofread--make-backend-request chunk 'llm))
            (diagnostic
@@ -220,7 +225,7 @@
   (with-temp-buffer
     (insert "helo")
     (let* ((proofread-llm-provider nil)
-           (chunk (car (proofread--request-ready-chunks-for-ranges
+           (chunk (car (proofread-llm-test--request-ready-chunks-for-ranges
                         (list (cons (point-min) (point-max))))))
            (request (proofread--make-backend-request chunk 'llm))
            result)
@@ -245,7 +250,7 @@
     (insert "helo")
     (let* ((proofread-llm-provider proofread-llm-test--provider)
            (proofread-llm-response-strategy 'provider-json)
-           (chunk (car (proofread--request-ready-chunks-for-ranges
+           (chunk (car (proofread-llm-test--request-ready-chunks-for-ranges
                         (list (cons (point-min) (point-max))))))
            (request (proofread--make-backend-request chunk 'llm))
            result)
@@ -274,7 +279,7 @@
     (insert "helo")
     (let* ((proofread-llm-provider proofread-llm-test--provider)
            (proofread-llm-response-strategy 'provider-json)
-           (chunk (car (proofread--request-ready-chunks-for-ranges
+           (chunk (car (proofread-llm-test--request-ready-chunks-for-ranges
                         (list (cons (point-min) (point-max))))))
            request
            (capability-calls 0))
@@ -300,7 +305,7 @@
   (with-temp-buffer
     (insert "helo")
     (let* ((proofread-llm-provider nil)
-           (chunk (car (proofread--request-ready-chunks-for-ranges
+           (chunk (car (proofread-llm-test--request-ready-chunks-for-ranges
                         (list (cons (point-min) (point-max))))))
            (request (proofread--make-backend-request chunk 'llm))
            result
@@ -337,7 +342,7 @@
     (insert "helo")
     (let* ((proofread-llm-provider
             (make-llm-deepseek :chat-model "deepseek-v4-flash"))
-           (chunk (car (proofread--request-ready-chunks-for-ranges
+           (chunk (car (proofread-llm-test--request-ready-chunks-for-ranges
                         (list (cons (point-min) (point-max))))))
            (request (proofread--make-backend-request chunk 'llm))
            (content (proofread-llm-test--response-content nil))
@@ -403,7 +408,7 @@
     (let* ((proofread-backend 'llm)
            (proofread-llm-provider 'proofread-llm-test-provider)
            (proofread-llm-provider-identity "provider-a")
-           (chunk (car (proofread--request-ready-chunks-for-ranges
+           (chunk (car (proofread-llm-test--request-ready-chunks-for-ranges
                         (list (cons (point-min) (point-max))))))
            (request (proofread--make-backend-request chunk))
            (diagnostic
@@ -424,7 +429,7 @@
            (proofread-llm-provider [:provider-a :api-key
                                                 "secret-token"])
            (proofread-llm-provider-identity nil)
-           (chunk (car (proofread--request-ready-chunks-for-ranges
+           (chunk (car (proofread-llm-test--request-ready-chunks-for-ranges
                         (list (cons (point-min) (point-max))))))
            (request (proofread--make-backend-request chunk))
            (diagnostic
@@ -452,7 +457,7 @@
     (let* ((proofread-language "en")
            (proofread-llm-provider 'proofread-llm-test-provider)
            (proofread-llm-max-diagnostic-passes 1)
-           (chunk (car (proofread--request-ready-chunks-for-ranges
+           (chunk (car (proofread-llm-test--request-ready-chunks-for-ranges
                         (list (cons (point-min) (point-max))))))
            (request (proofread--make-backend-request chunk 'llm))
            (content
@@ -521,7 +526,7 @@
                    'proofread-llm-test-handle))
                 ((symbol-function 'llm-capabilities)
                  #'proofread-llm-test--capabilities))
-        (let* ((chunk (car (proofread--request-ready-chunks-for-ranges
+        (let* ((chunk (car (proofread-llm-test--request-ready-chunks-for-ranges
                             (list (cons (point-min) (point-max))))))
                (request (proofread--make-backend-request chunk 'llm)))
           (proofread--backend-check request #'ignore 'llm)
@@ -556,7 +561,7 @@
                  #'proofread-llm-test--capabilities))
         (setq request
               (proofread--make-backend-request
-               (car (proofread--request-ready-chunks-for-ranges
+               (car (proofread-llm-test--request-ready-chunks-for-ranges
                      (list (cons (point-min) (point-max)))))
                'llm))
         (should (proofread--dispatch-backend-request
@@ -590,7 +595,7 @@
     (proofread-mode 1)
     (let* ((proofread-llm-provider 'proofread-llm-test-provider)
            (proofread-llm-max-diagnostic-passes 3)
-           (chunk (car (proofread--request-ready-chunks-for-ranges
+           (chunk (car (proofread-llm-test--request-ready-chunks-for-ranges
                         (list (cons (point-min) (point-max))))))
            request
            (first
@@ -661,7 +666,7 @@
            (proofread-llm-provider-identity
             proofread-llm-test--provider-identity)
            (proofread-llm-max-diagnostic-passes 2)
-           (chunk (car (proofread--request-ready-chunks-for-ranges
+           (chunk (car (proofread-llm-test--request-ready-chunks-for-ranges
                         (list (cons (point-min) (point-max))))))
            (invalid
             (proofread-llm-test--response-content
@@ -714,7 +719,7 @@
            (proofread-llm-provider-identity
             proofread-llm-test--provider-identity)
            (proofread-llm-max-diagnostic-passes 3)
-           (chunk (car (proofread--request-ready-chunks-for-ranges
+           (chunk (car (proofread-llm-test--request-ready-chunks-for-ranges
                         (list (cons (point-min) (point-max))))))
            (invalid
             (proofread-llm-test--response-content
@@ -754,7 +759,7 @@
            (proofread-llm-provider-identity
             proofread-llm-test--provider-identity)
            (proofread-llm-max-diagnostic-passes 3)
-           (chunk (car (proofread--request-ready-chunks-for-ranges
+           (chunk (car (proofread-llm-test--request-ready-chunks-for-ranges
                         (list (cons (point-min) (point-max))))))
            (invalid
             (proofread-llm-test--response-content
@@ -794,7 +799,7 @@
            (proofread-llm-provider-identity
             proofread-llm-test--provider-identity)
            (proofread-llm-max-diagnostic-passes 2)
-           (chunk (car (proofread--request-ready-chunks-for-ranges
+           (chunk (car (proofread-llm-test--request-ready-chunks-for-ranges
                         (list (cons (point-min) (point-max))))))
            (valid
             (proofread-llm-test--response-content
@@ -849,7 +854,7 @@
             result)
         (proofread-llm-test--with-capabilities
          (let* ((chunk (car
-                        (proofread--request-ready-chunks-for-ranges
+                        (proofread-llm-test--request-ready-chunks-for-ranges
                          (list (cons (point-min) (point-max))))))
                 (request (proofread--make-backend-request chunk
                                                           'llm)))
@@ -892,7 +897,7 @@
                    'proofread-llm-test-handle))
                 ((symbol-function 'llm-capabilities)
                  #'proofread-llm-test--capabilities))
-        (let* ((chunk (car (proofread--request-ready-chunks-for-ranges
+        (let* ((chunk (car (proofread-llm-test--request-ready-chunks-for-ranges
                             (list (cons (point-min) (point-max))))))
                (request (proofread--make-backend-request chunk 'llm)))
           (should (proofread--dispatch-backend-request
@@ -924,7 +929,7 @@
                      'proofread-llm-test-handle))
                   ((symbol-function 'llm-capabilities)
                    #'proofread-llm-test--capabilities))
-          (let* ((chunk (car (proofread--request-ready-chunks-for-ranges
+          (let* ((chunk (car (proofread-llm-test--request-ready-chunks-for-ranges
                               (list (cons (point-min) (point-max))))))
                  (request (proofread--make-backend-request chunk 'llm)))
             (should (proofread--dispatch-backend-request
@@ -961,7 +966,7 @@
                      (proofread-llm-max-diagnostic-passes 1)
                      (chunk
                       (car
-                       (proofread--request-ready-chunks-for-ranges
+                       (proofread-llm-test--request-ready-chunks-for-ranges
                         (list (cons (point-min)
                                     (point-max)))))))
                 (cl-letf (((symbol-function 'llm-chat-async)
@@ -1023,7 +1028,7 @@
     (text-mode)
     (insert "helo")
     (let* ((proofread-language "en")
-           (chunk (car (proofread--request-ready-chunks-for-ranges
+           (chunk (car (proofread-llm-test--request-ready-chunks-for-ranges
                         (list (cons (point-min) (point-max))))))
            (request (proofread--make-backend-request chunk 'llm))
            (prompt (proofread-llm--structured-response-prompt request)))
@@ -1087,7 +1092,7 @@
   "Structured response parser rejects extra text around a payload."
   (with-temp-buffer
     (insert "helo")
-    (let* ((chunk (car (proofread--request-ready-chunks-for-ranges
+    (let* ((chunk (car (proofread-llm-test--request-ready-chunks-for-ranges
                         (list (cons (point-min) (point-max))))))
            (request (proofread--make-backend-request chunk 'llm))
            (content
@@ -1107,7 +1112,7 @@
   "Structured response parser rejects multiple payloads."
   (with-temp-buffer
     (insert "helo")
-    (let* ((chunk (car (proofread--request-ready-chunks-for-ranges
+    (let* ((chunk (car (proofread-llm-test--request-ready-chunks-for-ranges
                         (list (cons (point-min) (point-max))))))
            (request (proofread--make-backend-request chunk 'llm))
            (payload
@@ -1123,7 +1128,7 @@
   "Non-schema structured response text is a parse error."
   (with-temp-buffer
     (insert "helo")
-    (let* ((chunk (car (proofread--request-ready-chunks-for-ranges
+    (let* ((chunk (car (proofread-llm-test--request-ready-chunks-for-ranges
                         (list (cons (point-min) (point-max))))))
            (request (proofread--make-backend-request chunk 'llm)))
       (should-error
@@ -1135,7 +1140,7 @@
   "Malformed structured response JSON is a parse error."
   (with-temp-buffer
     (insert "helo")
-    (let* ((chunk (car (proofread--request-ready-chunks-for-ranges
+    (let* ((chunk (car (proofread-llm-test--request-ready-chunks-for-ranges
                         (list (cons (point-min) (point-max))))))
            (request (proofread--make-backend-request chunk 'llm)))
       (should-error
@@ -1147,7 +1152,7 @@
   "Structured responses reject non-JSON Lisp payloads."
   (with-temp-buffer
     (insert "helo")
-    (let* ((chunk (car (proofread--request-ready-chunks-for-ranges
+    (let* ((chunk (car (proofread-llm-test--request-ready-chunks-for-ranges
                         (list (cons (point-min) (point-max))))))
            (request (proofread--make-backend-request chunk 'llm))
            (payload '(:diagnostics nil)))
@@ -1160,7 +1165,7 @@
   "Structured response diagnostics use absolute buffer ranges."
   (with-temp-buffer
     (insert "青晨六点，小城。")
-    (let* ((chunk (car (proofread--request-ready-chunks-for-ranges
+    (let* ((chunk (car (proofread-llm-test--request-ready-chunks-for-ranges
                         (list (cons (point-min) (point-max))))))
            (request (proofread--make-backend-request chunk 'llm))
            (content
@@ -1210,7 +1215,7 @@
   "Structured response keeps multiple diagnostics from one request."
   (with-temp-buffer
     (insert "helo wrld")
-    (let* ((chunk (car (proofread--request-ready-chunks-for-ranges
+    (let* ((chunk (car (proofread-llm-test--request-ready-chunks-for-ranges
                         (list (cons (point-min) (point-max))))))
            (request (proofread--make-backend-request chunk 'llm))
            (content
@@ -1241,7 +1246,7 @@
   "A diagnostic whose text is outside the request becomes one issue."
   (with-temp-buffer
     (insert "helo")
-    (let* ((chunk (car (proofread--request-ready-chunks-for-ranges
+    (let* ((chunk (car (proofread-llm-test--request-ready-chunks-for-ranges
                         (list (cons (point-min) (point-max))))))
            (request (proofread--make-backend-request chunk 'llm))
            (_ (setq request
@@ -1263,7 +1268,7 @@
   "Repair a wrong range when its text has one unique request match."
   (with-temp-buffer
     (insert "青晨六点半，小城的街到刚刚醒来。")
-    (let* ((chunk (car (proofread--request-ready-chunks-for-ranges
+    (let* ((chunk (car (proofread-llm-test--request-ready-chunks-for-ranges
                         (list (cons (point-min) (point-max))))))
            (request (proofread--make-backend-request chunk 'llm))
            (batch
@@ -1289,7 +1294,7 @@
   "A wrong range is not guessed when its text occurs more than once."
   (with-temp-buffer
     (insert "helo x helo")
-    (let* ((chunk (car (proofread--request-ready-chunks-for-ranges
+    (let* ((chunk (car (proofread-llm-test--request-ready-chunks-for-ranges
                         (list (cons (point-min) (point-max))))))
            (request (proofread--make-backend-request chunk 'llm))
            (batch
@@ -1310,7 +1315,7 @@
   "Accept exact reported ranges even when their text repeats."
   (with-temp-buffer
     (insert "helo x helo")
-    (let* ((chunk (car (proofread--request-ready-chunks-for-ranges
+    (let* ((chunk (car (proofread-llm-test--request-ready-chunks-for-ranges
                         (list (cons (point-min) (point-max))))))
            (request (proofread--make-backend-request chunk 'llm))
            (batch
@@ -1341,7 +1346,7 @@
   "Keep valid diagnostics when a response has invalid candidates."
   (with-temp-buffer
     (insert "helo wrld")
-    (let* ((chunk (car (proofread--request-ready-chunks-for-ranges
+    (let* ((chunk (car (proofread-llm-test--request-ready-chunks-for-ranges
                         (list (cons (point-min) (point-max))))))
            (request (proofread--make-backend-request chunk 'llm))
            (batch
@@ -1370,7 +1375,7 @@
   "A non-string suggestion invalidates only its candidate."
   (with-temp-buffer
     (insert "helo")
-    (let* ((chunk (car (proofread--request-ready-chunks-for-ranges
+    (let* ((chunk (car (proofread-llm-test--request-ready-chunks-for-ranges
                         (list (cons (point-min) (point-max))))))
            (request (proofread--make-backend-request chunk 'llm))
            (candidate
@@ -1392,7 +1397,7 @@
   "Treat a null root as fatal but isolate null suggestions."
   (with-temp-buffer
     (insert "helo")
-    (let* ((chunk (car (proofread--request-ready-chunks-for-ranges
+    (let* ((chunk (car (proofread-llm-test--request-ready-chunks-for-ranges
                         (list (cons (point-min) (point-max))))))
            (request (proofread--make-backend-request chunk 'llm)))
       (should-error
@@ -1418,7 +1423,7 @@
   "Reject root fields while isolating candidate and range fields."
   (with-temp-buffer
     (insert "helo")
-    (let* ((chunk (car (proofread--request-ready-chunks-for-ranges
+    (let* ((chunk (car (proofread-llm-test--request-ready-chunks-for-ranges
                         (list (cons (point-min) (point-max))))))
            (request (proofread--make-backend-request chunk 'llm))
            (candidate
@@ -1698,7 +1703,7 @@
   (with-temp-buffer
     (insert "helo")
     (proofread-mode 1)
-    (let* ((chunk (car (proofread--request-ready-chunks-for-ranges
+    (let* ((chunk (car (proofread-llm-test--request-ready-chunks-for-ranges
                         (list (cons (point-min) (point-max))))))
            (request (proofread--make-backend-request chunk 'llm))
            (content
@@ -1728,7 +1733,7 @@
            (proofread-llm-provider proofread-llm-test--provider)
            (proofread-llm-provider-identity "provider")
            (proofread-llm-response-strategy 'provider-json)
-           (chunk (car (proofread--request-ready-chunks-for-ranges
+           (chunk (car (proofread-llm-test--request-ready-chunks-for-ranges
                         (list (cons (point-min) (point-max))))))
            (diagnostic
             (proofread-llm-test--diagnostic-for-range 1 5 "helo")))
@@ -1751,7 +1756,7 @@
            (proofread-llm-provider proofread-llm-test--provider)
            (proofread-llm-provider-identity "provider")
            (proofread-llm-max-diagnostic-passes 1)
-           (chunk (car (proofread--request-ready-chunks-for-ranges
+           (chunk (car (proofread-llm-test--request-ready-chunks-for-ranges
                         (list (cons (point-min) (point-max))))))
            (request (proofread--make-backend-request chunk))
            (diagnostic
@@ -1769,7 +1774,7 @@
   (with-temp-buffer
     (insert "青晨")
     (proofread-mode 1)
-    (let* ((chunk (car (proofread--request-ready-chunks-for-ranges
+    (let* ((chunk (car (proofread-llm-test--request-ready-chunks-for-ranges
                         (list (cons (point-min) (point-max))))))
            (request (proofread--make-backend-request chunk 'llm))
            (content
@@ -1795,7 +1800,7 @@
     (insert "Alpha")
     (proofread-llm-test--with-success
      (proofread-llm-test--response-content nil)
-     (let* ((chunk (car (proofread--request-ready-chunks-for-ranges
+     (let* ((chunk (car (proofread-llm-test--request-ready-chunks-for-ranges
                          (list (cons (point-min) (point-max))))))
             (request (proofread--make-backend-request chunk))
             result)
@@ -1816,7 +1821,7 @@
     (insert "Alpha")
     (proofread-llm-test--with-error
      'llm-failure "LLM failure"
-     (let* ((chunk (car (proofread--request-ready-chunks-for-ranges
+     (let* ((chunk (car (proofread-llm-test--request-ready-chunks-for-ranges
                          (list (cons (point-min) (point-max))))))
             (request (proofread--make-backend-request chunk))
             result)
@@ -1857,7 +1862,7 @@
                  #'proofread-llm-test--capabilities))
         (setq request
               (proofread--make-backend-request
-               (car (proofread--request-ready-chunks-for-ranges
+               (car (proofread-llm-test--request-ready-chunks-for-ranges
                      (list (cons (point-min) (point-max)))))
                'llm))
         (let ((proofread-request-log-hook

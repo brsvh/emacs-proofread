@@ -900,8 +900,9 @@ CALLBACK-STATUS is the status plist passed to the URL callback."
                  buffer))))
          (let* ((chunk
                  (car
-                  (proofread--request-ready-chunks-for-ranges
-                   (list (cons (point-min) (point-max))))))
+                  (proofread--request-ready-chunks-for-islands
+                   (proofread--target-islands-for-ranges
+                    (list (cons (point-min) (point-max)))))))
                 (request
                  (proofread--make-backend-request
                   chunk 'languagetool)))

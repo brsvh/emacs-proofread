@@ -1711,13 +1711,6 @@ when sentence context is too large for `proofread-context-size'."
                   (push chunk request-chunks))))))))
     (nreverse request-chunks)))
 
-(defun proofread--request-ready-chunks-for-ranges (ranges)
-  "Return request-ready chunks for selected target text in RANGES.
-Cache lookup and backend dispatch consume this internal
-representation."
-  (proofread--request-ready-chunks-for-islands
-   (proofread--target-islands-for-ranges ranges)))
-
 (defun proofread--next-request-id ()
   "Return a fresh backend request id for the current buffer."
   (setq proofread--next-request-id (1+ proofread--next-request-id)))
