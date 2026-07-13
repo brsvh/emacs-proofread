@@ -1,14 +1,14 @@
 <p align="right"><strong>English</strong> · <a href="README_zh-Hans.md">简体中文</a></p>
 
-> Copyright (C) 2026 Bingshan Chang <chang@bingshan.org>
->
-> Permission is granted to copy, distribute and/or modify this document under
-> the terms of the GNU Free Documentation License, Version 1.3 or any later
-> version published by the Free Software Foundation; with no Invariant Sections,
-> no Front-Cover Texts, and no Back-Cover Texts.
->
-> You should have received a copy of the GNU Free Documentation License along
-> with this file. If not, see <https://www.gnu.org/licenses/>.
+```
+Copyright (c)  2026 Bingshan Chang.
+Permission is granted to copy, distribute and/or modify this document
+under the terms of the GNU Free Documentation License, Version 1.3
+or any later version published by the Free Software Foundation;
+with no Invariant Sections, no Front-Cover Texts, and no Back-Cover Texts.
+A copy of the license is included in the section entitled "GNU
+Free Documentation License".
+```
 
 # proofread
 
@@ -29,10 +29,10 @@ https://github.com/user-attachments/assets/9dc5c4ee-a43e-45b8-a9fc-a372079ed528
 
 ### Installation
 
-The core package requires GNU Emacs 30.1 or later and GNU ELPA `llm` 0.31.1 or
-later. The optional `proofread-popup` package additionally requires `posframe`
-1.5.2 or later. Install `llm` with your Emacs package manager, and install
-`posframe` as well if you want popup diagnostics.
+The core package requires GNU Emacs and GNU ELPA `llm`. The optional
+`proofread-popup` package additionally requires `posframe`. Install `llm` with
+your Emacs package manager, and install `posframe` as well if you want popup
+diagnostics.
 
 Clone this repository and add its `lisp` directory to `load-path`:
 
@@ -45,61 +45,37 @@ git clone https://github.com/brsvh/emacs-proofread.git
 (require 'proofread)
 ```
 
-Nix users can add both packages to an Emacs package set through the flake's
-default overlay. For example, a NixOS configuration can use:
+### Building packages
 
-```nix
-{
-  inputs.emacs-proofread.url =
-    "git+https://github.com/brsvh/emacs-proofread.git";
-  inputs.nixpkgs.url =
-    "git+https://github.com/NixOS/nixpkgs?ref=nixos-unstable";
-
-  outputs =
-    {
-      emacs-proofread,
-      nixpkgs,
-      ...
-    }:
-    {
-      nixosConfigurations.HOSTNAME =
-        nixpkgs.lib.nixosSystem {
-          system = "x86_64-linux";
-          modules = [
-            (
-              { pkgs, ... }:
-              {
-                nixpkgs.overlays = [
-                  emacs-proofread.overlays.default
-                ];
-
-                environment.systemPackages = [
-                  ((pkgs.emacsPackagesFor pkgs.emacs-pgtk).emacsWithPackages
-                    (epkgs: [
-                      epkgs.proofread
-                      epkgs.proofread-popup
-                    ]))
-                ];
-              }
-            )
-          ];
-        };
-    };
-}
-```
-
-Remove `epkgs.proofread-popup` if only the core package is needed. On
-`x86_64-linux`, the flake also provides ready-made launchers that start Emacs
-with a temporary, clean init directory. Run one from the repository root:
+The repository's `Makefile` builds the core `proofread` package and the optional
+`proofread-popup` package independently. Building uses GNU Make, GNU tar, and
+GNU Emacs. The package dependencies listed above must be available to the Emacs
+used for byte compilation. Run the targets from the repository root; set `EMACS`
+to select another executable, for example `make EMACS=/path/to/emacs all`.
 
 ```sh
-nix run .#emacs30-with-proofread
-# or
-nix run .#emacs31-with-proofread
+make all
+# or build one package
+make proofread
+make proofread-popup
 ```
 
-These launchers make the packages available on `load-path`; they do not load or
-configure Proofread automatically.
+`all` builds both packages. Each package target generates package metadata,
+autoloads, byte-compiled files, and an ELPA-compatible source archive. The
+stages can also be run separately:
+
+| Package           | Metadata                   | Autoloads                        | Byte compilation               | ELPA archive                   |
+| ----------------- | -------------------------- | -------------------------------- | ------------------------------ | ------------------------------ |
+| `proofread`       | `make proofread-pkg`       | `make proofread-autoloads`       | `make proofread-compile`       | `make proofread-archive`       |
+| `proofread-popup` | `make proofread-popup-pkg` | `make proofread-popup-autoloads` | `make proofread-popup-compile` | `make proofread-popup-archive` |
+
+Generated `-pkg.el`, `-autoloads.el`, and `.elc` files are written under
+`lisp/`. Archives are written as `dist/<package>-<version>.tar`; the version is
+read from the main source file's package metadata. Each archive has a
+`<package>-<version>/` top-level directory and contains the package sources, the
+generated `<package>-pkg.el`, and `COPYING`. Generated autoload and
+byte-compiled files are intentionally omitted because Emacs creates them when
+installing the package. `make clean` removes all generated files and `dist/`.
 
 ### Configuration
 
@@ -330,6 +306,59 @@ default of `3` to `1`.
 - Records created by `proofread-ignore` persist only for the current Emacs
   session; they are not saved, and there is no command to remove one.
 
+## Guide for Nix users
+
+Nix users can add both packages to an Emacs package set through the flake's
+default overlay. For example, a NixOS configuration can use:
+
+```nix
+{
+  inputs.emacs-proofread.url =
+    "git+https://github.com/brsvh/emacs-proofread.git";
+  inputs.nixpkgs.url =
+    "git+https://github.com/NixOS/nixpkgs?ref=nixos-unstable";
+
+  outputs =
+    {
+      emacs-proofread,
+      nixpkgs,
+      ...
+    }:
+    {
+      nixosConfigurations.HOSTNAME =
+        nixpkgs.lib.nixosSystem {
+          system = "x86_64-linux";
+          modules = [
+            (
+              { pkgs, ... }:
+              {
+                nixpkgs.overlays = [
+                  emacs-proofread.overlays.default
+                ];
+
+                environment.systemPackages = [
+                  ((pkgs.emacsPackagesFor pkgs.emacs-pgtk).emacsWithPackages
+                    (epkgs: [
+                      epkgs.proofread
+                      epkgs.proofread-popup
+                    ]))
+                ];
+              }
+            )
+          ];
+        };
+    };
+}
+```
+
+Remove `epkgs.proofread-popup` if only the core package is needed. On supported
+systems, the flake also provides ready-made launchers that start Emacs with a
+temporary, clean init directory. Use `nix flake show` from the repository root
+to find a suitable launcher, then run it with `nix run`.
+
+These launchers make the packages available on `load-path`; they do not load or
+configure Proofread automatically.
+
 ## AI Assistance Disclosure
 
 Parts of the code, tests, and documentation in this project were developed with
@@ -348,10 +377,10 @@ version.
 You should have received a copy of the GNU General Public License along with
 this emacs-proofread. If not, see <https://www.gnu.org/licenses/>.
 
-## COPYING of this file
+## GNU Free Documentation License
 
 <details>
-<summary>Toggle this to check the license of this file.</summary>
+<summary>Toggle this to check the GNU Free Documentation License.</summary>
 
 ```text
 

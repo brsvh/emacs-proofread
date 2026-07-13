@@ -1,14 +1,14 @@
 <p align="right"><a href="README.md">English</a> · <strong>简体中文</strong></p>
 
-> Copyright (C) 2026 Bingshan Chang <chang@bingshan.org>
->
-> Permission is granted to copy, distribute and/or modify this document under
-> the terms of the GNU Free Documentation License, Version 1.3 or any later
-> version published by the Free Software Foundation; with no Invariant Sections,
-> no Front-Cover Texts, and no Back-Cover Texts.
->
-> You should have received a copy of the GNU Free Documentation License along
-> with this file. If not, see <https://www.gnu.org/licenses/>.
+```
+Copyright (c)  2026 Bingshan Chang.
+Permission is granted to copy, distribute and/or modify this document
+under the terms of the GNU Free Documentation License, Version 1.3
+or any later version published by the Free Software Foundation;
+with no Invariant Sections, no Front-Cover Texts, and no Back-Cover Texts.
+A copy of the license is included in the section entitled "GNU
+Free Documentation License".
+```
 
 # proofread
 
@@ -25,9 +25,8 @@ https://github.com/user-attachments/assets/3c77758b-00ab-48e2-9e23-e54e8845d251
 
 ### 安装
 
-核心包要求 GNU Emacs 30.1 或更高版本，以及 GNU ELPA `llm` 0.31.1 或更高版本。可选的 `proofread-popup`
-包还要求 `posframe` 1.5.2 或更高版本。请使用你的 Emacs 包管理器安装 `llm`；如需使用弹窗显示诊断信息，再安装
-`posframe`。
+核心包依赖 GNU Emacs 和 GNU ELPA `llm`。可选的 `proofread-popup` 包还依赖 `posframe`。请使用你的
+Emacs 包管理器安装 `llm`；如需使用弹窗显示诊断信息，再安装 `posframe`。
 
 克隆本仓库并将其 `lisp` 目录加入 `load-path`：
 
@@ -40,58 +39,30 @@ git clone https://github.com/brsvh/emacs-proofread.git
 (require 'proofread)
 ```
 
-Nix 用户可以通过 flake 的默认 overlay 将这两个包添加到 Emacs 包集合中。例如，NixOS 配置可以这样写：
+### 构建软件包
 
-```nix
-{
-  inputs.emacs-proofread.url =
-    "git+https://github.com/brsvh/emacs-proofread.git";
-  inputs.nixpkgs.url =
-    "git+https://github.com/NixOS/nixpkgs?ref=nixos-unstable";
-
-  outputs =
-    {
-      emacs-proofread,
-      nixpkgs,
-      ...
-    }:
-    {
-      nixosConfigurations.HOSTNAME =
-        nixpkgs.lib.nixosSystem {
-          system = "x86_64-linux";
-          modules = [
-            (
-              { pkgs, ... }:
-              {
-                nixpkgs.overlays = [
-                  emacs-proofread.overlays.default
-                ];
-
-                environment.systemPackages = [
-                  ((pkgs.emacsPackagesFor pkgs.emacs-pgtk).emacsWithPackages
-                    (epkgs: [
-                      epkgs.proofread
-                      epkgs.proofread-popup
-                    ]))
-                ];
-              }
-            )
-          ];
-        };
-    };
-}
-```
-
-如果只需要核心包，请移除 `epkgs.proofread-popup`。在 `x86_64-linux` 上，flake
-还提供开箱即用的启动器，它们使用临时、干净的初始化目录启动 Emacs。请在仓库根目录运行其中一个：
+仓库中的 `Makefile` 可分别构建核心包 `proofread` 和可选包 `proofread-popup`。构建使用 GNU Make、GNU
+tar 和 GNU Emacs；进行字节编译时，上文列出的包依赖必须对所用 Emacs 可见。请从仓库根目录运行这些目标；可通过 `EMACS` 选择其他
+Emacs 可执行文件，例如 `make EMACS=/path/to/emacs all`。
 
 ```sh
-nix run .#emacs30-with-proofread
-# or
-nix run .#emacs31-with-proofread
+make all
+# 或仅构建一个包
+make proofread
+make proofread-popup
 ```
 
-这些启动器只会让包出现在 `load-path` 中；它们不会自动加载或配置 Proofread。
+`all` 会构建两个包。每个包的汇总目标都会生成包元数据、autoload 文件、字节编译文件和符合 ELPA 规范的源码归档。也可以分别运行各个阶段：
+
+| 软件包            | 元数据                     | Autoload                         | 字节编译                       | ELPA 归档                      |
+| ----------------- | -------------------------- | -------------------------------- | ------------------------------ | ------------------------------ |
+| `proofread`       | `make proofread-pkg`       | `make proofread-autoloads`       | `make proofread-compile`       | `make proofread-archive`       |
+| `proofread-popup` | `make proofread-popup-pkg` | `make proofread-popup-autoloads` | `make proofread-popup-compile` | `make proofread-popup-archive` |
+
+生成的 `-pkg.el`、`-autoloads.el` 和 `.elc` 文件位于 `lisp/` 下。归档以
+`dist/<package>-<version>.tar` 形式生成；版本取自主源码文件中的包元数据。每个归档以 `<package>-<version>/`
+为顶层目录，并包含软件包源码、生成的 `<package>-pkg.el` 和 `COPYING`。归档有意不包含生成的 autoload 与字节编译文件，因为
+Emacs 安装软件包时会自行生成它们。`make clean` 会删除所有生成文件和 `dist/`。
 
 ### 配置
 
@@ -282,6 +253,55 @@ https://github.com/user-attachments/assets/2dda228e-f85c-4500-aea0-549500628c6e
   只清除缓存。若要停止所有工作并清理状态，请禁用 `proofread-mode`。
 - 由 `proofread-ignore` 创建的记录仅在当前 Emacs 会话中持续有效；这些记录不会保存，也没有用于移除记录的命令。
 
+## Nix 用户指南
+
+Nix 用户可以通过 flake 的默认 overlay 将这两个包添加到 Emacs 包集合中。例如，NixOS 配置可以这样写：
+
+```nix
+{
+  inputs.emacs-proofread.url =
+    "git+https://github.com/brsvh/emacs-proofread.git";
+  inputs.nixpkgs.url =
+    "git+https://github.com/NixOS/nixpkgs?ref=nixos-unstable";
+
+  outputs =
+    {
+      emacs-proofread,
+      nixpkgs,
+      ...
+    }:
+    {
+      nixosConfigurations.HOSTNAME =
+        nixpkgs.lib.nixosSystem {
+          system = "x86_64-linux";
+          modules = [
+            (
+              { pkgs, ... }:
+              {
+                nixpkgs.overlays = [
+                  emacs-proofread.overlays.default
+                ];
+
+                environment.systemPackages = [
+                  ((pkgs.emacsPackagesFor pkgs.emacs-pgtk).emacsWithPackages
+                    (epkgs: [
+                      epkgs.proofread
+                      epkgs.proofread-popup
+                    ]))
+                ];
+              }
+            )
+          ];
+        };
+    };
+}
+```
+
+如果只需要核心包，请移除 `epkgs.proofread-popup`。在支持的系统上，flake 还提供开箱即用的启动器，它们使用临时、干净的初始化目录启动
+Emacs。请在仓库根目录通过 `nix flake show` 查找合适的启动器，然后使用 `nix run` 运行它。
+
+这些启动器只会让包出现在 `load-path` 中；它们不会自动加载或配置 Proofread。
+
 ## AI 辅助声明
 
 本项目中的部分代码、测试和文档是在 AI 工具的辅助下开发的。所有由 AI
@@ -295,10 +315,10 @@ emacs-proofread 是自由软件：你可以根据自由软件基金会发布的 
 您应该已经随本 emacs-proofread 收到了 GNU
 通用公共许可证的副本。如果没有，请访问<https://www.gnu.org/licenses/>。
 
-## 本文许可证
+## GNU Free Documentation License
 
 <details>
-<summary>展开这里以查看本文许可证。</summary>
+<summary>展开这里以查看“GNU Free Documentation License”.</summary>
 
 ```text
 
