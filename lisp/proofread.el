@@ -2,6 +2,8 @@
 
 ;; Copyright (C) 2026 Bingshan Chang <chang@bingshan.org>
 
+;; Assisted-by: Codex:gpt-5.5
+;; Assisted-by: Codex:gpt-5.6-sol
 ;; Author: Bingshan Chang <chang@bingshan.org>
 ;; Keywords: convenience, wp
 ;; Package-Requires: ((emacs "30.1") (llm "0.31.1"))

@@ -2,11 +2,11 @@
 
 ;; Copyright (C) 2026 Bingshan Chang <chang@bingshan.org>
 
+;; Assisted-by: Codex:gpt-5.5
+;; Assisted-by: Codex:gpt-5.6-sol
 ;; Author: Bingshan Chang <chang@bingshan.org>
 ;; Keywords: convenience, wp
-;; Package-Requires: ((emacs "30.1")
-;;                    (proofread "0.1.0")
-;;                    (posframe "1.5.2"))
+;; Package-Requires: ((emacs "30.1") (proofread "0.1.0") (posframe "1.5.2"))
 ;; Version: 0.1.0
 
 ;; This file is not part of GNU Emacs.
