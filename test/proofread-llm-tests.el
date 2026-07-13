@@ -1173,6 +1173,35 @@
                      '(6 . 8))))))
 
 (ert-deftest
+    proofread-llm-test-structured-response-uses-shared-constructor ()
+  "Normalize LLM candidates before shared diagnostic construction."
+  (let ((request '(:beg 10 :end 14 :text "helo"
+                        :target-kind text))
+        calls)
+    (cl-letf
+        (((symbol-function
+           'proofread--diagnostic-from-request-relative-range)
+          (lambda (actual-request range properties)
+            (push (list actual-request range properties) calls)
+            'sentinel)))
+      (let ((batch
+             (proofread-llm-test--structured-batch
+              request
+              (list (proofread-llm-test--response-diagnostic
+                     0 4 "helo" '("hello" "hullo"))))))
+        (should (equal (plist-get batch :diagnostics) '(sentinel)))
+        (should-not (plist-get batch :issues))
+        (should-not (plist-get batch :repairs))))
+    (should
+     (equal calls
+            (list
+             (list request '(0 . 4)
+                   '(:kind spelling
+                           :message "Possible misspelling"
+                           :suggestions ("hello" "hullo")
+                           :source llm)))))))
+
+(ert-deftest
     proofread-llm-test-structured-response-preserves-multiple-diagnostics
     ()
   "Structured response keeps multiple diagnostics from one request."

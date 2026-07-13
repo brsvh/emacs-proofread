@@ -2326,6 +2326,99 @@ This covers URLs, email, invisible text, faces, and properties."
     (should-not proofread--cache)
     (should-not (proofread--cache-read 'key))))
 
+(ert-deftest proofread-test-request-relative-diagnostic-construction ()
+  "Construct canonical diagnostics from request-relative ranges."
+  (let* ((request '(:beg 20 :end 28 :text "This are"
+                         :target-kind text))
+         (properties '(:kind grammar
+                             :message "Agreement"
+                             :suggestions ("is")
+                             :source test))
+         (diagnostic
+          (proofread--diagnostic-from-request-relative-range
+           request '(5 . 8) properties)))
+    (should
+     (equal diagnostic
+            '(:beg 25 :end 28 :text "are" :kind grammar
+                   :message "Agreement" :suggestions ("is")
+                   :source test :target-kind text)))
+    (should
+     (equal
+      (proofread--diagnostic-from-request-relative-range
+       request '(8 . 8) properties)
+      '(:beg 28 :end 28 :text "" :kind grammar
+             :message "Agreement" :suggestions ("is")
+             :source test :target-kind text)))))
+
+(ert-deftest proofread-test-request-relative-diagnostic-marker-base ()
+  "Convert a live request marker into integer diagnostic positions."
+  (with-temp-buffer
+    (insert "prefixThis are")
+    (let* ((request (list :beg (copy-marker 7)
+                          :end (point-max)
+                          :text "This are"
+                          :target-kind 'text))
+           (diagnostic
+            (proofread--diagnostic-from-request-relative-range
+             request '(5 . 8)
+             '(:kind grammar :message "Agreement"
+                     :suggestions ("is") :source test))))
+      (should (equal (proofread--diagnostic-range diagnostic)
+                     '(12 . 15)))
+      (should (integerp (plist-get diagnostic :beg)))
+      (should (integerp (plist-get diagnostic :end))))))
+
+(ert-deftest proofread-test-request-relative-diagnostic-validates-bounds ()
+  "Reject relative diagnostic ranges outside their request text."
+  (let ((request '(:beg 20 :end 28 :text "This are"))
+        (properties '(:kind grammar :message "Agreement"
+                            :suggestions nil :source test)))
+    (dolist (range '((-1 . 0) (0 . 9) (6 . 5)
+                     (nil . 4) (0)))
+      (should
+       (string-match-p
+        "outside the request text"
+        (error-message-string
+         (should-error
+          (proofread--diagnostic-from-request-relative-range
+           request range properties))))))
+    (dolist (invalid-request '((:beg nil :text "This are")
+                               (:beg 20 :text nil)))
+      (should
+       (string-match-p
+        "outside the request text"
+        (error-message-string
+         (should-error
+          (proofread--diagnostic-from-request-relative-range
+           invalid-request '(0 . 4) properties))))))))
+
+(ert-deftest
+    proofread-test-request-relative-diagnostic-validates-target ()
+  "Reject source delimiters while accepting safe target interiors."
+  (with-temp-buffer
+    (emacs-lisp-mode)
+    (insert ";; teh")
+    (syntax-propertize (point-max))
+    (let* ((request (list :buffer (current-buffer)
+                          :beg (point-min)
+                          :end (point-max)
+                          :text (buffer-string)
+                          :target-kind 'comment))
+           (properties '(:kind spelling
+                               :message "Possible misspelling"
+                               :suggestions ("the")
+                               :source test)))
+      (should-not
+       (proofread--diagnostic-from-request-relative-range
+        request '(0 . 2) properties))
+      (should
+       (equal
+        (proofread--diagnostic-from-request-relative-range
+         request '(3 . 6) properties)
+        '(:beg 4 :end 7 :text "teh" :kind spelling
+               :message "Possible misspelling" :suggestions ("the")
+               :source test :target-kind comment))))))
+
 (ert-deftest proofread-test-cache-relative-diagnostic-conversion ()
   "Cached diagnostics convert ranges between coordinate systems."
   (let* ((request '(:beg 10 :end 20 :text "0123456789"

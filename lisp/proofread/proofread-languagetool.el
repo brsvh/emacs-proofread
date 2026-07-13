@@ -790,29 +790,16 @@ does not stay wholly inside the target."
       (error "LanguageTool returned an invalid UTF-16 range"))
     (when (and (<= (plist-get request-data :target-beg) start)
                (<= end (plist-get request-data :target-end)))
-      (let* ((relative-beg
-              (- start (plist-get request-data :target-beg)))
-             (relative-end
-              (- end (plist-get request-data :target-beg)))
-             (request-beg
-              (proofread--position-integer (plist-get request :beg)))
-             (request-text (plist-get request :text)))
-        (unless (and request-beg
-                     (<= 0 relative-beg relative-end
-                         (length request-text)))
-          (error "LanguageTool match is outside the request text"))
-        (when (proofread--diagnostic-candidate-in-target-p
-               request (cons relative-beg relative-end))
-          (proofread--make-diagnostic
-           :beg (+ request-beg relative-beg)
-           :end (+ request-beg relative-end)
-           :text (substring request-text relative-beg relative-end)
-           :kind (proofread-languagetool--diagnostic-kind issue-type)
-           :message message
-           :suggestions
-           (proofread-languagetool--replacement-values match)
-           :source 'languagetool
-           :target-kind (plist-get request :target-kind)))))))
+      (proofread--diagnostic-from-request-relative-range
+       request
+       (cons (- start (plist-get request-data :target-beg))
+             (- end (plist-get request-data :target-beg)))
+       (list :kind
+             (proofread-languagetool--diagnostic-kind issue-type)
+             :message message
+             :suggestions
+             (proofread-languagetool--replacement-values match)
+             :source 'languagetool)))))
 
 (defun proofread-languagetool--parse-response
     (request request-data response)

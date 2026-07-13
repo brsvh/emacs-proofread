@@ -1910,7 +1910,7 @@ When BACKEND is nil, check the selected `proofread-backend'."
       (cons (plist-get range :beg)
             (plist-get range :end)))))
 
-(defun proofread--diagnostic-candidate-range-valid-p (request beg end)
+(defun proofread--request-relative-range-valid-p (request beg end)
   "Return non-nil if relative BEG and END are valid for REQUEST."
   (let ((text (plist-get request :text)))
     (and (integerp beg)
@@ -1942,7 +1942,7 @@ exactly once in the request text."
          (text (plist-get candidate :text))
          (reported-range (cons relative-beg relative-end)))
     (cond
-     ((and (proofread--diagnostic-candidate-range-valid-p
+     ((and (proofread--request-relative-range-valid-p
             request relative-beg relative-end)
            (stringp text)
            (equal text
@@ -2057,9 +2057,9 @@ exactly once in the request text."
                      (nth 5 (syntax-ppss (1+ beg)))))))
     found))
 
-(defun proofread--diagnostic-candidate-in-target-p (request range)
+(defun proofread--request-relative-range-in-target-p (request range)
   "Return non-nil when RANGE stays inside REQUEST's prose target.
-RANGE contains chunk-relative positions.  For comments and docstrings,
+RANGE contains request-relative positions.  For comments and docstrings,
 reject source delimiters and ranges crossing distinct syntactic
 containers."
   (let ((kind (plist-get request :target-kind)))
@@ -2110,6 +2110,36 @@ containers."
                             ('docstring
                              (and (nth 3 beg-state)
                                   (nth 3 end-state))))))))))))))
+
+(defun proofread--diagnostic-from-request-relative-range
+    (request range properties)
+  "Return a validated diagnostic for REQUEST, RANGE, and PROPERTIES.
+RANGE is a cons cell of request-relative positions.  PROPERTIES must
+contain the normalized `:kind', `:message', `:suggestions', and
+`:source' fields.  Derive the diagnostic text and absolute positions
+from REQUEST.  Return nil when RANGE does not stay inside REQUEST's
+prose target, and signal an error when REQUEST or RANGE has invalid
+bounds."
+  (let* ((request-beg
+          (proofread--position-integer (plist-get request :beg)))
+         (request-text (plist-get request :text))
+         (relative-beg (car-safe range))
+         (relative-end (cdr-safe range)))
+    (unless (and request-beg
+                 (proofread--request-relative-range-valid-p
+                  request relative-beg relative-end))
+      (error "Diagnostic range is outside the request text"))
+    (when (proofread--request-relative-range-in-target-p
+           request range)
+      (proofread--make-diagnostic
+       :beg (+ request-beg relative-beg)
+       :end (+ request-beg relative-end)
+       :text (substring request-text relative-beg relative-end)
+       :kind (plist-get properties :kind)
+       :message (plist-get properties :message)
+       :suggestions (plist-get properties :suggestions)
+       :source (plist-get properties :source)
+       :target-kind (plist-get request :target-kind)))))
 
 (defun proofread--diagnostic-candidate-shape-p (candidate)
   "Return non-nil when CANDIDATE has the required field shapes."
@@ -2163,7 +2193,7 @@ The returned plist has a `:status' of `exact', `repaired', or
                  (t 'ambiguous-text))
                 :reported-range reported-range
                 :occurrences occurrences)))
-       ((not (proofread--diagnostic-candidate-in-target-p
+       ((not (proofread--request-relative-range-in-target-p
               request matching-range))
         (list :status 'rejected
               :reason 'outside-target
@@ -2215,36 +2245,24 @@ is the already validated chunk-relative range for CANDIDATE."
           (or matching-range
               (proofread--diagnostic-candidate-matching-range
                request candidate relative-beg relative-end)))
-         (request-beg
-          (proofread--position-integer (plist-get request :beg)))
-         (request-text (plist-get request :text))
          (text (plist-get candidate :text))
          (kind (proofread--diagnostic-candidate-kind
                 (plist-get candidate :kind)))
-         (message (plist-get candidate :message))
-         (absolute-beg (and (integerp request-beg)
-                            (integerp (car-safe matching-range))
-                            (+ request-beg (car matching-range))))
-         (absolute-end (and (integerp request-beg)
-                            (integerp (cdr-safe matching-range))
-                            (+ request-beg (cdr matching-range)))))
+         (message (plist-get candidate :message)))
     (when (and matching-range
-               (proofread--diagnostic-candidate-in-target-p
-                request matching-range)
-               (stringp request-text)
-               (integerp request-beg)
                (stringp text)
                kind
                (stringp message))
-      (proofread--make-diagnostic
-       :beg absolute-beg
-       :end absolute-end
-       :text text
-       :kind kind
-       :message message
-       :suggestions (append (plist-get candidate :suggestions) nil)
-       :source (or default-source (plist-get request :backend) 'unknown)
-       :target-kind (plist-get request :target-kind)))))
+      (proofread--diagnostic-from-request-relative-range
+       request matching-range
+       (list :kind kind
+             :message message
+             :suggestions
+             (append (plist-get candidate :suggestions) nil)
+             :source
+             (or default-source
+                 (plist-get request :backend)
+                 'unknown))))))
 
 (defun proofread--diagnostic-batch-from-structured-payload
     (request payload &optional default-source)

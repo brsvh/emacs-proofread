@@ -535,6 +535,39 @@ CALLBACK-STATUS is the status plist passed to the URL callback."
         (should (= (plist-get insertion :end) 20))
         (should (equal (plist-get insertion :text) ""))))))
 
+(ert-deftest
+    proofread-languagetool-test-match-uses-shared-constructor ()
+  "Normalize LanguageTool matches before shared construction."
+  (with-temp-buffer
+    (let* ((request (proofread-languagetool-test--request))
+           (request-data
+            (proofread-languagetool--request-data request))
+           (payload
+            `((matches .
+                       (,(proofread-languagetool-test--match
+                          3 8 "grammar" "Agreement"
+                          '("This is" "This is"))))))
+           calls)
+      (cl-letf
+          (((symbol-function
+             'proofread--diagnostic-from-request-relative-range)
+            (lambda (actual-request range properties)
+              (push (list actual-request range properties) calls)
+              'sentinel)))
+        (should
+         (equal
+          (proofread-languagetool--parse-response
+           request request-data (json-encode payload))
+          '(sentinel))))
+      (should
+       (equal calls
+              (list
+               (list request '(0 . 8)
+                     '(:kind grammar
+                             :message "Agreement"
+                             :suggestions ("This is")
+                             :source languagetool))))))))
+
 (ert-deftest proofread-languagetool-test-comment-delimiter-is-safe ()
   "LanguageTool matches cannot edit comment delimiters."
   (with-temp-buffer
