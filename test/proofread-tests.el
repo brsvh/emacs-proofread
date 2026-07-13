@@ -6847,5 +6847,4 @@ This covers URLs, email, invisible text, faces, and properties."
                        live-neighbor)))))))))
 
 (provide 'proofread-tests)
-
 ;;; proofread-tests.el ends here

@@ -340,5 +340,4 @@ mode locally."
   nil)
 
 (provide 'proofread-popup)
-
 ;;; proofread-popup.el ends here

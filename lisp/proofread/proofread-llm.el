@@ -119,35 +119,35 @@ of 1 uses a single LLM call."
 
 (defconst proofread-llm--structured-response-schema
   `(:type "object"
-          :properties
-          (:diagnostics
-           (:type "array"
-                  :items
-                  (:type "object"
-                         :properties
-                         (:kind
-                          (:type "string"
-                                 :enum
-                                 ,proofread-llm--diagnostic-kind-names)
-                          :message (:type "string")
-                          :text (:type "string")
-                          :range
-                          (:type "object"
-                                 :properties
-                                 (:beg
-                                  (:type "integer")
-                                  :end
-                                  (:type "integer"))
-                                 :required ["beg" "end"]
-                                 :additionalProperties ,json-false)
-                          :suggestions
-                          (:type "array"
-                                 :items
-                                 (:type "string")))
-                         :required ["kind" "message" "text" "range"
-                                    "suggestions"]
-                         :additionalProperties ,json-false)))
-          :required ["diagnostics"])
+	  :properties
+	  (:diagnostics
+	   (:type "array"
+		  :items
+		  (:type "object"
+			 :properties
+			 (:kind
+			  (:type "string"
+				 :enum
+				 ,proofread-llm--diagnostic-kind-names)
+			  :message (:type "string")
+			  :text (:type "string")
+			  :range
+			  (:type "object"
+				 :properties
+				 (:beg
+				  (:type "integer")
+				  :end
+				  (:type "integer"))
+				 :required ["beg" "end"]
+				 :additionalProperties ,json-false)
+			  :suggestions
+			  (:type "array"
+				 :items
+				 (:type "string")))
+			 :required ["kind" "message" "text" "range"
+				    "suggestions"]
+			 :additionalProperties ,json-false)))
+	  :required ["diagnostics"])
   "JSON schema for structured LLM responses.")
 
 (defun proofread-llm--backend-invalid-diagnostics-result
@@ -722,5 +722,4 @@ state."
   nil)
 
 (provide 'proofread-llm)
-
 ;;; proofread-llm.el ends here

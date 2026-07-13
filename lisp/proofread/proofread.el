@@ -5927,5 +5927,4 @@ buffer."
   nil)
 
 (provide 'proofread)
-
 ;;; proofread.el ends here
