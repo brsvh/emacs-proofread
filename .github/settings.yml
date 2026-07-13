@@ -2,6 +2,13 @@ repository:
   name: emacs-proofread
   description: Context-aware LLM proofreading for GNU Emacs
   private: false
+  topics:
+    - emacs
+    - natural-language
+    - natural-language-processing
+    - proofreading
+    - spellcheck
+    - style-checker
 
   has_issues: true
   has_discussions: false
