@@ -1575,16 +1575,14 @@ range; no available backend"))))))
                               (proofread--backend-success-result
                                valid-request
                                (list
-                                (proofread--diagnostic-from-candidate
+                                (proofread--diagnostic-from-request-relative-range
                                  valid-request
-                                 (list :kind "spelling"
+                                 (cons relative-beg (+ relative-beg 5))
+                                 (list :kind 'spelling
                                        :message "Test diagnostic"
-                                       :text "First"
-                                       :range
-                                       (list :beg relative-beg
-                                             :end (+ relative-beg 5))
-                                       :suggestions '("First"))
-                                 proofread-test--backend)))
+                                       :suggestions '("First")
+                                       :source
+                                       proofread-test--backend))))
                             (proofread--backend-error-result
                              (nth index requests) 'test-error
                              (concat "Simulated background failure: "
@@ -2542,8 +2540,7 @@ This covers URLs, email, invisible text, faces, and properties."
              request
              (list later-range (copy-sequence old) earlier-range
                    (copy-sequence later-range)
-                   (copy-sequence earlier-range))
-             '((:reason ambiguous-text))))
+                   (copy-sequence earlier-range))))
            (original-create-overlay
             (symbol-function 'proofread--create-overlay))
            (created 0)
@@ -4896,15 +4893,13 @@ This covers URLs, email, invisible text, faces, and properties."
                             :text before
                             :target-kind (nth 2 spec)))
              (diagnostic
-              (proofread--diagnostic-from-candidate
+              (proofread--diagnostic-from-request-relative-range
                request
-               (list :kind "spelling"
+               (cons (nth 3 spec) (nth 4 spec))
+               (list :kind 'spelling
                      :message "Possible misspelling"
-                     :text (nth 5 spec)
-                     :range (list :beg (nth 3 spec)
-                                  :end (nth 4 spec))
-                     :suggestions (list (nth 6 spec)))
-               proofread-test--backend))
+                     :suggestions (list (nth 6 spec))
+                     :source proofread-test--backend)))
              (overlay
               (car (proofread-test--install-diagnostics
                     (list diagnostic)))))
@@ -4927,14 +4922,13 @@ This covers URLs, email, invisible text, faces, and properties."
                           :text (buffer-string)
                           :target-kind 'comment))
            (diagnostic
-            (proofread--diagnostic-from-candidate
+            (proofread--diagnostic-from-request-relative-range
              request
-             (list :kind "spelling"
+             '(2 . 6)
+             (list :kind 'spelling
                    :message "Possible misspelling"
-                   :text "helo"
-                   :range '(:beg 2 :end 6)
-                   :suggestions '("hello!"))
-             proofread-test--backend)))
+                   :suggestions '("hello!")
+                   :source proofread-test--backend))))
       (proofread-test--install-diagnostics (list diagnostic))
       (goto-char (plist-get diagnostic :beg))
       (should (eq (proofread-correct-at-point) 'applied))

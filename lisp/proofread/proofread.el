@@ -237,10 +237,6 @@ request-ready chunks."
   '(:beg :end :text :kind :message :suggestions :source :target-kind)
   "Required keys for proofread diagnostic plists.")
 
-(defconst proofread--diagnostic-kinds
-  '(spelling grammar style other)
-  "Diagnostic kind symbols accepted from structured responses.")
-
 (defconst proofread--contract-version 2
   "Version of the internal request, diagnostic, and cache contract.")
 
@@ -1758,35 +1754,17 @@ When BACKEND is non-nil, store its canonical identity in the request."
     (plist-put request :cache-key
                (proofread--cache-key request backend-identity))))
 
-(defun proofread--backend-success-result
-    (request diagnostics &optional candidate-issues repairs)
-  "Return a successful backend result for REQUEST and DIAGNOSTICS.
-When CANDIDATE-ISSUES or REPAIRS are non-nil, include them as
-diagnostic response metadata."
-  (proofread--backend-result-with-diagnostic-metadata
-   (list :status 'ok
-         :request request
-         :diagnostics diagnostics)
-   candidate-issues repairs))
+(defun proofread--backend-success-result (request diagnostics)
+  "Return a successful backend result for REQUEST and DIAGNOSTICS."
+  (list :status 'ok
+        :request request
+        :diagnostics diagnostics))
 
-(defun proofread--backend-partial-success-result
-    (request diagnostics &optional candidate-issues repairs)
-  "Return a partial backend success for REQUEST and DIAGNOSTICS.
-Store optional CANDIDATE-ISSUES and REPAIRS as response metadata."
+(defun proofread--backend-partial-success-result (request diagnostics)
+  "Return a partial backend success for REQUEST and DIAGNOSTICS."
   (plist-put
-   (proofread--backend-success-result
-    request diagnostics candidate-issues repairs)
+   (proofread--backend-success-result request diagnostics)
    :partial t))
-
-(defun proofread--backend-result-with-diagnostic-metadata
-    (result candidate-issues repairs)
-  "Return RESULT with optional CANDIDATE-ISSUES and REPAIRS metadata."
-  (when candidate-issues
-    (setq result
-          (plist-put result :candidate-issues candidate-issues)))
-  (when repairs
-    (setq result (plist-put result :repairs repairs)))
-  result)
 
 (defun proofread--backend-error-result
     (request error &optional message)
@@ -1891,25 +1869,6 @@ When BACKEND is nil, check the selected `proofread-backend'."
   (and (proofread--backend-descriptor (or backend proofread-backend))
        t))
 
-(defun proofread--diagnostic-candidates (payload)
-  "Return diagnostic candidates from structured PAYLOAD."
-  (unless (and (listp payload)
-               (plist-member payload :diagnostics))
-    (error "Missing diagnostics payload"))
-  (let ((diagnostics (plist-get payload :diagnostics)))
-    (unless (vectorp diagnostics)
-      (error "Invalid diagnostics payload"))
-    (append diagnostics nil)))
-
-(defun proofread--diagnostic-candidate-range (candidate)
-  "Return CANDIDATE's chunk-relative range as a cons cell."
-  (let ((range (plist-get candidate :range)))
-    (when (and (listp range)
-               (plist-member range :beg)
-               (plist-member range :end))
-      (cons (plist-get range :beg)
-            (plist-get range :end)))))
-
 (defun proofread--request-relative-range-valid-p (request beg end)
   "Return non-nil if relative BEG and END are valid for REQUEST."
   (let ((text (plist-get request :text)))
@@ -1919,55 +1878,6 @@ When BACKEND is nil, check the selected `proofread-backend'."
          (<= 0 beg)
          (<= beg end)
          (<= end (length text)))))
-
-(defun proofread--string-occurrences (needle haystack)
-  "Return zero-based ranges where NEEDLE occurs in HAYSTACK."
-  (when (and (stringp needle)
-             (not (string-empty-p needle))
-             (stringp haystack))
-    (let ((start 0)
-          ranges)
-      (while (setq start (string-search needle haystack start))
-        (push (cons start (+ start (length needle))) ranges)
-        (setq start (1+ start)))
-      (nreverse ranges))))
-
-(defun proofread--diagnostic-candidate-matching-range
-    (request candidate relative-beg relative-end)
-  "Return CANDIDATE's safe chunk-relative range for REQUEST.
-Prefer RELATIVE-BEG and RELATIVE-END when they select the candidate
-text exactly.  Otherwise, repair the range only when that text occurs
-exactly once in the request text."
-  (let* ((request-text (plist-get request :text))
-         (text (plist-get candidate :text))
-         (reported-range (cons relative-beg relative-end)))
-    (cond
-     ((and (proofread--request-relative-range-valid-p
-            request relative-beg relative-end)
-           (stringp text)
-           (equal text
-                  (substring request-text relative-beg relative-end)))
-      reported-range)
-     ((and (integerp relative-beg)
-           (integerp relative-end)
-           (stringp text)
-           (not (string-empty-p text)))
-      (let ((ranges
-             (proofread--string-occurrences text request-text)))
-        (when (= (length ranges) 1)
-          (car ranges)))))))
-
-(defun proofread--diagnostic-candidate-kind (value)
-  "Return normalized diagnostic kind for VALUE."
-  (let ((kind
-         (and (stringp value)
-              (cdr (assoc value
-                          '(("spelling" . spelling)
-                            ("grammar" . grammar)
-                            ("style" . style)
-                            ("other" . other)))))))
-    (when (memq kind proofread--diagnostic-kinds)
-      kind)))
 
 (defun proofread--syntax-state-in-container-p
     (state container-beg kind)
@@ -2140,179 +2050,6 @@ bounds."
        :suggestions (plist-get properties :suggestions)
        :source (plist-get properties :source)
        :target-kind (plist-get request :target-kind)))))
-
-(defun proofread--diagnostic-candidate-shape-p (candidate)
-  "Return non-nil when CANDIDATE has the required field shapes."
-  (and (listp candidate)
-       (let ((suggestions (plist-get candidate :suggestions)))
-         (and
-          (cl-every (lambda (key) (plist-member candidate key))
-                    '(:kind :message :text :range :suggestions))
-          (proofread--diagnostic-candidate-kind
-           (plist-get candidate :kind))
-          (stringp (plist-get candidate :message))
-          (stringp (plist-get candidate :text))
-          (proofread--diagnostic-candidate-range candidate)
-          (vectorp suggestions)
-          (cl-every #'stringp (append suggestions nil))))))
-
-(defun proofread--diagnostic-candidate-resolution (request candidate)
-  "Return REQUEST's safe range resolution for CANDIDATE.
-The returned plist has a `:status' of `exact', `repaired', or
-`rejected'."
-  (if (not (proofread--diagnostic-candidate-shape-p candidate))
-      (list :status 'rejected
-            :reason (if (and (listp candidate)
-                             (plist-member
-                              candidate :candidate-error))
-                        'invalid-candidate-json
-                      'invalid-shape)
-            :message (and (listp candidate)
-                          (plist-get candidate :candidate-error)))
-    (let* ((reported-range
-            (proofread--diagnostic-candidate-range candidate))
-           (relative-beg (car reported-range))
-           (relative-end (cdr reported-range))
-           (text (plist-get candidate :text))
-           (matching-range
-            (proofread--diagnostic-candidate-matching-range
-             request candidate relative-beg relative-end)))
-      (cond
-       ((not matching-range)
-        (let ((occurrences
-               (proofread--string-occurrences
-                text (plist-get request :text))))
-          (list :status 'rejected
-                :reason
-                (cond
-                 ((or (not (integerp relative-beg))
-                      (not (integerp relative-end)))
-                  'invalid-range)
-                 ((string-empty-p text) 'range-text-mismatch)
-                 ((null occurrences) 'unmatched-text)
-                 (t 'ambiguous-text))
-                :reported-range reported-range
-                :occurrences occurrences)))
-       ((not (proofread--request-relative-range-in-target-p
-              request matching-range))
-        (list :status 'rejected
-              :reason 'outside-target
-              :reported-range reported-range
-              :range matching-range))
-       ((equal matching-range reported-range)
-        (list :status 'exact :range matching-range))
-       (t
-        (list :status 'repaired
-              :reported-range reported-range
-              :range matching-range))))))
-
-(defun proofread--diagnostic-candidate-issue
-    (index candidate resolution)
-  "Return an issue for CANDIDATE at INDEX from RESOLUTION."
-  (list :action 'dropped
-        :candidate-index index
-        :reason (plist-get resolution :reason)
-        :message (plist-get resolution :message)
-        :text (and (listp candidate)
-                   (plist-get candidate :text))
-        :reported-range
-        (or
-         (plist-get resolution :reported-range)
-         (and
-          (listp candidate)
-          (proofread--diagnostic-candidate-range candidate)))
-        :resolved-range (plist-get resolution :range)
-        :occurrences (plist-get resolution :occurrences)))
-
-(defun proofread--diagnostic-candidate-repair
-    (index candidate resolution)
-  "Return repair metadata for CANDIDATE at INDEX from RESOLUTION."
-  (list :action 'repaired
-        :candidate-index index
-        :text (plist-get candidate :text)
-        :reported-range (plist-get resolution :reported-range)
-        :range (plist-get resolution :range)))
-
-(defun proofread--diagnostic-from-candidate
-    (request candidate &optional default-source matching-range)
-  "Return a diagnostic for REQUEST and CANDIDATE, or nil.
-Use DEFAULT-SOURCE when it is non-nil.  MATCHING-RANGE, when non-nil,
-is the already validated chunk-relative range for CANDIDATE."
-  (let* ((range (proofread--diagnostic-candidate-range candidate))
-         (relative-beg (car-safe range))
-         (relative-end (cdr-safe range))
-         (matching-range
-          (or matching-range
-              (proofread--diagnostic-candidate-matching-range
-               request candidate relative-beg relative-end)))
-         (text (plist-get candidate :text))
-         (kind (proofread--diagnostic-candidate-kind
-                (plist-get candidate :kind)))
-         (message (plist-get candidate :message)))
-    (when (and matching-range
-               (stringp text)
-               kind
-               (stringp message))
-      (proofread--diagnostic-from-request-relative-range
-       request matching-range
-       (list :kind kind
-             :message message
-             :suggestions
-             (append (plist-get candidate :suggestions) nil)
-             :source
-             (or default-source
-                 (plist-get request :backend)
-                 'unknown))))))
-
-(defun proofread--diagnostic-batch-from-structured-payload
-    (request payload &optional default-source)
-  "Return parsed diagnostic batch for REQUEST from PAYLOAD.
-DEFAULT-SOURCE is stored as each diagnostic's internal source.
-Candidate-level problems are returned in `:issues' instead of
-invalidating the whole payload."
-  (let ((index 0)
-        diagnostics
-        issues
-        repairs)
-    (dolist (candidate (proofread--diagnostic-candidates payload))
-      (let* ((resolution
-              (proofread--diagnostic-candidate-resolution
-               request candidate))
-             (status (plist-get resolution :status)))
-        (pcase status
-          ((or 'exact 'repaired)
-           (let ((diagnostic
-                  (proofread--diagnostic-from-candidate
-                   request candidate default-source
-                   (plist-get resolution :range))))
-             (if diagnostic
-                 (progn
-                   (push diagnostic diagnostics)
-                   (when (eq status 'repaired)
-                     (push (proofread--diagnostic-candidate-repair
-                            index candidate resolution)
-                           repairs)))
-               (push (proofread--diagnostic-candidate-issue
-                      index candidate
-                      (list :reason 'invalid-candidate))
-                     issues))))
-          ('rejected
-           (push (proofread--diagnostic-candidate-issue
-                  index candidate resolution)
-                 issues)))
-        (setq index (1+ index))))
-    (list :diagnostics (nreverse diagnostics)
-          :issues (nreverse issues)
-          :repairs (nreverse repairs))))
-
-(defun proofread--diagnostics-from-structured-payload
-    (request payload &optional default-source)
-  "Return proofread diagnostics for REQUEST from parsed PAYLOAD.
-DEFAULT-SOURCE is stored as each diagnostic's internal source."
-  (plist-get
-   (proofread--diagnostic-batch-from-structured-payload
-    request payload default-source)
-   :diagnostics))
 
 (defun proofread--same-diagnostic-p (left right)
   "Return non-nil when LEFT and RIGHT describe the same diagnostic."

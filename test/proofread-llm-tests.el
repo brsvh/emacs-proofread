@@ -1098,7 +1098,7 @@
                        0 4 "helo")))
                     "\nDone.")))
       (should-error
-       (proofread-llm--diagnostics-from-structured-response
+       (proofread-llm--diagnostic-batch-from-structured-response
         request content 'llm)))))
 
 (ert-deftest
@@ -1115,7 +1115,7 @@
              (list (proofread-llm-test--response-diagnostic 0 4
                                                             "helo")))))
       (should-error
-       (proofread-llm--diagnostics-from-structured-response
+       (proofread-llm--diagnostic-batch-from-structured-response
         request (concat payload "\n" payload) 'llm)))))
 
 (ert-deftest
@@ -1127,7 +1127,7 @@
                         (list (cons (point-min) (point-max))))))
            (request (proofread--make-backend-request chunk 'llm)))
       (should-error
-       (proofread-llm--diagnostics-from-structured-response
+       (proofread-llm--diagnostic-batch-from-structured-response
         request "I found a spelling issue." 'llm)))))
 
 (ert-deftest
@@ -1139,7 +1139,7 @@
                         (list (cons (point-min) (point-max))))))
            (request (proofread--make-backend-request chunk 'llm)))
       (should-error
-       (proofread-llm--diagnostics-from-structured-response
+       (proofread-llm--diagnostic-batch-from-structured-response
         request "Before {\"diagnostics\":[} after" 'llm)))))
 
 (ert-deftest
@@ -1152,7 +1152,7 @@
            (request (proofread--make-backend-request chunk 'llm))
            (payload '(:diagnostics nil)))
       (should-error
-       (proofread-llm--diagnostics-from-structured-response
+       (proofread-llm--diagnostic-batch-from-structured-response
         request payload 'llm)))))
 
 (ert-deftest
@@ -1167,8 +1167,11 @@
             (proofread-llm-test--response-content
              (list (proofread-llm-test--response-diagnostic 5 7 "小城"))))
            (diagnostic
-            (car (proofread-llm--diagnostics-from-structured-response
-                  request content 'llm))))
+            (car
+             (plist-get
+              (proofread-llm--diagnostic-batch-from-structured-response
+               request content 'llm)
+              :diagnostics))))
       (should (equal (proofread--diagnostic-range diagnostic)
                      '(6 . 8))))))
 
@@ -1218,8 +1221,10 @@
               (proofread-llm-test--response-diagnostic 5 9 "wrld"
                                                        '("world")))))
            (diagnostics
-            (proofread-llm--diagnostics-from-structured-response
-             request content 'llm)))
+            (plist-get
+             (proofread-llm--diagnostic-batch-from-structured-response
+              request content 'llm)
+             :diagnostics)))
       (should (= (length diagnostics) 2))
       (should (equal (mapcar (lambda (diagnostic)
                                (plist-get diagnostic :text))
@@ -1391,7 +1396,7 @@
                         (list (cons (point-min) (point-max))))))
            (request (proofread--make-backend-request chunk 'llm)))
       (should-error
-       (proofread-llm--diagnostics-from-structured-response
+       (proofread-llm--diagnostic-batch-from-structured-response
         request "{\"diagnostics\":null}" 'llm))
       (let ((batch
              (proofread-llm--diagnostic-batch-from-structured-response
@@ -1427,7 +1432,7 @@
                            ("end" . 4)
                            ("extra" . true)))))))
       (should-error
-       (proofread-llm--diagnostics-from-structured-response
+       (proofread-llm--diagnostic-batch-from-structured-response
         request "{\"diagnostics\":[],\"extra\":true}" 'llm))
       (dolist (candidate (list candidate-extra range-extra))
         (let ((batch
@@ -1454,7 +1459,7 @@
   "Reject duplicate root fields but isolate candidate duplicates."
   (let ((request '(:beg 1 :end 5 :text "helo")))
     (should-error
-     (proofread-llm--diagnostics-from-structured-response
+     (proofread-llm--diagnostic-batch-from-structured-response
       request "{\"diagnostics\":false,\"diagnostics\":[]}" 'llm))
     (dolist
         (content
@@ -1495,7 +1500,7 @@
 \"range\":{\"beg\":0,\"end\":4},\
 \"suggestions\":[\"hello\",]}]}"))
       (should-error
-       (proofread-llm--diagnostics-from-structured-response
+       (proofread-llm--diagnostic-batch-from-structured-response
         request content 'llm)))))
 
 (ert-deftest
@@ -1505,7 +1510,7 @@
         (request '(:beg 1 :end 5 :text "helo")))
     (should-not (intern-soft key))
     (should-error
-     (proofread-llm--diagnostics-from-structured-response
+     (proofread-llm--diagnostic-batch-from-structured-response
       request (format "{\"diagnostics\":[],\"%s\":true}" key) 'llm))
     (should-not (intern-soft key))))
 
@@ -1534,8 +1539,11 @@
             (proofread-llm-test--response-diagnostic 0 2 ";;"))
            'outside-target))
       (let ((diagnostic
-             (car (proofread-llm--diagnostics-from-structured-response
-                   request insertion 'llm))))
+             (car
+              (plist-get
+               (proofread-llm--diagnostic-batch-from-structured-response
+                request insertion 'llm)
+               :diagnostics))))
         (should (= (plist-get diagnostic :beg)
                    (+ (point-min) insertion-position)))
         (should (= (plist-get diagnostic :beg)
@@ -1617,8 +1625,10 @@
               (before-mark (mark t))
               (before-mark-active mark-active))
           (should
-           (proofread-llm--diagnostics-from-structured-response
-            request content 'llm))
+           (plist-get
+            (proofread-llm--diagnostic-batch-from-structured-response
+             request content 'llm)
+            :diagnostics))
           (should (= (point) before-point))
           (should (= (mark t) before-mark))
           (should (eq mark-active before-mark-active)))))))
@@ -1655,8 +1665,11 @@
             (proofread-llm-test--response-diagnostic 3 5 "街到"
                                                      '("街道")))))
          (diagnostic
-          (car (proofread-llm--diagnostics-from-structured-response
-                request content 'llm))))
+          (car
+           (plist-get
+            (proofread-llm--diagnostic-batch-from-structured-response
+             request content 'llm)
+            :diagnostics))))
     (should diagnostic)
     (should (= (plist-get diagnostic :beg) 4))
     (should (= (plist-get diagnostic :end) 6))))
@@ -1692,8 +1705,10 @@
             (proofread-llm-test--response-content
              (list (proofread-llm-test--response-diagnostic 0 4 "helo"))))
            (diagnostics
-            (proofread-llm--diagnostics-from-structured-response
-             request content 'llm)))
+            (plist-get
+             (proofread-llm--diagnostic-batch-from-structured-response
+              request content 'llm)
+             :diagnostics)))
       (goto-char (point-max))
       (insert "!")
       (should (eq (proofread--handle-backend-result
@@ -1761,8 +1776,10 @@
             (proofread-llm-test--response-content
              (list (proofread-llm-test--response-diagnostic 0 2 "青晨"))))
            (diagnostics
-            (proofread-llm--diagnostics-from-structured-response
-             request content 'llm)))
+            (plist-get
+             (proofread-llm--diagnostic-batch-from-structured-response
+              request content 'llm)
+             :diagnostics)))
       (goto-char (point-max))
       (insert "!")
       (should (eq (proofread--handle-backend-result

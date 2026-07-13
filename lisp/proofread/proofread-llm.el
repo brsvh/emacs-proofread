@@ -74,8 +74,12 @@ of 1 uses a single LLM call."
 (defconst proofread-llm--contract-version 3
   "Version of the LLM prompt, response, and cache identity contract.")
 
+(defconst proofread-llm--diagnostic-kinds
+  '(spelling grammar style other)
+  "Diagnostic kind symbols accepted from structured responses.")
+
 (defconst proofread-llm--diagnostic-kind-names
-  (vconcat (mapcar #'symbol-name proofread--diagnostic-kinds))
+  (vconcat (mapcar #'symbol-name proofread-llm--diagnostic-kinds))
   "Diagnostic kind names accepted by the structured response schema.")
 
 (defconst proofread-llm--structured-response-instructions
@@ -144,12 +148,22 @@ of 1 uses a single LLM call."
      :additionalProperties ,json-false)
   "JSON schema for structured LLM responses.")
 
+(defun proofread-llm--result-with-candidate-metadata
+    (result candidate-issues repairs)
+  "Return RESULT with optional CANDIDATE-ISSUES and REPAIRS metadata."
+  (when candidate-issues
+    (setq result
+          (plist-put result :candidate-issues candidate-issues)))
+  (when repairs
+    (setq result (plist-put result :repairs repairs)))
+  result)
+
 (defun proofread-llm--backend-invalid-diagnostics-result
     (request candidate-issues repairs)
   "Return an error for REQUEST with no usable diagnostic candidates.
 CANDIDATE-ISSUES and REPAIRS describe the responses that were
 rejected."
-  (proofread--backend-result-with-diagnostic-metadata
+  (proofread-llm--result-with-candidate-metadata
    (proofread--backend-error-result
     request 'llm-invalid-diagnostics
     (format (concat "No usable diagnostic candidates after %d "
@@ -330,20 +344,247 @@ CONTEXT names the containing object for error messages."
     (error "Structured response content is not JSON text"))
   (proofread-llm--json-read-string content))
 
+(defun proofread-llm--diagnostic-candidates (payload)
+  "Return diagnostic candidates from structured PAYLOAD."
+  (unless (and (listp payload)
+               (plist-member payload :diagnostics))
+    (error "Missing diagnostics payload"))
+  (let ((diagnostics (plist-get payload :diagnostics)))
+    (unless (vectorp diagnostics)
+      (error "Invalid diagnostics payload"))
+    (append diagnostics nil)))
+
+(defun proofread-llm--diagnostic-candidate-range (candidate)
+  "Return CANDIDATE's chunk-relative range as a cons cell."
+  (let ((range (plist-get candidate :range)))
+    (when (and (listp range)
+               (plist-member range :beg)
+               (plist-member range :end))
+      (cons (plist-get range :beg)
+            (plist-get range :end)))))
+
+(defun proofread-llm--string-occurrences (needle haystack)
+  "Return zero-based ranges where NEEDLE occurs in HAYSTACK."
+  (when (and (stringp needle)
+             (not (string-empty-p needle))
+             (stringp haystack))
+    (let ((start 0)
+          ranges)
+      (while (setq start (string-search needle haystack start))
+        (push (cons start (+ start (length needle))) ranges)
+        (setq start (1+ start)))
+      (nreverse ranges))))
+
+(defun proofread-llm--diagnostic-candidate-matching-range
+    (request candidate relative-beg relative-end)
+  "Return CANDIDATE's safe chunk-relative range for REQUEST.
+Prefer RELATIVE-BEG and RELATIVE-END when they select the candidate
+text exactly.  Otherwise, repair the range only when that text occurs
+exactly once in the request text."
+  (let* ((request-text (plist-get request :text))
+         (text (plist-get candidate :text))
+         (reported-range (cons relative-beg relative-end)))
+    (cond
+     ((and (proofread--request-relative-range-valid-p
+            request relative-beg relative-end)
+           (stringp text)
+           (equal text
+                  (substring request-text relative-beg relative-end)))
+      reported-range)
+     ((and (integerp relative-beg)
+           (integerp relative-end)
+           (stringp text)
+           (not (string-empty-p text)))
+      (let ((ranges
+             (proofread-llm--string-occurrences text request-text)))
+        (when (= (length ranges) 1)
+          (car ranges)))))))
+
+(defun proofread-llm--diagnostic-candidate-kind (value)
+  "Return normalized diagnostic kind for VALUE."
+  (let ((kind
+         (and (stringp value)
+              (cdr (assoc value
+                          '(("spelling" . spelling)
+                            ("grammar" . grammar)
+                            ("style" . style)
+                            ("other" . other)))))))
+    (when (memq kind proofread-llm--diagnostic-kinds)
+      kind)))
+
+(defun proofread-llm--diagnostic-candidate-shape-p (candidate)
+  "Return non-nil when CANDIDATE has the required field shapes."
+  (and (listp candidate)
+       (let ((suggestions (plist-get candidate :suggestions)))
+         (and
+          (cl-every (lambda (key) (plist-member candidate key))
+                    '(:kind :message :text :range :suggestions))
+          (proofread-llm--diagnostic-candidate-kind
+           (plist-get candidate :kind))
+          (stringp (plist-get candidate :message))
+          (stringp (plist-get candidate :text))
+          (proofread-llm--diagnostic-candidate-range candidate)
+          (vectorp suggestions)
+          (cl-every #'stringp (append suggestions nil))))))
+
+(defun proofread-llm--diagnostic-candidate-resolution
+    (request candidate)
+  "Return REQUEST's safe range resolution for CANDIDATE.
+The returned plist has a `:status' of `exact', `repaired', or
+`rejected'."
+  (if (not (proofread-llm--diagnostic-candidate-shape-p candidate))
+      (list :status 'rejected
+            :reason (if (and (listp candidate)
+                             (plist-member
+                              candidate :candidate-error))
+                        'invalid-candidate-json
+                      'invalid-shape)
+            :message (and (listp candidate)
+                          (plist-get candidate :candidate-error)))
+    (let* ((reported-range
+            (proofread-llm--diagnostic-candidate-range candidate))
+           (relative-beg (car reported-range))
+           (relative-end (cdr reported-range))
+           (text (plist-get candidate :text))
+           (matching-range
+            (proofread-llm--diagnostic-candidate-matching-range
+             request candidate relative-beg relative-end)))
+      (cond
+       ((not matching-range)
+        (let ((occurrences
+               (proofread-llm--string-occurrences
+                text (plist-get request :text))))
+          (list :status 'rejected
+                :reason
+                (cond
+                 ((or (not (integerp relative-beg))
+                      (not (integerp relative-end)))
+                  'invalid-range)
+                 ((string-empty-p text) 'range-text-mismatch)
+                 ((null occurrences) 'unmatched-text)
+                 (t 'ambiguous-text))
+                :reported-range reported-range
+                :occurrences occurrences)))
+       ((not (proofread--request-relative-range-in-target-p
+              request matching-range))
+        (list :status 'rejected
+              :reason 'outside-target
+              :reported-range reported-range
+              :range matching-range))
+       ((equal matching-range reported-range)
+        (list :status 'exact :range matching-range))
+       (t
+        (list :status 'repaired
+              :reported-range reported-range
+              :range matching-range))))))
+
+(defun proofread-llm--diagnostic-candidate-issue
+    (index candidate resolution)
+  "Return an issue for CANDIDATE at INDEX from RESOLUTION."
+  (list :action 'dropped
+        :candidate-index index
+        :reason (plist-get resolution :reason)
+        :message (plist-get resolution :message)
+        :text (and (listp candidate)
+                   (plist-get candidate :text))
+        :reported-range
+        (or
+         (plist-get resolution :reported-range)
+         (and
+          (listp candidate)
+          (proofread-llm--diagnostic-candidate-range candidate)))
+        :resolved-range (plist-get resolution :range)
+        :occurrences (plist-get resolution :occurrences)))
+
+(defun proofread-llm--diagnostic-candidate-repair
+    (index candidate resolution)
+  "Return repair metadata for CANDIDATE at INDEX from RESOLUTION."
+  (list :action 'repaired
+        :candidate-index index
+        :text (plist-get candidate :text)
+        :reported-range (plist-get resolution :reported-range)
+        :range (plist-get resolution :range)))
+
+(defun proofread-llm--diagnostic-from-candidate
+    (request candidate &optional default-source matching-range)
+  "Return a diagnostic for REQUEST and CANDIDATE, or nil.
+Use DEFAULT-SOURCE when it is non-nil.  MATCHING-RANGE, when non-nil,
+is the already validated chunk-relative range for CANDIDATE."
+  (let* ((range
+          (proofread-llm--diagnostic-candidate-range candidate))
+         (relative-beg (car-safe range))
+         (relative-end (cdr-safe range))
+         (matching-range
+          (or matching-range
+              (proofread-llm--diagnostic-candidate-matching-range
+               request candidate relative-beg relative-end)))
+         (text (plist-get candidate :text))
+         (kind (proofread-llm--diagnostic-candidate-kind
+                (plist-get candidate :kind)))
+         (message (plist-get candidate :message)))
+    (when (and matching-range
+               (stringp text)
+               kind
+               (stringp message))
+      (proofread--diagnostic-from-request-relative-range
+       request matching-range
+       (list :kind kind
+             :message message
+             :suggestions
+             (append (plist-get candidate :suggestions) nil)
+             :source
+             (or default-source
+                 (plist-get request :backend)
+                 'unknown))))))
+
+(defun proofread-llm--diagnostic-batch-from-structured-payload
+    (request payload &optional default-source)
+  "Return parsed diagnostic batch for REQUEST from PAYLOAD.
+DEFAULT-SOURCE is stored as each diagnostic's internal source.
+Candidate-level problems are returned in `:issues' instead of
+invalidating the whole payload."
+  (let ((index 0)
+        diagnostics
+        issues
+        repairs)
+    (dolist (candidate
+             (proofread-llm--diagnostic-candidates payload))
+      (let* ((resolution
+              (proofread-llm--diagnostic-candidate-resolution
+               request candidate))
+             (status (plist-get resolution :status)))
+        (pcase status
+          ((or 'exact 'repaired)
+           (let ((diagnostic
+                  (proofread-llm--diagnostic-from-candidate
+                   request candidate default-source
+                   (plist-get resolution :range))))
+             (if diagnostic
+                 (progn
+                   (push diagnostic diagnostics)
+                   (when (eq status 'repaired)
+                     (push
+                      (proofread-llm--diagnostic-candidate-repair
+                       index candidate resolution)
+                      repairs)))
+               (push (proofread-llm--diagnostic-candidate-issue
+                      index candidate
+                      (list :reason 'invalid-candidate))
+                     issues))))
+          ('rejected
+           (push (proofread-llm--diagnostic-candidate-issue
+                  index candidate resolution)
+                 issues)))
+        (setq index (1+ index))))
+    (list :diagnostics (nreverse diagnostics)
+          :issues (nreverse issues)
+          :repairs (nreverse repairs))))
+
 (defun proofread-llm--diagnostic-batch-from-structured-response
     (request content &optional default-source)
   "Return parsed diagnostic batch for REQUEST from response CONTENT.
 Use DEFAULT-SOURCE when it is non-nil."
-  (proofread--diagnostic-batch-from-structured-payload
-   request
-   (proofread-llm--structured-response-payload content)
-   default-source))
-
-(defun proofread-llm--diagnostics-from-structured-response
-    (request content &optional default-source)
-  "Return diagnostics for REQUEST from structured response CONTENT.
-Use DEFAULT-SOURCE when it is non-nil."
-  (proofread--diagnostics-from-structured-payload
+  (proofread-llm--diagnostic-batch-from-structured-payload
    request
    (proofread-llm--structured-response-payload content)
    default-source))
@@ -392,11 +633,13 @@ PASS identifies the diagnostic pass for request logging."
                  (repairs
                   (proofread-llm--diagnostic-metadata-for-pass
                    (plist-get batch :repairs) pass)))
-              (if issues
-                  (proofread--backend-partial-success-result
-                   request diagnostics issues repairs)
-                (proofread--backend-success-result
-                 request diagnostics nil repairs)))
+              (proofread-llm--result-with-candidate-metadata
+               (if issues
+                   (proofread--backend-partial-success-result
+                    request diagnostics)
+                 (proofread--backend-success-result
+                  request diagnostics))
+               issues repairs))
           (error
            (proofread--backend-error-result
             request
@@ -507,11 +750,15 @@ state."
                     (proofread-llm--backend-invalid-diagnostics-result
                      request merged-issues merged-repairs))
                    (merged-issues
-                    (proofread--backend-partial-success-result
-                     request merged merged-issues merged-repairs))
+                    (proofread-llm--result-with-candidate-metadata
+                     (proofread--backend-partial-success-result
+                      request merged)
+                     merged-issues merged-repairs))
                    (t
-                    (proofread--backend-success-result
-                     request merged nil merged-repairs)))))
+                    (proofread-llm--result-with-candidate-metadata
+                     (proofread--backend-success-result
+                      request merged)
+                     nil merged-repairs)))))
              (if handle
                  (proofread-llm--deliver-result
                   handle callback final-result)
@@ -521,10 +768,12 @@ state."
        (let ((final-result
               (cond
                (diagnostics
-                (proofread--backend-partial-success-result
-                 request diagnostics candidate-issues repairs))
+                (proofread-llm--result-with-candidate-metadata
+                 (proofread--backend-partial-success-result
+                  request diagnostics)
+                 candidate-issues repairs))
                (candidate-issues
-                (proofread--backend-result-with-diagnostic-metadata
+                (proofread-llm--result-with-candidate-metadata
                  result candidate-issues repairs))
                (t result))))
          (if handle
