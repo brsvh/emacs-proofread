@@ -160,6 +160,38 @@ disables backend dispatch."
                  (const :tag "LanguageTool backend" languagetool))
   :group 'proofread)
 
+(defcustom proofread-profiles nil
+  "Named proofreading profiles.
+Each element maps a stable profile name to a profile property list.
+A profile may contain:
+
+`:language'
+     Backend language hint for checks using this profile.
+
+`:display-language'
+     Human-readable language name for backends that build natural
+     language prompts.
+
+`:bindings'
+     Ordered backend bindings.  Each binding is a property list with
+     required `:name' and `:backend' properties, and an optional
+     `:options' property.  Binding names are stable identifiers, not
+     display labels, and must be unique inside one profile.  Binding
+     options are backend-local data interpreted by the selected
+     backend."
+  :type '(alist :key-type symbol :value-type sexp)
+  :group 'proofread)
+
+(defcustom proofread-profile nil
+  "Selected proofreading profile.
+The value nil keeps the legacy `proofread-backend' and
+`proofread-language' settings active.  A symbol selects the matching
+entry from `proofread-profiles'."
+  :type '(choice
+          (const :tag "Use legacy backend settings" nil)
+          symbol)
+  :group 'proofread)
+
 (defcustom proofread-cache-max-entries 128
   "Maximum diagnostic cache entries retained in each buffer.
 A value of 0 disables diagnostic caching."
@@ -205,6 +237,20 @@ request-ready chunks."
   '((llm . proofread-llm)
     (languagetool . proofread-languagetool))
   "Alist mapping built-in backend names to their library features.")
+
+(defconst proofread--legacy-profile-name 'legacy
+  "Profile name used for synthetic legacy backend settings.")
+
+(defconst proofread--legacy-binding-name 'legacy
+  "Binding name used for synthetic legacy backend settings.")
+
+(defconst proofread--profile-keys
+  '( :language :display-language :bindings)
+  "Property keys accepted in proofread profile definitions.")
+
+(defconst proofread--profile-binding-keys
+  '( :name :backend :options)
+  "Property keys accepted in proofread profile binding definitions.")
 
 (defconst proofread--diagnostic-keys
   '( :beg :end :text :kind :message :suggestions :source :target-kind)
@@ -482,6 +528,161 @@ optional callable `:cancel' entry cancels backend-specific handles."
                                       proofread--backend-features)))
         (require feature nil t)
         (gethash backend proofread--backend-registry))))
+
+;;;; Profiles
+
+(defun proofread--plist-keys (value context)
+  "Return property keys from VALUE, or signal an error for CONTEXT."
+  (unless (listp value)
+    (error "%s must be a property list" context))
+  (let ((tail value)
+        keys)
+    (while tail
+      (unless (consp tail)
+        (error "%s must be a proper property list" context))
+      (let ((key (pop tail)))
+        (unless (keywordp key)
+          (error "%s contains non-keyword property %S" context key))
+        (push key keys))
+      (unless (consp tail)
+        (error "%s must contain values for every property" context))
+      (pop tail))
+    (nreverse keys)))
+
+(defun proofread--validate-plist (value context)
+  "Return VALUE after validating it as a property list for CONTEXT."
+  (proofread--plist-keys value context)
+  value)
+
+(defun proofread--validate-known-plist
+    (value context allowed-keys)
+  "Return VALUE after validating known properties for CONTEXT.
+ALLOWED-KEYS is the list of accepted keyword properties."
+  (dolist (key (proofread--plist-keys value context))
+    (unless (memq key allowed-keys)
+      (error "%s contains unknown property %S" context key)))
+  value)
+
+(defun proofread--validate-language-option (value context)
+  "Return VALUE after validating a language option for CONTEXT."
+  (unless (or (null value) (stringp value))
+    (error "%s must be nil or a string" context))
+  value)
+
+(defun proofread--profile-definition (name)
+  "Return the raw profile definition named NAME.
+Signal an error when `proofread-profiles' has malformed entries or
+duplicate names."
+  (unless (symbolp name)
+    (error "Proofread profile name must be a symbol: %S" name))
+  (unless (listp proofread-profiles)
+    (error "proofread-profiles must be a list"))
+  (let (definition found)
+    (dolist (entry proofread-profiles)
+      (unless (and (consp entry) (symbolp (car entry)))
+        (error "Invalid proofread profile entry: %S" entry))
+      (when (eq (car entry) name)
+        (when found
+          (error "Duplicate proofread profile: %S" name))
+        (setq found t)
+        (setq definition (cdr entry))))
+    (unless found
+      (user-error "Unknown proofread profile: %S" name))
+    definition))
+
+(defun proofread--normalize-profile-binding
+    (profile-name binding seen-names)
+  "Return normalized BINDING for PROFILE-NAME.
+SEEN-NAMES is an eq hash table used to reject duplicate binding
+names inside the profile."
+  (let ((context (format "Proofread profile %S binding" profile-name)))
+    (proofread--validate-known-plist
+     binding context proofread--profile-binding-keys)
+    (let ((name (plist-get binding :name))
+          (backend (plist-get binding :backend))
+          (options (plist-get binding :options)))
+      (unless (and name (symbolp name))
+        (error "%s must have a non-nil symbol :name" context))
+      (when (gethash name seen-names)
+        (error "Duplicate proofread binding %S in profile %S"
+               name profile-name))
+      (puthash name t seen-names)
+      (unless (and backend (symbolp backend))
+        (error "%s must have a non-nil symbol :backend" context))
+      (when (plist-member binding :options)
+        (proofread--validate-plist
+         options
+         (format "%s %S :options" context name)))
+      (list :profile profile-name
+            :name name
+            :backend backend
+            :options (proofread--snapshot-value options)))))
+
+(defun proofread--normalize-profile-bindings
+    (profile-name bindings)
+  "Return normalized profile BINDINGS for PROFILE-NAME."
+  (unless (listp bindings)
+    (error "Proofread profile %S :bindings must be a list"
+           profile-name))
+  (let ((seen-names (make-hash-table :test #'eq))
+        normalized)
+    (dolist (binding bindings)
+      (push
+       (proofread--normalize-profile-binding
+        profile-name binding seen-names)
+       normalized))
+    (nreverse normalized)))
+
+(defun proofread--normalize-profile (name definition)
+  "Return normalized profile NAME from raw DEFINITION."
+  (let ((context (format "Proofread profile %S" name)))
+    (proofread--validate-known-plist
+     definition context proofread--profile-keys)
+    (let ((language (plist-get definition :language))
+          (display-language (plist-get definition :display-language))
+          (bindings (plist-get definition :bindings)))
+      (proofread--validate-language-option
+       language (format "%s :language" context))
+      (proofread--validate-language-option
+       display-language (format "%s :display-language" context))
+      (list :name name
+            :language (proofread--snapshot-value language)
+            :display-language
+            (proofread--snapshot-value display-language)
+            :bindings
+            (proofread--normalize-profile-bindings
+             name bindings)))))
+
+(defun proofread--legacy-profile ()
+  "Return a normalized profile from legacy backend options."
+  (unless (or (null proofread-backend)
+              (symbolp proofread-backend))
+    (error "proofread-backend must be nil or a symbol"))
+  (proofread--validate-language-option
+   proofread-language "proofread-language")
+  (let ((bindings
+         (and proofread-backend
+              (list
+               (list :profile proofread--legacy-profile-name
+                     :name proofread--legacy-binding-name
+                     :backend proofread-backend
+                     :options nil)))))
+    (list :name proofread--legacy-profile-name
+          :language (proofread--snapshot-value proofread-language)
+          :display-language nil
+          :bindings bindings)))
+
+(defun proofread--current-profile ()
+  "Return the normalized selected proofreading profile."
+  (if proofread-profile
+      (proofread--normalize-profile
+       proofread-profile
+       (proofread--profile-definition proofread-profile))
+    (proofread--legacy-profile)))
+
+(defun proofread--current-profile-bindings ()
+  "Return normalized bindings from the selected proofreading profile."
+  (plist-get (proofread--current-profile) :bindings))
 
 ;;;; State predicates
 

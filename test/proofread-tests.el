@@ -2769,6 +2769,104 @@ This covers URLs, email, invisible text, faces, and properties."
       (should-not proofread--diagnostics)
       (should-not proofread--overlays))))
 
+;;;; Profile configuration tests
+
+(ert-deftest proofread-test-legacy-profile-normalizes-backend-settings
+    ()
+  "Normalize legacy backend settings as one synthetic profile."
+  (let ((proofread-profile nil)
+        (proofread-backend proofread-test--backend)
+        (proofread-language "zh-Hans"))
+    (should
+     (equal
+      (proofread--current-profile)
+      `( :name legacy
+         :language "zh-Hans"
+         :display-language nil
+         :bindings
+         (( :profile legacy
+            :name legacy
+            :backend ,proofread-test--backend
+            :options nil)))))))
+
+(ert-deftest proofread-test-legacy-profile-allows-disabled-backend
+    ()
+  "Normalize disabled legacy backend settings as an empty profile."
+  (let ((proofread-profile nil)
+        (proofread-backend nil)
+        (proofread-language nil))
+    (should
+     (equal
+      (proofread--current-profile)
+      '( :name legacy
+         :language nil
+         :display-language nil
+         :bindings nil)))))
+
+(ert-deftest proofread-test-profile-normalizes-bindings ()
+  "Normalize an explicitly selected profile and its bindings."
+  (let ((proofread-profile 'zh-hans)
+        (proofread-profiles
+         `((zh-hans
+            :language "zh-Hans"
+            :display-language "Simplified Chinese"
+            :bindings
+            (( :name llm-primary
+               :backend ,proofread-test--backend
+               :options
+               ( :provider proofread-test-provider
+                 :provider-identity "test-provider"
+                 :instructions-function
+                 proofread-test-instructions
+                 :instructions-identity "instructions:v1"))
+             ( :name languagetool
+               :backend languagetool
+               :options
+               ( :language "zh-CN"
+                 :level picky)))))))
+    (let* ((profile (proofread--current-profile))
+           (bindings (plist-get profile :bindings))
+           (llm-binding (car bindings))
+           (languagetool-binding (cadr bindings)))
+      (should (eq (plist-get profile :name) 'zh-hans))
+      (should (equal (plist-get profile :language) "zh-Hans"))
+      (should (equal (plist-get profile :display-language)
+                     "Simplified Chinese"))
+      (should (= (length bindings) 2))
+      (should (eq (plist-get llm-binding :profile) 'zh-hans))
+      (should (eq (plist-get llm-binding :name) 'llm-primary))
+      (should (eq (plist-get llm-binding :backend)
+                  proofread-test--backend))
+      (should (equal (plist-get llm-binding :options)
+                     '( :provider proofread-test-provider
+                        :provider-identity "test-provider"
+                        :instructions-function
+                        proofread-test-instructions
+                        :instructions-identity "instructions:v1")))
+      (should (eq (plist-get languagetool-binding :name)
+                  'languagetool))
+      (should (eq (plist-get languagetool-binding :backend)
+                  'languagetool)))))
+
+(ert-deftest proofread-test-profile-rejects-unknown-selection ()
+  "Reject a selected profile that is not configured."
+  (let ((proofread-profile 'missing)
+        (proofread-profiles nil))
+    (should-error (proofread--current-profile) :type 'user-error)))
+
+(ert-deftest proofread-test-profile-rejects-duplicate-binding-names
+    ()
+  "Reject duplicate binding names inside one profile."
+  (let ((proofread-profile 'duplicate)
+        (proofread-profiles
+         `((duplicate
+            :bindings
+            (( :name repeated
+               :backend ,proofread-test--backend)
+             ( :name repeated
+               :backend languagetool))))))
+    (should-error (proofread--current-profile) :type 'error)))
+
 ;;;; Backend and scheduler tests
 
 (ert-deftest proofread-test-backend-registry-routes-adapter-functions
