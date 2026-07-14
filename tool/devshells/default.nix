@@ -1,6 +1,7 @@
 {
   lib,
   pkgs,
+  projectRoot,
   ...
 }:
 let
@@ -34,9 +35,10 @@ let
     ]
   );
 
-  languageToolServer =
-    pkgs.callPackage ../languagetool.nix
-      { };
+  languagetool-server = pkgs.callPackage (
+    projectRoot
+    + /tool/languagetool-server-wrapper.nix
+  ) { };
 
   formatters = with pkgs; [
     elisp-format
@@ -285,9 +287,11 @@ in
     };
   };
 
-  packages = with pkgs; [
+  packages = [
+    languagetool-server
+  ]
+  ++ (with pkgs; [
     gnumake
     gnutar
-    languageToolServer
-  ];
+  ]);
 }

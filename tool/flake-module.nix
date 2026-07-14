@@ -1,5 +1,6 @@
 {
   inputs,
+  projectRoot,
   ...
 }:
 let
@@ -18,7 +19,6 @@ in
       config,
       lib,
       pkgs',
-      projectRoot,
       system,
       ...
     }:
@@ -34,8 +34,6 @@ in
               infix.overlays.default
             ];
           };
-
-          projectRoot = ../.;
         };
       };
 

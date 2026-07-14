@@ -186,7 +186,8 @@
               ;
 
             languageToolServer = pkgs.callPackage (
-              projectRoot + /tool/languagetool.nix
+              projectRoot
+              + /tool/languagetool-server-wrapper.nix
             ) { };
 
             release = with pkgs; emacsPackagesFor emacs31;
