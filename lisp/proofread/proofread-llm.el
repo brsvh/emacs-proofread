@@ -52,9 +52,10 @@ provider advertises `json-response', and otherwise falls back to
 prompt-only JSON.  The value `provider-json' requires `json-response'.
 The value `prompt-json' always uses ordinary chat output and asks the
 model to return only JSON."
-  :type '( choice (const :tag "Auto" auto)
-           (const :tag "Provider JSON schema" provider-json)
-           (const :tag "Prompt-only JSON" prompt-json))
+  :type '(choice
+          (const :tag "Auto" auto)
+          (const :tag "Provider JSON schema" provider-json)
+          (const :tag "Prompt-only JSON" prompt-json))
   :group 'proofread)
 
 (defcustom proofread-llm-provider-identity nil

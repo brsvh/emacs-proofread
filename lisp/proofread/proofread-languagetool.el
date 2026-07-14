@@ -75,9 +75,9 @@ fixed arguments.  The executable may be found through variable
 arguments are visible in operating-system process listings and must
 not contain credentials; use a protected config file or environment
 variable for secrets."
-  :type '( choice
-           (string :tag "Executable")
-           (repeat :tag "Executable and fixed arguments" string))
+  :type '(choice
+          (string :tag "Executable")
+          (repeat :tag "Executable and fixed arguments" string))
   :group 'proofread-languagetool)
 
 (defcustom proofread-languagetool-config-file
@@ -87,8 +87,9 @@ variable for secrets."
 The environment variable `PROOFREAD_LANGUAGETOOL_CONFIG' supplies the
 initial value.  Avoid placing credentials in a properties file that
 is readable by other local users."
-  :type '( choice (const :tag "Server defaults" nil)
-           (file :must-match t))
+  :type '(choice
+          (const :tag "Server defaults" nil)
+          (file :must-match t))
   :group 'proofread-languagetool)
 
 (defcustom proofread-languagetool-startup-timeout 15.0
@@ -110,8 +111,9 @@ is readable by other local users."
 (defcustom proofread-languagetool-level 'default
   "LanguageTool checking level used for requests.
 The value `picky' enables additional style rules."
-  :type '( choice (const :tag "Default" default)
-           (const :tag "Picky" picky))
+  :type '(choice
+          (const :tag "Default" default)
+          (const :tag "Picky" picky))
   :local t
   :group 'proofread-languagetool)
 
@@ -119,38 +121,39 @@ The value `picky' enables additional style rules."
   "Specify preferred variants for automatic language detection.
 Each value is a LanguageTool long language code such as `en-US' or
 `de-DE'.  Send these values only when `proofread-language' is nil."
-  :type '( repeat string)
+  :type '(repeat string)
   :local t
   :group 'proofread-languagetool)
 
 (defcustom proofread-languagetool-mother-tongue nil
   "Optional mother-tongue language code for false-friend checks."
-  :type '( choice (const :tag "Unspecified" nil)
-           string)
+  :type '(choice
+          (const :tag "Unspecified" nil)
+          string)
   :local t
   :group 'proofread-languagetool)
 
 (defcustom proofread-languagetool-enabled-rules nil
   "LanguageTool rule identifiers enabled for each check."
-  :type '( repeat string)
+  :type '(repeat string)
   :local t
   :group 'proofread-languagetool)
 
 (defcustom proofread-languagetool-disabled-rules nil
   "LanguageTool rule identifiers disabled for each check."
-  :type '( repeat string)
+  :type '(repeat string)
   :local t
   :group 'proofread-languagetool)
 
 (defcustom proofread-languagetool-enabled-categories nil
   "LanguageTool category identifiers enabled for each check."
-  :type '( repeat string)
+  :type '(repeat string)
   :local t
   :group 'proofread-languagetool)
 
 (defcustom proofread-languagetool-disabled-categories nil
   "LanguageTool category identifiers disabled for each check."
-  :type '( repeat string)
+  :type '(repeat string)
   :local t
   :group 'proofread-languagetool)
 
@@ -450,7 +453,7 @@ When BASE-URL is nil, validate and use the configured server URL."
              (proofread-languagetool--command-snapshot)
            (error proofread-languagetool-command))))
     (list :fingerprint
-          (secure-hash 'sha256 (prin1-to-string snapshot)))))
+	  (secure-hash 'sha256 (prin1-to-string snapshot)))))
 
 (defun proofread-languagetool--config-identity-for-file (file)
   "Return non-secret identity information for config FILE."
@@ -484,10 +487,10 @@ When BASE-URL is nil, validate and use the configured server URL."
           :startup-timeout startup-timeout
           :managed-identity
           (list :server-config
-                (proofread-languagetool--config-identity-for-file
-                 config-file)
-                :command command
-                :startup-timeout startup-timeout))))
+		(proofread-languagetool--config-identity-for-file
+		 config-file)
+		:command command
+		:startup-timeout startup-timeout))))
 
 (defun proofread-languagetool--reject-local-session-options
     (&optional buffer managed)
@@ -1052,7 +1055,7 @@ Signal an error when STATUS is not a URL callback status plist."
           (let ((status-result
                  (condition-case err
                      (list :ok
-                           (proofread-languagetool--callback-status-error
+			   (proofread-languagetool--callback-status-error
                             status))
                    (error
                     (list :error (error-message-string err))))))
@@ -1099,7 +1102,7 @@ Signal an error when STATUS is not a URL callback status plist."
                               (proofread-languagetool--http-body))
                            (error
                             (list :error
-                                  (error-message-string err))))))
+				  (error-message-string err))))))
                     (if (eq (car decoded) :error)
                         (let ((message
                                (proofread-languagetool--bounded-message

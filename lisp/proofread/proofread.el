@@ -65,8 +65,7 @@
   "Language hint used by proofread backends.
 When nil, backends may infer the language from buffer contents or
 other configuration."
-  :type '( choice (const :tag "Infer" nil)
-           string)
+  :type '(choice (const :tag "Infer" nil) string)
   :group 'proofread)
 
 (defcustom proofread-auto-check t
@@ -90,12 +89,12 @@ Comment and docstring delimiters remain part of the selected text so
 backend offsets continue to map exactly to buffer positions.  Backends
 are instructed to report only natural-language prose inside those
 targets.  This option becomes buffer-local when set."
-  :type '( choice (const :tag "Automatic" auto)
-           (const :tag "All text" all)
-           (const :tag "Comments only" comments)
-           (const :tag "Docstrings only" docstrings)
-           (const :tag "Comments and docstrings"
-                  comments-and-docstrings))
+  :type '(choice
+          (const :tag "Automatic" auto)
+          (const :tag "All text" all)
+          (const :tag "Comments only" comments)
+          (const :tag "Docstrings only" docstrings)
+          (const :tag "Comments and docstrings" comments-and-docstrings))
   :local t
   :group 'proofread)
 
@@ -105,7 +104,7 @@ Each function is called with the beginning and end positions of a
 complete syntactic string and should return non-nil when that string
 is a docstring.  The generic `font-lock-doc-face' detector is always
 used as a fallback.  This option becomes buffer-local when set."
-  :type '( repeat function)
+  :type '(repeat function)
   :local t
   :group 'proofread)
 
@@ -156,9 +155,9 @@ prevents new backend requests from being sent."
 The symbol `llm' uses `proofread-llm-provider'.  The symbol
 `languagetool' uses a local LanguageTool HTTP server.  A nil value
 disables backend dispatch."
-  :type '( choice (const :tag "None" nil)
-           (const :tag "Generic llm backend" llm)
-           (const :tag "LanguageTool backend" languagetool))
+  :type '(choice (const :tag "None" nil)
+                 (const :tag "Generic llm backend" llm)
+                 (const :tag "LanguageTool backend" languagetool))
   :group 'proofread)
 
 (defcustom proofread-cache-max-entries 128
@@ -177,7 +176,7 @@ A value of 0 disables diagnostic caching."
 The `face' text property is inspected directly.  When its value is a
 symbol or a list containing any face in this option, that text is not
 included in request-ready chunks."
-  :type '( repeat symbol)
+  :type '(repeat symbol)
   :group 'proofread)
 
 (defcustom proofread-ignored-properties nil
@@ -185,7 +184,7 @@ included in request-ready chunks."
 Each property is inspected with `get-text-property'.  Text where any
 configured property has a non-nil value is not included in
 request-ready chunks."
-  :type '( repeat symbol)
+  :type '(repeat symbol)
   :group 'proofread)
 
 ;;;; Faces
