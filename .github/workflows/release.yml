@@ -3,7 +3,7 @@ name: Release
 on:
   push:
     tags:
-      - "v*"
+      - "*-v*"
 
 permissions: {}
 
@@ -21,8 +21,7 @@ jobs:
     name: Build and verify
     if: >-
       github.repository == 'brsvh/emacs-proofread' &&
-      github.ref_type == 'tag' &&
-      startsWith(github.ref, 'refs/tags/v')
+      github.ref_type == 'tag'
     runs-on: ubuntu-24.04
     timeout-minutes: 60
 
@@ -45,18 +44,59 @@ jobs:
         with:
           github_access_token: ${{ github.token }}
 
-      - name: Validate release source
+      - name: Identify package release
+        id: release
         shell: bash
         env:
-          RELEASE_SHA: ${{ github.sha }}
           RELEASE_TAG: ${{ github.ref_name }}
         run: |
           set -euo pipefail
 
-          if [[ ! "$RELEASE_TAG" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
-            printf 'Invalid release tag: %s\n' "$RELEASE_TAG" >&2
+          mapfile -t release_packages < <(
+            nix develop .#release --command \
+              make --silent release-packages
+          )
+          test "${#release_packages[@]}" -gt 0
+
+          release_package=
+          release_version=
+          for candidate in "${release_packages[@]}"; do
+            prefix="${candidate}-v"
+            if [[ "$RELEASE_TAG" == "$prefix"* ]]; then
+              version="${RELEASE_TAG#"$prefix"}"
+              if [[ "$version" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
+                if test -n "$release_package"; then
+                  printf 'Ambiguous release tag: %s\n' \
+                    "$RELEASE_TAG" >&2
+                  exit 1
+                fi
+                release_package="$candidate"
+                release_version="$version"
+              fi
+            fi
+          done
+
+          if test -z "$release_package"; then
+            printf 'Invalid package release tag: %s\n' \
+              "$RELEASE_TAG" >&2
             exit 1
           fi
+
+          {
+            printf 'package=%s\n' "$release_package"
+            printf 'version=%s\n' "$release_version"
+          } >> "$GITHUB_OUTPUT"
+          {
+            printf 'RELEASE_PACKAGE=%s\n' "$release_package"
+            printf 'RELEASE_VERSION=%s\n' "$release_version"
+          } >> "$GITHUB_ENV"
+
+      - name: Validate release source
+        shell: bash
+        env:
+          RELEASE_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
 
           git fetch --force --no-tags origin \
             refs/heads/main:refs/remotes/origin/main
@@ -77,6 +117,7 @@ jobs:
 
           mkdir -p release-input
           release_ref="refs/remotes/origin/${RELEASE_BRANCH}"
+          tag_pattern='^([a-z0-9][a-z0-9-]*-)?v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$'
 
           git show "${release_ref}:manifest.json" \
             > release-input/latest-manifest.json
@@ -92,7 +133,7 @@ jobs:
           )"
 
           if test -n "$ledger_tag"; then
-            if [[ ! "$ledger_tag" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
+            if [[ ! "$ledger_tag" =~ $tag_pattern ]]; then
               printf 'Invalid ledger tag: %s\n' "$ledger_tag" >&2
               exit 1
             fi
@@ -124,7 +165,6 @@ jobs:
 
           current_ref="${release_ref}:manifests/${RELEASE_TAG}.json"
           if git cat-file -e "$current_ref" 2>/dev/null; then
-            test -n "$ledger_tag"
             git show "$current_ref" \
               > release-input/current-history.json
             nix develop .#release --command \
@@ -139,12 +179,6 @@ jobs:
                 release-input/latest-manifest.json \
                 release-input/current-history.json
             else
-              test "$(
-                printf '%s\n' "$RELEASE_TAG" "$ledger_tag" \
-                  | sort --version-sort \
-                  | tail -n 1
-              )" = "$ledger_tag"
-
               gh api \
                 -H "X-GitHub-Api-Version: ${GITHUB_API_VERSION}" \
                 "repos/${GITHUB_REPOSITORY}/releases/tags/${RELEASE_TAG}" \
@@ -198,25 +232,31 @@ jobs:
           nix run .#emacs30-byte-compile-proofread
           nix run .#emacs31-byte-compile-proofread
 
-      - name: Build reproducible package archives
+      - name: Build reproducible package archive
         shell: bash
         run: |
           set -euo pipefail
 
           nix develop .#release --command make clean
-          nix develop .#release --command make release-archives
-
-          mapfile -t archives < <(
-            nix develop .#release --command \
-              make --silent release-artifacts
-          )
-          test "${#archives[@]}" -gt 0
           nix develop .#release --command \
-            sha256sum "${archives[@]}" \
+            make PACKAGE="$RELEASE_PACKAGE" release-package-archive
+
+          archive="$(
+            nix develop .#release --command \
+              make --silent \
+                PACKAGE="$RELEASE_PACKAGE" \
+                release-package-artifact
+          )"
+          test -n "$archive"
+          printf '%s\n' "$archive" \
+            > release-input/target-archive-path
+          nix develop .#release --command \
+            sha256sum "$archive" \
             > release-input/archive-sha256
 
           nix develop .#release --command make clean
-          nix develop .#release --command make release-archives
+          nix develop .#release --command \
+            make PACKAGE="$RELEASE_PACKAGE" release-package-archive
           nix develop .#release --command \
             sha256sum --check --strict \
             release-input/archive-sha256
@@ -224,48 +264,131 @@ jobs:
       - name: Prepare and install release snapshot
         shell: bash
         env:
+          GH_TOKEN: ${{ github.token }}
           RELEASE_SHA: ${{ github.sha }}
           RELEASE_TAG: ${{ github.ref_name }}
         run: |
           set -euo pipefail
 
-          mapfile -t archives < <(
-            nix develop .#release --command \
-              make --silent release-artifacts
+          api() {
+            gh api \
+              -H "X-GitHub-Api-Version: ${GITHUB_API_VERSION}" \
+              "$@"
+          }
+
+          asset_digest_from_release() {
+            local release_file=$1
+            local name=$2
+            local release_id
+            local digest
+            local assets_file
+
+            digest="$(
+              jq -r --arg name "$name" \
+                '.assets[]? | select(.name == $name) | .digest // empty' \
+                "$release_file"
+            )"
+            if test -z "$digest"; then
+              release_id="$(jq -r '.id' "$release_file")"
+              assets_file="$(mktemp)"
+              api \
+                "repos/${GITHUB_REPOSITORY}/releases/${release_id}/assets?per_page=100" \
+                > "$assets_file"
+              digest="$(
+                jq -r --arg name "$name" \
+                  '.[] | select(.name == $name) | .digest // empty' \
+                  "$assets_file"
+              )"
+              rm -f "$assets_file"
+            fi
+            if test -z "$digest"; then
+              printf 'Missing GitHub digest for asset: %s\n' "$name" >&2
+              exit 1
+            fi
+            printf '%s\n' "$digest"
+          }
+
+          verify_github_asset_digest() {
+            local release_file=$1
+            local name=$2
+            local path=$3
+            local expected
+            local actual
+
+            expected="sha256:$(sha256sum "$path" | cut -d ' ' -f 1)"
+            actual="$(asset_digest_from_release "$release_file" "$name")"
+            if test "$actual" != "$expected"; then
+              printf 'GitHub digest mismatch for %s: %s != %s\n' \
+                "$name" "$actual" "$expected" >&2
+              exit 1
+            fi
+          }
+
+          archive="$(cat release-input/target-archive-path)"
+          nix develop .#release --command \
+            proofread-release required-dependencies \
+            "$RELEASE_PACKAGE" \
+            "$RELEASE_VERSION" \
+            "$RELEASE_TAG" \
+            release-input/previous-manifest.json \
+            "$archive" \
+            release-input/dependencies.json
+
+          mkdir -p release-input/dependency-archives
+          dependency_archives=()
+          mapfile -t dependency_rows < <(
+            jq -c '.[]' release-input/dependencies.json
           )
+          for row in "${dependency_rows[@]}"; do
+            name="$(jq -r '.name' <<<"$row")"
+            dep_tag="$(jq -r '.release_tag' <<<"$row")"
+            asset="$(jq -r '.asset' <<<"$row")"
+            sha256="$(jq -r '.sha256' <<<"$row")"
+            dep_release="release-input/${name}-release.json"
+
+            api \
+              "repos/${GITHUB_REPOSITORY}/releases/tags/${dep_tag}" \
+              > "$dep_release"
+            jq -e '.draft == false and .immutable == true' \
+              "$dep_release"
+
+            gh release download "$dep_tag" \
+              --repo "$GITHUB_REPOSITORY" \
+              --pattern "$asset" \
+              --dir release-input/dependency-archives
+            path="release-input/dependency-archives/${asset}"
+            test "$(sha256sum "$path" | cut -d ' ' -f 1)" = "$sha256"
+            verify_github_asset_digest "$dep_release" "$asset" "$path"
+            dependency_archives+=("$path")
+          done
 
           nix develop .#release --command \
-            proofread-release prepare \
+            proofread-release prepare-package \
+            "$RELEASE_PACKAGE" \
+            "$RELEASE_VERSION" \
             "$RELEASE_TAG" \
             "$RELEASE_SHA" \
             release-input/previous-manifest.json \
             release-handoff \
-            "${archives[@]}"
+            "$archive" \
+            "${dependency_archives[@]}"
 
-          mapfile -t packages < <(
-            jq -r \
-              '.packages[] | select(.lifecycle == "active") | .name' \
-              release-handoff/assets/manifest.json
-          )
-          test "${#packages[@]}" -gt 0
-
-          installables=()
-          version_assignments=()
-          for package in "${packages[@]}"; do
-            installables+=(".#${package}")
-            version="$(nix eval --raw ".#${package}.version")"
-            version_assignments+=("${package}=${version}")
-          done
-
-          nix build --no-link "${installables[@]}"
+          nix build --no-link ".#${RELEASE_PACKAGE}"
+          nix_version="$(nix eval --raw ".#${RELEASE_PACKAGE}.version")"
           nix develop .#release --command \
-            proofread-release check-versions \
+            proofread-release check-package-version \
             release-handoff/assets/manifest.json \
-            "${version_assignments[@]}"
+            "$RELEASE_PACKAGE" \
+            "$nix_version"
 
+          target_asset="$(
+            jq -r '.asset' release-handoff/plan.json
+          )"
           nix develop .#release --command \
             proofread-release verify-install \
-            release-handoff/assets/manifest.json
+            release-handoff/assets/manifest.json \
+            "release-handoff/assets/${target_asset}" \
+            "${dependency_archives[@]}"
 
       - name: Upload verified handoff
         id: upload
@@ -282,8 +405,7 @@ jobs:
     needs: build
     if: >-
       github.repository == 'brsvh/emacs-proofread' &&
-      github.ref_type == 'tag' &&
-      startsWith(github.ref, 'refs/tags/v')
+      github.ref_type == 'tag'
     runs-on: ubuntu-24.04
     timeout-minutes: 20
 
@@ -318,7 +440,13 @@ jobs:
           jq -e \
             --arg tag "$RELEASE_TAG" \
             --arg commit "$RELEASE_SHA" \
-            '.tag == $tag and .commit == $commit' \
+            '(
+              .schema == 2 and
+              .tag == $tag and
+              .commit == $commit and
+              (.released_package | type == "string") and
+              (.asset | type == "string")
+            )' \
             release-handoff/plan.json
 
           sort --check release-handoff/expected-assets.txt
@@ -344,11 +472,6 @@ jobs:
           cmp \
             release-handoff/expected-assets.txt \
             release-handoff/actual-assets.txt
-
-          (
-            cd release-handoff/assets
-            sha256sum --check --strict SHA256SUMS
-          )
 
       - name: Check immutable releases
         shell: bash
@@ -392,6 +515,54 @@ jobs:
                 '
           }
 
+          asset_digest_from_release() {
+            local release_file=$1
+            local name=$2
+            local release_id
+            local digest
+            local assets_file
+
+            digest="$(
+              jq -r --arg name "$name" \
+                '.assets[]? | select(.name == $name) | .digest // empty' \
+                "$release_file"
+            )"
+            if test -z "$digest"; then
+              release_id="$(jq -r '.id' "$release_file")"
+              assets_file="$(mktemp)"
+              api \
+                "repos/${GITHUB_REPOSITORY}/releases/${release_id}/assets?per_page=100" \
+                > "$assets_file"
+              digest="$(
+                jq -r --arg name "$name" \
+                  '.[] | select(.name == $name) | .digest // empty' \
+                  "$assets_file"
+              )"
+              rm -f "$assets_file"
+            fi
+            if test -z "$digest"; then
+              printf 'Missing GitHub digest for asset: %s\n' "$name" >&2
+              exit 1
+            fi
+            printf '%s\n' "$digest"
+          }
+
+          verify_github_asset_digest() {
+            local release_file=$1
+            local name=$2
+            local path=$3
+            local expected
+            local actual
+
+            expected="sha256:$(sha256sum "$path" | cut -d ' ' -f 1)"
+            actual="$(asset_digest_from_release "$release_file" "$name")"
+            if test "$actual" != "$expected"; then
+              printf 'GitHub digest mismatch for %s: %s != %s\n' \
+                "$name" "$actual" "$expected" >&2
+              exit 1
+            fi
+          }
+
           release_json=release-handoff/release.json
           if release_by_tag > "$release_json"; then
             :
@@ -416,7 +587,7 @@ jobs:
             '.tag_name == $tag and (.draft == true or .immutable == true)' \
             "$release_json"
 
-          jq -r '.assets[].name' "$release_json" \
+          jq -r '.assets[]?.name' "$release_json" \
             | sort > release-handoff/remote-assets.txt
           while IFS= read -r name; do
             grep -Fqx "$name" release-handoff/expected-assets.txt || {
@@ -432,6 +603,10 @@ jobs:
             cmp \
               "release-handoff/assets/${name}" \
               "release-handoff/remote-asset/${name}"
+            verify_github_asset_digest \
+              "$release_json" \
+              "$name" \
+              "release-handoff/assets/${name}"
           done < release-handoff/remote-assets.txt
 
           if jq -e '.draft == true' "$release_json" >/dev/null; then
@@ -445,16 +620,22 @@ jobs:
             done < release-handoff/expected-assets.txt
 
             release_by_tag > "$release_json"
-            jq -r '.assets[].name' "$release_json" \
+            jq -r '.assets[]?.name' "$release_json" \
               | sort > release-handoff/remote-assets.txt
             cmp \
               release-handoff/expected-assets.txt \
               release-handoff/remote-assets.txt
 
+            while IFS= read -r name; do
+              verify_github_asset_digest \
+                "$release_json" \
+                "$name" \
+                "release-handoff/assets/${name}"
+            done < release-handoff/expected-assets.txt
+
             gh release edit "$RELEASE_TAG" \
               --repo "$GITHUB_REPOSITORY" \
-              --draft=false \
-              --latest
+              --draft=false
           fi
 
           for _attempt in 1 2 3 4 5; do
@@ -479,6 +660,10 @@ jobs:
               --dir published-assets
             cmp \
               "release-handoff/assets/${name}" \
+              "published-assets/${name}"
+            verify_github_asset_digest \
+              "$release_json" \
+              "$name" \
               "published-assets/${name}"
           done < release-handoff/expected-assets.txt
 

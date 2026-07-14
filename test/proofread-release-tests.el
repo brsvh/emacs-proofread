@@ -28,20 +28,18 @@
   (make-string 64 character))
 
 (defun proofread-release-test--package
-    (name version character &optional requires lifecycle change)
+    (name version character &optional requires release-tag commit)
   "Return test package NAME at VERSION using digest CHARACTER.
 
-REQUIRES, LIFECYCLE, and CHANGE override their normal defaults."
+REQUIRES, RELEASE-TAG, and COMMIT override their normal defaults."
   (proofread-release--make-package
    :name name
    :version version
    :sha256 (proofread-release-test--digest character)
-   :asset
-   (unless (equal lifecycle "retired")
-     (format "%s-%s.tar" name version))
+   :asset (format "%s-%s.tar" name version)
    :requires requires
-   :lifecycle (or lifecycle "active")
-   :change (or change "unchanged")))
+   :release-tag (or release-tag (format "%s-v%s" name version))
+   :commit (or commit proofread-release-test--commit)))
 
 (defun proofread-release-test--bootstrap ()
   "Return the empty release manifest."
@@ -49,19 +47,52 @@ REQUIRES, LIFECYCLE, and CHANGE override their normal defaults."
     (tag . :null)
     (commit . :null)
     (previous . :null)
-    (packages . [])
-    (install_order . [])))
+    (released_package . :null)
+    (packages . [])))
 
-(defun proofread-release-test--manifest (tag commit packages order)
-  "Return a manifest for TAG, COMMIT, PACKAGES, and install ORDER."
+(defun proofread-release-test--manifest
+    (tag commit released-package packages &optional previous)
+  "Return a schema 2 manifest.
+
+TAG, COMMIT, RELEASED-PACKAGE, PACKAGES, and PREVIOUS define the manifest."
   `((schema . ,proofread-release--schema)
+    (tag . ,tag)
+    (commit . ,commit)
+    (previous . ,(or previous :null))
+    (released_package . ,released-package)
+    (packages
+     . ,(vconcat
+         (mapcar #'proofread-release--package-to-json packages)))))
+
+(defun proofread-release-test--legacy-package-json
+    (package &optional lifecycle change)
+  "Return legacy JSON for PACKAGE.
+
+LIFECYCLE and CHANGE default to active new-package metadata."
+  `((name . ,(proofread-release--package-name package))
+    (lifecycle . ,(or lifecycle "active"))
+    (change . ,(or change "new"))
+    (version . ,(proofread-release--package-version package))
+    (asset . ,(if (equal lifecycle "retired")
+                  :null
+                (proofread-release--package-asset package)))
+    (sha256 . ,(proofread-release--package-sha256 package))
+    (requires
+     . ,(proofread-release--requirements-to-json
+         (proofread-release--package-requires package)))))
+
+(defun proofread-release-test--legacy-manifest (tag commit packages)
+  "Return a legacy aggregate manifest for TAG, COMMIT, and PACKAGES."
+  `((schema . ,proofread-release--legacy-schema)
     (tag . ,tag)
     (commit . ,commit)
     (previous . :null)
     (packages
      . ,(vconcat
-         (mapcar #'proofread-release--package-to-json packages)))
-    (install_order . ,(vconcat order))))
+         (mapcar #'proofread-release-test--legacy-package-json packages)))
+    (install_order
+     . ,(vconcat
+         (mapcar #'proofread-release--package-name packages)))))
 
 (defun proofread-release-test--manifest-package (manifest name)
   "Return package NAME parsed from MANIFEST."
@@ -69,6 +100,12 @@ REQUIRES, LIFECYCLE, and CHANGE override their normal defaults."
    (lambda (package)
      (equal (proofread-release--package-name package) name))
    (proofread-release--packages-from-manifest manifest)))
+
+(defun proofread-release-test--read-lines (file)
+  "Return FILE contents as a list of lines."
+  (with-temp-buffer
+    (insert-file-contents file)
+    (split-string (buffer-string) "\n" t)))
 
 (defun proofread-release-test--create-archive
     (directory name version requires body &optional extra-files)
@@ -136,6 +173,18 @@ EXTRA-FILES maps additional relative file names to their contents."
       (when (file-exists-p file)
         (delete-file file)))))
 
+(ert-deftest proofread-release-test-legacy-bootstrap-manifest-is-valid ()
+  "A legacy bootstrap release manifest remains readable."
+  (let ((manifest
+         `((schema . ,proofread-release--legacy-schema)
+           (tag . :null)
+           (commit . :null)
+           (previous . :null)
+           (packages . [])
+           (install_order . []))))
+    (should
+     (proofread-release--validate-manifest manifest))))
+
 (ert-deftest
     proofread-release-test-rejects-object-in-place-of-array ()
   "Manifest validation rejects an object in place of an array."
@@ -151,239 +200,279 @@ EXTRA-FILES maps additional relative file names to their contents."
         (progn
           (proofread-release--write-text
            (concat
-            "{\"schema\":1,\"tag\":null,\"tag\":\"v9.9.9\","
-            "\"commit\":null,\"previous\":null,\"packages\":[],"
-            "\"install_order\":[]}")
+            "{\"schema\":2,\"tag\":null,\"tag\":\"proofread-v9.9.9\","
+            "\"commit\":null,\"previous\":null,"
+            "\"released_package\":null,\"packages\":[]}")
            file)
           (should-error
            (proofread-release--validate-manifest
             (proofread-release--read-json file))))
       (delete-file file))))
 
-;;;; Snapshot classification
+(ert-deftest proofread-release-test-parses-package-tags ()
+  "Package release tags select a known package and version."
+  (should
+   (equal
+    (proofread-release--tag-package-and-version
+     "proofread-popup-v0.1.1"
+     '("proofread" "proofread-popup"))
+    '("proofread-popup" . "0.1.1")))
+  (should-error
+   (proofread-release--tag-package-and-version
+    "v0.1.1" '("proofread")))
+  (should-error
+   (proofread-release--tag-package-and-version
+    "unknown-v0.1.1" '("proofread"))))
 
-(ert-deftest
-    proofread-release-test-first-snapshot-marks-packages-new ()
-  "The first release snapshot marks every package as new."
-  (let* ((core
+;;;; Package release manifests
+
+(ert-deftest proofread-release-test-updates-one-package-record ()
+  "A package release updates only the released package record."
+  (let* ((old-core
           (proofread-release-test--package
            "proofread" "0.1.0" ?a))
-         (popup
+         (old-popup
           (proofread-release-test--package
            "proofread-popup" "0.1.0" ?b
            '(("proofread" . "0.1.0"))))
-         (manifest
-          (proofread-release--new-manifest
-           "v0.1.0"
-           proofread-release-test--commit
-           (proofread-release-test--bootstrap)
-           (list core popup))))
-    (should
-     (equal
-      (mapcar #'proofread-release--package-change
-              (proofread-release--packages-from-manifest manifest))
-      '( "new" "new")))
-    (should
-     (equal (proofread-release--field manifest 'install_order)
-            ["proofread" "proofread-popup"]))))
-
-(ert-deftest
-    proofread-release-test-snapshot-classifies-update-and-unchanged ()
-  "A snapshot distinguishes updated and unchanged packages."
-  (let* ((old-core
-          (proofread-release-test--package
-           "proofread" "0.1.0" ?a nil "active" "new"))
-         (old-popup
-          (proofread-release-test--package
-           "proofread-popup" "0.1.0" ?b nil "active" "new"))
          (previous
           (proofread-release-test--manifest
-           "v0.1.0"
+           "proofread-popup-v0.1.0"
            proofread-release-test--commit
-           (list old-core old-popup)
-           '( "proofread" "proofread-popup")))
-         (core
-          (proofread-release-test--package
-           "proofread" "0.2.0" ?c))
-         (popup
-          (proofread-release-test--package
-           "proofread-popup" "0.1.0" ?b))
-         (manifest
-          (proofread-release--new-manifest
-           "v0.2.0"
-           proofread-release-test--other-commit
-           previous
-           (list core popup))))
-    (should
-     (equal
-      (proofread-release--package-change
-       (proofread-release-test--manifest-package
-        manifest "proofread"))
-      "updated"))
-    (should
-     (equal
-      (proofread-release--package-change
-       (proofread-release-test--manifest-package
-        manifest "proofread-popup"))
-      "unchanged"))))
-
-(ert-deftest
-    proofread-release-test-rejects-change-without-version-increase ()
-  "Reject changed contents without a version bump."
-  (let ((current
-         (proofread-release-test--package
-          "proofread" "0.1.0" ?b))
-        (previous
-         (proofread-release-test--package
-          "proofread" "0.1.0" ?a)))
-    (should-error
-     (proofread-release--classify-package current previous))))
-
-(ert-deftest proofread-release-test-rejects-version-rollback ()
-  "Classification rejects a package version rollback."
-  (let ((current
-         (proofread-release-test--package
-          "proofread" "0.1.0" ?a))
-        (previous
-         (proofread-release-test--package
-          "proofread" "0.2.0" ?b)))
-    (should-error
-     (proofread-release--classify-package current previous))))
-
-(ert-deftest
-    proofread-release-test-rejects-equivalent-version-rewrite ()
-  "Classification rejects rewriting an equivalent version string."
-  (let ((current
-         (proofread-release-test--package
-          "proofread" "1.0.0" ?a))
-        (previous
-         (proofread-release-test--package
-          "proofread" "1.0" ?a)))
-    (should
-     (= (proofread-release--version-comparison "1.0.0" "1.0") 0))
-    (should-error
-     (proofread-release--classify-package current previous))))
-
-(ert-deftest proofread-release-test-retires-missing-package ()
-  "A new snapshot retires a package missing from current assets."
-  (let* ((old-core
-          (proofread-release-test--package
-           "proofread" "0.1.0" ?a nil "active" "new"))
-         (old-popup
-          (proofread-release-test--package
-           "proofread-popup" "0.1.0" ?b nil "active" "new"))
-         (previous
-          (proofread-release-test--manifest
-           "v0.1.0"
-           proofread-release-test--commit
-           (list old-core old-popup)
-           '( "proofread" "proofread-popup")))
-         (core
+           "proofread-popup"
+           (list old-core old-popup)))
+         (new-core
           (proofread-release-test--package
            "proofread" "0.2.0" ?c))
          (manifest
           (proofread-release--new-manifest
-           "v0.2.0"
+           "proofread-v0.2.0"
            proofread-release-test--other-commit
            previous
-           (list core)))
+           new-core))
+         (core
+          (proofread-release-test--manifest-package
+           manifest "proofread"))
          (popup
           (proofread-release-test--manifest-package
            manifest "proofread-popup")))
     (should
-     (equal (proofread-release--package-lifecycle popup) "retired"))
+     (equal (proofread-release--field manifest 'released_package)
+            "proofread"))
     (should
-     (equal (proofread-release--package-change popup) "retired"))
-    (should-not (proofread-release--package-asset popup))))
+     (equal (proofread-release--field manifest 'previous)
+            "proofread-popup-v0.1.0"))
+    (should
+     (equal (proofread-release--package-release-tag core)
+            "proofread-v0.2.0"))
+    (should
+     (equal (proofread-release--package-commit core)
+            proofread-release-test--other-commit))
+    (should
+     (equal (proofread-release--package-release-tag popup)
+            "proofread-popup-v0.1.0"))))
 
-(ert-deftest
-    proofread-release-test-rejects-retired-package-reactivation ()
-  "Classification rejects reactivating a retired package."
-  (let ((current
-         (proofread-release-test--package
-          "proofread" "0.2.0" ?b))
-        (previous
-         (proofread-release-test--package
-          "proofread" "0.1.0" ?a nil "retired" "retired")))
-    (should-error
-     (proofread-release--classify-package current previous))))
-
-(ert-deftest proofread-release-test-rejects-empty-snapshot-change ()
-  "A new snapshot must contain an effective package change."
-  (let* ((old
+(ert-deftest proofread-release-test-does-not-retire-absent-package ()
+  "A package release preserves unrelated package records."
+  (let* ((old-core
           (proofread-release-test--package
-           "proofread" "0.1.0" ?a nil "active" "new"))
+           "proofread" "0.1.0" ?a))
+         (old-popup
+          (proofread-release-test--package
+           "proofread-popup" "0.1.0" ?b))
          (previous
           (proofread-release-test--manifest
-           "v0.1.0"
+           "proofread-v0.1.0"
            proofread-release-test--commit
-           (list old)
-           '( "proofread")))
+           "proofread"
+           (list old-core old-popup)))
+         (new-core
+          (proofread-release-test--package
+           "proofread" "0.2.0" ?c))
+         (manifest
+          (proofread-release--new-manifest
+           "proofread-v0.2.0"
+           proofread-release-test--other-commit
+           previous
+           new-core)))
+    (should
+     (proofread-release-test--manifest-package
+      manifest "proofread-popup"))))
+
+(ert-deftest
+    proofread-release-test-rejects-change-without-version-increase ()
+  "Reject changed contents without a version bump."
+  (let* ((old
+          (proofread-release-test--package
+           "proofread" "0.1.0" ?a))
+         (previous
+          (proofread-release-test--manifest
+           "proofread-v0.1.0"
+           proofread-release-test--commit
+           "proofread"
+           (list old)))
+         (current
+          (proofread-release-test--package
+           "proofread" "0.1.0" ?b)))
+    (should-error
+     (proofread-release--new-manifest
+      "proofread-v0.1.0"
+      proofread-release-test--other-commit
+      previous
+      current))))
+
+(ert-deftest proofread-release-test-rejects-version-rollback ()
+  "Reject a package version rollback."
+  (let* ((old
+          (proofread-release-test--package
+           "proofread" "0.2.0" ?a))
+         (previous
+          (proofread-release-test--manifest
+           "proofread-v0.2.0"
+           proofread-release-test--commit
+           "proofread"
+           (list old)))
+         (current
+          (proofread-release-test--package
+           "proofread" "0.1.0" ?b)))
+    (should-error
+     (proofread-release--new-manifest
+      "proofread-v0.1.0"
+      proofread-release-test--other-commit
+      previous
+      current))))
+
+(ert-deftest
+    proofread-release-test-rejects-equivalent-version-rewrite ()
+  "Reject rewriting an equivalent version string."
+  (let* ((old
+          (proofread-release-test--package
+           "proofread" "1.0" ?a))
+         (previous
+          (proofread-release-test--manifest
+           "proofread-v1.0.0"
+           proofread-release-test--commit
+           "proofread"
+           (list old)))
+         (current
+          (proofread-release-test--package
+           "proofread" "1.0.0" ?a)))
+    (should
+     (= (proofread-release--version-comparison "1.0.0" "1.0") 0))
+    (should-error
+     (proofread-release--new-manifest
+      "proofread-v1.0.0"
+      proofread-release-test--other-commit
+      previous
+      current))))
+
+(ert-deftest proofread-release-test-rejects-unchanged-package-release ()
+  "A non-legacy package release must make an effective package change."
+  (let* ((old
+          (proofread-release-test--package
+           "proofread" "0.1.0" ?a))
+         (previous
+          (proofread-release-test--manifest
+           "proofread-v0.1.0"
+           proofread-release-test--commit
+           "proofread"
+           (list old)))
          (current
           (proofread-release-test--package
            "proofread" "0.1.0" ?a)))
     (should-error
      (proofread-release--new-manifest
-      "v0.1.1"
+      "proofread-v0.1.0"
       proofread-release-test--other-commit
       previous
-      (list current)))))
+      current))))
 
-(ert-deftest proofread-release-test-rejects-snapshot-tag-rollback ()
-  "A new snapshot rejects an earlier release tag."
-  (let* ((old
+(ert-deftest proofread-release-test-canonicalizes-legacy-manifests ()
+  "A package tag may canonicalize matching legacy aggregate metadata."
+  (let* ((legacy-core
           (proofread-release-test--package
-           "proofread" "0.1.0" ?a nil "active" "new"))
+           "proofread" "0.1.0" ?a nil "v0.1.0"))
+         (legacy-popup
+          (proofread-release-test--package
+           "proofread-popup" "0.1.0" ?b
+           '(("proofread" . "0.1.0")) "v0.1.0"))
          (previous
-          (proofread-release-test--manifest
-           "v0.2.0"
+          (proofread-release-test--legacy-manifest
+           "v0.1.0"
            proofread-release-test--commit
-           (list old)
-           '( "proofread")))
+           (list legacy-core legacy-popup)))
          (current
           (proofread-release-test--package
-           "proofread" "0.2.0" ?b)))
-    (should-error
-     (proofread-release--new-manifest
-      "v0.1.0"
-      proofread-release-test--other-commit
-      previous
-      (list current)))))
+           "proofread" "0.1.0" ?a))
+         (manifest
+          (proofread-release--new-manifest
+           "proofread-v0.1.0"
+           proofread-release-test--other-commit
+           previous
+           current))
+         (core
+          (proofread-release-test--manifest-package
+           manifest "proofread"))
+         (popup
+          (proofread-release-test--manifest-package
+           manifest "proofread-popup")))
+    (should
+     (proofread-release--validate-manifest manifest))
+    (should
+     (equal (proofread-release--field manifest 'previous) "v0.1.0"))
+    (should
+     (equal (proofread-release--package-release-tag core)
+            "proofread-v0.1.0"))
+    (should
+     (equal (proofread-release--package-release-tag popup)
+            "v0.1.0"))))
 
 ;;;; Dependency validation
 
+(ert-deftest proofread-release-test-finds-required-dependencies ()
+  "Internal dependencies are selected from the previous ledger."
+  (let* ((core
+          (proofread-release-test--package
+           "proofread" "0.1.0" ?a))
+         (previous
+          (proofread-release-test--manifest
+           "proofread-v0.1.0"
+           proofread-release-test--commit
+           "proofread"
+           (list core)))
+         (popup
+          (proofread-release-test--package
+           "proofread-popup" "0.1.0" ?b
+           '(("proofread" . "0.1.0"))))
+         (dependencies
+          (proofread-release--required-dependencies
+           previous popup)))
+    (should
+     (equal
+      (mapcar #'proofread-release--package-name dependencies)
+      '("proofread")))))
+
 (ert-deftest
     proofread-release-test-rejects-unsatisfied-internal-dependency ()
-  "Validation rejects an unsatisfied project package dependency."
-  (let ((core
-         (proofread-release-test--package
-          "proofread" "0.1.0" ?a))
-        (popup
-         (proofread-release-test--package
-          "proofread-popup" "0.2.0" ?b
-          '(("proofread" . "0.2.0")))))
+  "Dependency resolution rejects an insufficient ledger package."
+  (let* ((core
+          (proofread-release-test--package
+           "proofread" "0.1.0" ?a))
+         (previous
+          (proofread-release-test--manifest
+           "proofread-v0.1.0"
+           proofread-release-test--commit
+           "proofread"
+           (list core)))
+         (popup
+          (proofread-release-test--package
+           "proofread-popup" "0.1.0" ?b
+           '(("proofread" . "0.2.0")))))
     (should-error
-     (proofread-release--validate-dependencies
-      (list core popup)
-      nil))))
+     (proofread-release--required-dependencies
+      previous popup))))
 
-(ert-deftest
-    proofread-release-test-rejects-dependency-retired-this-release ()
-  "Validation rejects a dependency retired by the current release."
-  (let ((core
-         (proofread-release-test--package
-          "proofread" "0.1.0" ?a nil "active" "new"))
-        (popup
-         (proofread-release-test--package
-          "proofread-popup" "0.2.0" ?b
-          '(("proofread" . "0.1.0")))))
-    (should-error
-     (proofread-release--validate-dependencies
-      (list popup)
-      (list core)))))
-
-(ert-deftest
-    proofread-release-test-rejects-project-dependency-cycle ()
+(ert-deftest proofread-release-test-rejects-project-dependency-cycle ()
   "Dependency ordering rejects a cycle among project packages."
   (let ((first
          (proofread-release-test--package
@@ -394,137 +483,101 @@ EXTRA-FILES maps additional relative file names to their contents."
           "proofread-popup" "0.1.0" ?b
           '(("proofread" . "0.1.0")))))
     (should-error
-     (proofread-release--dependency-order
-      (list first second)))))
+     (proofread-release--collect-dependencies
+      first (list first second)))))
 
 ;;;; Replay and release metadata
 
 (ert-deftest proofread-release-test-validates-identical-replay ()
   "Replay validation accepts only an identical tag and commit."
-  (let* ((old
+  (let* ((package
           (proofread-release-test--package
-           "proofread" "0.1.0" ?a nil "active" "new"))
+           "proofread" "0.1.0" ?a))
          (manifest
           (proofread-release-test--manifest
-           "v0.1.0"
+           "proofread-v0.1.0"
            proofread-release-test--commit
-           (list old)
-           '( "proofread")))
+           "proofread"
+           (list package)))
          (current
           (proofread-release-test--package
            "proofread" "0.1.0" ?a)))
     (should
      (proofread-release--replay-manifest-p
       manifest
-      "v0.1.0"
+      "proofread-v0.1.0"
       proofread-release-test--commit
-      (list current)))
+      current))
     (should-error
      (proofread-release--replay-manifest-p
       manifest
-      "v0.1.0"
+      "proofread-v0.1.0"
       proofread-release-test--other-commit
-      (list current)))))
+      current))))
 
 (ert-deftest
-    proofread-release-test-rejects-incomplete-install-order ()
-  "Manifest validation rejects an incomplete installation order."
-  (let* ((core
-          (proofread-release-test--package
-           "proofread" "0.1.0" ?a nil "active" "new"))
-         (popup
-          (proofread-release-test--package
-           "proofread-popup" "0.1.0" ?b
-           '(("proofread" . "0.1.0")) "active" "new"))
-         (manifest
-          (proofread-release-test--manifest
-           "v0.1.0"
-           proofread-release-test--commit
-           (list core popup)
-           '( "proofread" "proofread"))))
-    (should-error
-     (proofread-release--validate-manifest manifest))))
-
-(ert-deftest
-    proofread-release-test-rejects-invalid-lifecycle-change ()
-  "Manifest validation rejects an invalid lifecycle change pair."
+    proofread-release-test-rejects-mismatched-released-package-record ()
+  "Manifest validation checks the released package record."
   (let* ((package
           (proofread-release-test--package
-           "proofread" "0.1.0" ?a nil "retired" "new"))
+           "proofread" "0.1.0" ?a nil "v0.1.0"))
          (manifest
           (proofread-release-test--manifest
-           "v0.1.0"
+           "proofread-v0.1.0"
            proofread-release-test--commit
-           (list package)
-           nil)))
+           "proofread"
+           (list package))))
     (should-error
      (proofread-release--validate-manifest manifest))))
 
-(ert-deftest proofread-release-test-checks-complete-nix-version-set ()
-  "Nix version checks require exactly the active package set."
+(ert-deftest proofread-release-test-checks-released-nix-version ()
+  "Nix version checks validate the released package only."
   (let* ((core
           (proofread-release-test--package
-           "proofread" "0.1.0" ?a nil "active" "new"))
+           "proofread" "0.1.0" ?a))
          (popup
           (proofread-release-test--package
-           "proofread-popup" "0.1.0" ?b nil "active" "new"))
+           "proofread-popup" "0.1.0" ?b))
          (manifest
           (proofread-release-test--manifest
-           "v0.1.0"
+           "proofread-v0.1.0"
            proofread-release-test--commit
-           (list core popup)
-           '( "proofread" "proofread-popup")))
+           "proofread"
+           (list core popup)))
          (file (make-temp-file "proofread-release-manifest-")))
     (unwind-protect
         (progn
           (proofread-release--write-json manifest file)
           (should
-           (proofread-release-check-versions
-            file
-            '( "proofread=0.1.0" "proofread-popup=0.1.0")))
+           (proofread-release-check-package-version
+            file "proofread" "0.1.0"))
           (should-error
-           (proofread-release-check-versions
-            file
-            '( "proofread=0.1.0"))))
+           (proofread-release-check-package-version
+            file "proofread-popup" "0.1.0"))
+          (should-error
+           (proofread-release-check-package-version
+            file "proofread" "0.2.0")))
       (delete-file file))))
 
 ;;;; Archive integration
 
 (ert-deftest
-    proofread-release-test-prepares-and-installs-real-archives ()
-  "Release preparation creates an installable archive handoff."
+    proofread-release-test-prepares-and-installs-single-package-releases ()
+  "Release preparation creates installable per-package handoffs."
   (let* ((directory
           (make-temp-file "proofread-release-integration-" t))
          (previous (expand-file-name "previous.json" directory))
-         (output (expand-file-name "handoff" directory))
+         (dependencies-file
+          (expand-file-name "dependencies.json" directory))
+         (core-output (expand-file-name "core-handoff" directory))
+         (addon-output (expand-file-name "addon-handoff" directory))
          (core-name "proofread-release-fixture-core")
          (addon-name "proofread-release-fixture-addon")
-         (llm-name (concat core-name "-llm"))
-         (llm-file (concat llm-name ".el"))
-         (languagetool-name (concat core-name "-languagetool"))
-         (languagetool-file (concat languagetool-name ".el"))
          (core
           (proofread-release-test--create-archive
            directory core-name "1.0.0"
            '((emacs "30.1"))
-           (format "(require '%s)\n(require '%s)"
-                   llm-name languagetool-name)
-           `((,llm-file
-              . ,(format
-                  (concat
-                   ";;; %s --- Release fixture LLM backend  "
-                   "-*- lexical-binding: t; -*-\n\n"
-                   "(provide '%s)\n;;; %s ends here\n")
-                  llm-file llm-name llm-file))
-             (,languagetool-file
-              . ,(format
-                  (concat
-                   ";;; %s --- Release fixture LanguageTool backend  "
-                   "-*- lexical-binding: t; -*-\n\n"
-                   "(provide '%s)\n;;; %s ends here\n")
-                  languagetool-file
-                  languagetool-name
-                  languagetool-file)))))
+           "(message \"core loaded\")"))
          (addon
           (proofread-release-test--create-archive
            directory addon-name "1.1.0"
@@ -533,18 +586,70 @@ EXTRA-FILES maps additional relative file names to their contents."
     (unwind-protect
         (progn
           (proofread-release-bootstrap previous)
-          (proofread-release-prepare
-           "v1.0.0"
+          (proofread-release-prepare-package
+           core-name
+           "1.0.0"
+           (format "%s-v1.0.0" core-name)
            proofread-release-test--commit
            previous
-           output
-           (list core addon))
-          (let ((manifest
-                 (expand-file-name "assets/manifest.json" output)))
+           core-output
+           core
+           nil)
+          (let ((core-manifest
+                 (expand-file-name "assets/manifest.json" core-output)))
             (should
-             (proofread-release--validate-manifest
-              (proofread-release--read-json manifest)))
-            (should (proofread-release-verify-install manifest))))
+             (equal
+              (proofread-release-test--read-lines
+               (expand-file-name "expected-assets.txt" core-output))
+              (sort
+               (list "manifest.json"
+                     (format "%s-1.0.0.tar" core-name))
+               #'string<)))
+            (should-not
+             (file-exists-p
+              (expand-file-name "assets/SHA256SUMS" core-output)))
+            (should
+             (proofread-release-verify-install
+              core-manifest
+              (list core)))
+            (should
+             (equal
+              (mapcar
+               #'proofread-release--package-name
+               (proofread-release-required-dependencies
+                addon-name
+                "1.1.0"
+                (format "%s-v1.1.0" addon-name)
+                core-manifest
+                addon
+                dependencies-file))
+              (list core-name)))
+            (proofread-release-prepare-package
+             addon-name
+             "1.1.0"
+             (format "%s-v1.1.0" addon-name)
+             proofread-release-test--other-commit
+             core-manifest
+             addon-output
+             addon
+             (list core)))
+          (let ((addon-manifest
+                 (expand-file-name "assets/manifest.json" addon-output)))
+            (should
+             (equal
+              (proofread-release-test--read-lines
+               (expand-file-name "expected-assets.txt" addon-output))
+              (sort
+               (list "manifest.json"
+                     (format "%s-1.1.0.tar" addon-name))
+               #'string<)))
+            (should-not
+             (file-exists-p
+              (expand-file-name "assets/SHA256SUMS" addon-output)))
+            (should
+             (proofread-release-verify-install
+              addon-manifest
+              (list core addon)))))
       (delete-directory directory t))))
 
 (provide 'proofread-release-tests)

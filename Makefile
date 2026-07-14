@@ -137,6 +137,9 @@ endef
 	proofread-popup-archive \
 	release-archives \
 	release-artifacts \
+	release-package-archive \
+	release-package-artifact \
+	release-packages \
 	tags
 
 all: proofread proofread-popup
@@ -179,6 +182,24 @@ release-artifacts: release-archives
 	for stamp in $(ARCHIVE_STAMPS); do
 		cat "$$stamp"
 	done
+
+release-packages:
+	@printf '%s\n' $(RELEASE_PACKAGES)
+
+release-package-archive:
+	@set -eu
+	case " $(RELEASE_PACKAGES) " in
+		*" $(PACKAGE) "*)
+			;;
+		*)
+			printf 'Unknown release package: %s\n' "$(PACKAGE)" >&2
+			exit 1
+			;;
+	esac
+	$(MAKE) "$(PACKAGE)-archive"
+
+release-package-artifact: release-package-archive
+	@cat "$(DIST_DIR)/.$(PACKAGE)-archive"
 
 $(PROOFREAD_PKG): $(PROOFREAD_MAIN) $(BUILD_FILE)
 $(PROOFREAD_POPUP_PKG): $(PROOFREAD_POPUP_MAIN) $(BUILD_FILE)
