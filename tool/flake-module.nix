@@ -51,6 +51,10 @@ in
         };
 
         release = import ./devshells/release.nix {
+          inherit
+            projectRoot
+            ;
+
           pkgs = pkgs';
         };
       };

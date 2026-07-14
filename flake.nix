@@ -242,6 +242,24 @@
                             proofread-popup
                           ]
                         );
+
+                    releaseEmacs =
+                      (emacsPackagesFor base).emacsWithPackages
+                        (
+                          epkgs: with epkgs; [
+                            llm
+                            posframe
+                          ]
+                        );
+
+                    proofreadRelease =
+                      pkgs.callPackage
+                        (
+                          projectRoot + /tool/proofread-release-wrapper.nix
+                        )
+                        {
+                          emacs = releaseEmacs;
+                        };
                   in
                   acc
                   // {
@@ -316,12 +334,9 @@
                               }" \
                               -f ert-run-tests-batch-and-exit
 
-                            "${emacs-with-proofread}/bin/emacs" --batch \
+                            "${releaseEmacs}/bin/emacs" --batch \
                               --init-directory "$releaseInitdir" \
-                              -L "${projectRoot + /tool/release}" \
-                              -l "${
-                                projectRoot + /tool/release/proofread-release.el
-                              }" \
+                              -l "${proofreadRelease}/bin/proofread-release" \
                               -l "${
                                 projectRoot + /test/proofread-release-tests.el
                               }" \
@@ -358,9 +373,8 @@
                               projectRoot
                               + /lisp/proofread-popup/proofread-popup.el
                             }" "$workdir/proofread-popup.el"
-                            cp "${
-                              projectRoot + /tool/release/proofread-release.el
-                            }" "$workdir/proofread-release.el"
+                            cp "${proofreadRelease}/bin/proofread-release" \
+                              "$workdir/proofread-release.el"
 
                             "${emacs-with-proofread}/bin/emacs" --batch \
                               --init-directory "$initdir" \
@@ -396,7 +410,7 @@
                               -f batch-byte-compile \
                               "$workdir/proofread-popup.el"
 
-                            "${emacs-with-proofread}/bin/emacs" --batch \
+                            "${releaseEmacs}/bin/emacs" --batch \
                               --init-directory "$initdir" \
                               --eval '(setq byte-compile-error-on-warn t)' \
                               -f batch-byte-compile \

@@ -1,10 +1,11 @@
 {
   pkgs,
+  projectRoot,
   ...
 }:
 let
-  releaseEmacs =
-    (with pkgs; emacsPackagesFor emacs30)
+  emacs =
+    (with pkgs; emacsPackagesFor emacs31)
     .emacsWithPackages
       (
         epkgs: with epkgs; [
@@ -12,9 +13,23 @@ let
           posframe
         ]
       );
+
+  proofreadRelease =
+    pkgs.callPackage
+      (
+        projectRoot + /tool/proofread-release-wrapper.nix
+      )
+      {
+        inherit
+          emacs
+          ;
+      };
 in
 {
-  packages = with pkgs; [
+  packages = [
+    emacs
+  ]
+  ++ (with pkgs; [
     actionlint
     coreutils
     gh
@@ -22,7 +37,7 @@ in
     gnumake
     gnutar
     jq
-    releaseEmacs
+    proofreadRelease
     shellcheck
-  ];
+  ]);
 }

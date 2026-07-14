@@ -82,7 +82,7 @@ jobs:
             > release-input/latest-manifest.json
 
           nix develop .#release --command \
-            tool/release/release validate \
+            proofread-release validate \
             release-input/latest-manifest.json
 
           ledger_tag="$(
@@ -128,7 +128,7 @@ jobs:
             git show "$current_ref" \
               > release-input/current-history.json
             nix develop .#release --command \
-              tool/release/release validate \
+              proofread-release validate \
               release-input/current-history.json
 
             test "$(jq -r '.tag' release-input/current-history.json)" \
@@ -235,7 +235,7 @@ jobs:
           )
 
           nix develop .#release --command \
-            tool/release/release prepare \
+            proofread-release prepare \
             "$RELEASE_TAG" \
             "$RELEASE_SHA" \
             release-input/previous-manifest.json \
@@ -259,12 +259,12 @@ jobs:
 
           nix build --no-link "${installables[@]}"
           nix develop .#release --command \
-            tool/release/release check-versions \
+            proofread-release check-versions \
             release-handoff/assets/manifest.json \
             "${version_assignments[@]}"
 
           nix develop .#release --command \
-            tool/release/release verify-install \
+            proofread-release verify-install \
             release-handoff/assets/manifest.json
 
       - name: Upload verified handoff
