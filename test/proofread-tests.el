@@ -103,7 +103,8 @@
   (mapcar #'proofread--create-overlay diagnostics))
 
 (defconst proofread-test--diagnostic-provenance-keys
-  '( :language :profile :checker-name :checker-ordinal :checker-owner)
+  '( :language :display-language :profile :checker-name
+     :checker-ordinal :checker-owner)
   "Diagnostic provenance keys added by the Proofread core.")
 
 (defun proofread-test--diagnostic-without-provenance
@@ -4546,6 +4547,63 @@ This covers URLs, email, invisible text, faces, and properties."
                          (plist-get request :checker-owner))))))))
 
 (ert-deftest
+    proofread-test-profile-display-language-snapshots-provenance ()
+  "Snapshot profile display language into requests and diagnostics."
+  (with-temp-buffer
+    (insert "helo")
+    (let* ((display-language (copy-sequence "Simplified Chinese"))
+           (proofread-profile 'multi)
+           (proofread-profiles
+            `((multi
+               :language "zh-Hans"
+               :display-language ,display-language
+               :checkers
+               (( :name strict
+                  :backend ,proofread-test--backend))))))
+      (proofread-mode 1)
+      (let* ((profile (proofread--current-profile))
+             (profile-display-language
+              (plist-get profile :display-language))
+             (checker (car (plist-get profile :checkers)))
+             (chunk
+              (car
+               (proofread-test--request-ready-chunks-for-ranges
+                (list (cons (point-min) (point-max))))))
+             (request
+              (proofread--make-backend-request
+               chunk proofread-test--backend checker profile))
+             (request-display-language
+              (plist-get request :display-language))
+             (diagnostic
+              (proofread-test--diagnostic-for-range 1 5 "helo")))
+        (should (equal profile-display-language
+                       "Simplified Chinese"))
+        (should-not (eq profile-display-language display-language))
+        (should (equal request-display-language
+                       "Simplified Chinese"))
+        (should-not
+         (eq request-display-language profile-display-language))
+        (aset profile-display-language 0 ?X)
+        (should (equal request-display-language
+                       "Simplified Chinese"))
+        (should
+         (eq (proofread--handle-backend-result
+              (proofread--backend-success-result
+               request (list diagnostic)))
+             'applied))
+        (should-not (plist-member diagnostic :display-language))
+        (let* ((live (car proofread--diagnostics))
+               (live-display-language
+                (plist-get live :display-language)))
+          (should (equal live-display-language
+                         "Simplified Chinese"))
+          (should-not (eq live-display-language
+                          request-display-language))
+          (aset request-display-language 0 ?Y)
+          (should (equal live-display-language
+                         "Simplified Chinese")))))))
+
+(ert-deftest
     proofread-test-profile-result-replaces-only-same-checker
     ()
   "Do not let one checker's result remove another checker's diagnostics."
@@ -5161,6 +5219,7 @@ This covers URLs, email, invisible text, faces, and properties."
           (proofread-profiles
            `((multi
               :language "en-US"
+              :display-language "English"
               :checkers
               (( :name strict
                  :backend ,proofread-test--backend))))))
@@ -5181,6 +5240,8 @@ This covers URLs, email, invisible text, faces, and properties."
         (let* ((entry (proofread--cache-read-request request))
                (cached (car (plist-get entry :diagnostics))))
           (should (equal (plist-get cached :language) "en-US"))
+          (should (equal (plist-get cached :display-language)
+                         "English"))
           (should (= (plist-get cached :checker-ordinal) 0))
           (should (equal (plist-get cached :checker-owner)
                          (plist-get request :checker-owner)))
@@ -5188,6 +5249,8 @@ This covers URLs, email, invisible text, faces, and properties."
                       'applied))
           (let ((live (car proofread--diagnostics)))
             (should (equal (plist-get live :language) "en-US"))
+            (should (equal (plist-get live :display-language)
+                           "English"))
             (should (equal (plist-get live :profile) 'multi))
             (should (equal (plist-get live :checker-name) 'strict))
             (should (= (plist-get live :checker-ordinal) 0))
@@ -5461,6 +5524,64 @@ This covers URLs, email, invisible text, faces, and properties."
                      :backend ,proofread-test--backend
                      :options ( :tone relaxed)))))))
           (should-not (proofread--fresh-request-p request)))))))
+
+(ert-deftest
+    proofread-test-profile-display-language-affects-cache-and-freshness
+    ()
+  "Invalidate request and cache identity after display language changes."
+  (with-temp-buffer
+    (insert "Alpha")
+    (let ((proofread-auto-check nil)
+          (proofread-context-size 0)
+          (proofread-profile 'multi)
+          (proofread-profiles
+           `((multi
+              :language "en-US"
+              :display-language "English"
+              :checkers
+              (( :name strict
+                 :backend ,proofread-test--backend))))))
+      (proofread-mode 1)
+      (let* ((profile (proofread--current-profile))
+             (checker (car (plist-get profile :checkers)))
+             (chunk
+              (car
+               (proofread-test--request-ready-chunks-for-ranges
+                (list (cons (point-min) (point-max))))))
+             (request
+              (proofread--make-backend-request
+               chunk proofread-test--backend checker profile))
+             (diagnostic
+              (proofread-test--diagnostic-for-range
+               1 6 "Alpha")))
+        (should (equal (plist-get request :display-language)
+                       "English"))
+        (proofread--cache-write-request request (list diagnostic))
+        (let ((proofread-profiles
+               `((multi
+                  :language "en-US"
+                  :display-language "American English"
+                  :checkers
+                  (( :name strict
+                     :backend ,proofread-test--backend))))))
+          (should-not (proofread--fresh-request-p request))
+          (let* ((changed-profile (proofread--current-profile))
+                 (changed-checker
+                  (car (plist-get changed-profile :checkers)))
+                 (changed-request
+                  (proofread--make-backend-request
+                   chunk proofread-test--backend changed-checker
+                   changed-profile)))
+            (should (equal (plist-get changed-request :language)
+                           (plist-get request :language)))
+            (should (equal
+                     (plist-get changed-request :display-language)
+                     "American English"))
+            (should-not
+             (equal (plist-get changed-request :cache-key)
+                    (plist-get request :cache-key)))
+            (should-not
+             (proofread--cache-read-request changed-request))))))))
 
 (ert-deftest
     proofread-test-profile-checkers-share-global-concurrency-limit

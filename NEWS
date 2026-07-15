@@ -17,6 +17,14 @@ unique symbol ':name', selects a registered backend with ':backend', and
 can carry backend-specific ':options'.  Multiple checkers can therefore
 proofread the same text with different backends or settings.
 
+The profile ':language' is a machine-readable language code, while
+':display-language' is the human-readable language name used in LLM prompts.
+LLM requests prefer ':display-language', fall back to ':language', and omit the
+target-language hint when both are nil.  LanguageTool continues to use the
+checker-local ':language' when that key is present (including nil for automatic
+detection), falls back to the profile ':language' when the key is absent, and
+never receives the display name.
+
 An empty ':checkers' list disables proofreading for that profile.
 'proofread-profile' can also be set buffer-locally to select different
 profiles in different buffers.

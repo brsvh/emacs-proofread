@@ -86,6 +86,10 @@ profile. A profile is a named language configuration with `:language`,
 `:display-language`, and ordered `:checkers`. Each checker has a stable `:name`,
 selects a registered `:backend`, and carries optional backend-local `:options`.
 
+Set `:language` to a machine-readable language code such as `"en-US"` or
+`"zh-CN"`. Set `:display-language` to the natural-language name used in LLM
+prompts, such as `"English"` or `"Simplified Chinese"`.
+
 #### Minimal configuration (`llm`)
 
 A minimal LLM setup uses one profile with one `llm` checker. This example checks
@@ -118,6 +122,10 @@ English text with a local Ollama model named `qwen3.5:4b`:
 LLM checkers read provider and request behavior from checker-local `:options`.
 Checker options override the corresponding `proofread-llm-*` defaults only for
 that checker.
+
+For every LLM request, Proofread uses the profile's non-`nil`
+`:display-language` as the target-language hint and falls back to `:language`.
+If both are `nil`, no target-language hint is added.
 
 For local models, this documentation covers Ollama. Use the provider supplied by
 the `llm` package and give the checker a stable, non-secret provider identity:
@@ -162,8 +170,12 @@ change. For provider-specific setup details, see the upstream
 #### `languagetool` backend configuration
 
 A single-language LanguageTool setup also uses one profile with one
-`languagetool` checker. LanguageTool language values are codes such as `en-US`,
-`zh-CN`, or `de-DE`, not display names such as `"English"`:
+`languagetool` checker. LanguageTool uses `:language` from checker-local
+`:options` when that key is present, including an explicit `nil` for automatic
+detection; otherwise it falls back to the profile's machine-readable
+`:language`. A non-`nil` value must be a code such as `en-US`, `zh-CN`, or
+`de-DE`, not a display name such as `"English"`. LanguageTool never receives the
+profile's `:display-language`:
 
 ```elisp
 (require 'proofread)

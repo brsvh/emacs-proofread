@@ -290,7 +290,7 @@ request-ready chunks."
   '( :id :generation :buffer
      :beg :end :text
      :context-before :context-after
-     :language
+     :language :display-language
      :profile :checker-name :checker-ordinal :checker-owner
      :checker-options :checker-identity
      :major-mode
@@ -303,7 +303,7 @@ request-ready chunks."
   '( :log-id :id :generation :buffer
      :beg :end :text
      :context-before :context-after
-     :language
+     :language :display-language
      :profile :checker-name :checker-ordinal :checker-owner
      :major-mode :target-kind
      :domain-beg :domain-end :accessible-beg :accessible-end
@@ -316,7 +316,8 @@ request-ready chunks."
 
 (defconst proofread--request-log-diagnostic-keys
   '( :beg :end :text :kind :message :target-kind
-     :language :profile :checker-name :checker-ordinal :checker-owner)
+     :language :display-language
+     :profile :checker-name :checker-ordinal :checker-owner)
   "Diagnostic properties safe to retain in request logs.")
 
 (defconst proofread--overlay-category 'proofread-overlay
@@ -885,6 +886,8 @@ effective backend identity."
                       (eq checker-name proofread--legacy-checker-name)
                       (equal (plist-get request :language)
                              (plist-get profile :language))
+                      (equal (plist-get request :display-language)
+                             (plist-get profile :display-language))
                       (when-let* ((checker
                                    (car (plist-get profile :checkers))))
                         (and (equal owner
@@ -900,6 +903,8 @@ effective backend identity."
                  (and (eq profile-name (plist-get profile :name))
                       (equal (plist-get request :language)
                              (plist-get profile :language))
+                      (equal (plist-get request :display-language)
+                             (plist-get profile :display-language))
                       checker
                       (equal owner
                              (proofread--checker-owner checker))
@@ -1059,7 +1064,7 @@ effective backend identity."
     (cons t (proofread--position-integer value)))
    ((and (memq property
                '( :text :context-before :context-after :language
-                  :message :method))
+                  :display-language :message :method))
          (stringp value))
     (cons t (substring-no-properties value)))
    ((and (memq property
@@ -1535,7 +1540,8 @@ The returned plist contains the keys in `proofread--diagnostic-keys'."
     (request diagnostic)
   "Return DIAGNOSTIC annotated with provenance from REQUEST."
   (let ((diagnostic (copy-sequence diagnostic)))
-    (dolist (key '( :language :profile :checker-name
+    (dolist (key '( :language :display-language
+                    :profile :checker-name
                     :checker-ordinal :checker-owner))
       (setq diagnostic
             (plist-put
@@ -2734,6 +2740,10 @@ snapshots for CHECKER."
           (if profile
               (plist-get profile :language)
             (plist-get chunk :language)))
+         (profile-display-language
+          (if profile
+              (plist-get profile :display-language)
+            (plist-get chunk :display-language)))
          (request
           (mapcan
            (lambda (key)
@@ -2762,6 +2772,9 @@ snapshots for CHECKER."
                      ( :language
                        (proofread--snapshot-value
                         profile-language))
+                     ( :display-language
+                       (proofread--snapshot-value
+                        profile-display-language))
                      (_ (proofread--snapshot-value
                          (plist-get chunk key))))))
            proofread--backend-request-keys)))
@@ -3909,6 +3922,9 @@ When BACKEND is nil, use the selected `proofread-backend'."
         (proofread--chunk-text-hash (plist-get chunk :text))
         :language (proofread--snapshot-value
                    (plist-get chunk :language))
+        :display-language
+        (proofread--snapshot-value
+         (plist-get chunk :display-language))
         :major-mode (plist-get chunk :major-mode)
         :target-policy (plist-get chunk :target-policy)
         :target-kind (plist-get chunk :target-kind)
@@ -5804,6 +5820,7 @@ instead."
           :backend (or (plist-get record :backend)
                        (plist-get request :backend))
           :language (plist-get request :language)
+          :display-language (plist-get request :display-language)
           :checker-identity (plist-get request :checker-identity)
           :backend-identity (plist-get request :backend-identity)
           :phase (plist-get record :phase)

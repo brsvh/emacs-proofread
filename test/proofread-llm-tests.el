@@ -33,10 +33,12 @@
 (defconst proofread-llm-test--checker 'llm-test
   "Checker selected by LLM backend tests.")
 
-(defun proofread-llm-test--profiles (&optional language)
-  "Return the LLM test profile using LANGUAGE."
+(defun proofread-llm-test--profiles
+    (&optional language display-language)
+  "Return the LLM test profile using LANGUAGE and DISPLAY-LANGUAGE."
   `((,proofread-llm-test--profile
      :language ,language
+     :display-language ,display-language
      :checkers
      (( :name ,proofread-llm-test--checker
         :backend llm)))))
@@ -1181,6 +1183,46 @@ When PROFILE is nil, use the current profile."
                                         (should (string-match-p "Major mode: text-mode" prompt))
                                         (should (string-match-p "Text:\nhelo" prompt))
                                         (should-not (string-match-p "absolute buffer" prompt))))))
+
+(ert-deftest proofread-llm-test-prompt-uses-profile-language-label ()
+  "Prefer a display name, then a language code, in LLM prompts."
+  (dolist (case
+           '( ("zh-Hans" "Simplified Chinese"
+               "Simplified Chinese")
+              ("zh-Hans" nil "zh-Hans")
+              (nil nil nil)))
+    (pcase-let ((`(,language ,display-language ,expected) case))
+      (with-temp-buffer
+        (text-mode)
+        (insert "helo")
+        (let ((proofread-profile proofread-llm-test--profile)
+              (proofread-profiles
+               (proofread-llm-test--profiles
+                language display-language)))
+          (let* ((chunk
+                  (proofread-llm-test--whole-buffer-chunk))
+                 (request
+                  (proofread-llm-test--make-profile-request chunk))
+                 (prompt
+                  (proofread-llm--structured-response-prompt
+                   request))
+                 (expected-line
+                  (and expected
+                       (format "Language: %S" expected))))
+            (should (equal (plist-get request :language) language))
+            (should (equal
+                     (plist-get request :display-language)
+                     display-language))
+            (if expected-line
+                (should
+                 (string-match-p
+                  (regexp-quote expected-line) prompt))
+              (should-not (string-match-p "Language:" prompt)))
+            (when display-language
+              (should-not
+               (string-match-p
+                (regexp-quote (format "Language: %S" language))
+                prompt)))))))))
 
 (ert-deftest
     proofread-llm-test-structured-response-schema-matches-parser-contract ()

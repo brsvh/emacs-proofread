@@ -256,6 +256,13 @@ is non-nil, because extra instructions can change LLM diagnostics."
         (error (concat "Proofread LLM instructions function must "
                        "return nil or a string")))))))
 
+(defun proofread-llm--request-language-prompt (request)
+  "Return REQUEST's effective language prompt line, or nil."
+  (when-let* ((language
+               (or (plist-get request :display-language)
+                   (plist-get request :language))))
+    (format "Language: %S\n" language)))
+
 (defun proofread-llm--structured-response-prompt
     (request &optional prompt-json reported-diagnostics)
   "Return the provider-independent proofreading prompt for REQUEST.
@@ -268,7 +275,7 @@ them."
            "%s"
            "%s"
            "%s"
-           "Language: %S\n"
+           "%s"
            "Major mode: %S\n"
            "Target kind: %S\n\n"
            "Context before:\n%s\n\n"
@@ -283,7 +290,7 @@ them."
    (if prompt-json
        (proofread-llm--prompt-json-response-contract)
      "")
-   (plist-get request :language)
+   (or (proofread-llm--request-language-prompt request) "")
    (plist-get request :major-mode)
    (plist-get request :target-kind)
    (or (plist-get request :context-before) "")

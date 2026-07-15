@@ -749,7 +749,8 @@ Reject context-only and target-crossing matches."
                 (list (lambda (event) (push event events)))))
            (let ((handle
                   (proofread-languagetool--check
-                   (proofread-languagetool-test--request)
+                   (proofread-languagetool-test--request
+                    :display-language "American English")
                    (lambda (value) (setq result value)))))
              (should (listp handle))
              (should-not result)
@@ -761,6 +762,9 @@ Reject context-only and target-crossing matches."
                                       (plist-get call :url)))
              (should (string-match-p "language=en-US"
                                      (plist-get call :data)))
+             (should-not
+              (string-match-p "American%20English"
+                              (plist-get call :data)))
              (proofread-languagetool-test--complete-call
               call 200 "{\"matches\":[]}")
              (should (eq (plist-get result :status) 'ok))
@@ -785,6 +789,9 @@ Reject context-only and target-crossing matches."
                  (should (stringp parameters))
                  (should (string-match-p
                           "language=en-US" parameters))
+                 (should-not
+                  (string-match-p "American%20English"
+                                  parameters))
                  (should (string-match-p
                           (regexp-quote
                            (concat
