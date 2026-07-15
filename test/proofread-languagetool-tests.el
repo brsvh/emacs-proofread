@@ -147,6 +147,8 @@ CALLBACK-STATUS is the status plist passed to the URL callback."
                 #'proofread-languagetool--check))
     (should (eq (plist-get descriptor :identity)
                 #'proofread-languagetool--identity))
+    (should (eq (plist-get descriptor :binding-identity)
+                #'proofread-languagetool--binding-identity))
     (should (eq (plist-get descriptor :cancel)
                 #'proofread-languagetool--cancel))))
 
@@ -431,6 +433,100 @@ The identity does not expose arguments."
                   "enabledOnly=true"
                   "text=%F0%9F%98%80%20This%20are%20fine."))
         (should (string-match-p (regexp-quote part) body))))))
+
+(ert-deftest
+    proofread-languagetool-test-binding-options-override-parameters ()
+  "Binding-local LanguageTool request options override defcustoms."
+  (let ((proofread-languagetool-level 'default)
+        (proofread-languagetool-preferred-variants nil)
+        (proofread-languagetool-mother-tongue nil)
+        (proofread-languagetool-enabled-rules nil)
+        (proofread-languagetool-disabled-rules '( "GLOBAL_OFF"))
+        (proofread-languagetool-enabled-categories nil)
+        (proofread-languagetool-disabled-categories nil)
+        (proofread-languagetool-enabled-only nil))
+    (let* ((request
+            (proofread-languagetool-test--request
+             :language "fr-FR"
+             :binding-options
+             '( :language nil
+                :level picky
+                :preferred-variants ( "en-US")
+                :mother-tongue "zh-CN"
+                :enabled-rules ( "RULE_B" "RULE_A")
+                :disabled-rules nil
+                :enabled-categories ( "STYLE")
+                :disabled-categories nil
+                :enabled-only t
+                :url "http://127.0.0.1:9999/v2")))
+           (data (proofread-languagetool--request-data request))
+           (body (plist-get data :body)))
+      (dolist (part
+               '( "language=auto"
+                  "level=picky"
+                  "preferredVariants=en-US"
+                  "motherTongue=zh-CN"
+                  "enabledRules=RULE_A%2CRULE_B"
+                  "enabledCategories=STYLE"
+                  "enabledOnly=true"))
+        (should (string-match-p (regexp-quote part) body)))
+      (should-not (string-match-p
+                   (regexp-quote "GLOBAL_OFF")
+                   body))
+      (should-not (string-match-p
+                   (regexp-quote "9999")
+                   body)))))
+
+(ert-deftest
+    proofread-languagetool-test-binding-identity-covers-options ()
+  "Binding identity covers request options and ignores binding URL."
+  (let ((proofread-languagetool-server-url
+         "http://127.0.0.1:8081/v2/")
+        (proofread-languagetool-level 'default)
+        (proofread-languagetool-enabled-rules nil)
+        (proofread-languagetool-auto-start nil))
+    (let* ((base
+            '( :profile multi
+               :name local
+               :backend languagetool
+               :options ( :language nil
+                          :level picky
+                          :enabled-rules ( "RULE_B" "RULE_A")
+                          :url "http://127.0.0.1:9999/v2")))
+           (same-url-changed
+            '( :profile multi
+               :name local
+               :backend languagetool
+               :options ( :language nil
+                          :level picky
+                          :enabled-rules ( "RULE_B" "RULE_A")
+                          :url "http://127.0.0.1:9998/v2")))
+           (changed-option
+            '( :profile multi
+               :name local
+               :backend languagetool
+               :options ( :language nil
+                          :level default
+                          :enabled-rules ( "RULE_B" "RULE_A")
+                          :url "http://127.0.0.1:9999/v2")))
+           (identity
+            (proofread-languagetool--binding-identity base)))
+      (should (equal (plist-get identity :server-url)
+                     "http://127.0.0.1:8081/v2"))
+      (should (equal (plist-get identity :language) "auto"))
+      (should (equal (plist-get identity :level) 'picky))
+      (should (equal (plist-get identity :enabled-rules)
+                     '( "RULE_A" "RULE_B")))
+      (should (equal identity
+                     (proofread-languagetool--binding-identity
+                      same-url-changed)))
+      (should-not (equal
+                   identity
+                   (proofread-languagetool--binding-identity
+                    changed-option)))
+      (should-not (string-match-p
+                   (regexp-quote "9999")
+                   (prin1-to-string identity))))))
 
 (ert-deftest proofread-languagetool-test-preferred-variant-order ()
   "Preferred variants preserve order and reject base conflicts."

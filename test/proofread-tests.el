@@ -3063,6 +3063,70 @@ This covers URLs, email, invisible text, faces, and properties."
                                     :cache-key))))))
 
 (ert-deftest
+    proofread-test-profile-cache-key-uses-backend-binding-identity ()
+  ()
+  "Let backend binding identity own raw binding options in cache keys."
+  (let ((proofread--backend-registry (make-hash-table :test #'eq)))
+    (proofread--register-backend
+     proofread-test--backend
+     :check (lambda (_request _callback) nil)
+     :identity
+     (lambda ()
+       '( :backend proofread-test-backend
+          :contract-version 1))
+     :binding-identity
+     (lambda (binding)
+       (list :backend proofread-test--backend
+             :tone (plist-get (plist-get binding :options)
+                              :tone)
+             :contract-version 1)))
+    (with-temp-buffer
+      (insert "Alpha")
+      (let ((proofread-auto-check nil))
+        (proofread-mode 1))
+      (let* ((profile '( :name multi :language "en-US"))
+             (formal-a
+              `( :profile multi
+                 :name local
+                 :backend ,proofread-test--backend
+                 :options ( :tone formal
+                            :secret "secret-a")))
+             (formal-b
+              `( :profile multi
+                 :name local
+                 :backend ,proofread-test--backend
+                 :options ( :tone formal
+                            :secret "secret-b")))
+             (relaxed
+              `( :profile multi
+                 :name local
+                 :backend ,proofread-test--backend
+                 :options ( :tone relaxed
+                            :secret "secret-a")))
+             (chunk
+              (car
+               (proofread-test--request-ready-chunks-for-ranges
+                (list (cons (point-min) (point-max))))))
+             (formal-a-request
+              (proofread--make-backend-request
+               chunk proofread-test--backend formal-a profile))
+             (formal-b-request
+              (proofread--make-backend-request
+               chunk proofread-test--backend formal-b profile))
+             (relaxed-request
+              (proofread--make-backend-request
+               chunk proofread-test--backend relaxed profile)))
+        (should (equal (plist-get formal-a-request :cache-key)
+                       (plist-get formal-b-request :cache-key)))
+        (should-not (equal (plist-get formal-a-request :cache-key)
+                           (plist-get relaxed-request :cache-key)))
+        (should-not
+         (string-match-p
+          (regexp-quote "secret-a")
+          (prin1-to-string
+           (plist-get formal-a-request :cache-key))))))))
+
+(ert-deftest
     proofread-test-profile-binding-change-makes-request-stale
     ()
   "Reject results when the owning profile binding identity changes."

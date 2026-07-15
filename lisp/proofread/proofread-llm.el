@@ -74,6 +74,24 @@ of 1 uses a single LLM call."
   :set #'proofread-set-positive-integer-option
   :group 'proofread)
 
+(defcustom proofread-llm-instructions-function nil
+  "Function returning extra LLM instructions for one backend request.
+When non-nil, the function is called with the backend request plist and
+must return either nil or a string.  Configure
+`proofread-llm-instructions-identity' with a stable, non-secret value
+that changes whenever this function's effective instructions change."
+  :type '(choice
+          (const :tag "None" nil)
+          function)
+  :group 'proofread)
+
+(defcustom proofread-llm-instructions-identity nil
+  "Stable cache identity for `proofread-llm-instructions-function'.
+This value is required whenever `proofread-llm-instructions-function'
+is non-nil, because extra instructions can change LLM diagnostics."
+  :type 'sexp
+  :group 'proofread)
+
 ;;;; Provider state
 
 (defvar proofread-llm--provider-identity-sequence 0
@@ -219,6 +237,25 @@ of 1 uses a single LLM call."
      "when no "
      "additional problems remain.\n\n")))
 
+(defun proofread-llm--additional-instructions-prompt (request)
+  "Return extra instruction prompt text for REQUEST, or nil."
+  (when-let* ((function
+               (proofread-llm--effective-instructions-function request)))
+    (proofread-llm--validate-instructions-identity
+     function
+     (proofread-llm--effective-instructions-identity request))
+    (let ((instructions (funcall function request)))
+      (cond
+       ((null instructions) nil)
+       ((stringp instructions)
+        (let ((instructions (string-trim instructions)))
+          (unless (string-empty-p instructions)
+            (format "Additional instructions:\n%s\n\n"
+                    instructions))))
+       (t
+        (error (concat "Proofread LLM instructions function must "
+                       "return nil or a string")))))))
+
 (defun proofread-llm--structured-response-prompt
     (request &optional prompt-json reported-diagnostics)
   "Return the provider-independent proofreading prompt for REQUEST.
@@ -230,6 +267,7 @@ them."
            "%s\n"
            "%s"
            "%s"
+           "%s"
            "Language: %S\n"
            "Major mode: %S\n"
            "Target kind: %S\n\n"
@@ -237,6 +275,8 @@ them."
            "Text:\n%s\n\n"
            "Context after:\n%s\n")
    proofread-llm--structured-response-instructions
+   (or (proofread-llm--additional-instructions-prompt request)
+       "")
    (or (proofread-llm--reported-diagnostics-prompt
         request reported-diagnostics)
        "")
@@ -713,12 +753,60 @@ PASS identifies the diagnostic pass for request logging."
       (memq 'json-response (llm-capabilities provider))
     (error nil)))
 
-(defun proofread-llm--response-strategy (&optional provider)
+(defun proofread-llm--source-options (source)
+  "Return binding-local options from SOURCE, or nil.
+SOURCE may be a backend request or a normalized profile binding."
+  (or (plist-get source :binding-options)
+      (plist-get source :options)))
+
+(defun proofread-llm--option (source key fallback)
+  "Return SOURCE binding option KEY, or FALLBACK when absent."
+  (let ((options (proofread-llm--source-options source)))
+    (if (plist-member options key)
+        (plist-get options key)
+      fallback)))
+
+(defun proofread-llm--effective-provider (source)
+  "Return the LLM provider effective for SOURCE."
+  (proofread-llm--option
+   source :provider proofread-llm-provider))
+
+(defun proofread-llm--effective-provider-identity (source)
+  "Return the stable provider identity effective for SOURCE."
+  (proofread-llm--option
+   source :provider-identity proofread-llm-provider-identity))
+
+(defun proofread-llm--effective-response-strategy (source)
+  "Return the configured response strategy effective for SOURCE."
+  (proofread-llm--option
+   source :response-strategy proofread-llm-response-strategy))
+
+(defun proofread-llm--effective-diagnostic-passes (source)
+  "Return the diagnostic pass count effective for SOURCE."
+  (proofread-llm--diagnostic-passes
+   (proofread-llm--option
+    source :diagnostic-passes
+    proofread-llm-max-diagnostic-passes)))
+
+(defun proofread-llm--effective-instructions-function (source)
+  "Return the extra-instructions function effective for SOURCE."
+  (proofread-llm--option
+   source :instructions-function proofread-llm-instructions-function))
+
+(defun proofread-llm--effective-instructions-identity (source)
+  "Return the extra-instructions identity effective for SOURCE."
+  (proofread-llm--option
+   source :instructions-identity
+   proofread-llm-instructions-identity))
+
+(defun proofread-llm--response-strategy
+    (provider configured-strategy)
   "Return the actual LLM response strategy for PROVIDER, or nil.
-When PROVIDER is nil, use `proofread-llm-provider'."
+CONFIGURED-STRATEGY is the user-selected response strategy before
+capability fallback."
   (let ((provider (or provider proofread-llm-provider)))
     (when provider
-      (pcase proofread-llm-response-strategy
+      (pcase configured-strategy
         ('auto
          (if (proofread-llm--provider-json-response-p provider)
              'provider-json
@@ -729,12 +817,12 @@ When PROVIDER is nil, use `proofread-llm-provider'."
         ('prompt-json 'prompt-json)
         (_ nil)))))
 
-(defun proofread-llm--diagnostic-passes ()
-  "Return the configured number of diagnostic LLM passes."
-  (unless (and (integerp proofread-llm-max-diagnostic-passes)
-               (> proofread-llm-max-diagnostic-passes 0))
+(defun proofread-llm--diagnostic-passes (passes)
+  "Return PASSES after validating it as a positive integer."
+  (unless (and (integerp passes)
+               (> passes 0))
     (user-error "Proofread diagnostic pass count must be positive"))
-  proofread-llm-max-diagnostic-passes)
+  passes)
 
 (defun proofread-llm--provider-session-identity (provider)
   "Return a non-secret session-local identity for PROVIDER."
@@ -743,30 +831,63 @@ When PROVIDER is nil, use `proofread-llm-provider'."
                (cl-incf proofread-llm--provider-identity-sequence)
                proofread-llm--provider-session-identities)))
 
-(defun proofread-llm--provider-name ()
-  "Return a stable display name for `proofread-llm-provider', or nil."
-  (when proofread-llm-provider
+(defun proofread-llm--provider-name (provider)
+  "Return a stable display name for PROVIDER, or nil."
+  (when provider
     (condition-case nil
-        (llm-name proofread-llm-provider)
+        (llm-name provider)
       (error nil))))
+
+(defun proofread-llm--validate-instructions-identity
+    (instructions-function instructions-identity)
+  "Require INSTRUCTIONS-IDENTITY when INSTRUCTIONS-FUNCTION is non-nil."
+  (when (and instructions-function (null instructions-identity))
+    (user-error (concat "Proofread LLM instructions identity must be "
+                        "non-nil when instructions function is "
+                        "configured"))))
+
+(defun proofread-llm--identity-for-source (source)
+  "Return stable cache identity for SOURCE's effective LLM settings."
+  (let* ((provider (proofread-llm--effective-provider source))
+         (provider-identity
+          (proofread-llm--effective-provider-identity source))
+         (response-strategy
+          (proofread-llm--response-strategy
+           provider
+           (proofread-llm--effective-response-strategy source)))
+         (diagnostic-passes
+          (proofread-llm--effective-diagnostic-passes source))
+         (instructions-function
+          (proofread-llm--effective-instructions-function source))
+         (instructions-identity
+          (proofread-llm--effective-instructions-identity source)))
+    (proofread-llm--validate-instructions-identity
+     instructions-function instructions-identity)
+    (list :backend 'llm
+          :provider
+          (if provider
+              (or provider-identity
+                  (list
+                   :name
+                   (or (proofread-llm--provider-name provider)
+                       'unknown)
+                   :session
+                   (proofread-llm--provider-session-identity
+                    provider)))
+            'unconfigured)
+          :response-strategy response-strategy
+          :diagnostic-passes diagnostic-passes
+          :instructions-identity
+          (and instructions-function instructions-identity)
+          :contract-version proofread-llm--contract-version)))
 
 (defun proofread-llm--provider-identity ()
   "Return stable cache identity for the configured LLM provider."
-  (list :backend 'llm
-        :provider
-        (if proofread-llm-provider
-            (or proofread-llm-provider-identity
-                (list
-                 :name
-                 (or (proofread-llm--provider-name) 'unknown)
-                 :session
-                 (proofread-llm--provider-session-identity
-                  proofread-llm-provider)))
-          'unconfigured)
-        :response-strategy
-        (proofread-llm--response-strategy proofread-llm-provider)
-        :diagnostic-passes (proofread-llm--diagnostic-passes)
-        :contract-version proofread-llm--contract-version))
+  (proofread-llm--identity-for-source nil))
+
+(defun proofread-llm--binding-identity (binding)
+  "Return stable cache identity for normalized profile BINDING."
+  (proofread-llm--identity-for-source binding))
 
 ;;;; Request execution
 
@@ -848,72 +969,80 @@ state."
             callback final-result))))))))
 
 (defun proofread-llm--submit-passes
-    (provider strategy request callback handle)
-  "Submit REQUEST to PROVIDER with STRATEGY and record HANDLE."
-  (let ((max-passes (proofread-llm--diagnostic-passes)))
-    (cl-labels
-        ((submit (pass diagnostics candidate-issues repairs)
-           (unless (plist-get handle :cancelled)
-             (let (pass-finished)
-               (cl-labels
-                   ((finish (result)
-                      (unless pass-finished
-                        (setq pass-finished t)
-                        (proofread-llm--finish-or-continue
-                         request callback #'submit max-passes pass
-                         diagnostics candidate-issues repairs
-                         result handle))))
-                 (condition-case err
-                     (let ((prompt
-                            (proofread-llm--prompt
-                             request strategy diagnostics)))
-                       (proofread--record-request-event
-                        request 'backend-request
-                        :backend 'llm
-                        :pass pass
-                        :max-passes max-passes
-                        :strategy strategy
-                        :prompt prompt
-                        :prompt-text
-                        (proofread-llm--request-log-prompt-text
-                         prompt)
-                        :schema
-                        (llm-chat-prompt-response-format prompt)
-                        :reported-diagnostics diagnostics)
-                       (let ((request-handle
-                              (llm-chat-async
-                               provider prompt
-                               (lambda (response)
-                                 (finish
-                                  (proofread-llm--success-result
-                                   request response pass)))
-                               (lambda
-                                 (error &optional message &rest _)
-                                 (finish
-                                  (proofread-llm--error-result
-                                   request error message pass))))))
-                         (push request-handle
-                               (plist-get handle :requests))))
-                   (error
-                    (let ((result
-                           (proofread--backend-error-result
-                            request 'llm-submit-error
-                            (error-message-string err))))
-                      (proofread--record-request-event
-                       request 'backend-result
-                       :backend 'llm
-                       :pass pass
-                       :result result)
-                      (finish result)))))))))
-      (submit 1 nil nil nil)))
+    (provider strategy max-passes request callback handle)
+  "Submit REQUEST to PROVIDER with STRATEGY and record HANDLE.
+MAX-PASSES is the request-local diagnostic pass limit."
+  (cl-labels
+      ((submit (pass diagnostics candidate-issues repairs)
+         (unless (plist-get handle :cancelled)
+           (let (pass-finished)
+             (cl-labels
+                 ((finish (result)
+                    (unless pass-finished
+                      (setq pass-finished t)
+                      (proofread-llm--finish-or-continue
+                       request callback #'submit max-passes pass
+                       diagnostics candidate-issues repairs
+                       result handle))))
+               (condition-case err
+                   (let ((prompt
+                          (proofread-llm--prompt
+                           request strategy diagnostics)))
+                     (proofread--record-request-event
+                      request 'backend-request
+                      :backend 'llm
+                      :pass pass
+                      :max-passes max-passes
+                      :strategy strategy
+                      :prompt prompt
+                      :prompt-text
+                      (proofread-llm--request-log-prompt-text
+                       prompt)
+                      :schema
+                      (llm-chat-prompt-response-format prompt)
+                      :reported-diagnostics diagnostics)
+                     (let ((request-handle
+                            (llm-chat-async
+                             provider prompt
+                             (lambda (response)
+                               (finish
+                                (proofread-llm--success-result
+                                 request response pass)))
+                             (lambda
+                               (error &optional message &rest _)
+                               (finish
+                                (proofread-llm--error-result
+                                 request error message pass))))))
+                       (push request-handle
+                             (plist-get handle :requests))))
+                 (error
+                  (let ((result
+                         (proofread--backend-error-result
+                          request 'llm-submit-error
+                          (error-message-string err))))
+                    (proofread--record-request-event
+                     request 'backend-result
+                     :backend 'llm
+                     :pass pass
+                     :result result)
+                    (finish result)))))))))
+    (submit 1 nil nil nil))
   handle)
 
 (defun proofread-llm--backend-check (request callback)
   "Submit REQUEST asynchronously and invoke CALLBACK with its result."
-  (let* ((provider proofread-llm-provider)
+  (let* ((provider (proofread-llm--effective-provider request))
          (strategy
           (and provider
-               (proofread-llm--response-strategy provider)))
+               (proofread-llm--response-strategy
+                provider
+                (proofread-llm--effective-response-strategy
+                 request))))
+         (max-passes
+          (and provider
+               strategy
+               (proofread-llm--effective-diagnostic-passes
+                request)))
          (handle (list :backend 'llm
                        :requests nil
                        :timer nil
@@ -934,7 +1063,7 @@ state."
         "The configured llm response strategy is unavailable")))
      (t
       (proofread-llm--submit-passes
-       provider strategy request callback handle)))
+       provider strategy max-passes request callback handle)))
     handle))
 
 (defun proofread-llm--cancel-request-handle (handle)
@@ -957,6 +1086,7 @@ state."
    'llm
    :check #'proofread-llm--backend-check
    :identity #'proofread-llm--provider-identity
+   :binding-identity #'proofread-llm--binding-identity
    :cancel #'proofread-llm--cancel-request-handle))
 
 (provide 'proofread-llm)

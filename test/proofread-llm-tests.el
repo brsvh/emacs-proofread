@@ -199,6 +199,7 @@
                         ,proofread-llm-test--provider-identity
                         :response-strategy prompt-json
                         :diagnostic-passes 3
+                        :instructions-identity nil
                         :contract-version 3)))
       (should (proofread--backend-identity-p
                (plist-get request :backend-identity)))
@@ -212,6 +213,8 @@
                 #'proofread-llm--backend-check))
     (should (eq (plist-get descriptor :identity)
                 #'proofread-llm--provider-identity))
+    (should (eq (plist-get descriptor :binding-identity)
+                #'proofread-llm--binding-identity))
     (should (eq (plist-get descriptor :cancel)
                 #'proofread-llm--cancel-request-handle))))
 
@@ -525,6 +528,91 @@
                        (car (plist-get result :diagnostics))
                        :source)
                       'llm)))))))
+
+(ert-deftest
+    proofread-llm-test-binding-options-build-local-prompt ()
+  "Binding-local LLM options select provider and prompt extras."
+  (with-temp-buffer
+    (text-mode)
+    (insert "helo")
+    (let* ((proofread-language "en")
+           (proofread-llm-provider 'proofread-global-provider)
+           (proofread-llm-provider-identity "global-provider")
+           (proofread-llm-response-strategy 'provider-json)
+           (proofread-llm-max-diagnostic-passes 3)
+           (binding
+            '( :profile multi
+               :name local
+               :backend llm
+               :options ( :provider proofread-binding-provider
+                          :provider-identity "binding-provider"
+                          :response-strategy prompt-json
+                          :diagnostic-passes 1
+                          :instructions-function
+                          proofread-llm-test--instructions
+                          :instructions-identity "instructions-v1")))
+           (profile '( :name multi :language "en"))
+           (chunk (proofread-llm-test--whole-buffer-chunk))
+           (request
+            (cl-letf
+                (((symbol-function
+                   'proofread-llm-test--instructions)
+                  (lambda (backend-request)
+                    (format "Prefer concise fixes for %s."
+                            (plist-get backend-request
+                                       :target-kind)))))
+              (proofread--make-backend-request
+               chunk 'llm binding profile)))
+           (content
+            (proofread-llm-test--response-for-range 0 4 "helo"))
+           captured-provider
+           captured-prompt
+           result)
+      (should
+       (equal
+        (plist-get request :backend-identity)
+        '( :backend llm
+           :provider "binding-provider"
+           :response-strategy prompt-json
+           :diagnostic-passes 1
+           :instructions-identity "instructions-v1"
+           :contract-version 3)))
+      (cl-letf (((symbol-function 'llm-chat-async)
+                 (lambda (provider prompt success _error
+                                   &optional _multi-output)
+                   (setq captured-provider provider)
+                   (setq captured-prompt prompt)
+                   (funcall success content)
+                   'proofread-llm-test-handle))
+                ((symbol-function
+                  'proofread-llm-test--instructions)
+                 (lambda (backend-request)
+                   (format "Prefer concise fixes for %s."
+                           (plist-get backend-request
+                                      :target-kind)))))
+        (let ((handle
+               (proofread-llm--backend-check
+                request
+                (lambda (backend-result)
+                  (setq result backend-result)))))
+          (proofread-llm-test--assert-handle-shape handle)
+          (should (eq captured-provider 'proofread-binding-provider))
+          (should (equal (llm-chat-prompt-response-format
+                          captured-prompt)
+                         nil))
+          (let* ((interaction
+                  (car (llm-chat-prompt-interactions
+                        captured-prompt)))
+                 (prompt-text
+                  (llm-chat-prompt-interaction-content interaction)))
+            (should (string-match-p "Additional instructions:"
+                                    prompt-text))
+            (should (string-match-p "Prefer concise fixes for text"
+                                    prompt-text))
+            (should (string-match-p "JSON schema:" prompt-text))
+            (should (string-match-p "Text:\nhelo" prompt-text)))
+          (should (proofread-llm-test--wait-for (lambda () result)))
+          (should (eq (plist-get result :status) 'ok)))))))
 
 (ert-deftest proofread-llm-test-prompt-describes-character-ranges ()
   "LLM prompts describe chunk-relative character ranges."
@@ -1758,6 +1846,68 @@
       (let ((proofread-llm-max-diagnostic-passes 2))
         (should-not (proofread--cache-read-request
                      (proofread--make-backend-request chunk)))))))
+
+(ert-deftest
+    proofread-llm-test-binding-instructions-identity-cache-miss ()
+  "Binding-local instruction identity participates in cache keys."
+  (with-temp-buffer
+    (insert "helo")
+    (proofread-mode 1)
+    (let* ((proofread-backend 'llm)
+           (proofread-llm-provider proofread-llm-test--provider)
+           (proofread-llm-provider-identity "global-provider")
+           (profile '( :name multi :language "en-US"))
+           (base-binding
+            '( :profile multi
+               :name local
+               :backend llm
+               :options ( :provider proofread-llm-test-provider
+                          :provider-identity "binding-provider"
+                          :instructions-function ignore
+                          :instructions-identity "instructions-a")))
+           (changed-function-binding
+            '( :profile multi
+               :name local
+               :backend llm
+               :options ( :provider proofread-llm-test-provider
+                          :provider-identity "binding-provider"
+                          :instructions-function identity
+                          :instructions-identity "instructions-a")))
+           (changed-identity-binding
+            '( :profile multi
+               :name local
+               :backend llm
+               :options ( :provider proofread-llm-test-provider
+                          :provider-identity "binding-provider"
+                          :instructions-function ignore
+                          :instructions-identity "instructions-b")))
+           (chunk (proofread-llm-test--whole-buffer-chunk))
+           (request
+            (proofread--make-backend-request
+             chunk 'llm base-binding profile))
+           (diagnostic
+            (proofread-llm-test--diagnostic-for-range 1 5 "helo")))
+      (proofread--cache-write-request request (list diagnostic))
+      (should
+       (proofread--cache-read-request
+        (proofread--make-backend-request
+         chunk 'llm changed-function-binding profile)))
+      (should-not
+       (proofread--cache-read-request
+        (proofread--make-backend-request
+         chunk 'llm changed-identity-binding profile)))
+      (should-not
+       (string-match-p
+        (regexp-quote "instructions-function")
+        (prin1-to-string (plist-get request :cache-key)))))))
+
+(ert-deftest
+    proofread-llm-test-instructions-function-requires-identity ()
+  "Reject extra instructions without a stable cache identity."
+  (let ((proofread-llm-instructions-function #'ignore)
+        (proofread-llm-instructions-identity nil))
+    (should-error (proofread-llm--provider-identity)
+                  :type 'user-error)))
 
 (ert-deftest
     proofread-llm-test-structured-response-stale-result-is-dropped ()

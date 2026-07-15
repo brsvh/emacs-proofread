@@ -504,7 +504,9 @@ interrupting proofreading.")
 (defun proofread--register-backend (backend &rest descriptor)
   "Register BACKEND using functions in DESCRIPTOR.
 DESCRIPTOR must contain callable `:check' and `:identity' entries.  An
-optional callable `:cancel' entry cancels backend-specific handles."
+optional callable `:binding-identity' entry returns the effective
+identity for one normalized profile binding, and an optional callable
+`:cancel' entry cancels backend-specific handles."
   (unless (symbolp backend)
     (error "Proofread backend name must be a symbol: %S" backend))
   (dolist (key '( :check :identity))
@@ -514,6 +516,10 @@ optional callable `:cancel' entry cancels backend-specific handles."
   (when (and (plist-member descriptor :cancel)
              (not (functionp (plist-get descriptor :cancel))))
     (error "Proofread backend %S has invalid :cancel function"
+           backend))
+  (when (and (plist-member descriptor :binding-identity)
+             (not (functionp (plist-get descriptor :binding-identity))))
+    (error "Proofread backend %S has invalid :binding-identity function"
            backend))
   (puthash backend (copy-sequence descriptor)
            proofread--backend-registry)
@@ -698,12 +704,41 @@ selected legacy backend is nil."
   (list :profile (plist-get binding :profile)
         :binding-name (plist-get binding :name)))
 
+(defun proofread--backend-binding-identity-function (backend)
+  "Return BACKEND's binding-local identity function, or nil."
+  (when-let* ((descriptor (proofread--backend-descriptor backend)))
+    (plist-get descriptor :binding-identity)))
+
+(defun proofread--backend-binding-identity (binding)
+  "Return the backend identity effective for normalized BINDING."
+  (let* ((backend (plist-get binding :backend))
+         (identity-function
+          (proofread--backend-binding-identity-function backend))
+         (value
+          (if identity-function
+              (funcall identity-function binding)
+            (proofread--backend-identity backend))))
+    (cond
+     ((null value)
+      (when identity-function
+        (error "Invalid binding identity for proofread backend %S"
+               backend))
+      nil)
+     ((and (proofread--backend-identity-p value)
+           (eq (plist-get value :backend) backend))
+      (proofread--snapshot-value value))
+     (t
+      (error "Invalid binding identity for proofread backend %S"
+             backend)))))
+
 (defun proofread--binding-identity
     (binding &optional backend-identity)
   "Return the cache and freshness identity for BINDING.
 BACKEND-IDENTITY, when non-nil, is used instead of recomputing the
-selected backend identity."
-  (let ((backend (plist-get binding :backend)))
+effective backend identity."
+  (let* ((backend (plist-get binding :backend))
+         (backend-owns-options
+          (proofread--backend-binding-identity-function backend)))
     (list :profile (proofread--snapshot-value
                     (plist-get binding :profile))
           :binding-name (proofread--snapshot-value
@@ -712,9 +747,10 @@ selected backend identity."
           :backend-identity
           (proofread--snapshot-value
            (or backend-identity
-               (proofread--backend-identity backend)))
+               (proofread--backend-binding-identity binding)))
           :options (proofread--snapshot-value
-                    (plist-get binding :options)))))
+                    (unless backend-owns-options
+                      (plist-get binding :options))))))
 
 (defun proofread--current-profile-supported-bindings (profile)
   "Return PROFILE bindings whose backends are registered."
@@ -741,10 +777,7 @@ selected backend identity."
                                (proofread--binding-owner binding))
                         (equal
                          (plist-get request :binding-identity)
-                         (proofread--binding-identity
-                          binding
-                          (plist-get request
-                                     :backend-identity))))))
+                         (proofread--binding-identity binding)))))
           (let* ((profile (proofread--current-profile))
                  (binding
                   (cl-find binding-name
@@ -2087,7 +2120,10 @@ owns the request."
                       (proofread--legacy-profile-binding backend)))
          (backend-name (or (plist-get binding :backend)
                            backend proofread-backend))
-         (backend-identity (proofread--backend-identity backend-name))
+         (backend-identity
+          (if binding
+              (proofread--backend-binding-identity binding)
+            (proofread--backend-identity backend-name)))
          (binding-owner (and binding
                              (proofread--binding-owner binding)))
          (binding-identity
@@ -3062,6 +3098,13 @@ documented by `proofread--drain-request-queue'."
                            (proofread--request-ready-context-after
                             end)))))))))
 
+(defun proofread--request-current-backend-identity-p (request)
+  "Return non-nil when REQUEST's backend identity is still current."
+  (or (plist-get request :binding-identity)
+      (equal (plist-get request :backend-identity)
+             (proofread--backend-identity
+              (plist-get request :backend)))))
+
 (defun proofread--fresh-request-p (request)
   "Return non-nil if REQUEST still matches its originating buffer."
   (let ((buffer (plist-get request :buffer)))
@@ -3080,9 +3123,8 @@ documented by `proofread--drain-request-queue'."
                            (= (point-min) accessible-beg)
                            (= (point-max) accessible-end))
                     (not (buffer-narrowed-p))))
-                (equal (plist-get request :backend-identity)
-                       (proofread--backend-identity
-                        (plist-get request :backend)))
+                (proofread--request-current-backend-identity-p
+                 request)
                 (proofread--request-current-binding-p request)
                 (proofread--request-range-valid-p request)
                 (proofread--request-text-matches-p request)
@@ -3181,10 +3223,10 @@ When BACKEND is nil, use the selected `proofread-backend'."
                                     proofread-backend))
                   (binding
                    (proofread--legacy-profile-binding backend-name)))
-        (proofread--binding-identity
-         binding
-         (or (plist-get chunk :backend-identity)
-             (proofread--backend-identity backend-name))))))
+        (if (plist-member chunk :backend-identity)
+            (proofread--binding-identity
+             binding (plist-get chunk :backend-identity))
+          (proofread--binding-identity binding)))))
 
 (defun proofread--cache-key (chunk &optional backend)
   "Return diagnostic cache key for CHUNK and BACKEND."

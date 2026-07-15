@@ -386,6 +386,85 @@ When BASE-URL is nil, validate and use the configured server URL."
       (proofread-languagetool--normalized-preferred-variants values)
     (error (format "%S" values))))
 
+(defun proofread-languagetool--source-options (source)
+  "Return binding-local options from SOURCE, or nil.
+SOURCE may be a backend request or a normalized profile binding."
+  (or (plist-get source :binding-options)
+      (plist-get source :options)))
+
+(defun proofread-languagetool--option (source key fallback)
+  "Return SOURCE binding option KEY, or FALLBACK when absent."
+  (let ((options (proofread-languagetool--source-options source)))
+    (if (plist-member options key)
+        (plist-get options key)
+      fallback)))
+
+(defun proofread-languagetool--effective-language (request)
+  "Return the LanguageTool language option effective for REQUEST."
+  (proofread-languagetool--option
+   request :language (plist-get request :language)))
+
+(defun proofread-languagetool--effective-level (source)
+  "Return the checking level effective for SOURCE."
+  (proofread-languagetool--option
+   source :level proofread-languagetool-level))
+
+(defun proofread-languagetool--effective-preferred-variants
+    (source)
+  "Return preferred language variants effective for SOURCE."
+  (proofread-languagetool--option
+   source :preferred-variants
+   proofread-languagetool-preferred-variants))
+
+(defun proofread-languagetool--effective-mother-tongue
+    (source)
+  "Return the mother-tongue option effective for SOURCE."
+  (proofread-languagetool--option
+   source :mother-tongue proofread-languagetool-mother-tongue))
+
+(defun proofread-languagetool--effective-enabled-rules
+    (source)
+  "Return enabled rules effective for SOURCE."
+  (proofread-languagetool--option
+   source :enabled-rules proofread-languagetool-enabled-rules))
+
+(defun proofread-languagetool--effective-disabled-rules
+    (source)
+  "Return disabled rules effective for SOURCE."
+  (proofread-languagetool--option
+   source :disabled-rules proofread-languagetool-disabled-rules))
+
+(defun proofread-languagetool--effective-enabled-categories
+    (source)
+  "Return enabled categories effective for SOURCE."
+  (proofread-languagetool--option
+   source :enabled-categories
+   proofread-languagetool-enabled-categories))
+
+(defun proofread-languagetool--effective-disabled-categories
+    (source)
+  "Return disabled categories effective for SOURCE."
+  (proofread-languagetool--option
+   source :disabled-categories
+   proofread-languagetool-disabled-categories))
+
+(defun proofread-languagetool--effective-enabled-only (source)
+  "Return enabled-only mode effective for SOURCE."
+  (proofread-languagetool--option
+   source :enabled-only proofread-languagetool-enabled-only))
+
+(defun proofread-languagetool--safe-language (language)
+  "Return a stable identity value for LANGUAGE."
+  (condition-case nil
+      (cond
+       ((null language) "auto")
+       ((and (stringp language)
+             (not (string-empty-p (string-trim language))))
+        (string-trim language))
+       (t
+        (error "Invalid language")))
+    (error (format "%S" language))))
+
 (defun proofread-languagetool--normalized-config-file ()
   "Return the configured absolute server config file, or nil."
   (when proofread-languagetool-config-file
@@ -581,8 +660,8 @@ startup even when automatic startup is disabled."
        (proofread-languagetool--same-session-p
         session proofread-languagetool--server-session)))
 
-(defun proofread-languagetool--identity ()
-  "Return the stable, non-secret LanguageTool backend identity."
+(defun proofread-languagetool--server-identity ()
+  "Return the stable, non-secret LanguageTool server identity."
   (append
    (list :backend 'languagetool
          :server-url
@@ -592,32 +671,65 @@ startup even when automatic startup is disabled."
    (when proofread-languagetool-auto-start
      (list :server-config (proofread-languagetool--config-identity)
            :server-command
-           (proofread-languagetool--safe-command-snapshot)))
-   (list :level proofread-languagetool-level
+           (proofread-languagetool--safe-command-snapshot)))))
+
+(defun proofread-languagetool--request-options-identity
+    (source)
+  "Return the stable LanguageTool request-options identity for SOURCE."
+  (append
+   (when (plist-member
+          (proofread-languagetool--source-options source)
+          :language)
+     (list :language
+           (proofread-languagetool--safe-language
+            (proofread-languagetool--option source :language nil))))
+   (list :level (proofread-languagetool--effective-level source)
          :preferred-variants
          (proofread-languagetool--safe-preferred-variants
-          proofread-languagetool-preferred-variants)
-         :mother-tongue proofread-languagetool-mother-tongue
+          (proofread-languagetool--effective-preferred-variants
+           source))
+         :mother-tongue
+         (proofread-languagetool--effective-mother-tongue source)
          :enabled-rules
          (proofread-languagetool--safe-identifiers
-          proofread-languagetool-enabled-rules)
+          (proofread-languagetool--effective-enabled-rules
+           source))
          :disabled-rules
          (proofread-languagetool--safe-identifiers
-          proofread-languagetool-disabled-rules)
+          (proofread-languagetool--effective-disabled-rules
+           source))
          :enabled-categories
          (proofread-languagetool--safe-identifiers
-          proofread-languagetool-enabled-categories)
+          (proofread-languagetool--effective-enabled-categories
+           source))
          :disabled-categories
          (proofread-languagetool--safe-identifiers
-          proofread-languagetool-disabled-categories)
-         :enabled-only proofread-languagetool-enabled-only
+          (proofread-languagetool--effective-disabled-categories
+           source))
+         :enabled-only
+         (proofread-languagetool--effective-enabled-only source)
          :contract-version proofread-languagetool--contract-version)))
+
+(defun proofread-languagetool--identity-for-source (source)
+  "Return stable LanguageTool identity for SOURCE."
+  (append
+   (proofread-languagetool--server-identity)
+   (proofread-languagetool--request-options-identity source)))
+
+(defun proofread-languagetool--identity ()
+  "Return the stable, non-secret LanguageTool backend identity."
+  (proofread-languagetool--identity-for-source nil))
+
+(defun proofread-languagetool--binding-identity (binding)
+  "Return stable cache identity for normalized profile BINDING."
+  (proofread-languagetool--identity-for-source binding))
 
 ;;;; Request encoding and response parsing
 
 (defun proofread-languagetool--request-language (request)
   "Return the LanguageTool language code for REQUEST."
-  (let ((language (plist-get request :language)))
+  (let ((language (proofread-languagetool--effective-language
+                   request)))
     (cond
      ((null language) "auto")
      ((and (stringp language)
@@ -642,33 +754,46 @@ startup even when automatic startup is disabled."
          (text (plist-get request :text))
          (after (or (plist-get request :context-after) ""))
          (language (proofread-languagetool--request-language request))
+         (level (proofread-languagetool--effective-level request))
+         (preferred-variants
+          (proofread-languagetool--effective-preferred-variants
+           request))
+         (mother-tongue
+          (proofread-languagetool--effective-mother-tongue
+           request))
+         (enabled-only
+          (proofread-languagetool--effective-enabled-only request))
          (enabled
           (proofread-languagetool--normalized-identifiers
-           proofread-languagetool-enabled-rules
+           (proofread-languagetool--effective-enabled-rules
+            request)
            'proofread-languagetool-enabled-rules))
          (disabled
           (proofread-languagetool--normalized-identifiers
-           proofread-languagetool-disabled-rules
+           (proofread-languagetool--effective-disabled-rules
+            request)
            'proofread-languagetool-disabled-rules))
          (enabled-categories
           (proofread-languagetool--normalized-identifiers
-           proofread-languagetool-enabled-categories
+           (proofread-languagetool--effective-enabled-categories
+            request)
            'proofread-languagetool-enabled-categories))
          (disabled-categories
           (proofread-languagetool--normalized-identifiers
-           proofread-languagetool-disabled-categories
+           (proofread-languagetool--effective-disabled-categories
+            request)
            'proofread-languagetool-disabled-categories))
          parameters)
     (unless (and (stringp before) (stringp text) (stringp after))
       (error "LanguageTool request text and context must be strings"))
-    (unless (memq proofread-languagetool-level '( default picky))
+    (unless (memq level '( default picky))
       (error "Invalid LanguageTool checking level: %S"
-             proofread-languagetool-level))
-    (when (and proofread-languagetool-enabled-only
+             level))
+    (when (and enabled-only
                (or disabled disabled-categories))
       (error (concat "LanguageTool enabled-only mode cannot include "
                      "disabled rules or categories")))
-    (when (and proofread-languagetool-enabled-only
+    (when (and enabled-only
                (null enabled)
                (null enabled-categories))
       (error (concat "LanguageTool enabled-only mode requires an "
@@ -676,26 +801,23 @@ startup even when automatic startup is disabled."
     (setq parameters
           (list (cons "language" language)
                 (cons "text" (concat before text after))
-                (cons "level"
-                      (symbol-name proofread-languagetool-level))))
-    (when (and (equal language "auto")
-               proofread-languagetool-preferred-variants)
+                (cons "level" (symbol-name level))))
+    (when (and (equal language "auto") preferred-variants)
       (push (cons
              "preferredVariants"
              (string-join
               (proofread-languagetool--normalized-preferred-variants
-               proofread-languagetool-preferred-variants)
+               preferred-variants)
               ","))
             parameters))
-    (when proofread-languagetool-mother-tongue
-      (unless (and (stringp proofread-languagetool-mother-tongue)
+    (when mother-tongue
+      (unless (and (stringp mother-tongue)
                    (not (string-empty-p
-                         (string-trim
-                          proofread-languagetool-mother-tongue))))
+                         (string-trim mother-tongue))))
         (error (concat "LanguageTool mother tongue must be a "
                        "nonempty string")))
       (push (cons "motherTongue"
-                  (string-trim proofread-languagetool-mother-tongue))
+                  (string-trim mother-tongue))
             parameters))
     (when enabled
       (push (cons "enabledRules" (string-join enabled ","))
@@ -711,7 +833,7 @@ startup even when automatic startup is disabled."
       (push (cons "disabledCategories"
                   (string-join disabled-categories ","))
             parameters))
-    (when proofread-languagetool-enabled-only
+    (when enabled-only
       (push (cons "enabledOnly" "true") parameters))
     (setq parameters (nreverse parameters))
     (list :body (proofread-languagetool--form-encode parameters)
@@ -1774,6 +1896,7 @@ An external server reused by this backend is never stopped."
    'languagetool
    :check #'proofread-languagetool--check
    :identity #'proofread-languagetool--identity
+   :binding-identity #'proofread-languagetool--binding-identity
    :cancel #'proofread-languagetool--cancel))
 
 (provide 'proofread-languagetool)
