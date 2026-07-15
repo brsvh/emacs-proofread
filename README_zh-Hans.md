@@ -27,9 +27,9 @@ https://github.com/user-attachments/assets/3c77758b-00ab-48e2-9e23-e54e8845d251
 ### 安装
 
 `proofread` 包依赖 GNU Emacs 和 GNU ELPA `llm`，其中同时包含核心、LLM 和 LanguageTool
-库。LanguageTool 本身是可选运行时依赖，仅在 `proofread-backend` 为 `languagetool` 时使用；核心与 LLM
-后端不会加载或启动它。该后端可以复用任意兼容的本地 v2 HTTP 服务；只有自动启动功能额外要求 `languagetool-http-server` 位于
-`exec-path`。可选的 `proofread-popup` 包还依赖 `posframe`。
+库。LanguageTool 本身是可选运行时依赖，仅在使用 LanguageTool 后端绑定时需要；核心与 LLM
+后端不会加载或启动它。LanguageTool 后端可以复用任意兼容的本地 v2 HTTP 服务；只有自动启动功能额外要求
+`languagetool-http-server` 位于 `exec-path`。可选的 `proofread-popup` 包还依赖 `posframe`。
 
 克隆本仓库并将其中的软件包目录加入 `load-path`：
 
@@ -45,99 +45,204 @@ git clone https://github.com/brsvh/emacs-proofread.git
 
 ### 构建软件包
 
-仓库中的 `Makefile` 可分别构建核心包 `proofread` 和可选包 `proofread-popup`。构建使用 GNU Make、GNU
-tar 和 GNU Emacs；进行字节编译时，上文列出的包依赖必须对所用 Emacs 可见。请从仓库根目录运行这些目标；可通过 `EMACS` 选择其他
-Emacs 可执行文件，例如 `make EMACS=/path/to/emacs all`。
+仓库中的 `Makefile` 可构建核心包 `proofread` 和可选包 `proofread-popup`。构建使用 GNU Make、GNU tar
+和 GNU Emacs；进行字节编译时，上文列出的包依赖必须对所用 Emacs 可见。请从仓库根目录运行这些命令：
 
 ```sh
 make all
-# 或仅构建一个包
 make proofread
 make proofread-popup
+make clean
 ```
 
-`all` 会构建两个包。每个包的汇总目标都会生成包元数据、autoload 文件、字节编译文件和符合 ELPA 规范的源码归档。也可以分别运行各个阶段：
+`make all` 会构建两个包。包专用目标只构建其中一个包，`make clean` 会删除生成文件。可通过 `EMACS` 选择其他 Emacs
+可执行文件，例如 `make EMACS=/path/to/emacs all`。
 
-| 软件包            | 元数据                     | Autoload                         | 字节编译                       | ELPA 归档                      |
-| ----------------- | -------------------------- | -------------------------------- | ------------------------------ | ------------------------------ |
-| `proofread`       | `make proofread-pkg`       | `make proofread-autoloads`       | `make proofread-compile`       | `make proofread-archive`       |
-| `proofread-popup` | `make proofread-popup-pkg` | `make proofread-popup-autoloads` | `make proofread-popup-compile` | `make proofread-popup-archive` |
-
-生成的 `-pkg.el`、`-autoloads.el` 和 `.elc` 文件位于 `lisp/` 下。归档以
-`dist/<package>-<version>.tar` 形式生成；版本取自主源码文件中的包元数据。每个归档以 `<package>-<version>/`
-为顶层目录，并包含软件包源码、生成的 `<package>-pkg.el` 和 `COPYING`。归档有意不包含生成的 autoload 与字节编译文件，因为
-Emacs 安装软件包时会自行生成它们。`make clean` 会删除所有生成文件和 `dist/`。
+构建输出位于 `lisp/` 和 `dist/` 下：包元数据、autoload 文件、字节编译文件，以及符合 ELPA
+规范的源码归档。`make proofread-compile` 或 `make proofread-archive`
+等单阶段目标仍可用于发布工作，但普通使用通常只需要上面的汇总目标。
 
 ### 配置
 
-`proofread-backend` 和 `proofread-llm-provider` 默认均为 `nil`，因此仅启用 `proofread-mode`
-不会发送请求。以下示例使用 `llm` 提供的本地 Ollama 提供程序；请将 `MODEL` 替换为已安装 Ollama 模型的名称：
+> [!WARNING]
+> 当前主分支的代码 API 并不稳定，建议您使用 v0.1.0 tag。
+
+Proofread 的派发由 profile 驱动。先定义 `proofread-profiles`，再用 `proofread-profile` 选中一个
+profile，并加载该 profile 使用的后端库。Profile 是命名语言配置，包含 `:language`、`:display-language`
+和有序的 `:bindings`。每个绑定都有稳定的 `:name`，选择一个已注册的 `:backend`，并携带可选的后端局部 `:options`。
+
+#### 最小配置（`llm`）
+
+一个最小 LLM 配置只需要一个 profile 和一个 `llm` 绑定。以下示例用本地 Ollama 模型 `qwen3.5:4b` 检查简体中文文本：
 
 ```elisp
 (require 'proofread)
 (require 'proofread-llm)
 (require 'llm-ollama)
 
-(setq proofread-backend 'llm
-      proofread-llm-provider
-      (make-llm-ollama :chat-model "MODEL")
-      proofread-language "English")
+(defvar qwen3.5-4b (make-llm-ollama :chat-model "qwen3.5:4b"))
+
+(setq proofread-profiles
+      `(( chinese
+          :language "zh-CN"
+          :display-language "Simplified Chinese"
+          :bindings (( :name ollama-qwen
+                       :backend llm
+                       :options ( :provider ,qwen3.5-4b
+                                  :provider-identity "ollama:qwen3.5:4b"))))))
+
+(setq proofread-profile 'chinese)
 
 (add-hook 'text-mode-hook #'proofread-mode)
 (add-hook 'prog-mode-hook #'proofread-mode)
 ```
 
-`proofread-llm-provider` 可以是 `llm` 支持的任意提供程序对象。对于远程提供程序，请将凭据保存在 `auth-source`
-或该提供程序推荐的其他安全设施中。`proofread-llm-response-strategy` 的默认值为 `auto`：当提供程序声明支持 JSON
-响应时使用 JSON Schema，否则回退到仅由提示词约束的 JSON。
+#### `llm` backend 的进一步配置
 
-若要自动启动本地 LanguageTool，请确保 `languagetool-http-server` 位于 `exec-path`，或将
-`proofread-languagetool-command` 设为它的绝对路径。该命令也可以是 argv
-列表：第一项为可执行文件，其余为固定参数；后端会直接执行，不经过 shell。命令参数可能显示在系统进程列表中，因此不要在其中放置凭据；应改用受保护的
-properties 文件或环境变量。若复用已经运行的本地服务，Emacs 中无需该可执行文件。LanguageTool 的语言值必须是
-`en-US`、`zh-CN` 或 `de-DE` 这样的代码，而不是 `"English"` 这样的显示名称：
+LLM 绑定从绑定局部 `:options` 读取 provider 和请求行为。绑定选项只覆盖该绑定对应的 `proofread-llm-*` 默认值。
+
+对于本地模型，本文档只介绍 Ollama。使用 `llm` 提供的 provider，并为绑定设置稳定、非秘密的 provider 身份：
+
+```elisp
+(require 'llm-ollama)
+
+(defvar qwen3.5-4b (make-llm-ollama :chat-model "qwen3.5:4b"))
+
+(defvar qwen3.5-4b-backend
+  `( :name ollama-qwen
+     :backend llm
+     :options ( :provider ,qwen3.5-4b
+                :provider-identity "ollama:qwen3.5:4b"
+                :diagnostic-passes 1)))
+```
+
+对于远程模型，请将凭据保存在 `auth-source` 或其他安全设施中。以下 OpenAI 示例从 `auth-source` 读取 key，并使用不包含
+key 的稳定 provider 身份：
+
+```elisp
+(require 'auth-source)
+(require 'llm-openai)
+
+(defvar gpt-5.4
+  (make-llm-openai :key (auth-source-pick-first-password
+                         :host "api.openai.com")
+                   :chat-model "gpt-5.4"))
+
+
+(defvar gpt-5.4-backend
+  `( :name openai
+     :backend llm
+     :options ( :provider ,gpt-5.4
+                :provider-identity "openai:gpt-5.4"
+                :response-strategy auto
+                :diagnostic-passes 1)))
+```
+
+`proofread-llm-response-strategy` 的默认值是 `auto`：当 provider 声明支持 JSON 响应时使用 JSON
+Schema，否则回退到仅由提示词约束的 JSON。如果提供 `:instructions-function`，也应提供稳定的
+`:instructions-identity`，以便指令变化时缓存身份同步变化。更完整的 provider 配置请参考上游
+[`llm.el` provider 文档](https://github.com/ahyatt/llm#setting-up-providers)。
+
+#### `languagetool` backend 的配置
+
+单语言 LanguageTool 配置同样只需要一个 profile 和一个 `languagetool` 绑定。LanguageTool 的语言值必须是
+`en-US`、`zh-CN` 或 `de-DE` 这样的代码，而不是 `"English"` 这样的显示名称。中文版示例使用 `zh-CN`：
 
 ```elisp
 (require 'proofread)
 (require 'proofread-languagetool)
 
-(setq proofread-backend 'languagetool
-      proofread-language "en-US")
+(setq proofread-profiles
+      '(( chinese-languagetool
+          :language "zh-CN"
+          :display-language "Simplified Chinese"
+          :bindings (( :name languagetool
+                       :backend languagetool
+                       :options ( :language "zh-CN"
+                                  :level picky))))))
+
+(setq proofread-profile 'chinese-languagetool)
 
 (add-hook 'text-mode-hook #'proofread-mode)
 (add-hook 'prog-mode-hook #'proofread-mode)
 ```
 
-后端会先探测 `http://127.0.0.1:8081/v2`。若已有 LanguageTool 服务则直接复用；否则默认在当前 Emacs
-会话中启动一个共享的 `languagetool-http-server` 进程，并异步等待其就绪。Emacs
-只会停止自己启动的进程。若端点由外部服务管理，请将 `proofread-languagetool-auto-start` 设为 `nil`。也可以用
-`proofread-languagetool-start-server` 和 `proofread-languagetool-stop-server`
-显式控制托管进程。
+若要自动启动本地 LanguageTool，请确保 `languagetool-http-server` 位于 `exec-path`，或将
+`proofread-languagetool-command` 设为它的绝对路径。服务 URL
+和生命周期设置是会话全局的。`:language`、`:level`、`:preferred-variants`、规则列表、分类列表、`:mother-tongue`
+和 `:enabled-only` 等请求选项应放在绑定中。LanguageTool 服务 URL 仍是全局设置；不要在绑定中放入 `:url` 并期待每个
+profile 使用不同服务。
 
-禁用自动启动后，普通检查会忽略托管命令、properties 文件和启动超时；显式启动仍会验证这些设置。这些设置也不会影响外部后端的缓存身份。
-
-明文 HTTP 端点只允许使用回环接口；任何非回环服务都必须使用 HTTPS。
-
-当 `proofread-language` 为 `nil` 时，后端会发送 `language=auto`。此时应设置
-`proofread-languagetool-preferred-variants`，以便启用依赖语言变体的拼写词典，例如：
+当 LanguageTool 绑定的 `:language` 为 `nil` 时，后端会发送 `language=auto`。此时应在该绑定中设置
+`:preferred-variants`，以便启用依赖语言变体的拼写词典，例如：
 
 ```elisp
-(setq proofread-language nil
-      proofread-languagetool-preferred-variants '("en-US" "de-DE"))
+'( :language nil
+   :preferred-variants ("en-US" "de-DE"))
 ```
-
-配置有意分为请求策略与服务运行时两层。语言、检查级别、首选变体、母语以及规则/分类选择会作为 HTTP 参数随每次检查发送；这些设置应保留在 Emacs
-中，以便 Proofread 将其纳入缓存验证。可选的 `proofread-languagetool-config-file`
-则用于模型路径、缓存大小、资源限制等服务全局 Java properties；它只在 Proofread
-启动托管进程时生效，无法配置已经运行的外部服务。检查策略应保留在 Emacs 中，而不是写入服务的 properties 文件。
-
-服务 URL、自动启动开关和健康探测超时始终必须保持会话全局。自动或显式启动托管服务时，命令、properties
-文件和启动超时也必须保持会话全局；仅使用外部服务的普通检查会忽略这些设置。后端会在相应设置生效时拒绝其缓冲区局部绑定。单次请求超时、检查级别、语言变体、母语以及规则/分类控制在设置后可以成为缓冲区局部值。托管服务的
-properties 文件必须使用本机绝对路径。
 
 本地开源服务会让被检查的文本留在本机，但不包含 LanguageTool 仅在云端提供的 AI 规则。若未另外配置 fastText
 模型，自动语言检测也会较弱，因此显式语言代码是最可预测的配置。上游细节请参阅官方的[本地服务指南](https://dev.languagetool.org/http-server.html)和
 [HTTP API](https://languagetool.org/http-api/)。
+
+#### 为多个语言启用不同的后端
+
+更复杂的配置通常为每种语言定义一个 profile。每个 profile 可以选择不同的后端集合，或不同的后端局部选项。以下示例为英文使用 OpenAI 加
+LanguageTool，为简体中文使用本地 Ollama 加 LanguageTool：
+
+```elisp
+(require 'proofread)
+(require 'proofread-llm)
+(require 'proofread-languagetool)
+(require 'auth-source)
+(require 'llm-openai)
+(require 'llm-ollama)
+
+(defvar gpt-5.4
+  (make-llm-openai :key (auth-source-pick-first-password
+                         :host "api.openai.com")
+                   :chat-model "gpt-5.4"))
+
+(defvar qwen3.5-4b
+  (make-llm-ollama :chat-model "qwen3.5:4b"))
+
+(setq proofread-profiles
+      `((english
+         :language "en-US"
+         :display-language "English"
+         :bindings (( :name openai
+                      :backend llm
+                      :options ( :provider ,gpt-5.4
+                                 :provider-identity "openai:gpt-5.4"
+                                 :response-strategy auto
+                                 :diagnostic-passes 1))
+                    ( :name languagetool
+                      :backend languagetool
+                      :options ( :language "en-US"
+                                 :level picky))))
+        (chinese
+         :language "zh-CN"
+         :display-language "Simplified Chinese"
+         :bindings (( :name ollama-qwen
+                      :backend llm
+                      :options ( :provider ,qwen3.5-4b
+                                 :provider-identity "ollama:qwen3.5:4b"
+                                 :diagnostic-passes 1))
+                    ( :name languagetool
+                      :backend languagetool
+                      :options ( :language "zh-CN"
+                                 :level picky))))))
+
+(setq proofread-profile 'chinese)
+```
+
+通过设置 `proofread-profile` 切换 profile：
+
+```elisp
+(setq proofread-profile 'chinese)
+```
+
+来自不同绑定的诊断项在内部仍然彼此独立。用户界面会把指向同一实时范围和同一文本的诊断项分组，保留每个绑定的消息，并去重相同的修改建议文本。
 
 `proofread-targets` 控制每个缓冲区中要检查的文本：
 
@@ -256,48 +361,50 @@ https://github.com/user-attachments/assets/2dda228e-f85c-4500-aea0-549500628c6e
 
 运行 `M-x customize-group RET proofread RET` 可编辑核心选项：
 
-| 选项                                      | 默认值 | 用途                                                             |
-| ----------------------------------------- | ------ | ---------------------------------------------------------------- |
-| `proofread-language`                      | `nil`  | 向后端提供语言提示；`nil` 表示允许推断语言                       |
-| `proofread-auto-check`                    | `t`    | 在启用模式、编辑和窗口活动后安排检查；设置后为缓冲区局部变量     |
-| `proofread-targets`                       | `auto` | 选择全部文本、注释或文档字符串；设置后为缓冲区局部变量           |
-| `proofread-docstring-predicate-functions` | `nil`  | 添加识别文档字符串的谓词函数；设置后为缓冲区局部变量             |
-| `proofread-idle-delay`                    | `1.0`  | 自动检查前等待的空闲秒数                                         |
-| `proofread-inhibit-progress-messages`     | `t`    | 抑制后台进度消息，但不抑制错误或显式命令反馈                     |
-| `proofread-max-chunk-size`                | `2000` | 限制每个校对文本块的字符数                                       |
-| `proofread-context-size`                  | `300`  | 限制文本块每侧发送的上下文字符数                                 |
-| `proofread-context-sentences-before`      | `1`    | 限制文本块之前的逻辑上下文句数                                   |
-| `proofread-context-sentences-after`       | `1`    | 限制文本块之后的逻辑上下文句数                                   |
-| `proofread-max-concurrent-requests`       | `8`    | 限制每个缓冲区的活动后端请求数                                   |
-| `proofread-backend`                       | `nil`  | 选择 `llm` 或 `languagetool`；设为 `nil` 可禁用请求派发          |
-| `proofread-llm-provider`                  | `nil`  | 指定 `llm` 提供程序对象                                          |
-| `proofread-llm-response-strategy`         | `auto` | 选择由提供程序强制执行的 JSON Schema 输出或仅由提示词约束的 JSON |
-| `proofread-llm-provider-identity`         | `nil`  | 为缓存键指定稳定且不含机密信息的提供程序标识                     |
-| `proofread-llm-max-diagnostic-passes`     | `3`    | 限制每个请求的 LLM 诊断轮数                                      |
-| `proofread-cache-max-entries`             | `128`  | 限制每个缓冲区的 LRU 缓存条目数；`0` 表示禁用缓存                |
-| `proofread-request-log-max-records`       | `100`  | 限制每个受监视缓冲区保留的记录数                                 |
-| `proofread-ignored-faces`                 | `nil`  | 排除 `face` 属性与指定 `face` 匹配的文本                         |
-| `proofread-ignored-properties`            | `nil`  | 排除指定文本属性之一为非 `nil` 的文本                            |
+| 选项                                      | 默认值 | 用途                                                         |
+| ----------------------------------------- | ------ | ------------------------------------------------------------ |
+| `proofread-auto-check`                    | `t`    | 在启用模式、编辑和窗口活动后安排检查；设置后为缓冲区局部变量 |
+| `proofread-targets`                       | `auto` | 选择全部文本、注释或文档字符串；设置后为缓冲区局部变量       |
+| `proofread-docstring-predicate-functions` | `nil`  | 添加识别文档字符串的谓词函数；设置后为缓冲区局部变量         |
+| `proofread-idle-delay`                    | `1.0`  | 自动检查前等待的空闲秒数                                     |
+| `proofread-inhibit-progress-messages`     | `t`    | 抑制后台进度消息，但不抑制错误或显式命令反馈                 |
+| `proofread-max-chunk-size`                | `2000` | 限制每个校对文本块的字符数                                   |
+| `proofread-context-size`                  | `300`  | 限制文本块每侧发送的上下文字符数                             |
+| `proofread-context-sentences-before`      | `1`    | 限制文本块之前的逻辑上下文句数                               |
+| `proofread-context-sentences-after`       | `1`    | 限制文本块之后的逻辑上下文句数                               |
+| `proofread-max-concurrent-requests`       | `8`    | 限制每个缓冲区的活动后端请求数                               |
+| `proofread-profiles`                      | `nil`  | 定义命名的多后端 profile                                     |
+| `proofread-profile`                       | `nil`  | 选择命名 profile                                             |
+| `proofread-llm-provider`                  | `nil`  | LLM 绑定省略 `:provider` 时使用的默认提供程序                |
+| `proofread-llm-response-strategy`         | `auto` | LLM 绑定省略 `:response-strategy` 时使用的默认响应策略       |
+| `proofread-llm-provider-identity`         | `nil`  | LLM 绑定省略 `:provider-identity` 时使用的默认稳定标识       |
+| `proofread-llm-max-diagnostic-passes`     | `3`    | LLM 绑定省略 `:diagnostic-passes` 时使用的默认诊断轮数       |
+| `proofread-llm-instructions-function`     | `nil`  | LLM 绑定省略 `:instructions-function` 时使用的默认附加说明   |
+| `proofread-llm-instructions-identity`     | `nil`  | LLM 绑定省略说明标识时使用的默认稳定标识                     |
+| `proofread-cache-max-entries`             | `128`  | 限制每个缓冲区的 LRU 缓存条目数；`0` 表示禁用缓存            |
+| `proofread-request-log-max-records`       | `100`  | 限制每个受监视缓冲区保留的记录数                             |
+| `proofread-ignored-faces`                 | `nil`  | 排除 `face` 属性与指定 `face` 匹配的文本                     |
+| `proofread-ignored-properties`            | `nil`  | 排除指定文本属性之一为非 `nil` 的文本                        |
 
 LanguageTool 库另有一个 `proofread-languagetool` Customize 组：
 
-| 选项                                         | 默认值                     | 用途                                      |
-| -------------------------------------------- | -------------------------- | ----------------------------------------- |
-| `proofread-languagetool-server-url`          | `http://127.0.0.1:8081/v2` | 选择本地或由外部管理的 v2 API 端点        |
-| `proofread-languagetool-auto-start`          | `t`                        | 端点不可用时启动当前会话共享的本地服务    |
-| `proofread-languagetool-command`             | `languagetool-http-server` | 选择托管启动所用的可执行文件或 argv 前缀  |
-| `proofread-languagetool-config-file`         | `nil`                      | 向服务传递可选的本机 Java properties 文件 |
-| `proofread-languagetool-startup-timeout`     | `15.0`                     | 限制托管服务的整体启动等待时间            |
-| `proofread-languagetool-health-timeout`      | `3.0`                      | 限制单次服务健康探测的等待时间            |
-| `proofread-languagetool-request-timeout`     | `10.0`                     | 限制单次 `/check` 请求的等待时间          |
-| `proofread-languagetool-level`               | `default`                  | 选择普通或 `picky` 检查                   |
-| `proofread-languagetool-preferred-variants`  | `nil`                      | 推断 `proofread-language` 时选择语言变体  |
-| `proofread-languagetool-mother-tongue`       | `nil`                      | 启用适用的易混淆词检查                    |
-| `proofread-languagetool-enabled-rules`       | `nil`                      | 启用指定规则 ID                           |
-| `proofread-languagetool-disabled-rules`      | `nil`                      | 禁用指定规则 ID                           |
-| `proofread-languagetool-enabled-categories`  | `nil`                      | 启用指定分类 ID                           |
-| `proofread-languagetool-disabled-categories` | `nil`                      | 禁用指定分类 ID                           |
-| `proofread-languagetool-enabled-only`        | `nil`                      | 仅运行显式启用的规则和分类                |
+| 选项                                         | 默认值                     | 用途                                       |
+| -------------------------------------------- | -------------------------- | ------------------------------------------ |
+| `proofread-languagetool-server-url`          | `http://127.0.0.1:8081/v2` | 选择本地或由外部管理的 v2 API 端点         |
+| `proofread-languagetool-auto-start`          | `t`                        | 端点不可用时启动当前会话共享的本地服务     |
+| `proofread-languagetool-command`             | `languagetool-http-server` | 选择托管启动所用的可执行文件或 argv 前缀   |
+| `proofread-languagetool-config-file`         | `nil`                      | 向服务传递可选的本机 Java properties 文件  |
+| `proofread-languagetool-startup-timeout`     | `15.0`                     | 限制托管服务的整体启动等待时间             |
+| `proofread-languagetool-health-timeout`      | `3.0`                      | 限制单次服务健康探测的等待时间             |
+| `proofread-languagetool-request-timeout`     | `10.0`                     | 限制单次 `/check` 请求的等待时间           |
+| `proofread-languagetool-level`               | `default`                  | 绑定省略 `:level` 时使用的默认检查级别     |
+| `proofread-languagetool-preferred-variants`  | `nil`                      | 绑定省略 `:preferred-variants` 时的默认值  |
+| `proofread-languagetool-mother-tongue`       | `nil`                      | 绑定省略 `:mother-tongue` 时的默认值       |
+| `proofread-languagetool-enabled-rules`       | `nil`                      | 绑定省略 `:enabled-rules` 时的默认值       |
+| `proofread-languagetool-disabled-rules`      | `nil`                      | 绑定省略 `:disabled-rules` 时的默认值      |
+| `proofread-languagetool-enabled-categories`  | `nil`                      | 绑定省略 `:enabled-categories` 时的默认值  |
+| `proofread-languagetool-disabled-categories` | `nil`                      | 绑定省略 `:disabled-categories` 时的默认值 |
+| `proofread-languagetool-enabled-only`        | `nil`                      | 绑定省略 `:enabled-only` 时的默认策略      |
 
 启用 `proofread-languagetool-enabled-only`
 时必须至少启用一个规则或分类，且不能同时配置禁用规则或分类。语言、检查级别、语言变体、母语、规则和分类设置都会进入后端缓存标识，因此修改检查策略后不会复用旧策略生成的结果。

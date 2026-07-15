@@ -31,8 +31,8 @@ https://github.com/user-attachments/assets/9dc5c4ee-a43e-45b8-a9fc-a372079ed528
 
 The `proofread` package requires GNU Emacs and GNU ELPA `llm`, and contains the
 core, LLM, and LanguageTool libraries. LanguageTool itself is an optional
-runtime dependency used only when `proofread-backend` is `languagetool`; the
-core and LLM backend neither load nor start it. That backend can reuse any
+runtime dependency used only by LanguageTool backend bindings; the core and LLM
+backend neither load nor start it. The LanguageTool backend can reuse any
 compatible local v2 HTTP server; automatic startup additionally requires a
 `languagetool-http-server` executable on `exec-path`. The optional
 `proofread-popup` package additionally requires `posframe`.
@@ -52,122 +52,159 @@ git clone https://github.com/brsvh/emacs-proofread.git
 ### Building packages
 
 The repository's `Makefile` builds the core `proofread` package and the optional
-`proofread-popup` package independently. Building uses GNU Make, GNU tar, and
-GNU Emacs. The package dependencies listed above must be available to the Emacs
-used for byte compilation. Run the targets from the repository root; set `EMACS`
-to select another executable, for example `make EMACS=/path/to/emacs all`.
+`proofread-popup` package. Building uses GNU Make, GNU tar, and GNU Emacs. The
+package dependencies listed above must be visible to the Emacs used for byte
+compilation. Run these commands from the repository root:
 
 ```sh
 make all
-# or build one package
 make proofread
 make proofread-popup
+make clean
 ```
 
-`all` builds both packages. Each package target generates package metadata,
-autoloads, byte-compiled files, and an ELPA-compatible source archive. The
-stages can also be run separately:
+`make all` builds both packages. The package-specific targets build just one
+package, and `make clean` removes generated files. Set `EMACS` to choose another
+executable, for example `make EMACS=/path/to/emacs all`.
 
-| Package           | Metadata                   | Autoloads                        | Byte compilation               | ELPA archive                   |
-| ----------------- | -------------------------- | -------------------------------- | ------------------------------ | ------------------------------ |
-| `proofread`       | `make proofread-pkg`       | `make proofread-autoloads`       | `make proofread-compile`       | `make proofread-archive`       |
-| `proofread-popup` | `make proofread-popup-pkg` | `make proofread-popup-autoloads` | `make proofread-popup-compile` | `make proofread-popup-archive` |
-
-Generated `-pkg.el`, `-autoloads.el`, and `.elc` files are written under
-`lisp/`. Archives are written as `dist/<package>-<version>.tar`; the version is
-read from the main source file's package metadata. Each archive has a
-`<package>-<version>/` top-level directory and contains the package sources, the
-generated `<package>-pkg.el`, and `COPYING`. Generated autoload and
-byte-compiled files are intentionally omitted because Emacs creates them when
-installing the package. `make clean` removes all generated files and `dist/`.
+Build outputs are written under `lisp/` and `dist/`: package metadata,
+autoloads, byte-compiled files, and ELPA-compatible source archives. Individual
+stage targets such as `make proofread-compile` or `make proofread-archive`
+remain available for release work, but the summary targets above are normally
+enough.
 
 ### Configuration
 
-Both `proofread-backend` and `proofread-llm-provider` default to `nil`, so
-enabling `proofread-mode` alone does not send requests. This example uses the
-local Ollama provider supplied by `llm`; replace `MODEL` with the name of an
-installed Ollama model:
+> [!WARNING]
+> The API in the current main branch is unstable; it is recommended that you use
+> the v0.1.0 tag instead.
+
+Proofread dispatch is profile-driven. Define `proofread-profiles`, select one
+with `proofread-profile`, and require the backend libraries used by that
+profile. A profile is a named language configuration with `:language`,
+`:display-language`, and ordered `:bindings`. Each binding has a stable `:name`,
+selects a registered `:backend`, and carries optional backend-local `:options`.
+
+#### Minimal configuration (`llm`)
+
+A minimal LLM setup uses one profile with one `llm` binding. This example checks
+English text with a local Ollama model named `qwen3.5:4b`:
 
 ```elisp
 (require 'proofread)
 (require 'proofread-llm)
 (require 'llm-ollama)
 
-(setq proofread-backend 'llm
-      proofread-llm-provider
-      (make-llm-ollama :chat-model "MODEL")
-      proofread-language "English")
+(defvar qwen3.5-4b (make-llm-ollama :chat-model "qwen3.5:4b"))
+
+(setq proofread-profiles
+      `(( english
+          :language "en-US"
+          :display-language "English"
+          :bindings (( :name ollama-qwen
+                       :backend llm
+                       :options ( :provider ,qwen3.5-4b
+                                  :provider-identity "ollama:qwen3.5:4b"))))))
+
+(setq proofread-profile 'english)
 
 (add-hook 'text-mode-hook #'proofread-mode)
 (add-hook 'prog-mode-hook #'proofread-mode)
 ```
 
-`proofread-llm-provider` may be any provider object supported by `llm`. For a
-remote provider, keep credentials in `auth-source` or another secure facility
-recommended by that provider. The default `proofread-llm-response-strategy` is
-`auto`: it uses a JSON schema when the provider advertises that capability, and
-otherwise falls back to prompt-only JSON.
+#### Further `llm` backend configuration
 
-To use automatic local startup, make sure `languagetool-http-server` is on
-`exec-path` or set `proofread-languagetool-command` to its absolute path. The
-command may also be an argv list whose first item is the executable and whose
-remaining items are fixed arguments; it is invoked directly without a shell. Do
-not put credentials in command arguments, which may be visible in process
-listings; use a protected properties file or environment variable instead. An
-already-running local server needs no executable in Emacs. LanguageTool language
-values are codes such as `en-US`, `zh-CN`, or `de-DE`, not display names such as
-`"English"`:
+LLM bindings read provider and request behavior from binding-local `:options`.
+Binding options override the corresponding `proofread-llm-*` defaults only for
+that binding.
+
+For local models, this documentation covers Ollama. Use the provider supplied by
+the `llm` package and give the binding a stable, non-secret provider identity:
+
+```elisp
+(require 'llm-ollama)
+
+(defvar qwen3.5-4b (make-llm-ollama :chat-model "qwen3.5:4b"))
+
+(defvar qwen3.5-4b-backend
+  `( :name ollama-qwen
+     :backend llm
+     :options ( :provider ,qwen3.5-4b
+                :provider-identity "ollama:qwen3.5:4b"
+                :diagnostic-passes 1)))
+```
+
+For remote models, keep credentials in `auth-source` or another secure facility.
+This OpenAI example reads the key from `auth-source` and uses a stable provider
+identity that does not contain the key:
+
+```elisp
+(require 'auth-source)
+(require 'llm-openai)
+
+(defvar gpt-5.4
+  (make-llm-openai :key (auth-source-pick-first-password
+                         :host "api.openai.com")
+                   :chat-model "gpt-5.4"))
+
+
+(defvar gpt-5.4-backend
+  `( :name openai
+     :backend llm
+     :options ( :provider ,gpt-5.4
+                :provider-identity "openai:gpt-5.4"
+                :response-strategy auto
+                :diagnostic-passes 1)))
+```
+
+`proofread-llm-response-strategy` defaults to `auto`: it uses a JSON schema when
+the provider advertises that capability, and otherwise falls back to prompt-only
+JSON. If you provide `:instructions-function`, also provide a stable
+`:instructions-identity` so cache identity changes when your instructions
+change. For provider-specific setup details, see the upstream
+[`llm.el` provider documentation](https://github.com/ahyatt/llm#setting-up-providers).
+
+#### `languagetool` backend configuration
+
+A single-language LanguageTool setup also uses one profile with one
+`languagetool` binding. LanguageTool language values are codes such as `en-US`,
+`zh-CN`, or `de-DE`, not display names such as `"English"`:
 
 ```elisp
 (require 'proofread)
 (require 'proofread-languagetool)
 
-(setq proofread-backend 'languagetool
-      proofread-language "en-US")
+(setq proofread-profiles
+      '(( english-languagetool
+          :language "en-US"
+          :display-language "English"
+          :bindings (( :name languagetool
+                       :backend languagetool
+                       :options ( :language "en-US"
+                                  :level picky))))))
+
+(setq proofread-profile 'english-languagetool)
 
 (add-hook 'text-mode-hook #'proofread-mode)
 (add-hook 'prog-mode-hook #'proofread-mode)
 ```
 
-The backend first probes `http://127.0.0.1:8081/v2`. It reuses an existing
-LanguageTool server when available; otherwise, by default, it starts one
-session-wide `languagetool-http-server` process and waits asynchronously for it
-to become healthy. Emacs stops only the process that it owns. Set
-`proofread-languagetool-auto-start` to `nil` when an external service manages
-the endpoint. The commands `proofread-languagetool-start-server` and
-`proofread-languagetool-stop-server` control the managed process explicitly.
-With automatic startup disabled, ordinary checks ignore the managed command,
-properties file, and startup timeout; explicit startup still validates them.
-Those settings do not affect the external backend cache identity. Plain HTTP
-endpoints are accepted only on the loopback interface; use HTTPS for any
-non-loopback service.
+To use automatic local startup, make sure `languagetool-http-server` is on
+`exec-path` or set `proofread-languagetool-command` to its absolute path. The
+server URL and lifecycle settings are session-global. Request options such as
+`:language`, `:level`, `:preferred-variants`, rule lists, category lists,
+`:mother-tongue`, and `:enabled-only` belong in the binding. The LanguageTool
+server URL remains global; do not put `:url` in a binding expecting a separate
+server per profile.
 
-When `proofread-language` is `nil`, the backend sends `language=auto`. Set
-`proofread-languagetool-preferred-variants` in that case so variant-dependent
+When a LanguageTool binding's `:language` is `nil`, the backend sends
+`language=auto`. Set `:preferred-variants` in that binding so variant-dependent
 spelling dictionaries can run, for example:
 
 ```elisp
-(setq proofread-language nil
-      proofread-languagetool-preferred-variants '("en-US" "de-DE"))
+'( :language nil
+   :preferred-variants ("en-US" "de-DE"))
 ```
-
-Configuration is intentionally divided into request policy and server runtime.
-Language, checking level, preferred variants, mother tongue, and rule/category
-selection are HTTP parameters sent for each check; keep those settings in Emacs,
-where Proofread can include them in cache validation. The optional
-`proofread-languagetool-config-file` is instead for server-wide Java properties
-such as model paths, cache sizing, and resource limits. It is applied only when
-Proofread starts its managed process and cannot configure an already-running
-external server. Keep checking policy under Emacs control rather than placing it
-in the server properties file.
-
-The server URL, automatic-start flag, and health-probe timeout are always
-session-global. The command, properties file, and startup timeout are also
-session-global whenever automatic or explicit managed startup uses them;
-ordinary external-only checks ignore those settings. Buffer-local bindings are
-rejected when the corresponding setting applies. Request timeout, checking
-level, variants, mother tongue, and rule/category controls become buffer-local
-when set. A managed-server properties file must be a local absolute path.
 
 The local open-source server keeps checked text on the local machine, but it
 does not include LanguageTool's cloud-only AI rules. Automatic language
@@ -175,6 +212,69 @@ detection is also less accurate without a separately configured fastText model,
 so an explicit language code is the most predictable configuration. See the
 official [local server guide](https://dev.languagetool.org/http-server.html) and
 [HTTP API](https://languagetool.org/http-api/) for upstream details.
+
+#### Enabling different backends for multiple languages
+
+More complex setups define one profile per language. Each profile can choose a
+different backend set or different backend-local options. This example uses
+OpenAI plus LanguageTool for English, and local Ollama plus LanguageTool for
+Simplified Chinese:
+
+```elisp
+(require 'proofread)
+(require 'proofread-llm)
+(require 'proofread-languagetool)
+(require 'auth-source)
+(require 'llm-openai)
+(require 'llm-ollama)
+
+(defvar gpt-5.4
+  (make-llm-openai :key (auth-source-pick-first-password
+                         :host "api.openai.com")
+                   :chat-model "gpt-5.4"))
+
+(defvar qwen3.5-4b
+  (make-llm-ollama :chat-model "qwen3.5:4b"))
+
+(setq proofread-profiles
+      `((english
+         :language "en-US"
+         :display-language "English"
+         :bindings (( :name openai
+                      :backend llm
+                      :options ( :provider ,gpt-5.4
+                                 :provider-identity "openai:gpt-5.4"
+                                 :response-strategy auto
+                                 :diagnostic-passes 1))
+                    ( :name languagetool
+                      :backend languagetool
+                      :options ( :language "en-US"
+                                 :level picky))))
+        (chinese
+         :language "zh-CN"
+         :display-language "Simplified Chinese"
+         :bindings (( :name ollama-qwen
+                      :backend llm
+                      :options ( :provider ,qwen3.5-4b
+                                 :provider-identity "ollama:qwen3.5:4b"
+                                 :diagnostic-passes 1))
+                    ( :name languagetool
+                      :backend languagetool
+                      :options ( :language "zh-CN"
+                                 :level picky))))))
+
+(setq proofread-profile 'english)
+```
+
+Switch profiles by setting `proofread-profile`:
+
+```elisp
+(setq proofread-profile 'chinese)
+```
+
+Diagnostics from different bindings remain separate internally. The user
+interface groups diagnostics that refer to the same live range and text,
+preserves each binding's message, and deduplicates identical suggestion text.
 
 `proofread-targets` controls which text is checked in each buffer:
 
@@ -320,7 +420,6 @@ Run `M-x customize-group RET proofread RET` to edit the core options:
 
 | Option                                    | Default | Purpose                                                                           |
 | ----------------------------------------- | ------- | --------------------------------------------------------------------------------- |
-| `proofread-language`                      | `nil`   | Give the backend a language hint; `nil` allows inference                          |
 | `proofread-auto-check`                    | `t`     | Schedule checks after enabling, edits, and window activity; buffer-local when set |
 | `proofread-targets`                       | `auto`  | Select all text, comments, or docstrings; buffer-local when set                   |
 | `proofread-docstring-predicate-functions` | `nil`   | Add predicate functions for recognizing docstrings; buffer-local when set         |
@@ -331,11 +430,14 @@ Run `M-x customize-group RET proofread RET` to edit the core options:
 | `proofread-context-sentences-before`      | `1`     | Limit logical context sentences before a chunk                                    |
 | `proofread-context-sentences-after`       | `1`     | Limit logical context sentences after a chunk                                     |
 | `proofread-max-concurrent-requests`       | `8`     | Limit active backend requests per buffer                                          |
-| `proofread-backend`                       | `nil`   | Select `llm` or `languagetool`; `nil` disables dispatch                           |
-| `proofread-llm-provider`                  | `nil`   | Supply the `llm` provider object                                                  |
-| `proofread-llm-response-strategy`         | `auto`  | Choose provider-enforced JSON schema output or prompt-only JSON                   |
-| `proofread-llm-provider-identity`         | `nil`   | Supply a stable, non-secret provider identity for cache keys                      |
-| `proofread-llm-max-diagnostic-passes`     | `3`     | Limit LLM diagnostic passes for each request                                      |
+| `proofread-profiles`                      | `nil`   | Define named multi-backend profiles                                               |
+| `proofread-profile`                       | `nil`   | Select a named profile                                                            |
+| `proofread-llm-provider`                  | `nil`   | Default provider when an LLM binding omits `:provider`                            |
+| `proofread-llm-response-strategy`         | `auto`  | Default response strategy when an LLM binding omits `:response-strategy`          |
+| `proofread-llm-provider-identity`         | `nil`   | Default stable provider identity when an LLM binding omits `:provider-identity`   |
+| `proofread-llm-max-diagnostic-passes`     | `3`     | Default pass limit when an LLM binding omits `:diagnostic-passes`                 |
+| `proofread-llm-instructions-function`     | `nil`   | Default extra instructions when an LLM binding omits `:instructions-function`     |
+| `proofread-llm-instructions-identity`     | `nil`   | Default stable instructions identity when an LLM binding omits it                 |
 | `proofread-cache-max-entries`             | `128`   | Limit per-buffer LRU cache entries; `0` disables caching                          |
 | `proofread-request-log-max-records`       | `100`   | Limit records retained for each monitored buffer                                  |
 | `proofread-ignored-faces`                 | `nil`   | Exclude text whose `face` property matches one of these faces                     |
@@ -353,14 +455,14 @@ group:
 | `proofread-languagetool-startup-timeout`     | `15.0`                     | Limit the overall managed-server startup wait                 |
 | `proofread-languagetool-health-timeout`      | `3.0`                      | Limit one server health probe                                 |
 | `proofread-languagetool-request-timeout`     | `10.0`                     | Limit one `/check` request                                    |
-| `proofread-languagetool-level`               | `default`                  | Select normal or `picky` checking                             |
-| `proofread-languagetool-preferred-variants`  | `nil`                      | Choose variants when `proofread-language` is inferred         |
-| `proofread-languagetool-mother-tongue`       | `nil`                      | Enable applicable false-friend checks                         |
-| `proofread-languagetool-enabled-rules`       | `nil`                      | Enable rule IDs                                               |
-| `proofread-languagetool-disabled-rules`      | `nil`                      | Disable rule IDs                                              |
-| `proofread-languagetool-enabled-categories`  | `nil`                      | Enable category IDs                                           |
-| `proofread-languagetool-disabled-categories` | `nil`                      | Disable category IDs                                          |
-| `proofread-languagetool-enabled-only`        | `nil`                      | Run only explicitly enabled rules and categories              |
+| `proofread-languagetool-level`               | `default`                  | Default level when a binding omits `:level`                   |
+| `proofread-languagetool-preferred-variants`  | `nil`                      | Default variants when a binding omits `:preferred-variants`   |
+| `proofread-languagetool-mother-tongue`       | `nil`                      | Default mother tongue when a binding omits `:mother-tongue`   |
+| `proofread-languagetool-enabled-rules`       | `nil`                      | Default enabled rules when a binding omits `:enabled-rules`   |
+| `proofread-languagetool-disabled-rules`      | `nil`                      | Default disabled rules when a binding omits `:disabled-rules` |
+| `proofread-languagetool-enabled-categories`  | `nil`                      | Default enabled categories when omitted by a binding          |
+| `proofread-languagetool-disabled-categories` | `nil`                      | Default disabled categories when omitted by a binding         |
+| `proofread-languagetool-enabled-only`        | `nil`                      | Default enabled-only policy when a binding omits it           |
 
 `proofread-languagetool-enabled-only` requires at least one enabled rule or
 category and cannot be combined with disabled rules or categories. Language,
