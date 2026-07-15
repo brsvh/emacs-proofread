@@ -172,11 +172,11 @@ A profile may contain:
      Human-readable language name for backends that build natural
      language prompts.
 
-`:bindings'
-     Ordered backend bindings.  Each binding is a property list with
+`:checkers'
+     Ordered backend checkers.  Each checker is a property list with
      required `:name' and `:backend' properties, and an optional
-     `:options' property.  Binding names are stable identifiers, not
-     display labels, and must be unique inside one profile.  Binding
+     `:options' property.  Checker names are stable identifiers, not
+     display labels, and must be unique inside one profile.  Checker
      options are backend-local data interpreted by the selected
      backend."
   :type '(alist :key-type symbol :value-type sexp)
@@ -245,7 +245,7 @@ request-ready chunks."
   "Binding name used for synthetic legacy backend settings.")
 
 (defconst proofread--profile-keys
-  '( :language :display-language :bindings)
+  '( :language :display-language :checkers)
   "Property keys accepted in proofread profile definitions.")
 
 (defconst proofread--profile-binding-keys
@@ -603,7 +603,7 @@ duplicate names."
   "Return normalized BINDING for PROFILE-NAME.
 SEEN-NAMES is an eq hash table used to reject duplicate binding
 names inside the profile."
-  (let ((context (format "Proofread profile %S binding" profile-name)))
+  (let ((context (format "Proofread profile %S checker" profile-name)))
     (proofread--validate-known-plist
      binding context proofread--profile-binding-keys)
     (let ((name (plist-get binding :name))
@@ -612,7 +612,7 @@ names inside the profile."
       (unless (and name (symbolp name))
         (error "%s must have a non-nil symbol :name" context))
       (when (gethash name seen-names)
-        (error "Duplicate proofread binding %S in profile %S"
+        (error "Duplicate proofread checker %S in profile %S"
                name profile-name))
       (puthash name t seen-names)
       (unless (and backend (symbolp backend))
@@ -630,7 +630,7 @@ names inside the profile."
     (profile-name bindings)
   "Return normalized profile BINDINGS for PROFILE-NAME."
   (unless (listp bindings)
-    (error "Proofread profile %S :bindings must be a list"
+    (error "Proofread profile %S :checkers must be a list"
            profile-name))
   (let ((seen-names (make-hash-table :test #'eq))
         normalized)
@@ -648,7 +648,7 @@ names inside the profile."
      definition context proofread--profile-keys)
     (let ((language (plist-get definition :language))
           (display-language (plist-get definition :display-language))
-          (bindings (plist-get definition :bindings)))
+          (checkers (plist-get definition :checkers)))
       (proofread--validate-language-option
        language (format "%s :language" context))
       (proofread--validate-language-option
@@ -659,7 +659,7 @@ names inside the profile."
             (proofread--snapshot-value display-language)
             :bindings
             (proofread--normalize-profile-bindings
-             name bindings)))))
+             name checkers)))))
 
 (defun proofread--legacy-profile-binding (&optional backend)
   "Return a normalized legacy binding for BACKEND.

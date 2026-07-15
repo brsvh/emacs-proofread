@@ -2845,14 +2845,14 @@ This covers URLs, email, invisible text, faces, and properties."
          :display-language nil
          :bindings nil)))))
 
-(ert-deftest proofread-test-profile-normalizes-bindings ()
-  "Normalize an explicitly selected profile and its bindings."
+(ert-deftest proofread-test-profile-normalizes-checkers ()
+  "Normalize an explicitly selected profile and its checkers."
   (let ((proofread-profile 'zh-hans)
         (proofread-profiles
          `((zh-hans
             :language "zh-Hans"
             :display-language "Simplified Chinese"
-            :bindings
+            :checkers
             (( :name llm-primary
                :backend ,proofread-test--backend
                :options
@@ -2896,21 +2896,31 @@ This covers URLs, email, invisible text, faces, and properties."
         (proofread-profiles nil))
     (should-error (proofread--current-profile) :type 'user-error)))
 
-(ert-deftest proofread-test-profile-rejects-duplicate-binding-names
+(ert-deftest proofread-test-profile-rejects-bindings-key ()
+  "Reject the unreleased `:bindings' profile key."
+  (let ((proofread-profile 'old-key)
+        (proofread-profiles
+         `((old-key
+            :bindings
+            (( :name old
+               :backend ,proofread-test--backend))))))
+    (should-error (proofread--current-profile) :type 'error)))
+
+(ert-deftest proofread-test-profile-rejects-duplicate-checker-names
     ()
-  "Reject duplicate binding names inside one profile."
+  "Reject duplicate checker names inside one profile."
   (let ((proofread-profile 'duplicate)
         (proofread-profiles
          `((duplicate
-            :bindings
+            :checkers
             (( :name repeated
                :backend ,proofread-test--backend)
              ( :name repeated
                :backend languagetool))))))
     (should-error (proofread--current-profile) :type 'error)))
 
-(ert-deftest proofread-test-profile-dispatch-fans-out-bindings ()
-  "Dispatch one request per request-ready chunk and profile binding."
+(ert-deftest proofread-test-profile-dispatch-fans-out-checkers ()
+  "Dispatch one request per request-ready chunk and profile checker."
   (with-temp-buffer
     (insert "Alpha")
     (let ((proofread-auto-check nil)
@@ -2919,7 +2929,7 @@ This covers URLs, email, invisible text, faces, and properties."
           (proofread-profiles
            `((multi
               :language "en-US"
-              :bindings
+              :checkers
               (( :name strict
                  :backend ,proofread-test--backend
                  :options ( :tone strict))
@@ -2952,9 +2962,9 @@ This covers URLs, email, invisible text, faces, and properties."
           (should (= (length proofread--active-requests) 2)))))))
 
 (ert-deftest
-    proofread-test-profile-pending-work-distinguishes-bindings
+    proofread-test-profile-pending-work-distinguishes-checkers
     ()
-  "Keep same-range work from different profile bindings distinct."
+  "Keep same-range work from different profile checkers distinct."
   (with-temp-buffer
     (insert "Alpha")
     (let ((proofread-auto-check nil)
@@ -2964,7 +2974,7 @@ This covers URLs, email, invisible text, faces, and properties."
           (proofread-profiles
            `((multi
               :language "en-US"
-              :bindings
+              :checkers
               (( :name first
                  :backend ,proofread-test--backend)
                ( :name second
@@ -2994,9 +3004,9 @@ This covers URLs, email, invisible text, faces, and properties."
                      2)))))))
 
 (ert-deftest
-    proofread-test-profile-supersedes-only-same-binding
+    proofread-test-profile-supersedes-only-same-checker
     ()
-  "Overlapping work supersedes only requests owned by the same binding."
+  "Overlapping work supersedes only requests owned by the same checker."
   (with-temp-buffer
     (insert "abcdef")
     (let ((proofread-auto-check nil)
@@ -3005,7 +3015,7 @@ This covers URLs, email, invisible text, faces, and properties."
           (proofread-profile 'multi)
           (proofread-profiles
            `((multi
-              :bindings
+              :checkers
               (( :name first
                  :backend ,proofread-test--backend)
                ( :name second
@@ -3065,14 +3075,14 @@ This covers URLs, email, invisible text, faces, and properties."
 (ert-deftest
     proofread-test-profile-result-adds-diagnostic-provenance
     ()
-  "Annotate accepted diagnostics with profile binding provenance."
+  "Annotate accepted diagnostics with profile checker provenance."
   (with-temp-buffer
     (insert "helo")
     (let ((proofread-profile 'multi)
           (proofread-profiles
            `((multi
               :language "en-US"
-              :bindings
+              :checkers
               (( :name strict
                  :backend ,proofread-test--backend))))))
       (proofread-mode 1)
@@ -3100,16 +3110,16 @@ This covers URLs, email, invisible text, faces, and properties."
                          (plist-get request :binding-owner))))))))
 
 (ert-deftest
-    proofread-test-profile-result-replaces-only-same-binding
+    proofread-test-profile-result-replaces-only-same-checker
     ()
-  "Do not let one binding's result remove another binding's diagnostics."
+  "Do not let one checker's result remove another checker's diagnostics."
   (with-temp-buffer
     (insert "helo")
     (let ((proofread-profile 'multi)
           (proofread-profiles
            `((multi
               :language "en-US"
-              :bindings
+              :checkers
               (( :name first
                  :backend ,proofread-test--backend)
                ( :name second
@@ -3167,14 +3177,14 @@ This covers URLs, email, invisible text, faces, and properties."
 (ert-deftest
     proofread-test-profile-cache-hit-preserves-diagnostic-provenance
     ()
-  "Keep binding provenance when diagnostics are served from cache."
+  "Keep checker provenance when diagnostics are served from cache."
   (with-temp-buffer
     (insert "helo")
     (let ((proofread-profile 'multi)
           (proofread-profiles
            `((multi
               :language "en-US"
-              :bindings
+              :checkers
               (( :name strict
                  :backend ,proofread-test--backend))))))
       (proofread-mode 1)
@@ -3204,16 +3214,16 @@ This covers URLs, email, invisible text, faces, and properties."
                            (plist-get request :binding-owner)))))))))
 
 (ert-deftest
-    proofread-test-profile-partial-results-keep-binding-duplicates
+    proofread-test-profile-partial-results-keep-checker-duplicates
     ()
-  "Do not merge identical internal diagnostics from different bindings."
+  "Do not merge identical internal diagnostics from different checkers."
   (with-temp-buffer
     (insert "helo")
     (let ((proofread-profile 'multi)
           (proofread-profiles
            `((multi
               :language "en-US"
-              :bindings
+              :checkers
               (( :name first
                  :backend ,proofread-test--backend)
                ( :name second
@@ -3361,9 +3371,9 @@ This covers URLs, email, invisible text, faces, and properties."
            (plist-get formal-a-request :cache-key))))))))
 
 (ert-deftest
-    proofread-test-profile-binding-change-makes-request-stale
+    proofread-test-profile-checker-change-makes-request-stale
     ()
-  "Reject results when the owning profile binding identity changes."
+  "Reject results when the owning profile checker identity changes."
   (with-temp-buffer
     (insert "Alpha")
     (let ((proofread-auto-check nil)
@@ -3372,7 +3382,7 @@ This covers URLs, email, invisible text, faces, and properties."
           (proofread-profiles
            `((multi
               :language "en-US"
-              :bindings
+              :checkers
               (( :name strict
                  :backend ,proofread-test--backend
                  :options ( :tone formal)))))))
@@ -3391,16 +3401,16 @@ This covers URLs, email, invisible text, faces, and properties."
         (let ((proofread-profiles
                `((multi
                   :language "en-US"
-                  :bindings
+                  :checkers
                   (( :name strict
                      :backend ,proofread-test--backend
                      :options ( :tone relaxed)))))))
           (should-not (proofread--fresh-request-p request)))))))
 
 (ert-deftest
-    proofread-test-profile-bindings-share-global-concurrency-limit
+    proofread-test-profile-checkers-share-global-concurrency-limit
     ()
-  "Apply the buffer-wide request limit across profile bindings."
+  "Apply the buffer-wide request limit across profile checkers."
   (with-temp-buffer
     (insert "Alpha")
     (let ((proofread-auto-check nil)
@@ -3410,7 +3420,7 @@ This covers URLs, email, invisible text, faces, and properties."
           (proofread-profiles
            `((multi
               :language "en-US"
-              :bindings
+              :checkers
               (( :name first
                  :backend ,proofread-test--backend)
                ( :name second

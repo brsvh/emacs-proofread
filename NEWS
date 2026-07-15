@@ -16,13 +16,19 @@ and rule selection, request timeouts, and optional management of a
 session-local LanguageTool server.
 
 LanguageTool remains an optional runtime dependency used only by
-LanguageTool backend bindings.
+LanguageTool checkers.
 
 ---
 *** New backend registry.
 Backends are now registered through a backend registry.  The registry
 supports lazy loading, backend-specific cache identities, and
 backend-specific request cancellation.
+
+---
+*** New profile/checker configuration model.
+Proofread profiles can now select an ordered set of backend checkers.
+Each checker has a stable name, selects a registered backend, and may
+carry backend-local options.
 
 ---
 *** Package sources have been reorganized.

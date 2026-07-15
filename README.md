@@ -31,9 +31,9 @@ https://github.com/user-attachments/assets/9dc5c4ee-a43e-45b8-a9fc-a372079ed528
 
 The `proofread` package requires GNU Emacs and GNU ELPA `llm`, and contains the
 core, LLM, and LanguageTool libraries. LanguageTool itself is an optional
-runtime dependency used only by LanguageTool backend bindings; the core and LLM
-backend neither load nor start it. The LanguageTool backend can reuse any
-compatible local v2 HTTP server; automatic startup additionally requires a
+runtime dependency used only by LanguageTool checkers; the core and LLM backend
+neither load nor start it. The LanguageTool backend can reuse any compatible
+local v2 HTTP server; automatic startup additionally requires a
 `languagetool-http-server` executable on `exec-path`. The optional
 `proofread-popup` package additionally requires `posframe`.
 
@@ -82,12 +82,12 @@ enough.
 Proofread dispatch is profile-driven. Define `proofread-profiles`, select one
 with `proofread-profile`, and require the backend libraries used by that
 profile. A profile is a named language configuration with `:language`,
-`:display-language`, and ordered `:bindings`. Each binding has a stable `:name`,
+`:display-language`, and ordered `:checkers`. Each checker has a stable `:name`,
 selects a registered `:backend`, and carries optional backend-local `:options`.
 
 #### Minimal configuration (`llm`)
 
-A minimal LLM setup uses one profile with one `llm` binding. This example checks
+A minimal LLM setup uses one profile with one `llm` checker. This example checks
 English text with a local Ollama model named `qwen3.5:4b`:
 
 ```elisp
@@ -101,7 +101,7 @@ English text with a local Ollama model named `qwen3.5:4b`:
       `(( english
           :language "en-US"
           :display-language "English"
-          :bindings (( :name ollama-qwen
+          :checkers (( :name ollama-qwen
                        :backend llm
                        :options ( :provider ,qwen3.5-4b
                                   :provider-identity "ollama:qwen3.5:4b"))))))
@@ -114,12 +114,12 @@ English text with a local Ollama model named `qwen3.5:4b`:
 
 #### Further `llm` backend configuration
 
-LLM bindings read provider and request behavior from binding-local `:options`.
-Binding options override the corresponding `proofread-llm-*` defaults only for
-that binding.
+LLM checkers read provider and request behavior from checker-local `:options`.
+Checker options override the corresponding `proofread-llm-*` defaults only for
+that checker.
 
 For local models, this documentation covers Ollama. Use the provider supplied by
-the `llm` package and give the binding a stable, non-secret provider identity:
+the `llm` package and give the checker a stable, non-secret provider identity:
 
 ```elisp
 (require 'llm-ollama)
@@ -167,7 +167,7 @@ change. For provider-specific setup details, see the upstream
 #### `languagetool` backend configuration
 
 A single-language LanguageTool setup also uses one profile with one
-`languagetool` binding. LanguageTool language values are codes such as `en-US`,
+`languagetool` checker. LanguageTool language values are codes such as `en-US`,
 `zh-CN`, or `de-DE`, not display names such as `"English"`:
 
 ```elisp
@@ -178,7 +178,7 @@ A single-language LanguageTool setup also uses one profile with one
       '(( english-languagetool
           :language "en-US"
           :display-language "English"
-          :bindings (( :name languagetool
+          :checkers (( :name languagetool
                        :backend languagetool
                        :options ( :language "en-US"
                                   :level picky))))))
@@ -193,12 +193,12 @@ To use automatic local startup, make sure `languagetool-http-server` is on
 `exec-path` or set `proofread-languagetool-command` to its absolute path. The
 server URL and lifecycle settings are session-global. Request options such as
 `:language`, `:level`, `:preferred-variants`, rule lists, category lists,
-`:mother-tongue`, and `:enabled-only` belong in the binding. The LanguageTool
-server URL remains global; do not put `:url` in a binding expecting a separate
+`:mother-tongue`, and `:enabled-only` belong in the checker. The LanguageTool
+server URL remains global; do not put `:url` in a checker expecting a separate
 server per profile.
 
-When a LanguageTool binding's `:language` is `nil`, the backend sends
-`language=auto`. Set `:preferred-variants` in that binding so variant-dependent
+When a LanguageTool checker's `:language` is `nil`, the backend sends
+`language=auto`. Set `:preferred-variants` in that checker so variant-dependent
 spelling dictionaries can run, for example:
 
 ```elisp
@@ -240,7 +240,7 @@ Simplified Chinese:
       `((english
          :language "en-US"
          :display-language "English"
-         :bindings (( :name openai
+         :checkers (( :name openai
                       :backend llm
                       :options ( :provider ,gpt-5.4
                                  :provider-identity "openai:gpt-5.4"
@@ -253,7 +253,7 @@ Simplified Chinese:
         (chinese
          :language "zh-CN"
          :display-language "Simplified Chinese"
-         :bindings (( :name ollama-qwen
+         :checkers (( :name ollama-qwen
                       :backend llm
                       :options ( :provider ,qwen3.5-4b
                                  :provider-identity "ollama:qwen3.5:4b"
@@ -272,9 +272,9 @@ Switch profiles by setting `proofread-profile`:
 (setq proofread-profile 'chinese)
 ```
 
-Diagnostics from different bindings remain separate internally. The user
+Diagnostics from different checkers remain separate internally. The user
 interface groups diagnostics that refer to the same live range and text,
-preserves each binding's message, and deduplicates identical suggestion text.
+preserves each checker's message, and deduplicates identical suggestion text.
 
 `proofread-targets` controls which text is checked in each buffer:
 
@@ -432,12 +432,12 @@ Run `M-x customize-group RET proofread RET` to edit the core options:
 | `proofread-max-concurrent-requests`       | `8`     | Limit active backend requests per buffer                                          |
 | `proofread-profiles`                      | `nil`   | Define named multi-backend profiles                                               |
 | `proofread-profile`                       | `nil`   | Select a named profile                                                            |
-| `proofread-llm-provider`                  | `nil`   | Default provider when an LLM binding omits `:provider`                            |
-| `proofread-llm-response-strategy`         | `auto`  | Default response strategy when an LLM binding omits `:response-strategy`          |
-| `proofread-llm-provider-identity`         | `nil`   | Default stable provider identity when an LLM binding omits `:provider-identity`   |
-| `proofread-llm-max-diagnostic-passes`     | `3`     | Default pass limit when an LLM binding omits `:diagnostic-passes`                 |
-| `proofread-llm-instructions-function`     | `nil`   | Default extra instructions when an LLM binding omits `:instructions-function`     |
-| `proofread-llm-instructions-identity`     | `nil`   | Default stable instructions identity when an LLM binding omits it                 |
+| `proofread-llm-provider`                  | `nil`   | Default provider when an LLM checker omits `:provider`                            |
+| `proofread-llm-response-strategy`         | `auto`  | Default response strategy when an LLM checker omits `:response-strategy`          |
+| `proofread-llm-provider-identity`         | `nil`   | Default stable provider identity when an LLM checker omits `:provider-identity`   |
+| `proofread-llm-max-diagnostic-passes`     | `3`     | Default pass limit when an LLM checker omits `:diagnostic-passes`                 |
+| `proofread-llm-instructions-function`     | `nil`   | Default extra instructions when an LLM checker omits `:instructions-function`     |
+| `proofread-llm-instructions-identity`     | `nil`   | Default stable instructions identity when an LLM checker omits it                 |
 | `proofread-cache-max-entries`             | `128`   | Limit per-buffer LRU cache entries; `0` disables caching                          |
 | `proofread-request-log-max-records`       | `100`   | Limit records retained for each monitored buffer                                  |
 | `proofread-ignored-faces`                 | `nil`   | Exclude text whose `face` property matches one of these faces                     |
@@ -455,14 +455,14 @@ group:
 | `proofread-languagetool-startup-timeout`     | `15.0`                     | Limit the overall managed-server startup wait                 |
 | `proofread-languagetool-health-timeout`      | `3.0`                      | Limit one server health probe                                 |
 | `proofread-languagetool-request-timeout`     | `10.0`                     | Limit one `/check` request                                    |
-| `proofread-languagetool-level`               | `default`                  | Default level when a binding omits `:level`                   |
-| `proofread-languagetool-preferred-variants`  | `nil`                      | Default variants when a binding omits `:preferred-variants`   |
-| `proofread-languagetool-mother-tongue`       | `nil`                      | Default mother tongue when a binding omits `:mother-tongue`   |
-| `proofread-languagetool-enabled-rules`       | `nil`                      | Default enabled rules when a binding omits `:enabled-rules`   |
-| `proofread-languagetool-disabled-rules`      | `nil`                      | Default disabled rules when a binding omits `:disabled-rules` |
-| `proofread-languagetool-enabled-categories`  | `nil`                      | Default enabled categories when omitted by a binding          |
-| `proofread-languagetool-disabled-categories` | `nil`                      | Default disabled categories when omitted by a binding         |
-| `proofread-languagetool-enabled-only`        | `nil`                      | Default enabled-only policy when a binding omits it           |
+| `proofread-languagetool-level`               | `default`                  | Default level when a checker omits `:level`                   |
+| `proofread-languagetool-preferred-variants`  | `nil`                      | Default variants when a checker omits `:preferred-variants`   |
+| `proofread-languagetool-mother-tongue`       | `nil`                      | Default mother tongue when a checker omits `:mother-tongue`   |
+| `proofread-languagetool-enabled-rules`       | `nil`                      | Default enabled rules when a checker omits `:enabled-rules`   |
+| `proofread-languagetool-disabled-rules`      | `nil`                      | Default disabled rules when a checker omits `:disabled-rules` |
+| `proofread-languagetool-enabled-categories`  | `nil`                      | Default enabled categories when omitted by a checker          |
+| `proofread-languagetool-disabled-categories` | `nil`                      | Default disabled categories when omitted by a checker         |
+| `proofread-languagetool-enabled-only`        | `nil`                      | Default enabled-only policy when a checker omits it           |
 
 `proofread-languagetool-enabled-only` requires at least one enabled rule or
 category and cannot be combined with disabled rules or categories. Language,
