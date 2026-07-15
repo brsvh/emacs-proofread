@@ -46,6 +46,12 @@
         (proofread-test--tree-member-p needle (cdr tree))))
    (t nil)))
 
+(defun proofread-test--assert-secret-not-printed (secret value)
+  "Assert that printing VALUE does not expose SECRET."
+  (should-not
+   (string-match-p (regexp-quote secret)
+                   (prin1-to-string value))))
+
 (defun proofread-test--diagnostic ()
   "Return a sample proofread diagnostic."
   (proofread--make-diagnostic
@@ -330,6 +336,24 @@ CHECKER-ORDER defaults to first followed by second."
     (should (<= (string-width detail) 320))
     (should (string-match-p "multi" detail))
     (should (string-match-p "failed" detail))
+    (should (string-match-p "failed" summary))))
+
+(defun proofread-test--assert-one-batch-error-report
+    (reports count condition-kind)
+  "Require one report for COUNT errors of CONDITION-KIND in REPORTS."
+  (should (= (length reports) 1))
+  (let ((detail (caar reports))
+        (summary (cadar reports)))
+    (should
+     (string-match-p
+      (regexp-quote
+       (format "Proofreading backend error (%S) (x%d)"
+               condition-kind count))
+      detail))
+    (should
+     (string-match-p
+      (format "%d request%s" count (if (= count 1) "" "s"))
+      detail))
     (should (string-match-p "failed" summary))))
 
 (defun proofread-test--assert-checker-dispatch-failure-event
@@ -4198,7 +4222,20 @@ This covers URLs, email, invisible text, faces, and properties."
                     (eq (plist-get event :type)
                         'checker-dispatch-failed))
                   events))
-                (proofread-test--assert-one-checker-report reports)
+                (proofread-test--assert-one-batch-error-report
+                 reports 2
+                 (if (eq failure-mode 'signal)
+                     'error
+                   'backend-returned-no-handle))
+                (proofread-test--assert-secret-not-printed
+                 "multi" reports)
+                (proofread-test--assert-secret-not-printed
+                 (if (eq failure-mode 'signal)
+                     "Simulated submission failure"
+                   (concat
+                    "backend returned no handle without "
+                    "delivering a result"))
+                 reports)
                 (proofread-test--assert-successful-checker-requests
                  requests successful-names)
                 (proofread-test--assert-dispatch-progress
@@ -4216,8 +4253,11 @@ This covers URLs, email, invisible text, faces, and properties."
                   (make-list (length requests) 'applied)))
                 (proofread-test--assert-request-diagnostics requests)
                 (proofread-test--assert-requests-settled all-requests)
-                (proofread-test--assert-one-checker-report
-                 reports)))))))))
+                (proofread-test--assert-one-batch-error-report
+                 reports 2
+                 (if (eq failure-mode 'signal)
+                     'error
+                   'backend-returned-no-handle))))))))))
 
 (ert-deftest
     proofread-test-synchronous-callback-then-signal-settles-once ()
@@ -5576,6 +5616,7 @@ This covers URLs, email, invisible text, faces, and properties."
           (make-hash-table :test #'eq))
          submitted
          cancelled
+         reports
          raised)
     (proofread-test--register-cancellable-backend
      backend
@@ -5612,19 +5653,71 @@ This covers URLs, email, invisible text, faces, and properties."
           (cl-letf
               (((symbol-function
                  'proofread-report-warning-without-window)
-                #'ignore))
+                (lambda (detail summary)
+                  (push (list detail summary) reports))))
             (proofread--clear-request-work)
             (should (= (length cancelled) 3))
+            (should (= (length reports) 1))
+            (should
+             (equal (caar reports)
+                    "Proofread backend cancellation failed (error)"))
+            (should
+             (equal (cadar reports)
+                    "backend cancellation failed; see *Warnings*"))
+            (proofread-test--assert-secret-not-printed
+             "Simulated cancellation failure" reports)
             (dolist (handle submitted)
               (should (= (cl-count handle cancelled :test #'eq) 1)))
             (let ((cancel-count (length cancelled)))
               (proofread--clear-request-work)
-              (should (= (length cancelled) cancel-count))))
+              (should (= (length cancelled) cancel-count))
+              (should (= (length reports) 1))))
           (should raised)
           (dolist (request requests)
             (should
              (proofread--request-state-flag-p request :cancelled)))
           (proofread-test--assert-no-pending-request-work))))))
+
+(ert-deftest
+    proofread-test-terminal-event-settles-when-hook-warning-signals ()
+  "Settle final and cancelled batches after hook reporting signals."
+  (dolist (type '( final-result cancelled))
+    (with-temp-buffer
+      (let* ((request
+              (proofread-test--lifecycle-request
+               (if (eq type 'final-result) 501 502) 1 2))
+             (batch (proofread--attach-request-batch (list request)))
+             (proofread-request-log-hook
+              (list
+               (lambda (_event)
+                 (error "Sensitive request hook failure"))))
+             reports)
+        (cl-letf
+            (((symbol-function
+               'proofread-report-warning-without-window)
+              (lambda (detail summary)
+                (push (list detail summary) reports)
+                (error "Warning reporter failure"))))
+          (should-error
+           (pcase type
+             ('final-result
+              (proofread--record-request-event
+               request type
+               :result
+               (proofread--backend-success-result request nil)
+               :status 'applied))
+             ('cancelled
+              (proofread--record-request-event
+               request type :reason 'cleared)))))
+        (should (= (length reports) 1))
+        (should
+         (equal (caar reports)
+                "Proofread request log hook error (error)"))
+        (proofread-test--assert-secret-not-printed
+         "Sensitive request hook failure" reports)
+        (should (zerop (plist-get batch :pending)))
+        (should
+         (plist-get (plist-get request :state) :batch-settled))))))
 
 (ert-deftest proofread-test-core-timers-stay-core-owned ()
   "Cancel core timers directly and backend timers through their adapter."
@@ -6548,7 +6641,17 @@ This covers URLs, email, invisible text, faces, and properties."
              (let ((message (nth 1 (car warnings))))
                (should (string-match-p "4 requests" message))
                (should
-                (string-match-p "1 more error kind" message))))
+                (string-match-p
+                 (regexp-quote
+                  (concat
+                   "Proofreading backend error "
+                   "(proofread-test-backend-invalid-diagnostics) "
+                   "(x4)"))
+                 message))
+               (should-not
+                (string-match-p "Failure kind" message))
+               (should-not
+                (string-match-p "more error kind" message))))
            (let ((second-recorder
                   (proofread-test--make-backend-recorder)))
              (cl-letf (((symbol-function 'proofread--backend-check)
@@ -6586,6 +6689,11 @@ This covers URLs, email, invisible text, faces, and properties."
                             '( :error :error :error)))
              (should (equal echo-truncation '( t t t)))
              (should (= (length echoes) 3))
+             (dolist (raw-message
+                      '( "Failure kind" "One failure"
+                         "Direct failure"))
+               (proofread-test--assert-secret-not-printed
+                raw-message warnings))
              (should (cl-every
                       (lambda (echo)
                         (and (< (string-width echo) 80)
@@ -9221,99 +9329,544 @@ This covers URLs, email, invisible text, faces, and properties."
 (ert-deftest
     proofread-test-request-log-preserves-backend-http-details ()
   "Preserve backend-specific HTTP request and response details."
-  (let ((request-details
-         (proofread--request-log-backend-request-details
-          '( :backend languagetool
-             :method "POST"
-             :url "http://127.0.0.1:8081/v2/check"
-             :parameters (("language" . "en-US")
-                          ("text" . "helo")))))
-        (response-details
-         (proofread--request-log-backend-response-details
-          '( :backend languagetool
-             :url "http://127.0.0.1:8081/v2/check"
-             :http-status 200
-             :response "{\"matches\":[]}"))))
+  (let* ((url
+          (concat
+           "https://private-user:private-password@example.test:9443"
+           "/v2/check?api-key=private-key#private-fragment"))
+         (parameters
+          (propertize
+           "language=en-US&text=helo"
+           'proofread-test-api-key "secret-text-property"))
+         (request-details
+          (proofread--request-log-backend-request-details
+           (list :backend 'languagetool
+                 :method "POST"
+                 :url url
+                 :parameters parameters)))
+         (opaque-details
+          (proofread--request-log-backend-request-details
+           '( :backend languagetool
+              :method "POST"
+              :parameters (("language" . "en-US")
+                           ("text" . "helo")))))
+         (response-details
+          (proofread--request-log-backend-response-details
+           (list :backend 'languagetool
+                 :url url
+                 :http-status 200
+                 :response "{\"matches\":[]}"))))
     (should (equal (plist-get request-details :method) "POST"))
     (should
+     (equal (plist-get request-details :url)
+            "https://example.test:9443"))
+    (should
      (equal (plist-get request-details :parameters)
-            '(("language" . "en-US") ("text" . "helo"))))
+            "language=en-US&text=helo"))
+    (should-not
+     (text-properties-at
+      0 (plist-get request-details :parameters)))
+    (should-not (plist-get opaque-details :parameters))
     (should (= (plist-get response-details :http-status) 200))
     (should
      (equal (plist-get response-details :url)
-            "http://127.0.0.1:8081/v2/check"))))
+            "https://example.test:9443"))
+    (dolist (details (list request-details response-details))
+      (proofread-test--assert-secret-not-printed
+       "private-user" details)
+      (proofread-test--assert-secret-not-printed
+       "private-password" details)
+      (proofread-test--assert-secret-not-printed
+       "/v2/check" details)
+      (proofread-test--assert-secret-not-printed
+       "private-key" details)
+      (proofread-test--assert-secret-not-printed
+       "private-fragment" details))))
 
 (ert-deftest
-    proofread-test-request-log-request-buffer-shows-lisp-data ()
-  "Render detailed requests as read-only Lisp data."
+    proofread-test-request-log-projects-scalars-by-field-type ()
+  "Omit opaque scalar values that do not match their field type."
+  (with-temp-buffer
+    (let* ((sentinel
+            "PROOFREAD-TEST-OPAQUE-SCALAR-MUST-NOT-APPEAR")
+           (opaque-symbol (make-symbol sentinel))
+           (safe-event
+            (proofread--request-log-safe-event
+             (list :type 'backend-request
+                   :time sentinel
+                   :log-id sentinel
+                   :request-id opaque-symbol
+                   :buffer sentinel
+                   :status sentinel
+                   :backend sentinel
+                   :method opaque-symbol
+                   :pass sentinel
+                   :max-passes opaque-symbol
+                   :strategy sentinel)))
+           (safe-request
+            (proofread--request-log-safe-request
+             (list :log-id sentinel
+                   :id opaque-symbol
+                   :generation sentinel
+                   :buffer sentinel
+                   :text opaque-symbol
+                   :language opaque-symbol
+                   :profile sentinel
+                   :checker-name sentinel
+                   :checker-ordinal opaque-symbol
+                   :major-mode sentinel
+                   :target-kind sentinel
+                   :backend sentinel)))
+           (typed-event
+            (proofread--request-log-safe-event
+             (list :type 'backend-request
+                   :time (current-time)
+                   :log-id 41
+                   :request-id 42
+                   :buffer (current-buffer)
+                   :status 'active
+                   :backend proofread-test--backend
+                   :method "POST"
+                   :pass 1
+                   :max-passes 2
+                   :strategy 'typed))))
+      (should (equal safe-event '( :type backend-request)))
+      (should-not safe-request)
+      (proofread-test--assert-secret-not-printed sentinel safe-event)
+      (proofread-test--assert-secret-not-printed sentinel safe-request)
+      (should (= (plist-get typed-event :log-id) 41))
+      (should (= (plist-get typed-event :request-id) 42))
+      (should (eq (plist-get typed-event :buffer) (current-buffer)))
+      (should (eq (plist-get typed-event :status) 'active))
+      (should (eq (plist-get typed-event :backend)
+                  proofread-test--backend))
+      (should (equal (plist-get typed-event :method) "POST"))
+      (should (= (plist-get typed-event :pass) 1))
+      (should (= (plist-get typed-event :max-passes) 2))
+      (should (eq (plist-get typed-event :strategy) 'typed)))))
+
+(ert-deftest proofread-test-request-monitor-redacts-opaque-values ()
+  "Exclude opaque backend values from every request-monitor surface."
   (save-window-excursion
-    (let ((source (generate-new-buffer
-                   " *proofread-request-detail-source*")))
+    (let* ((sentinel
+            "PROOFREAD-TEST-API-KEY-MUST-NOT-APPEAR")
+           (backend 'proofread-test-secret-backend)
+           (profile 'proofread-test-secret-profile)
+           (checker 'proofread-test-secret-checker)
+           (provider
+            (vector 'proofread-test-provider :api-key sentinel))
+           (handle
+            (vector 'proofread-test-handle provider))
+           (proofread--backend-registry
+            (make-hash-table :test #'eq))
+           (proofread--request-log-sources nil)
+           (proofread-request-log-hook nil)
+           (source
+            (generate-new-buffer
+             " *proofread-request-secret-source*"))
+           raw-request
+           raw-result
+           callback
+           events
+           reports
+           records
+           list-buffer
+           detail-buffer)
+      (proofread-test--register-cancellable-backend
+       backend
+       (lambda (request backend-callback)
+         (setq raw-request request)
+         (setq callback backend-callback)
+         (proofread--record-request-event
+          request 'backend-request
+          :backend backend
+          :method "POST"
+          :strategy 'test-json
+          :schema
+          (propertize
+           "{\"type\":\"object\"}"
+           'proofread-test-api-key sentinel)
+          :parameters
+          (propertize
+           "language=en-US&text=helo"
+           'proofread-test-api-key sentinel)
+          :prompt provider
+          :prompt-text "Review this text: helo."
+          :opaque provider)
+         handle)
+       #'ignore)
       (unwind-protect
-          (progn
+          (let ((proofread-auto-check nil)
+                (proofread-cache-max-entries 0)
+                (proofread-context-size 0)
+                (proofread-max-concurrent-requests 1)
+                (proofread-profile profile)
+                (proofread-profiles
+                 (list
+                  (list
+                   profile
+                   :language "en-US"
+                   :checkers
+                   (list
+                    (list :name checker
+                          :backend backend
+                          :options
+                          (list :provider provider)))))))
             (switch-to-buffer source)
-            (insert "helo")
+            (text-mode)
+            (insert "helo.")
             (proofread-mode 1)
-            (let* ((request
-                    (list :log-id 9002
-                          :id 8
-                          :buffer source
-                          :beg 1
-                          :end 5
-                          :text "helo"
-                          :backend proofread-test--backend))
-                   (result
-                    (proofread--backend-success-result
-                     request
-                     (list (proofread-test--diagnostic-for-range
-                            1 5 "helo"))))
-                   (record
-                    (list :key 9002
-                          :log-id 9002
-                          :request-id 8
-                          :source-buffer source
-                          :buffer source
-                          :beg 1
-                          :end 5
-                          :status 'applied
-                          :chunk request
-                          :request request
-                          :backend-requests
-                          (list (list :backend proofread-test--backend
-                                      :pass 1
-                                      :schema
-                                      '( :type "object")
-                                      :prompt nil))
-                          :backend-responses
-                          (list (list :backend proofread-test--backend
-                                      :pass 1
-                                      :response
-                                      '( :diagnostics nil)))
-                          :backend-results (list result)
-                          :final-status 'applied
-                          :final-result result))
-                   (detail-name
-                    (proofread--request-log-request-buffer-name
-                     record)))
-              (unwind-protect
-                  (progn
-                    (proofread--request-log-show-record record)
-                    (with-current-buffer detail-name
-                      (should buffer-read-only)
-                      (should (eq major-mode 'lisp-data-mode))
-                      (goto-char (point-min))
-                      (dolist (heading '( ";;; Summary"
-                                          ";;; Chunk request"
-                                          ";;; Lifecycle events"
-                                          ";;; Backend requests"
-                                          ";;; Backend responses"
-                                          ";;; Parsed backend results"
-                                          ";;; Final result"))
-                        (should (search-forward heading nil t)))))
-                (when-let* ((buffer (get-buffer detail-name)))
-                  (kill-buffer buffer)))))
-        (when (buffer-live-p source)
-          (kill-buffer source))))))
+            (let ((proofread-request-log-hook
+                   (list (lambda (event)
+                           (push event events)))))
+              (cl-letf
+                  (((symbol-function
+                     'proofread-report-warning-without-window)
+                    (lambda (detail summary)
+                      (push (list detail summary) reports))))
+                (setq list-buffer
+                      (proofread-show-buffer-requests source))
+                (proofread-check-buffer)
+                (should raw-request)
+                (should callback)
+                (should
+                 (string-match-p
+                  (regexp-quote sentinel)
+                  (prin1-to-string raw-request)))
+                (should
+                 (string-match-p
+                  (regexp-quote sentinel)
+                  (prin1-to-string handle)))
+                (dolist (opaque-schema
+                         (list provider '( :type "object")))
+                  (should-not
+                   (plist-member
+                    (proofread--request-log-safe-event
+                     (list :type 'backend-request
+                           :schema opaque-schema))
+                    :schema)))
+                (should-not
+                 (plist-get
+                  (proofread--request-log-safe-event
+                   '( :type backend-request
+                      :parameters (("text" . "helo"))))
+                  :parameters))
+                ;; Exercise the recorder's defensive projection too,
+                ;; independently of the safe hook boundary.
+                (proofread--request-log-record-event
+                 (list :type 'backend-dispatched
+                       :time (current-time)
+                       :log-id (plist-get raw-request :log-id)
+                       :request-id (plist-get raw-request :id)
+                       :buffer source
+                       :beg (plist-get raw-request :beg)
+                       :end (plist-get raw-request :end)
+                       :request raw-request
+                       :backend backend
+                       :handle handle))
+                (proofread--record-request-event
+                 raw-request 'backend-response
+                 :backend backend
+                 :http-status 503
+                 :response "Safe fake provider response"
+                 :error
+                 (list 'proofread-test-transport-error provider)
+                 :message provider)
+                (setq raw-result
+                      (proofread--backend-error-result
+                       raw-request
+                       (list 'proofread-test-backend-error provider)
+                       "Fake backend failure"))
+                (should
+                 (string-match-p
+                  (regexp-quote sentinel)
+                  (prin1-to-string raw-result)))
+                (proofread--record-request-event
+                 raw-request 'backend-result
+                 :backend backend
+                 :result raw-result)
+                (should (eq (funcall callback raw-result) 'error))
+                (should reports)))
+            (setq events (nreverse events))
+            (proofread-test--flush-request-log-refresh source)
+            (with-current-buffer source
+              (setq records (proofread--request-log-record-list)))
+            (should (= (length records) 1))
+            (let* ((record (car records))
+                   (safe-request (plist-get record :request))
+                   (safe-checker-identity
+                    (plist-get safe-request :checker-identity))
+                   (backend-dispatched
+                    (cl-find-if
+                     (lambda (event)
+                       (eq (plist-get event :type)
+                           'backend-dispatched))
+                     events))
+                   (backend-request
+                    (cl-find-if
+                     (lambda (event)
+                       (eq (plist-get event :type)
+                           'backend-request))
+                     events))
+                   (backend-response
+                    (cl-find-if
+                     (lambda (event)
+                       (eq (plist-get event :type)
+                           'backend-response))
+                     events))
+                   (backend-result
+                    (cl-find-if
+                     (lambda (event)
+                       (eq (plist-get event :type)
+                           'backend-result))
+                     events))
+                   (final-result
+                    (cl-find-if
+                     (lambda (event)
+                       (eq (plist-get event :type)
+                           'final-result))
+                     events)))
+              (dolist (value (append events records reports))
+                (proofread-test--assert-secret-not-printed
+                 sentinel value))
+              (should backend-dispatched)
+              (should-not
+               (plist-member backend-dispatched :handle))
+              (should-not (plist-member record :handle))
+              (dolist (property
+                       '( :checker-options :state :cache-key :handle))
+                (should-not (plist-member safe-request property)))
+              (should (eq (plist-get safe-request :profile) profile))
+              (should
+               (eq (plist-get safe-request :checker-name) checker))
+              (should (eq (plist-get safe-request :backend) backend))
+              (should (equal (plist-get safe-request :language)
+                             "en-US"))
+              (should (= (plist-get safe-request :beg) 1))
+              (should (= (plist-get safe-request :end) 6))
+              (should (equal (plist-get safe-request :text) "helo."))
+              (should
+               (stringp (plist-get safe-checker-identity
+                                   :fingerprint)))
+              (dolist (event events)
+                (should (plist-get event :time))
+                (when-let* ((event-request
+                             (plist-get event :request)))
+                  (should
+                   (equal
+                    (plist-get event-request :checker-identity)
+                    safe-checker-identity))))
+              (should
+               (equal (plist-get backend-request :prompt-text)
+                      "Review this text: helo."))
+              (should
+               (equal (plist-get backend-request :schema)
+                      "{\"type\":\"object\"}"))
+              (should-not
+               (text-properties-at
+                0 (plist-get backend-request :schema)))
+              (should
+               (equal (plist-get backend-request :parameters)
+                      "language=en-US&text=helo"))
+              (should-not
+               (text-properties-at
+                0 (plist-get backend-request :parameters)))
+              (should (eq (plist-get backend-request :strategy)
+                          'test-json))
+              (should-not (plist-member backend-request :prompt))
+              (should-not (plist-member backend-request :opaque))
+              (should
+               (equal (plist-get backend-response :response)
+                      "Safe fake provider response"))
+              (should
+               (eq (plist-get backend-response :error)
+                   'proofread-test-transport-error))
+              (should
+               (equal (plist-get backend-response :message)
+                      "Backend request failed"))
+              (let ((logged-result
+                     (plist-get backend-result :result)))
+                (should (eq (plist-get logged-result :status) 'error))
+                (should
+                 (eq (plist-get logged-result :error)
+                     'proofread-test-backend-error))
+                (should
+                 (equal (plist-get logged-result :message)
+                        "Backend request failed")))
+              (should (eq (plist-get final-result :status) 'error))
+              (should (eq (plist-get record :status) 'error))
+              (should (eq (plist-get record :final-status) 'error))
+              (should (plist-get record :created-at))
+              (should (plist-get record :updated-at))
+              (with-current-buffer list-buffer
+                (proofread-test--assert-secret-not-printed
+                 sentinel tabulated-list-entries)
+                (proofread-test--assert-secret-not-printed
+                 sentinel (buffer-string))
+                (should (= (length tabulated-list-entries) 1))
+                (let* ((entry (car tabulated-list-entries))
+                       (id (car entry))
+                       (columns (cadr entry)))
+                  (should (eq (plist-get id :source-buffer) source))
+                  (should (equal (plist-get id :key)
+                                 (plist-get record :key)))
+                  (should (equal (aref columns 1) "error"))
+                  (should (equal (aref columns 5) "1-6"))
+                  (should (string-prefix-p
+                           "proofre" (aref columns 6)))
+                  (should (equal (aref columns 7) "helo.")))
+                (goto-char (point-min))
+                (should (tabulated-list-get-id))
+                (proofread-show-request))
+              (setq detail-buffer
+                    (get-buffer
+                     (proofread--request-log-request-buffer-name
+                      record)))
+              (should (buffer-live-p detail-buffer))
+              (with-current-buffer detail-buffer
+                (should buffer-read-only)
+                (should (eq major-mode 'lisp-data-mode))
+                (proofread-test--assert-secret-not-printed
+                 sentinel (buffer-string))
+                (goto-char (point-min))
+                (dolist (heading '( ";;; Summary"
+                                    ";;; Chunk request"
+                                    ";;; Lifecycle events"
+                                    ";;; Backend requests"
+                                    ";;; Backend responses"
+                                    ";;; Parsed backend results"
+                                    ";;; Final result"))
+                  (should (search-forward heading nil t)))
+                (goto-char (point-min))
+                (should (search-forward
+                         "Review this text: helo." nil t))
+                (should (search-forward
+                         "Safe fake provider response" nil t)))))
+        (dolist (buffer
+                 (delete-dups
+                  (list detail-buffer list-buffer source)))
+          (when (buffer-live-p buffer)
+            (kill-buffer buffer)))))))
+
+(ert-deftest
+    proofread-test-request-monitor-redacts-checker-failure ()
+  "Redact opaque condition data from checker preparation failures."
+  (save-window-excursion
+    (let* ((sentinel
+            "PROOFREAD-TEST-CHECKER-KEY-MUST-NOT-APPEAR")
+           (backend 'proofread-test-failing-secret-backend)
+           (profile 'proofread-test-failing-secret-profile)
+           (checker 'proofread-test-failing-secret-checker)
+           (provider
+            (vector 'proofread-test-provider :api-key sentinel))
+           (proofread--backend-registry
+            (make-hash-table :test #'eq))
+           (proofread--request-log-sources nil)
+           (proofread-request-log-hook nil)
+           (source
+            (generate-new-buffer
+             " *proofread-checker-failure-secret-source*"))
+           backend-called
+           raw-error-text
+           events
+           reports
+           records
+           list-buffer)
+      (proofread--register-backend
+       backend
+       :check
+       (lambda (&rest _)
+         (setq backend-called t)
+         (error "Failing checker must not submit work"))
+       :identity
+       (lambda ()
+         (list :backend backend :contract-version 1))
+       :checker-identity
+       (lambda (_normalized-checker)
+         (setq raw-error-text
+               (format "Identity failure for %S" provider))
+         (error "%s" raw-error-text))
+       :cancel #'ignore)
+      (unwind-protect
+          (let ((proofread-auto-check nil)
+                (proofread-cache-max-entries 0)
+                (proofread-context-size 0)
+                (proofread-profile profile)
+                (proofread-profiles
+                 (list
+                  (list
+                   profile
+                   :language "en-US"
+                   :checkers
+                   (list
+                    (list :name checker
+                          :backend backend
+                          :options
+                          (list :provider provider)))))))
+            (switch-to-buffer source)
+            (text-mode)
+            (insert "helo.")
+            (proofread-mode 1)
+            (let ((proofread-request-log-hook
+                   (list (lambda (event)
+                           (push event events)))))
+              (cl-letf
+                  (((symbol-function
+                     'proofread-report-warning-without-window)
+                    (lambda (detail summary)
+                      (push (list detail summary) reports))))
+                (setq list-buffer
+                      (proofread-show-buffer-requests source))
+                (proofread-check-buffer)))
+            (setq events (nreverse events))
+            (should raw-error-text)
+            (should
+             (string-match-p (regexp-quote sentinel)
+                             raw-error-text))
+            (should-not backend-called)
+            (should (= (length reports) 1))
+            (proofread-test--flush-request-log-refresh source)
+            (with-current-buffer source
+              (setq records (proofread--request-log-record-list)))
+            (should (= (length records) 1))
+            (dolist (value (append events records reports))
+              (proofread-test--assert-secret-not-printed
+               sentinel value))
+            (let ((failure
+                   (cl-find-if
+                    (lambda (event)
+                      (eq (plist-get event :type)
+                          'checker-dispatch-failed))
+                    events))
+                  (record (car records)))
+              (should failure)
+              (should (eq (plist-get failure :profile) profile))
+              (should (eq (plist-get failure :checker-name) checker))
+              (should (eq (plist-get failure :backend) backend))
+              (should (eq (plist-get failure :phase)
+                          'checker-identity))
+              (should (eq (plist-get failure :status) 'error))
+              (should (eq (plist-get failure :error) 'error))
+              (should (string-match-p
+                       "checker identity calculation"
+                       (plist-get failure :message)))
+              (should (eq (plist-get record :profile) profile))
+              (should (eq (plist-get record :checker-name) checker))
+              (should (eq (plist-get record :backend) backend))
+              (should (eq (plist-get record :phase)
+                          'checker-identity))
+              (should (eq (plist-get record :status) 'error)))
+            (with-current-buffer list-buffer
+              (proofread-test--assert-secret-not-printed
+               sentinel tabulated-list-entries)
+              (proofread-test--assert-secret-not-printed
+               sentinel (buffer-string))
+              (should (= (length tabulated-list-entries) 1))
+              (let ((columns
+                     (cadr (car tabulated-list-entries))))
+                (should (equal (aref columns 1) "error")))))
+        (dolist (buffer (list list-buffer source))
+          (when (buffer-live-p buffer)
+            (kill-buffer buffer)))))))
 
 ;;;; Target selection tests
 
@@ -10149,29 +10702,38 @@ This covers URLs, email, invisible text, faces, and properties."
     ()
   "Publish every superseded partition before hooks and cancellation."
   (with-temp-buffer
-    (let* ((active-first
+    (let* ((request-labels
+            '( (101 . active-first)
+               (102 . active-retained)
+               (103 . active-last)
+               (104 . claimed-retained)
+               (105 . claimed-selected)
+               (106 . queued-selected)
+               (107 . queued-retained)
+               (108 . replacement)))
+           (active-first
             (proofread-test--lifecycle-request
-             'active-first 12 14 'active-first-handle))
+             101 12 14 'active-first-handle))
            (active-retained
             (proofread-test--lifecycle-request
-             'active-retained 1 4 'active-retained-handle))
+             102 1 4 'active-retained-handle))
            (active-last
             (proofread-test--lifecycle-request
-             'active-last 16 18 'active-last-handle))
+             103 16 18 'active-last-handle))
            (claimed-retained
             (proofread-test--lifecycle-request
-             'claimed-retained 30 32))
+             104 30 32))
            (claimed-selected
             (proofread-test--lifecycle-request
-             'claimed-selected 10 20 'claimed-selected-handle))
+             105 10 20 'claimed-selected-handle))
            (queued-selected
             (proofread-test--lifecycle-request
-             'queued-selected 11 13 'queued-selected-handle))
+             106 11 13 'queued-selected-handle))
            (queued-retained
             (proofread-test--lifecycle-request
-             'queued-retained 40 42))
+             107 40 42))
            (replacement
-            (proofread-test--lifecycle-request 'replacement 10 20))
+            (proofread-test--lifecycle-request 108 10 20))
            (queued-selected-entry
             (list :request queued-selected
                   :backend proofread-test--backend))
@@ -10240,8 +10802,9 @@ This covers URLs, email, invisible text, faces, and properties."
                          event-trace
                          (list
                           (list
-                           (plist-get
-                            (plist-get event :request) :id)
+                           (alist-get
+                            (plist-get event :request-id)
+                            request-labels)
                            (plist-get event :reason))))))))))
         (cl-letf
             (((symbol-function
@@ -10306,26 +10869,34 @@ This covers URLs, email, invisible text, faces, and properties."
     ()
   "Finish shifted-request hooks before cancellation and scheduling."
   (with-temp-buffer
-    (let* ((active-first
+    (let* ((request-labels
+            '( (201 . active-first)
+               (202 . active-retained)
+               (203 . active-last)
+               (204 . claimed-retained)
+               (205 . claimed-selected)
+               (206 . queued-selected)
+               (207 . late)))
+           (active-first
             (proofread-test--lifecycle-request
-             'active-first 1 12 'active-first-handle))
+             201 1 12 'active-first-handle))
            (active-retained
             (proofread-test--lifecycle-request
-             'active-retained 1 10 'active-retained-handle))
+             202 1 10 'active-retained-handle))
            (active-last
             (proofread-test--lifecycle-request
-             'active-last 20 22 'active-last-handle))
+             203 20 22 'active-last-handle))
            (claimed-retained
             (proofread-test--lifecycle-request
-             'claimed-retained 2 9))
+             204 2 9))
            (claimed-selected
             (proofread-test--lifecycle-request
-             'claimed-selected 2 11 'claimed-selected-handle))
+             205 2 11 'claimed-selected-handle))
            (queued-selected
             (proofread-test--lifecycle-request
-             'queued-selected 5 15 'queued-selected-handle))
+             206 5 15 'queued-selected-handle))
            (late
-            (proofread-test--lifecycle-request 'late 50 52))
+            (proofread-test--lifecycle-request 207 50 52))
            (queued-selected-entry
             (list :request queued-selected
                   :backend proofread-test--backend))
@@ -10387,8 +10958,9 @@ This covers URLs, email, invisible text, faces, and properties."
                          event-trace
                          (list
                           (list
-                           (plist-get
-                            (plist-get event :request) :id)
+                           (alist-get
+                            (plist-get event :request-id)
+                            request-labels)
                            (plist-get event :reason))))))))))
         (cl-letf
             (((symbol-function
@@ -11037,7 +11609,7 @@ This covers URLs, email, invisible text, faces, and properties."
     (insert "abcdef")
     (let ((proofread-auto-check nil)
           triggered
-          new-request
+          new-log-id
           events)
       (proofread-mode 1)
       (let* ((old-chunk (proofread--make-request-ready-chunk 1 5))
@@ -11059,19 +11631,15 @@ This covers URLs, email, invisible text, faces, and properties."
                     (proofread--dispatch-request-ready-chunks
                      (list new-chunk) proofread-test--backend))
                    ((eq (plist-get event :reason) 'cleared)
-                    (setq new-request (plist-get event
-                                                 :request))))))))
+                    (setq new-log-id
+                          (plist-get event :log-id))))))))
           (proofread--clear-scheduled-work))
         (should triggered)
-        (should new-request)
-        (should (proofread--request-invalidated-p new-request))
-        (should (proofread--request-state-flag-p new-request
-                                                 :cancelled))
+        (should new-log-id)
         (should-not
          (cl-find-if
           (lambda (event)
-            (and (equal (plist-get event :log-id)
-                        (plist-get new-request :log-id))
+            (and (equal (plist-get event :log-id) new-log-id)
                  (eq (plist-get event :type) 'queued-request)))
           events))
         (should-not proofread--active-requests)
@@ -11089,7 +11657,7 @@ This covers URLs, email, invisible text, faces, and properties."
     (insert "abcdef")
     (let ((proofread-auto-check nil)
           triggered
-          rejected)
+          rejected-log-id)
       (proofread-mode 1)
       (let* ((old-chunk (proofread--make-request-ready-chunk 1 5))
              (new-chunk (proofread--make-request-ready-chunk 2 6))
@@ -11109,12 +11677,11 @@ This covers URLs, email, invisible text, faces, and properties."
                     (proofread--dispatch-request-ready-chunks
                      (list new-chunk) proofread-test--backend))
                    ((eq (plist-get event :reason) 'cleared)
-                    (setq rejected (plist-get event :request))))))))
+                    (setq rejected-log-id
+                          (plist-get event :log-id))))))))
           (proofread--clear-request-work))
         (should triggered)
-        (should rejected)
-        (should (proofread--request-invalidated-p rejected))
-        (should (proofread--request-state-flag-p rejected :cancelled))
+        (should rejected-log-id)
         (should-not proofread--active-requests)
         (should-not proofread--claimed-requests)
         (should-not proofread--request-queue)

@@ -1305,7 +1305,7 @@ Signal an error when STATUS is not a URL callback status plist."
            :backend 'languagetool
            :method "POST"
            :url check-url
-           :parameters (plist-get request-data :parameters))
+           :parameters (plist-get request-data :body))
           (when (proofread-languagetool--handle-live-p handle)
             (setq buffer
                   (cl-progv '( url-max-redirections) '( 0)

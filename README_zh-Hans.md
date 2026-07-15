@@ -477,8 +477,12 @@ LanguageTool 库另有一个 `proofread-languagetool` Customize 组：
 ## 行为与注意事项
 
 - 请求异步运行。只有当文本、上下文、校对目标范围和提供程序配置仍与原始请求匹配时，才会应用返回结果；编辑导致的过期结果会被丢弃。
-- 远程 LLM 提供程序或非回环 LanguageTool 服务会接收选中的文本及有限的周边上下文，并可能收取使用费用。请求监视缓冲区还会显示完整的提示词或
-  HTTP 参数及响应，其中可能含有敏感文本。
+- 远程 LLM 提供程序或非回环 LanguageTool 服务会接收选中的文本及有限的周边上下文，并可能收取使用费用。
+- 请求监视功能会为调试保留源文本、生成的提示词文本或 HTTP 请求参数，以及 provider 响应；这些字段可能包含敏感的缓冲区内容。
+- 请求日志事件和显示记录不会包含原始 checker `:options`、provider 对象、backend handle
+  和其他不透明的后端局部对象。记录的 URL 仅保留 origin（scheme、host 和 port）；后端错误及相关警告只保留 condition
+  种类。Checker fingerprint 只从安全的 identity 摘要派生，不读取原始选项。Proofread
+  不会递归检查不透明对象来猜测其中的机密字段。
 - `proofread-show-buffer-requests`
   从调用时开始记录后续请求，并使用当时处于活动或排队状态的请求初始化日志。它无法恢复已经完成的请求。
 - `proofread-clear`

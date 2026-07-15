@@ -999,7 +999,8 @@ MAX-PASSES is the request-local diagnostic pass limit."
                       (proofread-llm--request-log-prompt-text
                        prompt)
                       :schema
-                      (llm-chat-prompt-response-format prompt)
+                      (when (llm-chat-prompt-response-format prompt)
+                        (proofread-llm--structured-response-schema-text))
                       :reported-diagnostics diagnostics)
                      (let ((request-handle
                             (llm-chat-async

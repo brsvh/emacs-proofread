@@ -780,17 +780,32 @@ Reject context-only and target-crossing matches."
                            'languagetool))
                (should (equal (plist-get request-event :method)
                               "POST"))
-               (should
-                (equal
-                 (cdr (assoc "text"
-                             (plist-get request-event :parameters)))
-                 "😀 This are fine."))
+               (let ((parameters
+                      (plist-get request-event :parameters)))
+                 (should (stringp parameters))
+                 (should (string-match-p
+                          "language=en-US" parameters))
+                 (should (string-match-p
+                          (regexp-quote
+                           (concat
+                            "text=%F0%9F%98%80%20This%20are%20"
+                            "fine."))
+                          parameters)))
                (should (= (plist-get response-event :http-status)
                           200))
                (should (equal (plist-get response-event :response)
                               "{\"matches\":[]}"))
-               (should (eq (plist-get result-event :result)
-                           result))))))))))
+               (let ((logged-result
+                      (plist-get result-event :result)))
+                 (should-not (eq logged-result result))
+                 (should (eq (plist-get logged-result :status) 'ok))
+                 (should-not
+                  (plist-get logged-result :diagnostics))
+                 (should
+                  (equal
+                   (plist-get
+                    (plist-get logged-result :request) :text)
+                   "This are")))))))))))
 
 (ert-deftest proofread-languagetool-test-http-error-is-not-json ()
   "A non-success response produces a bounded backend error."
@@ -836,9 +851,7 @@ Reject context-only and target-crossing matches."
              (should (eq (plist-get response-event :error)
                          'languagetool-http-error))
              (should (equal (plist-get response-event :message)
-                            (concat
-                             "LanguageTool HTTP status 599: "
-                             "Error: invalid language"))))))))))
+                            "Backend request failed")))))))))
 
 (ert-deftest
     proofread-languagetool-test-request-timeout-cleans-buffer ()

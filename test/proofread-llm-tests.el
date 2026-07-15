@@ -2081,14 +2081,24 @@ When PROFILE is nil, use the current profile."
                              events))
                 (final-result
                  (car (last events))))
-            (should (plist-get backend-request :schema))
-            (should (plist-get backend-request :prompt))
+            (should
+             (stringp (plist-get backend-request :schema)))
+            (should
+             (> (length (plist-get backend-request :schema)) 0))
+            (should-not (plist-member backend-request :prompt))
+            (should (string-match-p
+                     "helo"
+                     (plist-get backend-request :prompt-text)))
             (should (equal (plist-get backend-response :response)
                            content))
-            (should (plist-get (plist-get backend-result :result)
-                               :candidate-issues))
-            (should (plist-get (plist-get backend-result :result)
-                               :repairs))
+            (let ((logged-result
+                   (plist-get backend-result :result)))
+              (should (eq (plist-get logged-result :status) 'ok))
+              (should (plist-get logged-result :partial))
+              (should (plist-get logged-result :diagnostics))
+              (should-not
+               (plist-member logged-result :candidate-issues))
+              (should-not (plist-member logged-result :repairs)))
             (should (eq (plist-get final-result :status)
                         'applied))))))))
 

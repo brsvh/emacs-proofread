@@ -556,8 +556,15 @@ default of `3` to `1`.
   stale results caused by edits are discarded.
 - A remote LLM provider or non-loopback LanguageTool service receives the
   selected text and limited surrounding context, and may charge for its use.
-  Request-monitor buffers also expose complete prompts or HTTP parameters and
-  responses, which may contain sensitive text.
+- Request monitoring keeps source text, generated prompt text or HTTP request
+  parameters, and provider responses for debugging; these fields may contain
+  sensitive buffer content.
+- Request-log events and displayed records omit raw checker `:options`, provider
+  objects, backend handles, and other opaque backend-local objects. Logged URLs
+  retain only their origin (scheme, host, and port); backend errors and related
+  warnings retain only the condition kind. Checker fingerprints are derived from
+  safe identity summaries, not raw options. Proofread does not recursively
+  inspect opaque objects for secrets.
 - `proofread-show-buffer-requests` starts recording future requests and seeds
   the log with requests that are active or queued at that moment. It cannot
   recover requests that have already finished.

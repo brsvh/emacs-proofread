@@ -78,6 +78,20 @@ suggestions, correction, and ignoring.  Grouped sources, messages,
 suggestions, and correction choices follow the profile's declared checker
 order, regardless of asynchronous completion order.
 
+---
+*** Request monitoring excludes configuration secrets and opaque objects.
+All request-log events, stored records, and detail buffers now use a safe
+representation that omits raw checker options, provider objects, backend
+handles, and other opaque backend-local objects.
+
+Logged URLs retain only their origin (scheme, host, and port).  Backend
+errors and related warnings retain only the condition kind rather than raw
+payloads or messages.  Checker fingerprints are derived from safe identity
+summaries, not raw options.
+
+Source text, generated prompt text, HTTP request parameters, and provider
+responses remain visible for debugging and may contain sensitive text.
+
 ** Packaging and development
 
 ---
