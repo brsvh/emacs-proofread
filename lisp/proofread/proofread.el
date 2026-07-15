@@ -186,7 +186,11 @@ A profile may contain:
   "Selected proofreading profile.
 The value nil keeps the legacy `proofread-backend' and
 `proofread-language' settings active.  A symbol selects the matching
-entry from `proofread-profiles'."
+entry from `proofread-profiles'.
+
+This option may be set buffer-locally, for example with
+`setq-local' or file/directory-local variables, when different
+buffers should use different profiles."
   :type '(choice
           (const :tag "Use legacy backend settings" nil)
           symbol)
@@ -3396,7 +3400,8 @@ When BACKEND is nil, use the selected `proofread-backend'."
 
 (defun proofread--diagnostic-replaced-by-request-p
     (diagnostic request request-range)
-  "Return non-nil if DIAGNOSTIC is replaced by REQUEST."
+  "Return non-nil if DIAGNOSTIC is replaced by REQUEST.
+REQUEST-RANGE is the checked buffer range as a (BEG . END) pair."
   (let
       ((diagnostic-range
         (proofread--diagnostic-live-range diagnostic))

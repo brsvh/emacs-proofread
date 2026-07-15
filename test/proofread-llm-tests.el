@@ -27,6 +27,43 @@
   "proofread-llm-test-provider"
   "Stable provider identity used for local LLM backend tests.")
 
+(defconst proofread-llm-test--profile 'llm-test
+  "Profile selected by LLM backend tests.")
+
+(defconst proofread-llm-test--checker 'llm-test
+  "Checker selected by LLM backend tests.")
+
+(defun proofread-llm-test--profiles (&optional language)
+  "Return the LLM test profile using LANGUAGE."
+  `((,proofread-llm-test--profile
+     :language ,language
+     :checkers
+     (( :name ,proofread-llm-test--checker
+        :backend llm)))))
+
+(defun proofread-llm-test--current-profile-checker
+    (&optional profile)
+  "Return the first normalized checker from PROFILE.
+When PROFILE is nil, use the current profile."
+  (car (plist-get (or profile (proofread--current-profile))
+                  :bindings)))
+
+(defun proofread-llm-test--make-profile-request (chunk)
+  "Return an LLM backend request for CHUNK under the current profile."
+  (let* ((profile (proofread--current-profile))
+         (checker
+          (proofread-llm-test--current-profile-checker profile)))
+    (proofread--make-backend-request
+     chunk (plist-get checker :backend) checker profile)))
+
+(defmacro proofread-llm-test--with-profile (language &rest body)
+  "Run BODY with an LLM test profile using LANGUAGE."
+  (declare (indent 1) (debug (form body)))
+  `(let ((proofread-profiles
+          (proofread-llm-test--profiles ,language))
+         (proofread-profile proofread-llm-test--profile))
+     ,@body))
+
 (defun proofread-llm-test--tree-member-p (needle tree)
   "Return non-nil if NEEDLE appears anywhere in TREE."
   (cond
@@ -185,26 +222,28 @@
   (with-temp-buffer
     (insert "Alpha")
     (proofread-mode 1)
-    (let* ((proofread-backend 'llm)
-           (proofread-llm-provider proofread-llm-test--provider)
-           (proofread-llm-provider-identity
-            proofread-llm-test--provider-identity)
-           (chunk (proofread-llm-test--whole-buffer-chunk))
-           (request (proofread--make-backend-request chunk 'llm))
-           (diagnostic
-            (proofread-llm-test--diagnostic-for-range 1 6 "Alpha")))
-      (should (equal (proofread--backend-identity)
-                     `( :backend llm
-                        :provider
-                        ,proofread-llm-test--provider-identity
-                        :response-strategy prompt-json
-                        :diagnostic-passes 3
-                        :instructions-identity nil
-                        :contract-version 3)))
-      (should (proofread--backend-identity-p
-               (plist-get request :backend-identity)))
-      (proofread--cache-write-request request (list diagnostic))
-      (should (proofread--cache-read-request request)))))
+    (proofread-llm-test--with-profile
+     nil
+     (let* ((proofread-llm-provider proofread-llm-test--provider)
+            (proofread-llm-provider-identity
+             proofread-llm-test--provider-identity)
+            (chunk (proofread-llm-test--whole-buffer-chunk))
+            (request
+             (proofread-llm-test--make-profile-request chunk))
+            (diagnostic
+             (proofread-llm-test--diagnostic-for-range 1 6 "Alpha")))
+       (should (equal (proofread--backend-identity 'llm)
+                      `( :backend llm
+                         :provider
+                         ,proofread-llm-test--provider-identity
+                         :response-strategy prompt-json
+                         :diagnostic-passes 3
+                         :instructions-identity nil
+                         :contract-version 3)))
+       (should (proofread--backend-identity-p
+                (plist-get request :backend-identity)))
+       (proofread--cache-write-request request (list diagnostic))
+       (should (proofread--cache-read-request request))))))
 
 (ert-deftest proofread-llm-test-backend-registers-adapter ()
   "Register LLM check, identity, and cancellation functions."
@@ -221,23 +260,15 @@
 (ert-deftest
     proofread-llm-test-backend-support-is-configuration-independent ()
   "Keep LLM support detectable despite configuration errors."
-  (let ((proofread-backend 'llm)
-        (proofread-llm-provider nil))
-    (should (proofread--supported-backend-p))
+  (let ((proofread-llm-provider nil))
     (should (proofread--supported-backend-p 'llm)))
-  (let ((proofread-backend 'llm)
-        (proofread-llm-provider 'proofread-llm-test-provider))
-    (should (proofread--supported-backend-p))
+  (let ((proofread-llm-provider 'proofread-llm-test-provider))
     (should (proofread--supported-backend-p 'llm)))
-  (let ((proofread-backend 'llm)
-        (proofread-llm-provider 'proofread-llm-test-provider)
+  (let ((proofread-llm-provider 'proofread-llm-test-provider)
         (proofread-llm-response-strategy 'provider-json))
-    (should (proofread--supported-backend-p))
     (should (proofread--supported-backend-p 'llm)))
   (proofread-llm-test--with-capabilities
-   (let ((proofread-backend 'llm)
-         (proofread-llm-provider proofread-llm-test--provider))
-     (should (proofread--supported-backend-p))
+   (let ((proofread-llm-provider proofread-llm-test--provider))
      (should (proofread--supported-backend-p 'llm)))))
 
 ;;;; Submission and cancellation
@@ -398,14 +429,13 @@
 
 (ert-deftest proofread-llm-test-provider-identity-is-stable ()
   "LLM identity uses stable provider metadata, not provider objects."
-  (let ((proofread-backend 'llm)
-        (proofread-llm-provider
+  (let ((proofread-llm-provider
          [:proofread-llm-test-provider :api-key "secret-token"])
         (proofread-llm-provider-identity nil))
     (cl-letf (((symbol-function 'llm-name)
                (lambda (_provider)
                  "qwen3:1.7b")))
-      (let ((identity (proofread--backend-identity)))
+      (let ((identity (proofread--backend-identity 'llm)))
         (should (eq (plist-get identity :backend) 'llm))
         (let ((provider (plist-get identity :provider)))
           (should (equal (plist-get provider :name) "qwen3:1.7b"))
@@ -426,46 +456,51 @@
   (with-temp-buffer
     (insert "Alpha")
     (proofread-mode 1)
-    (let* ((proofread-backend 'llm)
-           (proofread-llm-provider 'proofread-llm-test-provider)
-           (proofread-llm-provider-identity "provider-a")
-           (chunk (proofread-llm-test--whole-buffer-chunk))
-           (request (proofread--make-backend-request chunk))
-           (diagnostic
-            (proofread-llm-test--diagnostic-for-range 1 6 "Alpha")))
-      (proofread--cache-write-request request (list diagnostic))
-      (should (proofread--cache-read-request
-               (proofread--make-backend-request chunk)))
-      (let ((proofread-llm-provider-identity "provider-b"))
-        (should-not (proofread--cache-read-request
-                     (proofread--make-backend-request chunk)))))))
+    (proofread-llm-test--with-profile nil
+                                      (let* ((proofread-llm-provider 'proofread-llm-test-provider)
+                                             (proofread-llm-provider-identity "provider-a")
+                                             (chunk (proofread-llm-test--whole-buffer-chunk))
+                                             (request
+                                              (proofread-llm-test--make-profile-request chunk))
+                                             (diagnostic
+                                              (proofread-llm-test--diagnostic-for-range 1 6 "Alpha")))
+                                        (proofread--cache-write-request request (list diagnostic))
+                                        (should (proofread--cache-read-request
+                                                 (proofread-llm-test--make-profile-request chunk)))
+                                        (let ((proofread-llm-provider-identity "provider-b"))
+                                          (should-not (proofread--cache-read-request
+                                                       (proofread-llm-test--make-profile-request
+                                                        chunk))))))))
 
 (ert-deftest proofread-llm-test-provider-object-cache-miss ()
   "Miss the cache when LLM provider objects change."
   (with-temp-buffer
     (insert "Alpha")
     (proofread-mode 1)
-    (let* ((proofread-backend 'llm)
-           (proofread-llm-provider [:provider-a :api-key
-                                                "secret-token"])
-           (proofread-llm-provider-identity nil)
-           (chunk (proofread-llm-test--whole-buffer-chunk))
-           (request (proofread--make-backend-request chunk))
-           (diagnostic
-            (proofread-llm-test--diagnostic-for-range 1 6 "Alpha")))
-      (proofread--cache-write-request request (list diagnostic))
-      (should (proofread--cache-read-request
-               (proofread--make-backend-request chunk)))
-      (let ((proofread-llm-provider [:provider-b :api-key
-                                                 "secret-token"]))
-        (let ((key (proofread--cache-key
-                    (proofread--make-backend-request chunk))))
-          (should-not (proofread-llm-test--tree-member-p
-                       proofread-llm-provider key))
-          (should-not (proofread-llm-test--tree-member-p
-                       "secret-token" key)))
-        (should-not (proofread--cache-read-request
-                     (proofread--make-backend-request chunk)))))))
+    (proofread-llm-test--with-profile nil
+                                      (let* ((proofread-llm-provider [:provider-a :api-key
+                                                                                  "secret-token"])
+                                             (proofread-llm-provider-identity nil)
+                                             (chunk (proofread-llm-test--whole-buffer-chunk))
+                                             (request
+                                              (proofread-llm-test--make-profile-request chunk))
+                                             (diagnostic
+                                              (proofread-llm-test--diagnostic-for-range 1 6 "Alpha")))
+                                        (proofread--cache-write-request request (list diagnostic))
+                                        (should (proofread--cache-read-request
+                                                 (proofread-llm-test--make-profile-request chunk)))
+                                        (let ((proofread-llm-provider [:provider-b :api-key
+                                                                                   "secret-token"]))
+                                          (let ((key
+                                                 (proofread--cache-key
+                                                  (proofread-llm-test--make-profile-request chunk))))
+                                            (should-not (proofread-llm-test--tree-member-p
+                                                         proofread-llm-provider key))
+                                            (should-not (proofread-llm-test--tree-member-p
+                                                         "secret-token" key)))
+                                          (should-not (proofread--cache-read-request
+                                                       (proofread-llm-test--make-profile-request
+                                                        chunk))))))))
 
 ;;;; Prompt submission and multi-pass results
 
@@ -475,59 +510,62 @@
   (with-temp-buffer
     (text-mode)
     (insert "helo")
-    (let* ((proofread-language "en")
-           (proofread-llm-provider 'proofread-llm-test-provider)
-           (proofread-llm-max-diagnostic-passes 1)
-           (chunk (proofread-llm-test--whole-buffer-chunk))
-           (request (proofread--make-backend-request chunk 'llm))
-           (content
-            (proofread-llm-test--response-for-range 0 4 "helo"))
-           captured-provider
-           captured-prompt
-           captured-multi-output
-           result)
-      (cl-letf (((symbol-function 'llm-chat-async)
-                 (lambda (provider prompt success _error
-                                   &optional multi-output)
-                   (setq captured-provider provider)
-                   (setq captured-prompt prompt)
-                   (setq captured-multi-output multi-output)
-                   (funcall success content)
-                   'proofread-llm-test-handle))
-                ((symbol-function 'llm-capabilities)
-                 #'proofread-llm-test--capabilities))
-        (let ((handle
-               (proofread--backend-check
-                request
-                (lambda (backend-result)
-                  (setq result backend-result))
-                'llm)))
-          (proofread-llm-test--assert-handle-shape handle)
-          (should (equal (plist-get handle :requests)
-                         '( proofread-llm-test-handle)))
-          (should (eq captured-provider proofread-llm-provider))
-          (should-not captured-multi-output)
-          (should (equal (llm-chat-prompt-response-format
-                          captured-prompt)
-                         proofread-llm--structured-response-schema))
-          (let* ((interaction
-                  (car (llm-chat-prompt-interactions
-                        captured-prompt)))
-                 (prompt-text
-                  (llm-chat-prompt-interaction-content interaction)))
-            (should (string-match-p "requested response schema"
-                                    prompt-text))
-            (should (string-match-p "Language: \"en\"" prompt-text))
-            (should (string-match-p "Major mode: text-mode"
-                                    prompt-text))
-            (should (string-match-p "Text:\nhelo" prompt-text)))
-          (should-not result)
-          (should (proofread-llm-test--wait-for (lambda () result)))
-          (should (eq (plist-get result :status) 'ok))
-          (should (eq (plist-get
-                       (car (plist-get result :diagnostics))
-                       :source)
-                      'llm)))))))
+    (proofread-llm-test--with-profile "en"
+                                      (let* ((proofread-llm-provider 'proofread-llm-test-provider)
+                                             (proofread-llm-max-diagnostic-passes 1)
+                                             (chunk (proofread-llm-test--whole-buffer-chunk))
+                                             (request
+                                              (proofread-llm-test--make-profile-request chunk))
+                                             (content
+                                              (proofread-llm-test--response-for-range 0 4 "helo"))
+                                             captured-provider
+                                             captured-prompt
+                                             captured-multi-output
+                                             result)
+                                        (cl-letf (((symbol-function 'llm-chat-async)
+                                                   (lambda (provider prompt success _error
+                                                                     &optional multi-output)
+                                                     (setq captured-provider provider)
+                                                     (setq captured-prompt prompt)
+                                                     (setq captured-multi-output multi-output)
+                                                     (funcall success content)
+                                                     'proofread-llm-test-handle))
+                                                  ((symbol-function 'llm-capabilities)
+                                                   #'proofread-llm-test--capabilities))
+                                          (let ((handle
+                                                 (proofread--backend-check
+                                                  request
+                                                  (lambda (backend-result)
+                                                    (setq result backend-result))
+                                                  'llm)))
+                                            (proofread-llm-test--assert-handle-shape handle)
+                                            (should (equal (plist-get handle :requests)
+                                                           '( proofread-llm-test-handle)))
+                                            (should (eq captured-provider proofread-llm-provider))
+                                            (should-not captured-multi-output)
+                                            (should (equal (llm-chat-prompt-response-format
+                                                            captured-prompt)
+                                                           proofread-llm--structured-response-schema))
+                                            (let* ((interaction
+                                                    (car (llm-chat-prompt-interactions
+                                                          captured-prompt)))
+                                                   (prompt-text
+                                                    (llm-chat-prompt-interaction-content interaction)))
+                                              (should (string-match-p "requested response schema"
+                                                                      prompt-text))
+                                              (should (string-match-p "Language: \"en\""
+                                                                      prompt-text))
+                                              (should (string-match-p "Major mode: text-mode"
+                                                                      prompt-text))
+                                              (should (string-match-p "Text:\nhelo" prompt-text)))
+                                            (should-not result)
+                                            (should (proofread-llm-test--wait-for
+                                                     (lambda () result)))
+                                            (should (eq (plist-get result :status) 'ok))
+                                            (should (eq (plist-get
+                                                         (car (plist-get result :diagnostics))
+                                                         :source)
+                                                        'llm))))))))
 
 (ert-deftest
     proofread-llm-test-binding-options-build-local-prompt ()
@@ -535,8 +573,7 @@
   (with-temp-buffer
     (text-mode)
     (insert "helo")
-    (let* ((proofread-language "en")
-           (proofread-llm-provider 'proofread-global-provider)
+    (let* ((proofread-llm-provider 'proofread-global-provider)
            (proofread-llm-provider-identity "global-provider")
            (proofread-llm-response-strategy 'provider-json)
            (proofread-llm-max-diagnostic-passes 3)
@@ -619,28 +656,30 @@
   (with-temp-buffer
     (org-mode)
     (insert "青晨六点。")
-    (let ((proofread-language "zh")
-          (proofread-context-size 0)
-          (proofread-llm-provider 'proofread-llm-test-provider)
-          captured-prompt)
-      (cl-letf (((symbol-function 'llm-chat-async)
-                 (lambda (_provider prompt _success _error
-                                    &optional _multi-output)
-                   (setq captured-prompt prompt)
-                   'proofread-llm-test-handle))
-                ((symbol-function 'llm-capabilities)
-                 #'proofread-llm-test--capabilities))
-        (let* ((chunk (proofread-llm-test--whole-buffer-chunk))
-               (request (proofread--make-backend-request chunk 'llm)))
-          (proofread--backend-check request #'ignore 'llm)
-          (let* ((interaction
-                  (car (llm-chat-prompt-interactions
-                        captured-prompt)))
-                 (prompt-text
-                  (llm-chat-prompt-interaction-content interaction)))
-            (should (string-match-p "Text:\n青晨六点。" prompt-text))
-            (should (string-match-p "range end is exclusive"
-                                    prompt-text))))))))
+    (proofread-llm-test--with-profile "zh"
+                                      (let ((proofread-context-size 0)
+                                            (proofread-llm-provider 'proofread-llm-test-provider)
+                                            captured-prompt)
+                                        (cl-letf (((symbol-function 'llm-chat-async)
+                                                   (lambda (_provider prompt _success _error
+                                                                      &optional _multi-output)
+                                                     (setq captured-prompt prompt)
+                                                     'proofread-llm-test-handle))
+                                                  ((symbol-function 'llm-capabilities)
+                                                   #'proofread-llm-test--capabilities))
+                                          (let* ((chunk (proofread-llm-test--whole-buffer-chunk))
+                                                 (request
+                                                  (proofread-llm-test--make-profile-request chunk)))
+                                            (proofread--backend-check request #'ignore 'llm)
+                                            (let* ((interaction
+                                                    (car (llm-chat-prompt-interactions
+                                                          captured-prompt)))
+                                                   (prompt-text
+                                                    (llm-chat-prompt-interaction-content interaction)))
+                                              (should (string-match-p "Text:\n青晨六点。"
+                                                                      prompt-text))
+                                              (should (string-match-p "range end is exclusive"
+                                                                      prompt-text)))))))))
 
 (ert-deftest proofread-llm-test-success-enters-overlay-pipeline ()
   "Send fresh LLM diagnostics through the normal result path."
@@ -1115,31 +1154,32 @@
   (with-temp-buffer
     (text-mode)
     (insert "helo")
-    (let* ((proofread-language "en")
-           (chunk (proofread-llm-test--whole-buffer-chunk))
-           (request (proofread--make-backend-request chunk 'llm))
-           (prompt
-            (proofread-llm--structured-response-prompt request)))
-      (should (string-match-p "requested response schema" prompt))
-      (should (string-match-p "diagnostics array" prompt))
-      (should (string-match-p "every independent problem" prompt))
-      (should (string-match-p "Do not stop after the first" prompt))
-      (should (string-match-p "one diagnostic per issue" prompt))
-      (should (string-match-p "adjacent characters" prompt))
-      (should (string-match-p "multiple suggestions" prompt))
-      (should (string-match-p "best-first order" prompt))
-      (should (string-match-p "only for the Text section" prompt))
-      (should (string-match-p "zero-based chunk-relative offsets"
-                              prompt))
-      (should (string-match-p "range end is exclusive" prompt))
-      (dolist (field '( "kind" "message" "text" "range"
-                        "suggestions"))
-        (should (string-match-p field prompt)))
-      (should-not (string-match-p "source" prompt))
-      (should (string-match-p "Language: \"en\"" prompt))
-      (should (string-match-p "Major mode: text-mode" prompt))
-      (should (string-match-p "Text:\nhelo" prompt))
-      (should-not (string-match-p "absolute buffer" prompt)))))
+    (proofread-llm-test--with-profile "en"
+                                      (let* ((chunk (proofread-llm-test--whole-buffer-chunk))
+                                             (request
+                                              (proofread-llm-test--make-profile-request chunk))
+                                             (prompt
+                                              (proofread-llm--structured-response-prompt request)))
+                                        (should (string-match-p "requested response schema" prompt))
+                                        (should (string-match-p "diagnostics array" prompt))
+                                        (should (string-match-p "every independent problem" prompt))
+                                        (should (string-match-p "Do not stop after the first" prompt))
+                                        (should (string-match-p "one diagnostic per issue" prompt))
+                                        (should (string-match-p "adjacent characters" prompt))
+                                        (should (string-match-p "multiple suggestions" prompt))
+                                        (should (string-match-p "best-first order" prompt))
+                                        (should (string-match-p "only for the Text section" prompt))
+                                        (should (string-match-p "zero-based chunk-relative offsets"
+                                                                prompt))
+                                        (should (string-match-p "range end is exclusive" prompt))
+                                        (dolist (field '( "kind" "message" "text" "range"
+                                                          "suggestions"))
+                                          (should (string-match-p field prompt)))
+                                        (should-not (string-match-p "source" prompt))
+                                        (should (string-match-p "Language: \"en\"" prompt))
+                                        (should (string-match-p "Major mode: text-mode" prompt))
+                                        (should (string-match-p "Text:\nhelo" prompt))
+                                        (should-not (string-match-p "absolute buffer" prompt))))))
 
 (ert-deftest
     proofread-llm-test-structured-response-schema-matches-parser-contract ()
@@ -1810,42 +1850,46 @@
   (with-temp-buffer
     (insert "helo")
     (proofread-mode 1)
-    (let* ((proofread-backend 'llm)
-           (proofread-llm-provider proofread-llm-test--provider)
-           (proofread-llm-provider-identity "provider")
-           (proofread-llm-response-strategy 'provider-json)
-           (chunk (proofread-llm-test--whole-buffer-chunk))
-           (diagnostic
-            (proofread-llm-test--diagnostic-for-range 1 5 "helo")))
-      (proofread-llm-test--with-capabilities
-       (let ((request (proofread--make-backend-request chunk)))
-         (proofread--cache-write-request request (list diagnostic))
-         (should (proofread--cache-read-request
-                  (proofread--make-backend-request chunk)))
-         (let ((proofread-llm-response-strategy 'prompt-json))
-           (should-not (proofread--cache-read-request
-                        (proofread--make-backend-request
-                         chunk)))))))))
+    (proofread-llm-test--with-profile nil
+                                      (let* ((proofread-llm-provider proofread-llm-test--provider)
+                                             (proofread-llm-provider-identity "provider")
+                                             (proofread-llm-response-strategy 'provider-json)
+                                             (chunk (proofread-llm-test--whole-buffer-chunk))
+                                             (diagnostic
+                                              (proofread-llm-test--diagnostic-for-range 1 5 "helo")))
+                                        (proofread-llm-test--with-capabilities
+                                         (let ((request
+                                                (proofread-llm-test--make-profile-request chunk)))
+                                           (proofread--cache-write-request request (list diagnostic))
+                                           (should (proofread--cache-read-request
+                                                    (proofread-llm-test--make-profile-request chunk)))
+                                           (let ((proofread-llm-response-strategy 'prompt-json))
+                                             (should-not
+                                              (proofread--cache-read-request
+                                               (proofread-llm-test--make-profile-request
+                                                chunk))))))))))
 
 (ert-deftest proofread-llm-test-diagnostic-passes-cache-miss ()
   "Cache entries miss when LLM diagnostic pass count changes."
   (with-temp-buffer
     (insert "helo")
     (proofread-mode 1)
-    (let* ((proofread-backend 'llm)
-           (proofread-llm-provider proofread-llm-test--provider)
-           (proofread-llm-provider-identity "provider")
-           (proofread-llm-max-diagnostic-passes 1)
-           (chunk (proofread-llm-test--whole-buffer-chunk))
-           (request (proofread--make-backend-request chunk))
-           (diagnostic
-            (proofread-llm-test--diagnostic-for-range 1 5 "helo")))
-      (proofread--cache-write-request request (list diagnostic))
-      (should (proofread--cache-read-request
-               (proofread--make-backend-request chunk)))
-      (let ((proofread-llm-max-diagnostic-passes 2))
-        (should-not (proofread--cache-read-request
-                     (proofread--make-backend-request chunk)))))))
+    (proofread-llm-test--with-profile nil
+                                      (let* ((proofread-llm-provider proofread-llm-test--provider)
+                                             (proofread-llm-provider-identity "provider")
+                                             (proofread-llm-max-diagnostic-passes 1)
+                                             (chunk (proofread-llm-test--whole-buffer-chunk))
+                                             (request
+                                              (proofread-llm-test--make-profile-request chunk))
+                                             (diagnostic
+                                              (proofread-llm-test--diagnostic-for-range 1 5 "helo")))
+                                        (proofread--cache-write-request request (list diagnostic))
+                                        (should (proofread--cache-read-request
+                                                 (proofread-llm-test--make-profile-request chunk)))
+                                        (let ((proofread-llm-max-diagnostic-passes 2))
+                                          (should-not (proofread--cache-read-request
+                                                       (proofread-llm-test--make-profile-request
+                                                        chunk))))))))
 
 (ert-deftest
     proofread-llm-test-binding-instructions-identity-cache-miss ()
@@ -1853,8 +1897,7 @@
   (with-temp-buffer
     (insert "helo")
     (proofread-mode 1)
-    (let* ((proofread-backend 'llm)
-           (proofread-llm-provider proofread-llm-test--provider)
+    (let* ((proofread-llm-provider proofread-llm-test--provider)
            (proofread-llm-provider-identity "global-provider")
            (profile '( :name multi :language "en-US"))
            (base-binding
