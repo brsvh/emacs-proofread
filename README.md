@@ -98,13 +98,13 @@ English text with a local Ollama model named `qwen3.5:4b`:
 (defvar qwen3.5-4b (make-llm-ollama :chat-model "qwen3.5:4b"))
 
 (setq proofread-profiles
-      `(( english
-          :language "en-US"
-          :display-language "English"
-          :checkers (( :name ollama-qwen
-                       :backend llm
-                       :options ( :provider ,qwen3.5-4b
-                                  :provider-identity "ollama:qwen3.5:4b"))))))
+      `((english
+         :language "en-US"
+         :display-language "English"
+         :checkers (( :name ollama-qwen
+                      :backend llm
+                      :options ( :provider ,qwen3.5-4b
+                                 :provider-identity "ollama:qwen3.5:4b"))))))
 
 (setq proofread-profile 'english)
 
@@ -124,12 +124,10 @@ the `llm` package and give the checker a stable, non-secret provider identity:
 ```elisp
 (require 'llm-ollama)
 
-(defvar qwen3.5-4b (make-llm-ollama :chat-model "qwen3.5:4b"))
-
-(defvar qwen3.5-4b-backend
+(defvar qwen3.5-4b-checker
   `( :name ollama-qwen
      :backend llm
-     :options ( :provider ,qwen3.5-4b
+     :options ( :provider ,(make-llm-ollama :chat-model "qwen3.5:4b")
                 :provider-identity "ollama:qwen3.5:4b"
                 :diagnostic-passes 1)))
 ```
@@ -142,16 +140,12 @@ identity that does not contain the key:
 (require 'auth-source)
 (require 'llm-openai)
 
-(defvar gpt-5.4
-  (make-llm-openai :key (auth-source-pick-first-password
-                         :host "api.openai.com")
-                   :chat-model "gpt-5.4"))
-
-
-(defvar gpt-5.4-backend
+(defvar gpt-5.4-checker
   `( :name openai
      :backend llm
-     :options ( :provider ,gpt-5.4
+     :options ( :provider ,(make-llm-openai :key (auth-source-pick-first-password
+                                                  :host "api.openai.com")
+                                            :chat-model "gpt-5.4")
                 :provider-identity "openai:gpt-5.4"
                 :response-strategy auto
                 :diagnostic-passes 1)))
@@ -174,14 +168,17 @@ A single-language LanguageTool setup also uses one profile with one
 (require 'proofread)
 (require 'proofread-languagetool)
 
+(defvar languagetool-checker
+  '( :name languagetool
+     :backend languagetool
+     :options ( :language "en-US"
+                :level picky)))
+
 (setq proofread-profiles
-      '(( english-languagetool
-          :language "en-US"
-          :display-language "English"
-          :checkers (( :name languagetool
-                       :backend languagetool
-                       :options ( :language "en-US"
-                                  :level picky))))))
+      `((english-languagetool
+         :language "en-US"
+         :display-language "English"
+         :checkers (,languagetool-checker))))
 
 (setq proofread-profile 'english-languagetool)
 
@@ -228,40 +225,46 @@ Simplified Chinese:
 (require 'llm-openai)
 (require 'llm-ollama)
 
-(defvar gpt-5.4
-  (make-llm-openai :key (auth-source-pick-first-password
-                         :host "api.openai.com")
-                   :chat-model "gpt-5.4"))
+(defvar gpt-5.4-checker
+  `( :name openai
+     :backend llm
+     :options ( :provider ,(make-llm-openai :key (auth-source-pick-first-password
+                                                  :host "api.openai.com")
+                                            :chat-model "gpt-5.4")
+                :provider-identity "openai:gpt-5.4"
+                :response-strategy auto
+                :diagnostic-passes 1)))
 
-(defvar qwen3.5-4b
-  (make-llm-ollama :chat-model "qwen3.5:4b"))
+(defvar languagetool-english-checker
+  '( :name languagetool
+     :backend languagetool
+     :options ( :language "en-US"
+                :level picky)))
+
+(defvar languagetool-chinese-checker
+  '( :name languagetool
+     :backend languagetool
+     :options ( :language "zh-CN"
+                :level picky)))
+
+(defvar qwen3.5-4b-checker
+  `( :name ollama-qwen
+     :backend llm
+     :options ( :provider ,(make-llm-ollama :chat-model "qwen3.5:4b")
+                :provider-identity "ollama:qwen3.5:4b"
+                :diagnostic-passes 1)))
 
 (setq proofread-profiles
       `((english
          :language "en-US"
          :display-language "English"
-         :checkers (( :name openai
-                      :backend llm
-                      :options ( :provider ,gpt-5.4
-                                 :provider-identity "openai:gpt-5.4"
-                                 :response-strategy auto
-                                 :diagnostic-passes 1))
-                    ( :name languagetool
-                      :backend languagetool
-                      :options ( :language "en-US"
-                                 :level picky))))
+         :checkers (,gpt-5.4-checker
+                    ,languagetool-english-checker))
         (chinese
          :language "zh-CN"
          :display-language "Simplified Chinese"
-         :checkers (( :name ollama-qwen
-                      :backend llm
-                      :options ( :provider ,qwen3.5-4b
-                                 :provider-identity "ollama:qwen3.5:4b"
-                                 :diagnostic-passes 1))
-                    ( :name languagetool
-                      :backend languagetool
-                      :options ( :language "zh-CN"
-                                 :level picky))))))
+         :checkers (,qwen3.5-4b-checker
+                    ,languagetool-chinese-checker))))
 
 (setq proofread-profile 'english)
 ```
@@ -304,9 +307,7 @@ unconditionally disable dispatch. To disable dispatch explicitly, select a named
 profile whose `:checkers` list is empty:
 
 ```elisp
-(add-to-list 'proofread-profiles
-             '( disabled
-                :checkers nil))
+(add-to-list 'proofread-profiles '(disabled :checkers nil))
 (setq-local proofread-profile 'disabled)
 ```
 
