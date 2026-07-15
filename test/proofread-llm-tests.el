@@ -117,9 +117,8 @@ When PROFILE is nil, use the current profile."
 (defun proofread-llm-test--assert-handle-shape (handle)
   "Assert that HANDLE has the canonical LLM backend shape."
   (should (eq (plist-get handle :backend) 'llm))
-  (dolist (key '( :requests :timer :delivered :cancelled))
-    (should (plist-member handle key)))
-  (should-not (plist-member handle :request)))
+  (dolist (key '( :requests :timer :delivered :cancelled :settled))
+    (should (plist-member handle key))))
 
 (defun proofread-llm-test--capabilities (_provider)
   "Return LLM capabilities used by the local backend fixture."
@@ -335,6 +334,7 @@ When PROFILE is nil, use the current profile."
     (insert "helo")
     (let* ((proofread-llm-provider proofread-llm-test--provider)
            (proofread-llm-response-strategy 'provider-json)
+           (proofread-llm--live-handles nil)
            (chunk (proofread-llm-test--whole-buffer-chunk))
            request
            (capability-calls 0))
@@ -353,13 +353,18 @@ When PROFILE is nil, use the current profile."
           (proofread-llm-test--assert-handle-shape handle)
           (should (= capability-calls 1))
           (should (equal (plist-get handle :requests)
-                         '( proofread-llm-test-request))))))))
+                         '( proofread-llm-test-request)))
+          (should (memq handle proofread-llm--live-handles))
+          (proofread-llm--cancel-request-handle handle)
+          (should (plist-get handle :settled))
+          (should-not proofread-llm--live-handles))))))
 
 (ert-deftest proofread-llm-test-cancel-handle-cancels-all-work ()
   "Cancel both deferred and provider work recorded by an LLM handle."
   (with-temp-buffer
     (insert "helo")
     (let* ((proofread-llm-provider nil)
+           (proofread-llm--live-handles nil)
            (chunk (proofread-llm-test--whole-buffer-chunk))
            (request (proofread--make-backend-request chunk 'llm))
            result
@@ -367,8 +372,11 @@ When PROFILE is nil, use the current profile."
             (proofread-llm--backend-check
              request (lambda (value) (setq result value)))))
       (proofread-llm-test--assert-handle-shape handle)
+      (should (memq handle proofread-llm--live-handles))
       (proofread-llm--cancel-request-handle handle)
       (should (plist-get handle :cancelled))
+      (should (plist-get handle :settled))
+      (should-not proofread-llm--live-handles)
       (accept-process-output nil 0.02)
       (should-not result)))
   (let ((handle (list :backend 'llm
@@ -376,7 +384,8 @@ When PROFILE is nil, use the current profile."
                                    provider-request-b)
                       :timer nil
                       :delivered nil
-                      :cancelled nil))
+                      :cancelled nil
+                      :settled nil))
         cancelled)
     (cl-letf (((symbol-function 'llm-cancel-request)
                (lambda (request-handle)
@@ -385,8 +394,193 @@ When PROFILE is nil, use the current profile."
                    (error "Cancellation failed")))))
       (proofread-llm--cancel-request-handle handle))
     (should (plist-get handle :cancelled))
+    (should (plist-get handle :settled))
     (should (equal (nreverse cancelled)
                    '( provider-request-a provider-request-b)))))
+
+(ert-deftest proofread-llm-test-success-settles-live-handle ()
+  "Settle and forget a live handle after normal success delivery."
+  (with-temp-buffer
+    (insert "helo")
+    (let* ((proofread-llm-provider proofread-llm-test--provider)
+           (proofread-llm-provider-identity
+            proofread-llm-test--provider-identity)
+           (proofread-llm-max-diagnostic-passes 1)
+           (proofread-llm--live-handles nil)
+           (chunk (proofread-llm-test--whole-buffer-chunk))
+           request handle provider-success provider-error result
+           (callbacks 0))
+      (proofread-llm-test--with-capabilities
+       (setq request (proofread--make-backend-request chunk 'llm))
+       (cl-letf
+           (((symbol-function 'llm-chat-async)
+             (lambda (_provider _prompt success error
+                                &optional _multi-output)
+               (setq provider-success success)
+               (setq provider-error error)
+               'proofread-llm-test-request)))
+         (setq handle
+               (proofread-llm--backend-check
+                request
+                (lambda (value)
+                  (cl-incf callbacks)
+                  (setq result value))))
+         (proofread-llm-test--assert-handle-shape handle)
+         (should (memq handle proofread-llm--live-handles))
+         (should-not (plist-get handle :settled))
+         (should (functionp provider-success))
+         (should (functionp provider-error))
+         (funcall provider-success
+                  (proofread-llm-test--response-content nil))
+         (should (plist-get handle :delivered))
+         (should-not (plist-get handle :settled))
+         (should (timerp (plist-get handle :timer)))
+         (should (memq handle proofread-llm--live-handles))
+         (should (proofread-llm-test--wait-for
+                  (lambda () result)))
+         (should (= callbacks 1))
+         (should (eq (plist-get result :status) 'ok))
+         (should (plist-get handle :settled))
+         (should-not (plist-get handle :timer))
+         (should-not proofread-llm--live-handles)
+         (funcall provider-error 'late-provider-error "Late error")
+         (funcall provider-success
+                  (proofread-llm-test--response-content nil))
+         (should (= callbacks 1)))))))
+
+(ert-deftest
+    proofread-llm-test-explicit-cancel-ignores-late-callbacks ()
+  "Explicit cancellation settles once and ignores provider callbacks."
+  (with-temp-buffer
+    (insert "helo")
+    (let* ((proofread-llm-provider proofread-llm-test--provider)
+           (proofread-llm-provider-identity
+            proofread-llm-test--provider-identity)
+           (proofread-llm-max-diagnostic-passes 1)
+           (proofread-llm--live-handles nil)
+           (chunk (proofread-llm-test--whole-buffer-chunk))
+           request handle provider-success provider-error result
+           cancelled
+           (callbacks 0))
+      (proofread-llm-test--with-capabilities
+       (setq request (proofread--make-backend-request chunk 'llm))
+       (cl-letf
+           (((symbol-function 'llm-chat-async)
+             (lambda (_provider _prompt success error
+                                &optional _multi-output)
+               (setq provider-success success)
+               (setq provider-error error)
+               'proofread-llm-test-request))
+            ((symbol-function 'llm-cancel-request)
+             (lambda (provider-handle)
+               (push provider-handle cancelled))))
+         (setq handle
+               (proofread-llm--backend-check
+                request
+                (lambda (value)
+                  (cl-incf callbacks)
+                  (setq result value))))
+         (should (memq handle proofread-llm--live-handles))
+         (proofread-llm--cancel-request-handle handle)
+         (should (plist-get handle :cancelled))
+         (should (plist-get handle :settled))
+         (should-not (plist-get handle :delivered))
+         (should-not (plist-get handle :requests))
+         (should-not (plist-get handle :timer))
+         (should-not proofread-llm--live-handles)
+         (should (equal cancelled
+                        '( proofread-llm-test-request)))
+         (funcall provider-success
+                  (proofread-llm-test--response-content nil))
+         (funcall provider-error 'late-provider-error "Late error")
+         (proofread-llm--cancel-request-handle handle)
+         (accept-process-output nil 0.02)
+         (should (= callbacks 0))
+         (should-not result)
+         (should (equal cancelled
+                        '( proofread-llm-test-request))))))))
+
+(ert-deftest proofread-llm-test-unload-retires-active-request-once ()
+  "Unload one active request and ignore callbacks after code removal."
+  (with-temp-buffer
+    (insert "helo")
+    (setq-local proofread-auto-check nil)
+    (proofread-mode 1)
+    (let* ((proofread-max-concurrent-requests 1)
+           (proofread-llm-provider proofread-llm-test--provider)
+           (proofread-llm-provider-identity
+            proofread-llm-test--provider-identity)
+           (proofread-llm-max-diagnostic-passes 1)
+           (proofread-llm--live-handles nil)
+           (chunk (proofread-llm-test--whole-buffer-chunk))
+           request handle provider-success provider-error result
+           settled-result callback-saw-provider-cancel cancelled
+           (callbacks 0))
+      (unwind-protect
+          (proofread-llm-test--with-capabilities
+           (setq request
+                 (proofread--make-backend-request chunk 'llm))
+           (cl-letf
+               (((symbol-function 'llm-chat-async)
+                 (lambda (_provider _prompt success error
+                                    &optional _multi-output)
+                   (setq provider-success success)
+                   (setq provider-error error)
+                   'proofread-llm-test-request))
+                ((symbol-function 'llm-cancel-request)
+                 (lambda (provider-handle)
+                   (push provider-handle cancelled))))
+             (setq handle
+                   (proofread--dispatch-backend-request
+                    request
+                    (lambda (value)
+                      (cl-incf callbacks)
+                      (setq callback-saw-provider-cancel
+                            (equal cancelled
+                                   '( proofread-llm-test-request)))
+                      (setq result value))
+                    'llm))
+             (should (proofread--active-request-p request))
+             (should (proofread--request-work-pending-p request))
+             (should (= (proofread--active-request-slots) 0))
+             (should (memq handle proofread-llm--live-handles))
+             (should (functionp provider-success))
+             (should (functionp provider-error))
+             (unload-feature 'proofread-llm t)
+             (should-not (featurep 'proofread-llm))
+             (should (= callbacks 1))
+             (should callback-saw-provider-cancel)
+             (should (eq (plist-get result :status) 'error))
+             (should (eq (plist-get result :error) 'llm-unloaded))
+             (setq settled-result result)
+             (should (plist-get handle :cancelled))
+             (should (plist-get handle :delivered))
+             (should (plist-get handle :settled))
+             (should-not (plist-get handle :requests))
+             (should-not (plist-get handle :timer))
+             (should (equal cancelled
+                            '( proofread-llm-test-request)))
+             (should-not (proofread--active-request-p request))
+             (should-not proofread--active-requests)
+             (should-not
+              (proofread--request-work-pending-p request))
+             (should (= (hash-table-count
+                         proofread--pending-request-keys)
+                        0))
+             (should (= (proofread--active-request-slots) 1))
+             (funcall provider-success
+                      (proofread-llm-test--response-content nil))
+             (funcall provider-error
+                      'late-provider-error "Late error")
+             (should (= callbacks 1))
+             (should (eq result settled-result))
+             (should (equal cancelled
+                            '( proofread-llm-test-request)))))
+        (ignore-errors
+          (unload-feature 'proofread-llm t))
+        (require 'proofread-llm))
+      (should (proofread--supported-backend-p 'llm))
+      (should-not proofread-llm--live-handles))))
 
 ;;;; Provider selection and cache identity
 
@@ -661,28 +855,39 @@ When PROFILE is nil, use the current profile."
     (insert "青晨六点。")
     (proofread-llm-test--with-profile "zh"
                                       (let ((proofread-context-size 0)
-                                            (proofread-llm-provider 'proofread-llm-test-provider)
+                                            (proofread-llm-provider
+                                             'proofread-llm-test-provider)
+                                            (proofread-llm--live-handles nil)
                                             captured-prompt)
-                                        (cl-letf (((symbol-function 'llm-chat-async)
-                                                   (lambda (_provider prompt _success _error
-                                                                      &optional _multi-output)
-                                                     (setq captured-prompt prompt)
-                                                     'proofread-llm-test-handle))
-                                                  ((symbol-function 'llm-capabilities)
-                                                   #'proofread-llm-test--capabilities))
-                                          (let* ((chunk (proofread-llm-test--whole-buffer-chunk))
+                                        (cl-letf
+                                            (((symbol-function 'llm-chat-async)
+                                              (lambda (_provider prompt _success _error
+                                                                 &optional _multi-output)
+                                                (setq captured-prompt prompt)
+                                                'proofread-llm-test-handle))
+                                             ((symbol-function 'llm-capabilities)
+                                              #'proofread-llm-test--capabilities))
+                                          (let* ((chunk
+                                                  (proofread-llm-test--whole-buffer-chunk))
                                                  (request
-                                                  (proofread-llm-test--make-profile-request chunk)))
-                                            (proofread--backend-check request #'ignore 'llm)
+                                                  (proofread-llm-test--make-profile-request
+                                                   chunk))
+                                                 (handle
+                                                  (proofread--backend-check
+                                                   request #'ignore 'llm)))
                                             (let* ((interaction
                                                     (car (llm-chat-prompt-interactions
                                                           captured-prompt)))
                                                    (prompt-text
-                                                    (llm-chat-prompt-interaction-content interaction)))
-                                              (should (string-match-p "Text:\n青晨六点。"
-                                                                      prompt-text))
-                                              (should (string-match-p "range end is exclusive"
-                                                                      prompt-text)))))))))
+                                                    (llm-chat-prompt-interaction-content
+                                                     interaction)))
+                                              (should
+                                               (string-match-p "Text:\n青晨六点。" prompt-text))
+                                              (should
+                                               (string-match-p
+                                                "range end is exclusive" prompt-text)))
+                                            (proofread-llm--cancel-request-handle handle)
+                                            (should-not proofread-llm--live-handles)))))))
 
 (ert-deftest proofread-llm-test-success-enters-overlay-pipeline ()
   "Send fresh LLM diagnostics through the normal result path."

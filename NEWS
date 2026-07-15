@@ -65,6 +65,13 @@ Failures while loading a backend, computing checker identity, constructing
 requests, or submitting them are reported for that checker.  Remaining
 checkers in the profile continue to run.
 
+---
+*** Unloading the LLM backend safely terminates active requests.
+Unloading "proofread-llm" now cancels live provider work and timers and
+settles the related core requests exactly once.  Late provider callbacks are
+ignored, preventing void-function errors and occupied scheduler slots during
+unload or reload.
+
 ** User interface
 
 ---
