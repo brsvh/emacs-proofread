@@ -3950,6 +3950,133 @@ buffer; otherwise return the diagnostic's stored range."
   "Return the text identified by DIAGNOSTIC."
   (plist-get diagnostic :text))
 
+(defun proofread--aggregate-diagnostic-p (diagnostic)
+  "Return non-nil when DIAGNOSTIC is a UI aggregate."
+  (and (plist-get diagnostic :proofread-aggregate) t))
+
+(defun proofread--diagnostic-members (diagnostic)
+  "Return the raw diagnostics represented by DIAGNOSTIC."
+  (if (proofread--aggregate-diagnostic-p diagnostic)
+      (plist-get diagnostic :diagnostics)
+    (list diagnostic)))
+
+(defun proofread--diagnostic-source-label (diagnostic)
+  "Return a display label for DIAGNOSTIC's binding or source."
+  (let ((binding-name (plist-get diagnostic :binding-name))
+        (source (plist-get diagnostic :source)))
+    (cond
+     (binding-name (proofread-format-diagnostic-field binding-name))
+     (source (proofread-format-diagnostic-field source)))))
+
+(defun proofread--diagnostic-source-labels (diagnostic)
+  "Return unique source labels for DIAGNOSTIC in display order."
+  (let (labels)
+    (dolist (member (proofread--diagnostic-members diagnostic))
+      (when-let* ((label (proofread--diagnostic-source-label member)))
+        (unless (member label labels)
+          (setq labels (append labels (list label))))))
+    labels))
+
+(defun proofread--diagnostic-source-summary (diagnostic)
+  "Return a source summary string for DIAGNOSTIC, or nil."
+  (when-let* ((labels (proofread--diagnostic-source-labels diagnostic)))
+    (string-join labels ", ")))
+
+(defun proofread--diagnostic-message-entries (diagnostic)
+  "Return provenance-preserving message entries for DIAGNOSTIC."
+  (let (entries)
+    (dolist (member (proofread--diagnostic-members diagnostic))
+      (when-let* ((message (plist-get member :message)))
+        (push (list :source
+                    (proofread--diagnostic-source-label member)
+                    :message message
+                    :diagnostic member)
+              entries)))
+    (nreverse entries)))
+
+(defun proofread--diagnostic-message-summary (diagnostic)
+  "Return a one-line message summary for DIAGNOSTIC."
+  (if (proofread--aggregate-diagnostic-p diagnostic)
+      (let (messages)
+        (dolist (entry (proofread--diagnostic-message-entries
+                        diagnostic))
+          (let ((source (plist-get entry :source))
+                (message
+                 (proofread-format-diagnostic-field
+                  (plist-get entry :message))))
+            (push (if source
+                      (format "%s: %s" source message)
+                    message)
+                  messages)))
+        (when messages
+          (string-join (nreverse messages) "; ")))
+    (plist-get diagnostic :message)))
+
+(defun proofread--diagnostic-suggestion-records (diagnostic)
+  "Return deduplicated suggestion records for DIAGNOSTIC.
+Each record has the keys `:text', `:sources', and `:diagnostics'."
+  (let (records)
+    (dolist (member (proofread--diagnostic-members diagnostic))
+      (let ((source (proofread--diagnostic-source-label member)))
+        (dolist (suggestion (proofread--diagnostic-suggestions member))
+          (let ((record
+                 (cl-find suggestion records
+                          :key (lambda (entry)
+                                 (plist-get entry :text))
+                          :test #'equal)))
+            (if record
+                (progn
+                  (when (and source
+                             (not (member source
+                                          (plist-get record :sources))))
+                    (setf (plist-get record :sources)
+                          (append (plist-get record :sources)
+                                  (list source))))
+                  (setf (plist-get record :diagnostics)
+                        (append (plist-get record :diagnostics)
+                                (list member))))
+              (push (list :text suggestion
+                          :sources (and source (list source))
+                          :diagnostics (list member))
+                    records))))))
+    (nreverse records)))
+
+(defun proofread--diagnostic-aggregate-key (diagnostic beg end)
+  "Return the UI aggregate key for DIAGNOSTIC at BEG and END."
+  (list beg end (plist-get diagnostic :text)))
+
+(defun proofread--make-aggregate-diagnostic
+    (diagnostics beg end)
+  "Return a UI aggregate for DIAGNOSTICS covering BEG to END."
+  (let* ((first (car diagnostics))
+         (aggregate
+          (list :proofread-aggregate t
+                :diagnostics diagnostics
+                :beg beg
+                :end end
+                :text (plist-get first :text)
+                :kind (plist-get first :kind)
+                :target-kind (plist-get first :target-kind))))
+    (setq aggregate
+          (plist-put
+           aggregate :message
+           (proofread--diagnostic-message-summary aggregate)))
+    (setq aggregate
+          (plist-put
+           aggregate :suggestions
+           (mapcar (lambda (record)
+                     (plist-get record :text))
+                   (proofread--diagnostic-suggestion-records
+                    aggregate))))
+    (plist-put aggregate :source
+               (proofread--diagnostic-source-labels aggregate))))
+
+(defun proofread--diagnostic-ui-equivalent-p (left right)
+  "Return non-nil when LEFT and RIGHT represent the same UI diagnostic."
+  (or (eq left right)
+      (memq left (proofread--diagnostic-members right))
+      (memq right (proofread--diagnostic-members left))))
+
 (defun proofread-format-diagnostic-field (value)
   "Return VALUE formatted as a Proofread diagnostic field.
 Return strings unchanged and symbols by name.  Format other values
@@ -3974,8 +4101,8 @@ using their printed representation."
      ((> a-end b-end) nil)
      (t (< a-index b-index)))))
 
-(defun proofread--navigation-entries (&optional accessible-only)
-  "Return sorted entries for live diagnostics in the current buffer.
+(defun proofread--raw-navigation-entries (&optional accessible-only)
+  "Return sorted entries for live raw diagnostics in the current buffer.
 When ACCESSIBLE-ONLY is non-nil, omit ranges outside the current
 restriction."
   (let ((index 0)
@@ -3991,11 +4118,67 @@ restriction."
       (setq index (1+ index)))
     (sort entries #'proofread--navigation-entry<)))
 
+(defun proofread--aggregate-navigation-entries (entries)
+  "Return UI-aggregated navigation ENTRIES."
+  (let ((groups (make-hash-table :test #'equal))
+        ordered-groups)
+    (dolist (entry entries)
+      (let* ((diagnostic (car entry))
+             (beg (nth 1 entry))
+             (end (nth 2 entry))
+             (index (nth 3 entry))
+             (key (proofread--diagnostic-aggregate-key
+                   diagnostic beg end))
+             (group (gethash key groups)))
+        (unless group
+          (setq group (list :beg beg
+                            :end end
+                            :index index
+                            :diagnostics nil))
+          (puthash key group groups)
+          (setq ordered-groups (append ordered-groups
+                                       (list group))))
+        (setf (plist-get group :diagnostics)
+              (append (plist-get group :diagnostics)
+                      (list diagnostic)))))
+    (mapcar
+     (lambda (group)
+       (let* ((diagnostics (plist-get group :diagnostics))
+              (diagnostic
+               (if (cdr diagnostics)
+                   (proofread--make-aggregate-diagnostic
+                    diagnostics
+                    (plist-get group :beg)
+                    (plist-get group :end))
+                 (car diagnostics))))
+         (list diagnostic
+               (plist-get group :beg)
+               (plist-get group :end)
+               (plist-get group :index))))
+     ordered-groups)))
+
+(defun proofread--navigation-entries (&optional accessible-only)
+  "Return sorted UI diagnostics for navigation.
+When ACCESSIBLE-ONLY is non-nil, omit ranges outside the current
+restriction.  Diagnostics with the same live range and text are
+returned as one aggregate entry."
+  (proofread--aggregate-navigation-entries
+   (proofread--raw-navigation-entries accessible-only)))
+
 (defun proofread--navigation-diagnostics (&optional accessible-only)
   "Return live diagnostics sorted for navigation.
 When ACCESSIBLE-ONLY is non-nil, omit ranges outside the current
 restriction."
   (mapcar #'car (proofread--navigation-entries accessible-only)))
+
+(defun proofread--navigation-entry-for-diagnostic
+    (diagnostic entries)
+  "Return DIAGNOSTIC's UI-equivalent entry from ENTRIES."
+  (cl-find-if
+   (lambda (entry)
+     (proofread--diagnostic-ui-equivalent-p
+      (car entry) diagnostic))
+   entries))
 
 (defun proofread--range-covers-position-p (range position)
   "Return non-nil when RANGE covers POSITION."
@@ -4075,8 +4258,12 @@ restriction."
     (proofread--delete-overlays-matching-ignore-key key)
     (proofread--remove-diagnostics diagnostics)
     (when (and proofread--current-diagnostic
-               (proofread--diagnostic-matches-ignore-key-p
-                proofread--current-diagnostic key))
+               (cl-some
+                (lambda (diagnostic)
+                  (proofread--diagnostic-matches-ignore-key-p
+                   diagnostic key))
+                (proofread--diagnostic-members
+                 proofread--current-diagnostic)))
       (setq proofread--current-diagnostic nil))
     (when diagnostics
       (proofread--run-diagnostics-changed-hook))
@@ -4100,7 +4287,10 @@ restriction."
   "Return the nearest diagnostic strictly after POSITION."
   (let* ((entries (proofread--navigation-entries t))
          (point-position (proofread--position-integer position))
-         (candidate (assq proofread--current-diagnostic entries))
+         (candidate
+          (and proofread--current-diagnostic
+               (proofread--navigation-entry-for-diagnostic
+                proofread--current-diagnostic entries)))
          (current (and candidate point-position
                        (proofread--range-covers-position-p
                         (cons (nth 1 candidate) (nth 2 candidate))
@@ -4117,7 +4307,10 @@ restriction."
   "Return the nearest diagnostic strictly before POSITION."
   (let* ((entries (proofread--navigation-entries t))
          (point-position (proofread--position-integer position))
-         (candidate (assq proofread--current-diagnostic entries))
+         (candidate
+          (and proofread--current-diagnostic
+               (proofread--navigation-entry-for-diagnostic
+                proofread--current-diagnostic entries)))
          (current (and candidate point-position
                        (proofread--range-covers-position-p
                         (cons (nth 1 candidate) (nth 2 candidate))
@@ -4139,11 +4332,11 @@ restriction."
 
 (defun proofread--clear-current-diagnostic ()
   "Clear the current diagnostic and its highlight face."
-  (when-let* ((overlay
-               (and proofread--current-diagnostic
-                    (proofread--overlay-for-diagnostic
-                     proofread--current-diagnostic))))
-    (overlay-put overlay 'face 'proofread-face))
+  (when proofread--current-diagnostic
+    (dolist (overlay
+             (proofread--overlays-for-diagnostic
+              proofread--current-diagnostic))
+      (overlay-put overlay 'face 'proofread-face)))
   (setq proofread--current-diagnostic nil))
 
 (defun proofread--overlay-for-diagnostic (diagnostic)
@@ -4159,6 +4352,12 @@ restriction."
                  (hash-table-p proofread--diagnostic-overlays))
         (remhash diagnostic proofread--diagnostic-overlays))
       nil)))
+
+(defun proofread--overlays-for-diagnostic (diagnostic)
+  "Return this buffer's proofread overlays for DIAGNOSTIC."
+  (delq nil
+        (mapcar #'proofread--overlay-for-diagnostic
+                (proofread--diagnostic-members diagnostic))))
 
 (defun proofread-diagnostic-at-point (&optional position)
   "Return the live proofreading diagnostic at POSITION or point.
@@ -4195,15 +4394,35 @@ the current buffer."
                   (setq best diagnostic
                         best-beg beg
                         best-end end)))))
-          best)))))
+          (and best
+               (proofread--ui-diagnostic-for-raw-diagnostic
+                best)))))))
+
+(defun proofread--ui-diagnostic-for-raw-diagnostic
+    (diagnostic)
+  "Return the UI diagnostic representing raw DIAGNOSTIC."
+  (when-let* ((range (proofread--diagnostic-live-range diagnostic)))
+    (let* ((key (proofread--diagnostic-aggregate-key
+                 diagnostic (car range) (cdr range)))
+           diagnostics)
+      (dolist (entry (proofread--raw-navigation-entries))
+        (let ((candidate (car entry)))
+          (when (equal key
+                       (proofread--diagnostic-aggregate-key
+                        candidate (nth 1 entry) (nth 2 entry)))
+            (setq diagnostics (append diagnostics
+                                      (list candidate))))))
+      (if (cdr diagnostics)
+          (proofread--make-aggregate-diagnostic
+           diagnostics (car range) (cdr range))
+        diagnostic))))
 
 (defun proofread--mark-current-diagnostic (diagnostic)
   "Mark DIAGNOSTIC current and update its overlay face."
   (proofread--clear-current-diagnostic)
   (setq proofread--current-diagnostic diagnostic)
-  (let ((overlay (proofread--overlay-for-diagnostic diagnostic)))
-    (when overlay
-      (overlay-put overlay 'face 'proofread-current-face)))
+  (dolist (overlay (proofread--overlays-for-diagnostic diagnostic))
+    (overlay-put overlay 'face 'proofread-current-face))
   diagnostic)
 
 ;;;; Request listings
@@ -4849,12 +5068,19 @@ events."
 
 (defun proofread--diagnostic-live-range (diagnostic)
   "Return DIAGNOSTIC's current live range, or nil."
-  (let ((overlay (proofread--overlay-for-diagnostic diagnostic)))
-    (when (and overlay
-               (overlay-start overlay)
-               (overlay-end overlay))
-      (cons (overlay-start overlay)
-            (overlay-end overlay)))))
+  (if (proofread--aggregate-diagnostic-p diagnostic)
+      (let (range)
+        (dolist (member (proofread--diagnostic-members diagnostic))
+          (unless range
+            (setq range
+                  (proofread--diagnostic-live-range member))))
+        range)
+    (let ((overlay (proofread--overlay-for-diagnostic diagnostic)))
+      (when (and overlay
+                 (overlay-start overlay)
+                 (overlay-end overlay))
+        (cons (overlay-start overlay)
+              (overlay-end overlay))))))
 
 (defun proofread--diagnostic-line-column (diagnostic)
   "Return DIAGNOSTIC's current line and column as a cons cell."
@@ -4886,9 +5112,11 @@ events."
     (let* ((line (car line-column))
            (column (cdr line-column))
            (kind (plist-get diagnostic :kind))
-           (source (plist-get diagnostic :source))
+           (source (proofread--diagnostic-source-summary
+                    diagnostic))
            (text (plist-get diagnostic :text))
-           (message (plist-get diagnostic :message))
+           (message (proofread--diagnostic-message-summary
+                     diagnostic))
            (id (list :diagnostic diagnostic
                      :buffer (current-buffer)
                      :line line
@@ -5030,12 +5258,17 @@ When RESET is non-nil, move from the beginning of the buffer."
 
 (defun proofread--diagnostic-suggestions (diagnostic)
   "Return DIAGNOSTIC suggestions as strings in stored order."
-  (let ((suggestions (plist-get diagnostic :suggestions)))
-    (cond
-     ((null suggestions) nil)
-     ((listp suggestions)
-      (mapcar #'proofread-format-diagnostic-field suggestions))
-     (t (list (proofread-format-diagnostic-field suggestions))))))
+  (if (proofread--aggregate-diagnostic-p diagnostic)
+      (mapcar (lambda (record)
+                (plist-get record :text))
+              (proofread--diagnostic-suggestion-records
+               diagnostic))
+    (let ((suggestions (plist-get diagnostic :suggestions)))
+      (cond
+       ((null suggestions) nil)
+       ((listp suggestions)
+        (mapcar #'proofread-format-diagnostic-field suggestions))
+       (t (list (proofread-format-diagnostic-field suggestions)))))))
 
 ;;;; Corrections
 
@@ -5213,7 +5446,10 @@ hook."
     (proofread--delete-overlay overlay))
   (proofread--remove-diagnostics diagnostics)
   (when (and proofread--current-diagnostic
-             (memq proofread--current-diagnostic diagnostics))
+             (cl-some (lambda (diagnostic)
+                        (memq diagnostic diagnostics))
+                      (proofread--diagnostic-members
+                       proofread--current-diagnostic)))
     (setq proofread--current-diagnostic nil))
   (proofread--prune-overlays)
   (unless inhibit-notification
@@ -5496,11 +5732,10 @@ DIAGNOSTICS must be in navigation order.  Return `applied'."
 
 (defun proofread--format-diagnostic-description (diagnostic)
   "Return a stable plain-text description for DIAGNOSTIC."
-  (let ((kind (plist-get diagnostic :kind))
-        (message (plist-get diagnostic :message))
+  (let ((aggregate (proofread--aggregate-diagnostic-p diagnostic))
+        (kind (plist-get diagnostic :kind))
         (text (plist-get diagnostic :text))
         (suggestions (proofread--diagnostic-suggestions diagnostic))
-        (source (plist-get diagnostic :source))
         (lines '( "Proofread diagnostic")))
     (when kind
       (setq lines
@@ -5509,12 +5744,28 @@ DIAGNOSTICS must be in navigation order.  Return `applied'."
                           (format "Kind: %s"
                                   (proofread-format-diagnostic-field
                                    kind))))))
-    (when message
-      (setq lines
-            (append lines
-                    (list (format "Message: %s"
-                                  (proofread-format-diagnostic-field
-                                   message))))))
+    (if aggregate
+        (when-let* ((entries
+                     (proofread--diagnostic-message-entries
+                      diagnostic)))
+          (setq lines (append lines (list "" "Messages:")))
+          (dolist (entry entries)
+            (let ((source (plist-get entry :source))
+                  (message
+                   (proofread-format-diagnostic-field
+                    (plist-get entry :message))))
+              (setq lines
+                    (append
+                     lines
+                     (list (if source
+                               (format "%s: %s" source message)
+                             message)))))))
+      (when-let* ((message (plist-get diagnostic :message)))
+        (setq lines
+              (append lines
+                      (list (format "Message: %s"
+                                    (proofread-format-diagnostic-field
+                                     message)))))))
     (when text
       (setq lines
             (append lines
@@ -5525,23 +5776,43 @@ DIAGNOSTICS must be in navigation order.  Return `applied'."
     (when suggestions
       (setq lines (append lines (list "" "Suggestions:")))
       (let ((index 1))
-        (dolist (suggestion suggestions)
-          (setq lines
-                (append
-                 lines
-                 (list
-                  (format
-                   "%d. %s"
-                   index
-                   (proofread-format-diagnostic-field
-                    suggestion)))))
-          (setq index (1+ index)))))
-    (when source
+        (if aggregate
+            (dolist (record
+                     (proofread--diagnostic-suggestion-records
+                      diagnostic))
+              (let ((sources (plist-get record :sources)))
+                (setq lines
+                      (append
+                       lines
+                       (list
+                        (format
+                         "%d. %s%s"
+                         index
+                         (proofread-format-diagnostic-field
+                          (plist-get record :text))
+                         (if sources
+                             (format " (from %s)"
+                                     (string-join sources ", "))
+                           ""))))))
+              (setq index (1+ index)))
+          (dolist (suggestion suggestions)
+            (setq lines
+                  (append
+                   lines
+                   (list
+                    (format
+                     "%d. %s"
+                     index
+                     (proofread-format-diagnostic-field
+                      suggestion)))))
+            (setq index (1+ index))))))
+    (when-let* ((source
+                 (proofread--diagnostic-source-summary diagnostic)))
       (setq lines
             (append lines
-                    (list (format "Source: %s"
-                                  (proofread-format-diagnostic-field
-                                   source))))))
+                    (list (format "%s: %s"
+                                  (if aggregate "Sources" "Source")
+                                  source)))))
     (mapconcat #'identity lines "\n")))
 
 (defun proofread--display-diagnostic-description (diagnostic)
@@ -6026,9 +6297,10 @@ This function does not move point in the source buffer."
         (with-selected-window window
           (cl-loop initially (goto-char (point-min))
                    until (eobp)
-                   until (eq (plist-get (tabulated-list-get-id)
-                                        :diagnostic)
-                             diagnostic)
+                   until
+                   (proofread--diagnostic-ui-equivalent-p
+                    (plist-get (tabulated-list-get-id) :diagnostic)
+                    diagnostic)
                    do (forward-line)
                    finally
                    (recenter)
@@ -6100,10 +6372,9 @@ provide the selection interface."
   "Return accessible RANGES' diagnostics in navigation order."
   (let ((ranges (proofread--normalize-accessible-ranges ranges))
         diagnostics)
-    (dolist (diagnostic (proofread--navigation-diagnostics))
-      (when-let*
-          ((range
-            (proofread--diagnostic-live-range diagnostic)))
+    (dolist (entry (proofread--raw-navigation-entries t))
+      (let ((diagnostic (car entry))
+            (range (cons (nth 1 entry) (nth 2 entry))))
         (when (proofread--range-contained-in-any-p range ranges)
           (push diagnostic diagnostics))))
     (nreverse diagnostics)))
@@ -6150,12 +6421,12 @@ buffer."
 (defun proofread-ignore ()
   "Ignore the proofreading diagnostic at point."
   (interactive)
-  (let ((diagnostic (proofread-diagnostic-at-point))
-        key)
+  (let ((diagnostic (proofread-diagnostic-at-point)))
     (unless diagnostic
       (user-error "No proofread diagnostic at point"))
-    (setq key (proofread--record-ignored-diagnostic diagnostic))
-    (proofread--remove-diagnostics-matching-ignore-key key)
+    (dolist (member (proofread--diagnostic-members diagnostic))
+      (proofread--remove-diagnostics-matching-ignore-key
+       (proofread--record-ignored-diagnostic member)))
     (message "proofread: ignored diagnostic")
     'ignored))
 

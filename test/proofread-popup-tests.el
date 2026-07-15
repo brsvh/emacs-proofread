@@ -35,6 +35,15 @@ SUGGESTIONS and MESSAGE supply the optional field values."
   (setq proofread--diagnostics diagnostics)
   (mapcar #'proofread--create-overlay diagnostics))
 
+(defun proofread-popup-test--diagnostic-with-binding
+    (diagnostic binding)
+  "Return DIAGNOSTIC annotated as owned by BINDING."
+  (let ((diagnostic (copy-sequence diagnostic)))
+    (setq diagnostic (plist-put diagnostic :profile 'multi))
+    (setq diagnostic (plist-put diagnostic :binding-name binding))
+    (plist-put diagnostic :binding-owner
+               (list :profile 'multi :binding-name binding))))
+
 (defmacro proofread-popup-test--with-posframe-recorder (&rest body)
   "Run BODY and record invocations of the Posframe frontend."
   (declare (indent 0) (debug (body)))
@@ -108,6 +117,30 @@ SUGGESTIONS and MESSAGE supply the optional field values."
                      "Proofread: <formatted>")))
     (should (equal (nreverse fields)
                    '( misspelling ( bad "text"))))))
+
+(ert-deftest proofread-popup-test-message-aggregates-bindings ()
+  "Popup messages use aggregate binding summaries."
+  (with-temp-buffer
+    (insert "helo")
+    (proofread-mode 1)
+    (let ((first
+           (proofread-popup-test--diagnostic-with-binding
+            (proofread-popup-test--diagnostic
+             1 5 "helo" '( "hello") "First message")
+            'first))
+          (second
+           (proofread-popup-test--diagnostic-with-binding
+            (proofread-popup-test--diagnostic
+             1 5 "helo" '( "hello") "Second message")
+            'second)))
+      (proofread-popup-test--install-diagnostics
+       (list first second))
+      (goto-char 2)
+      (should
+       (equal
+        (proofread-popup--message
+         (proofread-diagnostic-at-point))
+        "first: First message; second: Second message")))))
 
 ;;;; Core integration
 

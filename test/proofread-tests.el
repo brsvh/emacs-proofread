@@ -103,6 +103,15 @@
       (cl-remf diagnostic key))
     diagnostic))
 
+(defun proofread-test--diagnostic-with-binding
+    (diagnostic binding)
+  "Return DIAGNOSTIC annotated as owned by BINDING."
+  (let ((diagnostic (copy-sequence diagnostic)))
+    (setq diagnostic (plist-put diagnostic :profile 'multi))
+    (setq diagnostic (plist-put diagnostic :binding-name binding))
+    (plist-put diagnostic :binding-owner
+               (list :profile 'multi :binding-name binding))))
+
 (defun proofread-test--diagnostics-without-provenance
     (diagnostics)
   "Return DIAGNOSTICS without core provenance fields."
@@ -4616,6 +4625,116 @@ This covers URLs, email, invisible text, faces, and properties."
           (when-let* ((buffer (get-buffer name)))
             (kill-buffer buffer)))))))
 
+(ert-deftest
+    proofread-test-diagnostics-list-aggregates-bindings ()
+  "List one row for same-range diagnostics from multiple bindings."
+  (save-window-excursion
+    (with-temp-buffer
+      (switch-to-buffer (current-buffer))
+      (insert "aa helo")
+      (proofread-mode 1)
+      (let* ((first
+              (proofread-test--diagnostic-with-binding
+               (proofread--make-diagnostic
+                :beg 4
+                :end 8
+                :text "helo"
+                :kind 'spelling
+                :message "First message"
+                :suggestions '( "hello")
+                :source 'test)
+               'first))
+             (second
+              (proofread-test--diagnostic-with-binding
+               (proofread--make-diagnostic
+                :beg 4
+                :end 8
+                :text "helo"
+                :kind 'spelling
+                :message "Second message"
+                :suggestions '( "hello" "hullo")
+                :source 'test)
+               'second))
+             (name (proofread--diagnostics-buffer-name)))
+        (unwind-protect
+            (progn
+              (proofread-test--install-diagnostics
+               (list first second))
+              (proofread-show-buffer-diagnostics)
+              (with-current-buffer name
+                (should (= (length tabulated-list-entries) 1))
+                (let* ((entry (car tabulated-list-entries))
+                       (id (car entry))
+                       (diagnostic (plist-get id :diagnostic))
+                       (columns (cadr entry)))
+                  (should (proofread--aggregate-diagnostic-p
+                           diagnostic))
+                  (should (equal (plist-get diagnostic :diagnostics)
+                                 (list first second)))
+                  (should (equal (aref columns 3)
+                                 "first, second"))
+                  (should (equal (car (aref columns 5))
+                                 (concat "first: First message; "
+                                         "second: Second message"))))))
+          (when-let* ((buffer (get-buffer name)))
+            (kill-buffer buffer)))))))
+
+(ert-deftest
+    proofread-test-diagnostics-list-keeps-distinct-groups ()
+  "Do not aggregate diagnostics whose range or text differs."
+  (with-temp-buffer
+    (insert "helo hallo")
+    (proofread-mode 1)
+    (let ((same-range-different-text
+           (proofread-test--diagnostic-with-binding
+            (proofread-test--diagnostic-for-range 1 5 "helo")
+            'first))
+          (different-text
+           (proofread-test--diagnostic-with-binding
+            (proofread-test--diagnostic-for-range 1 5 "hallo")
+            'second))
+          (different-range
+           (proofread-test--diagnostic-with-binding
+            (proofread-test--diagnostic-for-range 6 11 "hallo")
+            'third)))
+      (proofread-test--install-diagnostics
+       (list same-range-different-text different-text
+             different-range))
+      (should (= (length (proofread--navigation-diagnostics)) 3)))))
+
+(ert-deftest
+    proofread-test-show-buffer-diagnostics-selects-aggregate-member
+    ()
+  "Selecting a raw diagnostic highlights its aggregate list row."
+  (save-window-excursion
+    (with-temp-buffer
+      (switch-to-buffer (current-buffer))
+      (insert "aa helo")
+      (proofread-mode 1)
+      (let* ((first
+              (proofread-test--diagnostic-with-binding
+               (proofread-test--diagnostic-for-range 4 8 "helo")
+               'first))
+             (second
+              (proofread-test--diagnostic-with-binding
+               (proofread-test--diagnostic-for-range 4 8 "helo")
+               'second))
+             (name (proofread--diagnostics-buffer-name)))
+        (unwind-protect
+            (progn
+              (proofread-test--install-diagnostics
+               (list first second))
+              (proofread-show-buffer-diagnostics second)
+              (with-current-buffer name
+                (should
+                 (memq second
+                       (plist-get
+                        (plist-get (tabulated-list-get-id)
+                                   :diagnostic)
+                        :diagnostics)))))
+          (when-let* ((buffer (get-buffer name)))
+            (kill-buffer buffer)))))))
+
 (ert-deftest proofread-test-show-diagnostic-visits-source ()
   "`proofread-show-diagnostic' visits the source diagnostic location."
   (save-window-excursion
@@ -4706,6 +4825,32 @@ This covers URLs, email, invisible text, faces, and properties."
       (proofread-test--install-diagnostics (list later long short))
       (goto-char 4)
       (should (eq (proofread-diagnostic-at-point) short)))))
+
+(ert-deftest proofread-test-diagnostic-at-point-aggregates-bindings
+    ()
+  "Point lookup aggregates same-range diagnostics from bindings."
+  (with-temp-buffer
+    (insert "helo")
+    (proofread-mode 1)
+    (let ((first
+           (proofread-test--diagnostic-with-binding
+            (proofread-test--diagnostic-with-suggestions
+             1 5 "helo" '( "hello"))
+            'first))
+          (second
+           (proofread-test--diagnostic-with-binding
+            (proofread-test--diagnostic-with-suggestions
+             1 5 "helo" '( "hello" "hullo"))
+            'second)))
+      (proofread-test--install-diagnostics (list first second))
+      (goto-char 2)
+      (let ((diagnostic (proofread-diagnostic-at-point)))
+        (should (proofread--aggregate-diagnostic-p diagnostic))
+        (should (equal (plist-get diagnostic :diagnostics)
+                       (list first second)))
+        (should (equal (proofread--diagnostic-suggestions
+                        diagnostic)
+                       '( "hello" "hullo")))))))
 
 (ert-deftest
     proofread-test-diagnostic-at-point-ignores-foreign-overlays ()
@@ -4918,6 +5063,53 @@ This covers URLs, email, invisible text, faces, and properties."
             (should (< first second))
             (should (< second third))))))))
 
+(ert-deftest proofread-test-describe-aggregates-binding-details ()
+  "`proofread-describe' preserves aggregate messages and sources."
+  (save-window-excursion
+    (with-temp-buffer
+      (insert "helo")
+      (proofread-mode 1)
+      (let ((first
+             (proofread-test--diagnostic-with-binding
+              (proofread--make-diagnostic
+               :beg 1
+               :end 5
+               :text "helo"
+               :kind 'spelling
+               :message "First message"
+               :suggestions '( "hello" "hullo")
+               :source 'test)
+              'first))
+            (second
+             (proofread-test--diagnostic-with-binding
+              (proofread--make-diagnostic
+               :beg 1
+               :end 5
+               :text "helo"
+               :kind 'spelling
+               :message "Second message"
+               :suggestions '( "hello")
+               :source 'test)
+              'second)))
+        (proofread-test--install-diagnostics (list first second))
+        (goto-char 2)
+        (proofread-describe)
+        (with-current-buffer proofread--description-buffer-name
+          (let ((description (buffer-string)))
+            (should (string-match-p "Messages:" description))
+            (should (string-match-p "first: First message"
+                                    description))
+            (should (string-match-p "second: Second message"
+                                    description))
+            (should (string-match-p
+                     "1\\. hello (from first, second)"
+                     description))
+            (should (string-match-p
+                     "2\\. hullo (from first)"
+                     description))
+            (should (string-match-p "Sources: first, second"
+                                    description))))))))
+
 (ert-deftest proofread-test-describe-handles-missing-optional-fields
     ()
   "Show available fields when optional diagnostic data is absent."
@@ -5057,6 +5249,35 @@ This covers URLs, email, invisible text, faces, and properties."
                    (error "Unexpected completion prompt"))))
         (should (eq (proofread-correct-at-point) 'applied)))
       (should (equal (buffer-string) "aa hello zz")))))
+
+(ert-deftest proofread-test-correct-at-point-aggregates-suggestions
+    ()
+  "Correct an aggregate using deduplicated suggestion text."
+  (with-temp-buffer
+    (insert "aa helo zz")
+    (proofread-mode 1)
+    (let ((first
+           (proofread-test--diagnostic-with-binding
+            (proofread-test--diagnostic-with-suggestions
+             4 8 "helo" '( "hello" "hullo"))
+            'first))
+          (second
+           (proofread-test--diagnostic-with-binding
+            (proofread-test--diagnostic-with-suggestions
+             4 8 "helo" '( "hello"))
+            'second))
+          collection-seen)
+      (proofread-test--install-diagnostics (list first second))
+      (goto-char 5)
+      (cl-letf (((symbol-function 'completing-read)
+                 (lambda (_prompt collection &rest _args)
+                   (setq collection-seen collection)
+                   "hello")))
+        (should (eq (proofread-correct-at-point) 'applied)))
+      (should (equal collection-seen '( "hello" "hullo")))
+      (should (equal (buffer-string) "aa hello zz"))
+      (should-not proofread--diagnostics)
+      (should-not proofread--overlays))))
 
 (ert-deftest
     proofread-test-correction-entry-points-use-transaction-runner ()
