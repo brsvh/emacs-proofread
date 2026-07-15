@@ -242,11 +242,46 @@ LanguageTool，为简体中文使用本地 Ollama 加 LanguageTool：
 通过设置 `proofread-profile` 切换 profile：
 
 ```elisp
-(setq proofread-profile 'chinese)
+(setq proofread-profile 'english)
 ```
 
 来自不同 checker 的诊断项在内部仍然彼此独立。用户界面会把指向同一实时范围和同一文本的诊断项分组，保留每个 checker
 的消息，并去重相同的修改建议文本。
+
+#### 为单个缓冲区选择 profile
+
+`proofread-profile` 仍是普通的全局默认值。若要只在一个缓冲区中选择不同的
+profile，而不改变其他缓冲区使用的默认值，请将它设为缓冲区局部变量：
+
+```elisp
+(setq-local proofread-profile 'english)
+```
+
+文件局部和目录局部值使用 Emacs 的常规确认流程。如果信任某个确定的 profile 值，可以只将这个值显式加入允许列表：
+
+```elisp
+(add-to-list 'safe-local-variable-values
+             '(proofread-profile . english))
+```
+
+不要把 `proofread-profile` 的任意值都标记为安全。Profile 可能选择远程
+checker，而自动检查随后可能把缓冲区内容发送给该提供程序。
+
+在兼容 0.1 版配置期间，`nil` 表示已配置的废弃单后端设置仍然生效，并不表示无条件禁用派发。若要显式禁用派发，请选择一个 `:checkers`
+列表为空的命名 profile：
+
+```elisp
+(add-to-list 'proofread-profiles
+             '( disabled
+                :checkers nil))
+(setq-local proofread-profile 'disabled)
+```
+
+#### 从 0.1 版迁移
+
+`proofread-backend` 和 `proofread-language` 已在 0.2 版中废弃。请把后端选择移入各 checker 的
+`:backend`，把语言提示移入 profile 的 `:language`，再用 `proofread-profile` 选择该 profile。当
+`proofread-profile` 为 `nil` 时，旧变量暂时仍可用于兼容，但新配置不应再设置它们。
 
 `proofread-targets` 控制每个缓冲区中要检查的文本：
 

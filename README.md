@@ -276,6 +276,48 @@ Diagnostics from different checkers remain separate internally. The user
 interface groups diagnostics that refer to the same live range and text,
 preserves each checker's message, and deduplicates identical suggestion text.
 
+#### Selecting a profile for one buffer
+
+`proofread-profile` remains an ordinary global default. To select a different
+profile in one buffer without changing the default for other buffers, set it
+buffer-locally:
+
+```elisp
+(setq-local proofread-profile 'chinese)
+```
+
+File-local and directory-local values use Emacs's normal confirmation flow. If
+you trust one exact profile value, you can explicitly allow only that value:
+
+```elisp
+(add-to-list 'safe-local-variable-values
+             '(proofread-profile . chinese))
+```
+
+Do not mark arbitrary values of `proofread-profile` as safe. A profile may
+select a remote checker, and automatic checking may then send buffer contents to
+that provider.
+
+During compatibility with version 0.1 configurations, `nil` means that the
+obsolete single-backend settings remain active when configured; it does not
+unconditionally disable dispatch. To disable dispatch explicitly, select a named
+profile whose `:checkers` list is empty:
+
+```elisp
+(add-to-list 'proofread-profiles
+             '( disabled
+                :checkers nil))
+(setq-local proofread-profile 'disabled)
+```
+
+#### Migrating from version 0.1
+
+`proofread-backend` and `proofread-language` are obsolete in version 0.2. Move
+backend selection into each checker's `:backend`, move the language hint into
+the profile's `:language`, and select that profile with `proofread-profile`. The
+old variables remain temporarily functional for compatibility when
+`proofread-profile` is `nil`, but new configurations should not set them.
+
 `proofread-targets` controls which text is checked in each buffer:
 
 | Value                     | Behavior                                                                                     |

@@ -914,7 +914,7 @@ effective backend identity."
   (proofread--message-without-resizing "proofread: %s" summary))
 
 (defun proofread--warn-about-legacy-dispatch ()
-  "Warn once this session when a check uses legacy configuration."
+  "Warn once per session about legacy configuration use."
   (unless proofread--legacy-dispatch-warning-issued-p
     (setq proofread--legacy-dispatch-warning-issued-p t)
     (proofread-report-warning-without-window

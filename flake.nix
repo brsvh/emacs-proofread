@@ -87,7 +87,7 @@
 
                     pname = "proofread";
                     src = projectRoot + /lisp/proofread;
-                    version = "0.1.0";
+                    version = "0.2.0";
                   };
 
                 emacs-proofread-popup =
@@ -181,9 +181,52 @@
           }:
           let
             inherit (lib)
+              baseNameOf
+              concatMapStringsSep
+              dirOf
+              filter
               foldl'
+              hasPrefix
+              hasSuffix
+              removePrefix
               versions
               ;
+
+            elispRelativePath =
+              source:
+              removePrefix "${toString projectRoot}/" (
+                toString source
+              );
+
+            elispSources =
+              filter
+                (
+                  source:
+                  let
+                    name = baseNameOf source;
+                  in
+                  hasSuffix ".el" name
+                  && !(hasSuffix "-autoloads.el" name)
+                  && !(hasSuffix "-pkg.el" name)
+                )
+                (
+                  lib.filesystem.listFilesRecursive (
+                    projectRoot + /lisp
+                  )
+                  ++ lib.filesystem.listFilesRecursive (
+                    projectRoot + /test
+                  )
+                );
+
+            implementationElispSources = filter (
+              source:
+              hasPrefix "lisp/" (elispRelativePath source)
+            ) elispSources;
+
+            testElispSources = filter (
+              source:
+              hasPrefix "test/" (elispRelativePath source)
+            ) elispSources;
 
             languageToolServer = pkgs.callPackage (
               projectRoot
@@ -221,6 +264,7 @@
                     inherit (pkgs)
                       coreutils
                       emacsPackagesFor
+                      gnugrep
                       gnutar
                       writeShellApplication
                       ;
@@ -352,6 +396,7 @@
 
                           runtimeInputs = [
                             coreutils
+                            gnugrep
                             languageToolServer
                           ];
 
@@ -360,62 +405,145 @@
                             workdir="$(mktemp --tmpdir -d emacs-proofread-byte-compile-src-XXXXXX)"
                             trap 'rm -rf "$initdir" "$workdir"' EXIT
 
-                            cp "${
-                              projectRoot + /lisp/proofread/proofread.el
-                            }" "$workdir/proofread.el"
-                            cp "${
-                              projectRoot + /lisp/proofread/proofread-llm.el
-                            }" "$workdir/proofread-llm.el"
-                            cp "${
-                              projectRoot
-                              + /lisp/proofread/proofread-languagetool.el
-                            }" "$workdir/proofread-languagetool.el"
-                            cp "${
-                              projectRoot
-                              + /lisp/proofread-popup/proofread-popup.el
-                            }" "$workdir/proofread-popup.el"
+                            ${concatMapStringsSep "\n" (
+                              source:
+                              let
+                                relative = elispRelativePath source;
+                              in
+                              ''
+                                mkdir -p "$workdir/${dirOf relative}"
+                                cp "${source}" "$workdir/${relative}"
+                              ''
+                            ) elispSources}
+                            mkdir -p "$workdir/tool"
                             cp "${proofreadRelease}/bin/proofread-release" \
-                              "$workdir/proofread-release.el"
+                              "$workdir/tool/proofread-release.el"
 
-                            "${emacs-with-proofread}/bin/emacs" --batch \
-                              --init-directory "$initdir" \
-                              -L "$workdir" \
-                              --eval '(setq byte-compile-error-on-warn t)' \
-                              -f batch-byte-compile \
-                              "$workdir/proofread.el"
+                            implementationSources=(
+                              ${concatMapStringsSep "\n"
+                                (
+                                  source: ''"$workdir/${elispRelativePath source}"''
+                                )
+                                (
+                                  filter (
+                                    source:
+                                    elispRelativePath source
+                                    != "lisp/proofread/proofread.el"
+                                  ) implementationElispSources
+                                )
+                              }
+                            )
+                            testSources=(
+                              ${concatMapStringsSep "\n" (
+                                source: ''"$workdir/${elispRelativePath source}"''
+                              ) testElispSources}
+                            )
 
-                            "${emacs-with-proofread}/bin/emacs" --batch \
-                              --init-directory "$initdir" \
-                              -L "$workdir" \
-                              --eval '(setq byte-compile-error-on-warn t)' \
-                              -f batch-byte-compile \
-                              "$workdir/proofread-llm.el" \
-                              "$workdir/proofread-languagetool.el"
+                            compileLog="$workdir/byte-compile.log"
 
-                            "${emacs-with-proofread}/bin/emacs" --batch \
+                            {
+                              "${emacs-with-proofread-popup}/bin/emacs" --batch \
+                                --init-directory "$initdir" \
+                                -L "$workdir/lisp/proofread" \
+                                -L "$workdir/lisp/proofread-popup" \
+                                -L "$workdir/test" \
+                                -L "$workdir/tool" \
+                                --eval '(setq byte-compile-error-on-warn t)' \
+                                -f batch-byte-compile \
+                                "$workdir/lisp/proofread/proofread.el"
+
+                              "${emacs-with-proofread-popup}/bin/emacs" --batch \
+                                --init-directory "$initdir" \
+                                -L "$workdir/lisp/proofread" \
+                                -L "$workdir/lisp/proofread-popup" \
+                                -L "$workdir/test" \
+                                -L "$workdir/tool" \
+                                --eval '(setq byte-compile-error-on-warn t)' \
+                                -f batch-byte-compile \
+                                "''${implementationSources[@]}"
+
+                              "${releaseEmacs}/bin/emacs" --batch \
+                                --init-directory "$initdir" \
+                                -L "$workdir/tool" \
+                                --eval '(setq byte-compile-error-on-warn t)' \
+                                -f batch-byte-compile \
+                                "$workdir/tool/proofread-release.el"
+
+                              "${emacs-with-proofread-popup}/bin/emacs" --batch \
+                                --init-directory "$initdir" \
+                                -L "$workdir/lisp/proofread" \
+                                -L "$workdir/lisp/proofread-popup" \
+                                -L "$workdir/test" \
+                                -L "$workdir/tool" \
+                                --eval '(setq byte-compile-error-on-warn t)' \
+                                -f batch-byte-compile \
+                                "''${testSources[@]}"
+                            } 2>&1 | tee "$compileLog"
+
+                            if grep -Fq 'Note:' "$compileLog"; then
+                              echo 'Byte compilation emitted Note diagnostics:' >&2
+                              grep -F 'Note:' "$compileLog" >&2
+                              exit 1
+                            fi
+
+                            "${emacs-with-proofread-popup}/bin/emacs" --batch \
                               --init-directory "$initdir" \
-                              -L "$workdir" \
+                              -L "$workdir/lisp/proofread" \
+                              -L "$workdir/lisp/proofread-popup" \
                               --eval '(progn
                                 (require (quote proofread))
                                 (require (quote proofread-llm))
                                 (require (quote proofread-languagetool))
+                                (require (quote proofread-popup))
                                 (unless (executable-find
                                          "languagetool-http-server")
                                   (error
                                    "LanguageTool server is unavailable")))'
+                          '';
+                        };
+
+                    "emacs${version}-checkdoc-proofread" =
+                      writeShellApplication
+                        {
+                          name = "emacs${version}-checkdoc-proofread";
+
+                          runtimeInputs = [
+                            coreutils
+                          ];
+
+                          text = ''
+                            initdir="$(mktemp --tmpdir -d emacs-proofread-checkdoc-XXXXXX)"
+                            trap 'rm -rf "$initdir"' EXIT
 
                             "${emacs-with-proofread-popup}/bin/emacs" --batch \
                               --init-directory "$initdir" \
-                              -L "$workdir" \
-                              --eval '(setq byte-compile-error-on-warn t)' \
-                              -f batch-byte-compile \
-                              "$workdir/proofread-popup.el"
-
-                            "${releaseEmacs}/bin/emacs" --batch \
-                              --init-directory "$initdir" \
-                              --eval '(setq byte-compile-error-on-warn t)' \
-                              -f batch-byte-compile \
-                              "$workdir/proofread-release.el"
+                              --eval '(progn
+                                (require (quote checkdoc))
+                                (dolist
+                                    (file
+                                     (quote
+                                      (
+                                       ${concatMapStringsSep "\n" (
+                                         source:
+                                         ''"${projectRoot}/${elispRelativePath source}"''
+                                       ) elispSources}
+                                       )))
+                                  (let ((buffer
+                                         (find-file-noselect file)))
+                                    (unwind-protect
+                                        (with-current-buffer buffer
+                                          (let
+                                              ((checkdoc-autofix-flag
+                                                (quote never)))
+                                            (condition-case error-data
+                                                (checkdoc-current-buffer)
+                                              (error
+                                               (error
+                                                "Checkdoc failed for %s: %s"
+                                                file
+                                                (error-message-string
+                                                 error-data))))))
+                                      (kill-buffer buffer)))))'
                           '';
                         };
                   }

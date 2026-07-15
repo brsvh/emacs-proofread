@@ -4,9 +4,36 @@ This file records notable user-visible changes to proofread and
 proofread-popup.  For detailed development history, see the Git log.
 
 
-* Changes in proofread since 0.1.0
+* Changes in proofread 0.2.0
 
-** proofread
+** Configuration
+
+---
+*** Profiles and checkers are now the primary configuration interface.
+The user option 'proofread-profile' selects a named entry from
+'proofread-profiles'.  Each profile can specify ':language',
+':display-language', and an ordered ':checkers' list.  Each checker has a
+unique symbol ':name', selects a registered backend with ':backend', and
+can carry backend-specific ':options'.  Multiple checkers can therefore
+proofread the same text with different backends or settings.
+
+An empty ':checkers' list disables proofreading for that profile.
+'proofread-profile' can also be set buffer-locally to select different
+profiles in different buffers.
+
+---
+*** The legacy single-backend configuration is now obsolete.
+The user options 'proofread-backend' and 'proofread-language' are both
+obsolete as of proofread 0.2.0.  They remain functional for compatibility
+in this release.  An actual check that uses the legacy configuration
+issues one warning per Emacs session.
+
+To migrate, define a named entry in 'proofread-profiles', move the old
+language value to the profile's ':language' property, represent the old
+backend with a named checker whose ':backend' property selects it, and
+select the profile with 'proofread-profile'.
+
+** Backends
 
 ---
 *** New local LanguageTool backend.
@@ -20,23 +47,25 @@ LanguageTool checkers.
 
 ---
 *** New backend registry.
-Backends are now registered through a backend registry.  The registry
-supports lazy loading, backend-specific cache identities, and
-backend-specific request cancellation.
+The core now dispatches through a backend registry.  The registry supports
+lazy loading, backend-specific cache identities, and backend-specific
+request cancellation.
+
+** User interface
 
 ---
-*** New profile/checker configuration model.
-Proofread profiles can now select an ordered set of backend checkers.
-Each checker has a stable name, selects a registered backend, and may
-carry backend-local options.
+*** Matching diagnostics from multiple checkers are aggregated.
+Diagnostics for the same text and range remain independent internally but
+are presented as one source-aware diagnostic for navigation, descriptions,
+suggestions, correction, and ignoring.
+
+** Packaging and development
 
 ---
 *** Package sources have been reorganized.
 The proofread package sources now live under "lisp/proofread/".  The
 implementation is split into "proofread.el", "proofread-llm.el", and
 "proofread-languagetool.el".
-
-The optional popup package now lives under "lisp/proofread-popup/".
 
 ---
 *** Backend-private implementation details use feature namespaces.
@@ -59,7 +88,7 @@ selected or required explicitly.
 
 Initial release.
 
-** proofread
+** Proofreading
 
 ---
 *** Asynchronous, context-aware proofreading.
@@ -117,7 +146,12 @@ preserves usable results when only part of a check fails.
 Proofread can record and inspect complete request lifecycles on demand,
 including queued, active, completed, failed, and stale requests.
 
-** proofread-popup
+
+* Changes in proofread-popup 0.1.0 (2026-07-13)
+
+Initial release.
+
+** Popup display
 
 ---
 *** Optional Posframe frontend.
@@ -126,7 +160,7 @@ displays the diagnostic at point in a child frame.
 
 ---
 *** Automatic integration with proofread-mode.
-proofread-popup follows "proofread-mode" automatically while allowing
+proofread-popup follows 'proofread-mode' automatically while allowing
 popup display to be disabled per buffer.
 
 ---
