@@ -1,0 +1,134 @@
+proofread NEWS -- history of user-visible changes.
+
+This file records notable user-visible changes to proofread and
+proofread-popup.  For detailed development history, see the Git log.
+
+
+* Changes in proofread since 0.1.0
+
+** proofread
+
+---
+*** New local LanguageTool backend.
+The new backend sends asynchronous HTTP requests to a LanguageTool v2
+server.  It supports safe UTF-16 offset conversion, configurable language
+and rule selection, request timeouts, and optional management of a
+session-local LanguageTool server.
+
+LanguageTool remains an optional runtime dependency used only by
+LanguageTool backend bindings.
+
+---
+*** New backend registry.
+Backends are now registered through a backend registry.  The registry
+supports lazy loading, backend-specific cache identities, and
+backend-specific request cancellation.
+
+---
+*** Package sources have been reorganized.
+The proofread package sources now live under "lisp/proofread/".  The
+implementation is split into "proofread.el", "proofread-llm.el", and
+"proofread-languagetool.el".
+
+The optional popup package now lives under "lisp/proofread-popup/".
+
+---
+*** Backend-private implementation details use feature namespaces.
+Backend-private functions and variables now live under their feature
+namespaces.  Shared callback scheduling and position conversion are
+centralized in the core library.
+
+---
+*** Tests are split by backend.
+Core, LLM, and LanguageTool tests are now independent suites.  Backend
+test symbols are aligned with their feature namespaces.
+
+---
+*** The core library no longer loads GNU ELPA llm eagerly.
+The core library does not load GNU ELPA "llm" until the LLM backend is
+selected or required explicitly.
+
+
+* Changes in proofread 0.1.0 (2026-07-13)
+
+Initial release.
+
+** proofread
+
+---
+*** Asynchronous, context-aware proofreading.
+Proofread provides asynchronous, context-aware proofreading through
+provider objects from the GNU ELPA "llm" package.
+
+---
+*** LLM JSON response handling.
+Proofread supports provider-enforced JSON schema responses and
+prompt-only JSON responses, with automatic selection based on provider
+capabilities.
+
+---
+*** Automatic and explicit checks.
+Proofread can check visible text automatically after idle time.  It also
+provides explicit commands for checking the text at point, the active
+region, the accessible buffer, or all visible ranges.
+
+---
+*** Mode-aware text selection.
+Proofread can select ordinary text, comments, or docstrings with
+mode-aware defaults.  It excludes URLs, email addresses, invisible text,
+configured faces, and configured text properties.
+
+---
+*** Sentence-aware request chunking.
+Proofread splits prose into bounded, sentence-aware requests with
+configurable surrounding context.
+
+---
+*** Overlay diagnostics and navigation.
+Diagnostics are displayed with overlays.  Commands are provided for
+navigation, detailed descriptions, and a tabulated buffer-wide diagnostic
+list.
+
+---
+*** Interactive and batch correction.
+Proofread can correct individual diagnostics or scoped groups of
+diagnostics.  Batch corrections are applied atomically as one undo step
+and roll back on failure.
+
+---
+*** Session-local ignore records.
+Proofread can ignore semantically identical diagnostics for the current
+Emacs session.
+
+---
+*** Caching, concurrency, and stale-result handling.
+Proofread caches diagnostics per buffer, queues requests behind a
+configurable concurrency limit, rejects stale results after edits, and
+preserves usable results when only part of a check fails.
+
+---
+*** Request lifecycle recording.
+Proofread can record and inspect complete request lifecycles on demand,
+including queued, active, completed, failed, and stale requests.
+
+** proofread-popup
+
+---
+*** Optional Posframe frontend.
+The proofread-popup package provides an optional Posframe frontend that
+displays the diagnostic at point in a child frame.
+
+---
+*** Automatic integration with proofread-mode.
+proofread-popup follows "proofread-mode" automatically while allowing
+popup display to be disabled per buffer.
+
+---
+*** Customizable popup appearance.
+Popup width, text appearance, and border appearance are customizable.
+
+
+Local variables:
+mode: outline
+paragraph-separate: "[ 	]*$"
+end:
