@@ -1123,6 +1123,12 @@ Use ERROR-SYMBOL and MESSAGE for each result."
     "[[:space:]]+" " " (or message "LanguageTool request failed"))
    500 nil nil t))
 
+(defun proofread-languagetool--bounded-response-body (body)
+  "Return a single-line, bounded copy of response BODY, or nil."
+  (when (stringp body)
+    (proofread-languagetool--bounded-message
+     (substring-no-properties body))))
+
 (defun proofread-languagetool--callback-status-error (status)
   "Return transport error from URL callback STATUS.
 Signal an error when STATUS is not a URL callback status plist."
@@ -1132,11 +1138,13 @@ Signal an error when STATUS is not a URL callback status plist."
    (t (error "Malformed URL callback status"))))
 
 (defun proofread-languagetool--http-response-status ()
-  "Return the current integer HTTP response status, or nil."
+  "Return the current HTTP status from 100 through 599, or nil."
   (let ((status
          (and (boundp 'url-http-response-status)
               (symbol-value 'url-http-response-status))))
-    (unless (or (null status) (integerp status))
+    (unless (or (null status)
+                (and (integerp status)
+                     (<= 100 status 599)))
       (error "Malformed HTTP response status"))
     status))
 
@@ -1148,6 +1156,30 @@ Signal an error when STATUS is not a URL callback status plist."
          :backend 'languagetool
          :url (plist-get handle :url)
          properties))
+
+(defun proofread-languagetool--deliver-http-error
+    (handle http-status body)
+  "Deliver an HTTP error for HANDLE with HTTP-STATUS and BODY."
+  (let* ((response
+          (proofread-languagetool--bounded-response-body body))
+         (message
+          (proofread-languagetool--bounded-message
+           (format "LanguageTool HTTP status %d: %s"
+                   http-status (or response ""))))
+         (result
+          (append
+           (proofread--backend-error-result
+            (plist-get handle :request)
+            'languagetool-http-error message)
+           (list :http-status http-status
+                 :response response))))
+    (proofread-languagetool--record-response
+     handle
+     :http-status http-status
+     :response response
+     :error 'languagetool-http-error
+     :message message)
+    (proofread-languagetool--deliver handle result)))
 
 (defun proofread-languagetool--request-timeout (handle)
   "Fail the LanguageTool request represented by HANDLE."
@@ -1179,7 +1211,7 @@ Signal an error when STATUS is not a URL callback status plist."
           (let ((status-result
                  (condition-case err
                      (list :ok
-		           (proofread-languagetool--callback-status-error
+                           (proofread-languagetool--callback-status-error
                             status))
                    (error
                     (list :error (error-message-string err))))))
@@ -1193,40 +1225,53 @@ Signal an error when STATUS is not a URL callback status plist."
                    :message message)
                   (proofread-languagetool--deliver-error
                    handle 'languagetool-invalid-response message))
-              (let ((transport-error (cadr status-result)))
-                (if transport-error
-                    (let ((http-status
-                           (ignore-errors
-                             (proofread-languagetool--http-response-status)))
-                          (body
-                           (ignore-errors
-                             (proofread-languagetool--http-body)))
-                          (message
-                           (proofread-languagetool--bounded-message
-                            (format "%S" transport-error))))
-                      (proofread-languagetool--record-response
-                       handle
-                       :http-status http-status
-                       :response body
-                       :error 'languagetool-transport-error
-                       :message message)
-                      (when
-                          (proofread-languagetool--current-session-p
-                           (plist-get handle :server-generation)
-                           (plist-get handle :session))
-                        (setq proofread-languagetool--server-state
-                              'unknown))
-                      (proofread-languagetool--deliver-error
-                       handle 'languagetool-transport-error message))
+              (let* ((transport-error (cadr status-result))
+                     (http-status
+                      (ignore-errors
+                        (proofread-languagetool--http-response-status))))
+                (cond
+                 ((and http-status (/= http-status 200))
+                  ;; `url-retrieve' reports non-2xx responses through
+                  ;; STATUS as errors, but an HTTP status still proves
+                  ;; that the configured server was reachable.
+                  (proofread-languagetool--deliver-http-error
+                   handle http-status
+                   (ignore-errors
+                     (proofread-languagetool--http-body))))
+                 ((and transport-error (null http-status))
+                  (let ((body
+                         (proofread-languagetool--bounded-response-body
+                          (ignore-errors
+                            (proofread-languagetool--http-body))))
+                        (message
+                         (proofread-languagetool--bounded-message
+                          (format "%S" transport-error))))
+                    (proofread-languagetool--record-response
+                     handle
+                     :http-status nil
+                     :response body
+                     :error 'languagetool-transport-error
+                     :message message)
+                    (when
+                        (proofread-languagetool--current-session-p
+                         (plist-get handle :server-generation)
+                         (plist-get handle :session))
+                      (setq proofread-languagetool--server-state
+                            'unknown))
+                    (proofread-languagetool--deliver-error
+                     handle 'languagetool-transport-error message)))
+                 (t
                   (let ((decoded
                          (condition-case err
-                             (list
-                              :ok
-                              (proofread-languagetool--http-response-status)
-                              (proofread-languagetool--http-body))
+                             (let ((response-status
+                                    (proofread-languagetool--http-response-status)))
+                               (unless response-status
+                                 (error "Missing HTTP response status"))
+                               (list :ok response-status
+                                     (proofread-languagetool--http-body)))
                            (error
                             (list :error
-			          (error-message-string err))))))
+                                  (error-message-string err))))))
                     (if (eq (car decoded) :error)
                         (let ((message
                                (proofread-languagetool--bounded-message
@@ -1238,27 +1283,17 @@ Signal an error when STATUS is not a URL callback status plist."
                           (proofread-languagetool--deliver-error
                            handle 'languagetool-invalid-response
                            message))
-                      (let* ((http-status (nth 1 decoded))
-                             (body (nth 2 decoded))
-                             (response-error
-                              (unless (eq http-status 200)
-                                'languagetool-http-error))
-                             (message
-                              (and response-error
-                                   (proofread-languagetool--bounded-message
-                                    (format
-                                     "LanguageTool HTTP status %s: %s"
-                                     (or http-status "unknown")
-                                     body)))))
-                        (proofread-languagetool--record-response
-                         handle
-                         :http-status http-status
-                         :response body
-                         :error response-error
-                         :message message)
-                        (if response-error
-                            (proofread-languagetool--deliver-error
-                             handle response-error message)
+                      (let ((response-status (nth 1 decoded))
+                            (body (nth 2 decoded)))
+                        (if (/= response-status 200)
+                            (proofread-languagetool--deliver-http-error
+                             handle response-status body)
+                          (proofread-languagetool--record-response
+                           handle
+                           :http-status response-status
+                           :response body
+                           :error nil
+                           :message nil)
                           (condition-case err
                               (proofread-languagetool--deliver
                                handle
@@ -1272,7 +1307,8 @@ Signal an error when STATUS is not a URL callback status plist."
                              (proofread-languagetool--deliver-error
                               handle
                               'languagetool-invalid-response
-                              (error-message-string err)))))))))))))
+                              (proofread-languagetool--bounded-message
+                               (error-message-string err)))))))))))))))
       (proofread-languagetool--kill-url-buffer buffer))))
 
 (defun proofread-languagetool--submit (handle)

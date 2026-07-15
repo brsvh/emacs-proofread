@@ -861,6 +861,151 @@ Reject context-only and target-crossing matches."
                             "Backend request failed")))))))))
 
 (ert-deftest
+    proofread-languagetool-test-http-callback-errors-retain-response ()
+  "HTTP callback errors retain bounded response details.
+They leave a reachable server ready without scheduling a probe."
+  (dolist (http-status '( 400 500))
+    (proofread-languagetool-test--with-state
+     (with-temp-buffer
+       (let* ((proofread-languagetool--server-state 'ready)
+              (proofread-languagetool--server-session
+               (proofread-languagetool--server-session-snapshot))
+              (long-body-p (= http-status 500))
+              (body
+               (if long-body-p
+                   (concat "Internal\nserver\tfailure "
+                           (make-string 600 ?x)
+                           " tail-marker")
+                 "Bad request: unsupported language"))
+              call events handle result response-buffer
+              (probes 0))
+         (cl-letf
+             (((symbol-function 'url-retrieve)
+               (lambda (_url callback arguments &rest _ignored)
+                 (let ((buffer
+                        (generate-new-buffer
+                         " *proofread-lt-http-callback-error*")))
+                   (setq call (list :callback callback
+                                    :arguments arguments
+                                    :buffer buffer))
+                   buffer)))
+              ((symbol-function
+                'proofread-languagetool--schedule-probe)
+               (lambda (&rest _ignored) (cl-incf probes))))
+           (let ((proofread-request-log-hook
+                  (list (lambda (event) (push event events)))))
+             (setq handle
+                   (proofread-languagetool--check
+                    (proofread-languagetool-test--request)
+                    (lambda (value) (setq result value))))
+             (setq response-buffer (plist-get call :buffer))
+             (proofread-languagetool-test--complete-call
+              call http-status body
+              `( :error (error http ,http-status)))
+             (should (eq (plist-get result :status) 'error))
+             (should (eq (plist-get result :error)
+                         'languagetool-http-error))
+             (should (= (plist-get result :http-status)
+                        http-status))
+             (let ((response (plist-get result :response))
+                   (message (plist-get result :message)))
+               (should (stringp response))
+               (should (stringp message))
+               (should (<= (string-width response) 500))
+               (should (<= (string-width message) 500))
+               (should
+                (string-prefix-p
+                 (format "LanguageTool HTTP status %d: "
+                         http-status)
+                 message))
+               (if long-body-p
+                   (progn
+                     (should
+                      (string-prefix-p
+                       "Internal server failure " response))
+                     (should-not (string-match-p "[\n\t]" response))
+                     (should-not
+                      (string-match-p "tail-marker" response))
+                     (should-not
+                      (string-match-p "tail-marker" message)))
+                 (should (equal response body))
+                 (should
+                  (equal message
+                         (format
+                          "LanguageTool HTTP status %d: %s"
+                          http-status body)))))
+             (should (eq proofread-languagetool--server-state
+                         'ready))
+             (should (= probes 0))
+             (should (plist-get handle :delivered))
+             (should-not (buffer-live-p response-buffer))
+             (let* ((response-event
+                     (cl-find-if
+                      (lambda (event)
+                        (eq (plist-get event :type)
+                            'backend-response))
+                      events))
+                    (result-event
+                     (cl-find-if
+                      (lambda (event)
+                        (eq (plist-get event :type)
+                            'backend-result))
+                      events))
+                    (logged-result
+                     (plist-get result-event :result)))
+               (should (= (plist-get response-event :http-status)
+                          http-status))
+               (should (eq (plist-get response-event :error)
+                           'languagetool-http-error))
+               (should
+                (equal (plist-get response-event :response)
+                       (plist-get result :response)))
+               (should
+                (equal (plist-get response-event :message)
+                       "Backend request failed"))
+               (should (eq (plist-get logged-result :status) 'error))
+               (should (eq (plist-get logged-result :error)
+                           'languagetool-http-error))
+               (should
+                (equal (plist-get logged-result :message)
+                       "Backend request failed"))))))))))
+
+(ert-deftest
+    proofread-languagetool-test-invalid-http-status-is-transport-error ()
+  "Callback errors with invalid HTTP statuses are transport errors."
+  (dolist (http-status '( 0 600))
+    (proofread-languagetool-test--with-state
+     (with-temp-buffer
+       (let ((proofread-languagetool--server-state 'ready)
+             (proofread-languagetool--server-session
+              (proofread-languagetool--server-session-snapshot))
+             call result response-buffer)
+         (cl-letf
+             (((symbol-function 'url-retrieve)
+               (lambda (_url callback arguments &rest _ignored)
+                 (let ((buffer
+                        (generate-new-buffer
+                         " *proofread-lt-invalid-http-status*")))
+                   (setq call (list :callback callback
+                                    :arguments arguments
+                                    :buffer buffer))
+                   buffer))))
+           (proofread-languagetool--check
+            (proofread-languagetool-test--request)
+            (lambda (value) (setq result value)))
+           (setq response-buffer (plist-get call :buffer))
+           (proofread-languagetool-test--complete-call
+            call http-status "Unusable response status"
+            `( :error (error http ,http-status)))
+           (should (eq (plist-get result :status) 'error))
+           (should (eq (plist-get result :error)
+                       'languagetool-transport-error))
+           (should-not (plist-member result :http-status))
+           (should (eq proofread-languagetool--server-state
+                       'unknown))
+           (should-not (buffer-live-p response-buffer))))))))
+
+(ert-deftest
     proofread-languagetool-test-request-timeout-cleans-buffer ()
   "A current timeout invalidates readiness.
 A stale timeout leaves readiness unchanged."
@@ -1825,6 +1970,74 @@ The failure does not escape or leak state."
            (should (= callbacks 1))))))))
 
 (ert-deftest
+    proofread-languagetool-test-malformed-http-200-is-invalid-response ()
+  "Malformed JSON in an HTTP 200 response is invalid response data."
+  (proofread-languagetool-test--with-state
+   (with-temp-buffer
+     (let ((proofread-languagetool--server-state 'ready)
+           (proofread-languagetool--server-session
+            (proofread-languagetool--server-session-snapshot))
+           (body "{\"matches\": [")
+           call events handle result response-buffer
+           (probes 0))
+       (cl-letf
+           (((symbol-function 'url-retrieve)
+             (lambda (_url callback arguments &rest _ignored)
+               (let ((buffer
+                      (generate-new-buffer
+                       " *proofread-lt-malformed-http-200*")))
+                 (setq call (list :callback callback
+                                  :arguments arguments
+                                  :buffer buffer))
+                 buffer)))
+            ((symbol-function
+              'proofread-languagetool--schedule-probe)
+             (lambda (&rest _ignored) (cl-incf probes))))
+         (let ((proofread-request-log-hook
+                (list (lambda (event) (push event events)))))
+           (setq handle
+                 (proofread-languagetool--check
+                  (proofread-languagetool-test--request)
+                  (lambda (value) (setq result value))))
+           (setq response-buffer (plist-get call :buffer))
+           (proofread-languagetool-test--complete-call
+            call 200 body)
+           (should (eq (plist-get result :status) 'error))
+           (should (eq (plist-get result :error)
+                       'languagetool-invalid-response))
+           (should (stringp (plist-get result :message)))
+           (should-not
+            (string-empty-p (plist-get result :message)))
+           (should (eq proofread-languagetool--server-state 'ready))
+           (should (= probes 0))
+           (should (plist-get handle :delivered))
+           (should-not (buffer-live-p response-buffer))
+           (let* ((response-event
+                   (cl-find-if
+                    (lambda (event)
+                      (eq (plist-get event :type)
+                          'backend-response))
+                    events))
+                  (result-event
+                   (cl-find-if
+                    (lambda (event)
+                      (eq (plist-get event :type)
+                          'backend-result))
+                    events))
+                  (logged-result
+                   (plist-get result-event :result)))
+             (should (= (plist-get response-event :http-status)
+                        200))
+             (should (equal (plist-get response-event :response)
+                            body))
+             (should (eq (plist-get logged-result :status) 'error))
+             (should (eq (plist-get logged-result :error)
+                         'languagetool-invalid-response))
+             (should
+              (equal (plist-get logged-result :message)
+                     "Backend request failed")))))))))
+
+(ert-deftest
     proofread-languagetool-test-url-rejects-secrets-and-controls ()
   "Unsafe URLs are rejected without exposing them through identity."
   (dolist (url
@@ -1859,7 +2072,8 @@ The reprobe never overwrites the process."
             (proofread-languagetool--server-session session)
             (proofread-languagetool--server-process 'owned-process)
             (proofread-languagetool--server-process-session session)
-            calls first-result second-result make-count)
+            calls events first-result second-result make-count
+            first-buffer)
        (cl-letf
            (((symbol-function 'process-live-p)
              (lambda (process) (eq process 'owned-process)))
@@ -1881,15 +2095,55 @@ The reprobe never overwrites the process."
                                            :method
                                            url-request-method))))
                  buffer))))
-         (proofread-languagetool--check
-          (proofread-languagetool-test--request)
-          (lambda (value) (setq first-result value)))
-         (with-current-buffer (plist-get (car calls) :buffer)
-           (apply (plist-get (car calls) :callback)
-                  (cons '( :error (error connection-refused))
-                        (plist-get (car calls) :arguments))))
+         (let ((proofread-request-log-hook
+                (list (lambda (event) (push event events)))))
+           (proofread-languagetool--check
+            (proofread-languagetool-test--request)
+            (lambda (value) (setq first-result value)))
+           (setq first-buffer (plist-get (car calls) :buffer))
+           (with-current-buffer first-buffer
+             (apply
+              (plist-get (car calls) :callback)
+              (cons
+               '( :error
+                  (error connection-failed
+                         "failed with code 111\n"
+                         :host "127.0.0.1"
+                         :service 8081))
+               (plist-get (car calls) :arguments)))))
          (should (eq (plist-get first-result :error)
                      'languagetool-transport-error))
+         (should-not (plist-member first-result :http-status))
+         (should-not (plist-member first-result :response))
+         (should (string-match-p
+                  "connection-failed"
+                  (plist-get first-result :message)))
+         (should (<= (string-width
+                      (plist-get first-result :message))
+                     500))
+         (should-not (buffer-live-p first-buffer))
+         (let* ((response-event
+                 (cl-find-if
+                  (lambda (event)
+                    (eq (plist-get event :type)
+                        'backend-response))
+                  events))
+                (result-event
+                 (cl-find-if
+                  (lambda (event)
+                    (eq (plist-get event :type)
+                        'backend-result))
+                  events))
+                (logged-result (plist-get result-event :result)))
+           (should-not (plist-get response-event :http-status))
+           (should-not (plist-get response-event :response))
+           (should (eq (plist-get response-event :error)
+                       'languagetool-transport-error))
+           (should
+            (equal (plist-get response-event :message)
+                   "Backend request failed"))
+           (should (eq (plist-get logged-result :error)
+                       'languagetool-transport-error)))
          (should (eq proofread-languagetool--server-state 'unknown))
          (should (eq proofread-languagetool--server-process
                      'owned-process))

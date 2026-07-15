@@ -87,6 +87,14 @@ key is present, including nil.  A timeout cancels provider work and releases
 the core scheduler slot.  Timeout settings affect liveness, not cache
 compatibility.
 
+---
+*** LanguageTool distinguishes HTTP responses from transport failures.
+Non-200 responses with a valid HTTP status now report a
+'languagetool-http-error' and retain the status and bounded response body in
+the error details.  Such responses keep a reachable server ready.
+'languagetool-transport-error' is reserved for failures without a valid HTTP
+response; malformed successful responses remain invalid-response errors.
+
 ** User interface
 
 ---
