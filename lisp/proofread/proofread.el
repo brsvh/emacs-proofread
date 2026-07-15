@@ -973,6 +973,25 @@ The returned plist contains the keys in `proofread--diagnostic-keys'."
             (list key (plist-get properties key)))
           proofread--diagnostic-keys))
 
+(defun proofread--diagnostic-with-request-provenance
+    (request diagnostic)
+  "Return DIAGNOSTIC annotated with binding provenance from REQUEST."
+  (let ((diagnostic (copy-sequence diagnostic)))
+    (dolist (key '( :profile :binding-name :binding-owner))
+      (setq diagnostic
+            (plist-put
+             diagnostic key
+             (proofread--snapshot-value (plist-get request key)))))
+    diagnostic))
+
+(defun proofread--diagnostics-with-request-provenance
+    (request diagnostics)
+  "Return DIAGNOSTICS annotated with provenance from REQUEST."
+  (mapcar (lambda (diagnostic)
+            (proofread--diagnostic-with-request-provenance
+             request diagnostic))
+          diagnostics))
+
 (defun proofread--position-integer (position)
   "Return integer POSITION, or nil for a non-buffer position."
   (cond
@@ -2478,7 +2497,9 @@ bounds."
        (equal (plist-get left :end) (plist-get right :end))
        (equal (plist-get left :text) (plist-get right :text))
        (equal (plist-get left :kind) (plist-get right :kind))
-       (equal (plist-get left :message) (plist-get right :message))))
+       (equal (plist-get left :message) (plist-get right :message))
+       (equal (plist-get left :binding-owner)
+              (plist-get right :binding-owner))))
 
 (defun proofread--diagnostic-member-p (diagnostic diagnostics)
   "Return non-nil when DIAGNOSTIC is already in DIAGNOSTICS."
@@ -3313,7 +3334,10 @@ When BACKEND is nil, use the selected `proofread-backend'."
   "Return cache entry for REQUEST and accepted DIAGNOSTICS."
   (list :text (plist-get request :text)
         :diagnostics
-        (proofread--diagnostics-to-relative diagnostics request)))
+        (proofread--diagnostics-to-relative
+         (proofread--diagnostics-with-request-provenance
+          request diagnostics)
+         request)))
 
 (defun proofread--cache-read-request (request)
   "Return cache entry matching REQUEST in the current buffer."
@@ -3337,9 +3361,11 @@ When BACKEND is nil, use the selected `proofread-backend'."
                  :source 'cache
                  :request request
                  :diagnostics
-                 (proofread--diagnostics-to-absolute
-                  (plist-get entry :diagnostics)
-                  request))))
+                 (proofread--diagnostics-with-request-provenance
+                  request
+                  (proofread--diagnostics-to-absolute
+                   (plist-get entry :diagnostics)
+                   request)))))
       (proofread--record-request-event
        request 'backend-result
        :backend (plist-get request :backend)
@@ -3369,28 +3395,48 @@ When BACKEND is nil, use the selected `proofread-backend'."
       (cons beg end))))
 
 (defun proofread--diagnostic-replaced-by-request-p
-    (diagnostic request-range)
-  "Return non-nil if DIAGNOSTIC is replaced by REQUEST-RANGE."
+    (diagnostic request request-range)
+  "Return non-nil if DIAGNOSTIC is replaced by REQUEST."
   (let
       ((diagnostic-range
         (proofread--diagnostic-live-range diagnostic))
        (owner-range
         (proofread--diagnostic-request-range diagnostic)))
-    (or (equal owner-range request-range)
-        (and diagnostic-range
-             (if (= (car diagnostic-range) (cdr diagnostic-range))
-                 (and (< (car request-range) (car diagnostic-range))
-                      (< (car diagnostic-range) (cdr request-range)))
-               (proofread--ranges-intersect-p
-                (car request-range) (cdr request-range)
-                (car diagnostic-range) (cdr diagnostic-range)))))))
+    (and (proofread--diagnostic-owned-by-request-p diagnostic request)
+         (or (equal owner-range request-range)
+             (and diagnostic-range
+                  (if (= (car diagnostic-range) (cdr diagnostic-range))
+                      (and (< (car request-range)
+                              (car diagnostic-range))
+                           (< (car diagnostic-range)
+                              (cdr request-range)))
+                    (proofread--ranges-intersect-p
+                     (car request-range) (cdr request-range)
+                     (car diagnostic-range)
+                     (cdr diagnostic-range))))))))
 
-(defun proofread--diagnostics-replaced-by-request (request-range)
-  "Return diagnostics replaced by REQUEST-RANGE."
+(defun proofread--diagnostic-owned-by-request-p (diagnostic request)
+  "Return non-nil when REQUEST may replace DIAGNOSTIC.
+Diagnostics without binding provenance are legacy diagnostics.  They
+can be replaced by legacy requests or by requests that also have no
+binding owner."
+  (let ((owner (plist-get request :binding-owner))
+        (diagnostic-owner (plist-get diagnostic :binding-owner)))
+    (or (equal diagnostic-owner owner)
+        (and (null diagnostic-owner)
+             (or (null owner)
+                 (and (eq (plist-get request :profile)
+                          proofread--legacy-profile-name)
+                      (eq (plist-get request :binding-name)
+                          proofread--legacy-binding-name)))))))
+
+(defun proofread--diagnostics-replaced-by-request
+    (request request-range)
+  "Return diagnostics replaced by REQUEST over REQUEST-RANGE."
   (cl-remove-if-not
    (lambda (diagnostic)
      (proofread--diagnostic-replaced-by-request-p
-      diagnostic request-range))
+      diagnostic request request-range))
    proofread--diagnostics))
 
 (defun proofread--record-diagnostic-request-ranges
@@ -3428,7 +3474,7 @@ range."
       (let* ((request-range (cons beg end))
              (replaced
               (proofread--diagnostics-replaced-by-request
-               request-range)))
+               request request-range)))
         (proofread--invalidate-affected-diagnostics
          (delq nil
                (mapcar #'proofread--overlay-for-diagnostic replaced))
@@ -3466,7 +3512,9 @@ range."
                  (with-current-buffer buffer
                    (let
                        ((diagnostics
-                         (plist-get result :diagnostics)))
+                         (proofread--diagnostics-with-request-provenance
+                          request
+                          (plist-get result :diagnostics))))
                      (if (plist-get result :partial)
                          (proofread--merge-backend-diagnostics
                           request diagnostics)

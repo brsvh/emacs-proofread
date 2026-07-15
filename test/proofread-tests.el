@@ -91,6 +91,24 @@
   (setq proofread--diagnostics diagnostics)
   (mapcar #'proofread--create-overlay diagnostics))
 
+(defconst proofread-test--diagnostic-provenance-keys
+  '( :profile :binding-name :binding-owner)
+  "Diagnostic provenance keys added by the Proofread core.")
+
+(defun proofread-test--diagnostic-without-provenance
+    (diagnostic)
+  "Return DIAGNOSTIC without core provenance fields."
+  (let ((diagnostic (copy-sequence diagnostic)))
+    (dolist (key proofread-test--diagnostic-provenance-keys)
+      (cl-remf diagnostic key))
+    diagnostic))
+
+(defun proofread-test--diagnostics-without-provenance
+    (diagnostics)
+  "Return DIAGNOSTICS without core provenance fields."
+  (mapcar #'proofread-test--diagnostic-without-provenance
+          diagnostics))
+
 (defun proofread-test--chunk-texts (chunks)
   "Return the text payloads from CHUNKS."
   (mapcar (lambda (chunk)
@@ -2523,15 +2541,21 @@ This covers URLs, email, invisible text, faces, and properties."
                    (should (= (hash-table-count proofread--cache) 1))
                    (proofread-check-visible-range)
                    (should (= backend-calls 1))
-                   (should (equal proofread--diagnostics
-                                  (list diagnostic)))
+                   (should
+                    (equal
+                     (proofread-test--diagnostics-without-provenance
+                      proofread--diagnostics)
+                     (list diagnostic)))
                    (should (= (length proofread--overlays) 1))
                    (proofread-clear)
                    (setq proofread--diagnostics nil)
                    (proofread-check-visible-range)
                    (should (= backend-calls 1))
-                   (should (equal proofread--diagnostics
-                                  (list diagnostic)))
+                   (should
+                    (equal
+                     (proofread-test--diagnostics-without-provenance
+                      proofread--diagnostics)
+                     (list diagnostic)))
                    (should (= (length proofread--overlays) 1)))))))
         (kill-buffer buffer)))))
 
@@ -2559,7 +2583,10 @@ This covers URLs, email, invisible text, faces, and properties."
                    (proofread--backend-success-result
                     request (list diagnostic)))
                   'applied))
-      (should (equal proofread--diagnostics (list diagnostic)))
+      (should
+       (equal (proofread-test--diagnostics-without-provenance
+               proofread--diagnostics)
+              (list diagnostic)))
       (should (= (length proofread--overlays) 1))
       (should (eq (proofread--handle-backend-result
                    (proofread--backend-success-result request nil))
@@ -2606,16 +2633,20 @@ This covers URLs, email, invisible text, faces, and properties."
                    (funcall original-create-overlay diagnostic))))
         (should (eq (proofread--handle-backend-result partial)
                     'applied))
-        (should (equal proofread--diagnostics
-                       (list old later-range earlier-range)))
+        (should
+         (equal (proofread-test--diagnostics-without-provenance
+                 proofread--diagnostics)
+                (list old later-range earlier-range)))
         (should (= (length proofread--overlays) 3))
         (should (= created 2))
         (should (= changed 1))
         (should (= (hash-table-count proofread--cache) 0))
         (should (eq (proofread--handle-backend-result partial)
                     'applied))
-        (should (equal proofread--diagnostics
-                       (list old later-range earlier-range)))
+        (should
+         (equal (proofread-test--diagnostics-without-provenance
+                 proofread--diagnostics)
+                (list old later-range earlier-range)))
         (should (= (length proofread--overlays) 3))
         (should (= created 2))
         (should (= changed 1))))))
@@ -2690,8 +2721,10 @@ This covers URLs, email, invisible text, faces, and properties."
                                  (funcall (plist-get recorder
                                                      :requests)))
                                 '( " Beta")))
-                 (should (equal proofread--diagnostics
-                                (list cached-diagnostic)))
+                 (should
+                  (equal (proofread-test--diagnostics-without-provenance
+                          proofread--diagnostics)
+                         (list cached-diagnostic)))
                  (should (= (length proofread--overlays) 1))))))
         (kill-buffer buffer)))))
 
@@ -3019,6 +3052,198 @@ This covers URLs, email, invisible text, faces, and properties."
               (should (proofread--active-request-p new-first))
               (should (= (length proofread--active-requests)
                          2)))))))))
+
+(ert-deftest
+    proofread-test-profile-result-adds-diagnostic-provenance
+    ()
+  "Annotate accepted diagnostics with profile binding provenance."
+  (with-temp-buffer
+    (insert "helo")
+    (let ((proofread-profile 'multi)
+          (proofread-profiles
+           `((multi
+              :language "en-US"
+              :bindings
+              (( :name strict
+                 :backend ,proofread-test--backend))))))
+      (proofread-mode 1)
+      (let* ((profile (proofread--current-profile))
+             (binding (car (plist-get profile :bindings)))
+             (chunk
+              (car
+               (proofread-test--request-ready-chunks-for-ranges
+                (list (cons (point-min) (point-max))))))
+             (request
+              (proofread--make-backend-request
+               chunk proofread-test--backend binding profile))
+             (diagnostic
+              (proofread-test--diagnostic-for-range
+               1 5 "helo")))
+        (should (eq (proofread--handle-backend-result
+                     (proofread--backend-success-result
+                      request (list diagnostic)))
+                    'applied))
+        (should-not (plist-member diagnostic :profile))
+        (let ((live (car proofread--diagnostics)))
+          (should (equal (plist-get live :profile) 'multi))
+          (should (equal (plist-get live :binding-name) 'strict))
+          (should (equal (plist-get live :binding-owner)
+                         (plist-get request :binding-owner))))))))
+
+(ert-deftest
+    proofread-test-profile-result-replaces-only-same-binding
+    ()
+  "Do not let one binding's result remove another binding's diagnostics."
+  (with-temp-buffer
+    (insert "helo")
+    (let ((proofread-profile 'multi)
+          (proofread-profiles
+           `((multi
+              :language "en-US"
+              :bindings
+              (( :name first
+                 :backend ,proofread-test--backend)
+               ( :name second
+                 :backend ,proofread-test--backend))))))
+      (proofread-mode 1)
+      (let* ((profile (proofread--current-profile))
+             (bindings (plist-get profile :bindings))
+             (first-binding (car bindings))
+             (second-binding (cadr bindings))
+             (chunk
+              (car
+               (proofread-test--request-ready-chunks-for-ranges
+                (list (cons (point-min) (point-max))))))
+             (first-request
+              (proofread--make-backend-request
+               chunk proofread-test--backend first-binding profile))
+             (second-request
+              (proofread--make-backend-request
+               chunk proofread-test--backend second-binding profile))
+             (first-diagnostic
+              (proofread-test--diagnostic-with-suggestions
+               1 5 "helo" '( "hello")))
+             (second-diagnostic
+              (proofread-test--diagnostic-with-suggestions
+               1 5 "helo" '( "hullo"))))
+        (should (eq (proofread--handle-backend-result
+                     (proofread--backend-success-result
+                      second-request (list second-diagnostic)))
+                    'applied))
+        (should (eq (proofread--handle-backend-result
+                     (proofread--backend-success-result
+                      first-request (list first-diagnostic)))
+                    'applied))
+        (should
+         (equal (proofread-test--diagnostics-without-provenance
+                 proofread--diagnostics)
+                (list second-diagnostic first-diagnostic)))
+        (should
+         (equal (mapcar (lambda (diagnostic)
+                          (plist-get diagnostic :binding-name))
+                        proofread--diagnostics)
+                '( second first)))
+        (should (eq (proofread--handle-backend-result
+                     (proofread--backend-success-result
+                      first-request nil))
+                    'applied))
+        (should
+         (equal (proofread-test--diagnostics-without-provenance
+                 proofread--diagnostics)
+                (list second-diagnostic)))
+        (should (equal (plist-get (car proofread--diagnostics)
+                                  :binding-owner)
+                       (plist-get second-request :binding-owner)))))))
+
+(ert-deftest
+    proofread-test-profile-cache-hit-preserves-diagnostic-provenance
+    ()
+  "Keep binding provenance when diagnostics are served from cache."
+  (with-temp-buffer
+    (insert "helo")
+    (let ((proofread-profile 'multi)
+          (proofread-profiles
+           `((multi
+              :language "en-US"
+              :bindings
+              (( :name strict
+                 :backend ,proofread-test--backend))))))
+      (proofread-mode 1)
+      (let* ((profile (proofread--current-profile))
+             (binding (car (plist-get profile :bindings)))
+             (chunk
+              (car
+               (proofread-test--request-ready-chunks-for-ranges
+                (list (cons (point-min) (point-max))))))
+             (request
+              (proofread--make-backend-request
+               chunk proofread-test--backend binding profile))
+             (diagnostic
+              (proofread-test--diagnostic-for-range
+               1 5 "helo")))
+        (proofread--cache-write-request request (list diagnostic))
+        (let* ((entry (proofread--cache-read-request request))
+               (cached (car (plist-get entry :diagnostics))))
+          (should (equal (plist-get cached :binding-owner)
+                         (plist-get request :binding-owner)))
+          (should (eq (proofread--apply-cache-entry request entry)
+                      'applied))
+          (let ((live (car proofread--diagnostics)))
+            (should (equal (plist-get live :profile) 'multi))
+            (should (equal (plist-get live :binding-name) 'strict))
+            (should (equal (plist-get live :binding-owner)
+                           (plist-get request :binding-owner)))))))))
+
+(ert-deftest
+    proofread-test-profile-partial-results-keep-binding-duplicates
+    ()
+  "Do not merge identical internal diagnostics from different bindings."
+  (with-temp-buffer
+    (insert "helo")
+    (let ((proofread-profile 'multi)
+          (proofread-profiles
+           `((multi
+              :language "en-US"
+              :bindings
+              (( :name first
+                 :backend ,proofread-test--backend)
+               ( :name second
+                 :backend ,proofread-test--backend))))))
+      (proofread-mode 1)
+      (let* ((profile (proofread--current-profile))
+             (bindings (plist-get profile :bindings))
+             (chunk
+              (car
+               (proofread-test--request-ready-chunks-for-ranges
+                (list (cons (point-min) (point-max))))))
+             (first-request
+              (proofread--make-backend-request
+               chunk proofread-test--backend (car bindings)
+               profile))
+             (second-request
+              (proofread--make-backend-request
+               chunk proofread-test--backend (cadr bindings)
+               profile))
+             (diagnostic
+              (proofread-test--diagnostic-for-range
+               1 5 "helo")))
+        (should (eq (proofread--handle-backend-result
+                     (proofread--backend-partial-success-result
+                      first-request (list diagnostic)))
+                    'applied))
+        (should (eq (proofread--handle-backend-result
+                     (proofread--backend-partial-success-result
+                      second-request (list (copy-sequence diagnostic))))
+                    'applied))
+        (should
+         (equal (proofread-test--diagnostics-without-provenance
+                 proofread--diagnostics)
+                (list diagnostic diagnostic)))
+        (should
+         (equal (mapcar (lambda (live-diagnostic)
+                          (plist-get live-diagnostic :binding-name))
+                        proofread--diagnostics)
+                '( first second)))))))
 
 (ert-deftest
     proofread-test-profile-cache-key-distinguishes-binding-identity
@@ -3697,8 +3922,10 @@ This covers URLs, email, invisible text, faces, and properties."
                                  request (list diagnostic)))
                                'applied))
                    (should
-                    (equal proofread--diagnostics
-                           (list diagnostic)))
+                    (equal
+                     (proofread-test--diagnostics-without-provenance
+                      proofread--diagnostics)
+                     (list diagnostic)))
                    (should (= (length proofread--overlays) 1))
                    (should
                     (overlay-buffer (car proofread--overlays)))
@@ -7712,7 +7939,10 @@ This covers URLs, email, invisible text, faces, and properties."
                    (proofread--backend-success-result
                     older (list old-diagnostic)))
                   'stale))
-      (should (equal proofread--diagnostics (list new-diagnostic))))))
+      (should
+       (equal (proofread-test--diagnostics-without-provenance
+               proofread--diagnostics)
+              (list new-diagnostic))))))
 
 (ert-deftest proofread-test-cache-evicts-least-recently-used-entry ()
   "The buffer-local cache honors its least-recently-used size limit."
@@ -8727,11 +8957,21 @@ This covers URLs, email, invisible text, faces, and properties."
                      'applied))))
             (should (= (length proofread--diagnostics) 2))
             (let ((live-boundary
-                   (cl-find boundary-diagnostic proofread--diagnostics
-                            :test #'equal))
+                   (cl-find-if
+                    (lambda (diagnostic)
+                      (equal
+                       (proofread-test--diagnostic-without-provenance
+                        diagnostic)
+                       boundary-diagnostic))
+                    proofread--diagnostics))
                   (live-neighbor
-                   (cl-find neighbor-diagnostic proofread--diagnostics
-                            :test #'equal)))
+                   (cl-find-if
+                    (lambda (diagnostic)
+                      (equal
+                       (proofread-test--diagnostic-without-provenance
+                        diagnostic)
+                       neighbor-diagnostic))
+                    proofread--diagnostics)))
               (should live-boundary)
               (should live-neighbor)
               (should (proofread--overlay-for-diagnostic
@@ -8746,8 +8986,11 @@ This covers URLs, email, invisible text, faces, and properties."
               (should-not (memq live-boundary proofread--diagnostics))
               (should-not (proofread--overlay-for-diagnostic
                            live-boundary))
-              (should (equal proofread--diagnostics
-                             (list neighbor-diagnostic)))
+              (should
+               (equal
+                (proofread-test--diagnostics-without-provenance
+                 proofread--diagnostics)
+                (list neighbor-diagnostic)))
               (should (proofread--overlay-for-diagnostic
                        live-neighbor)))))))))
 
