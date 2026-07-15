@@ -533,7 +533,7 @@ SOURCE may be a backend request or a normalized profile binding."
              (proofread-languagetool--command-snapshot)
            (error proofread-languagetool-command))))
     (list :fingerprint
-      (secure-hash 'sha256 (prin1-to-string snapshot)))))
+          (secure-hash 'sha256 (prin1-to-string snapshot)))))
 
 (defun proofread-languagetool--config-identity-for-file (file)
   "Return non-secret identity information for config FILE."
@@ -567,10 +567,10 @@ SOURCE may be a backend request or a normalized profile binding."
           :startup-timeout startup-timeout
           :managed-identity
           (list :server-config
-	    (proofread-languagetool--config-identity-for-file
-	     config-file)
-	    :command command
-	    :startup-timeout startup-timeout))))
+	        (proofread-languagetool--config-identity-for-file
+	         config-file)
+	        :command command
+	        :startup-timeout startup-timeout))))
 
 (defun proofread-languagetool--reject-local-session-options
     (&optional buffer managed)
@@ -682,8 +682,8 @@ startup even when automatic startup is disabled."
           (proofread-languagetool--source-options source)
           :language)
      (list :language
-       (proofread-languagetool--safe-language
-        (proofread-languagetool--option source :language nil))))
+           (proofread-languagetool--safe-language
+            (proofread-languagetool--option source :language nil))))
    (list :level (proofread-languagetool--effective-level source)
          :preferred-variants
          (proofread-languagetool--safe-preferred-variants
@@ -946,11 +946,11 @@ does not stay wholly inside the target."
        (cons (- start (plist-get request-data :target-beg))
              (- end (plist-get request-data :target-beg)))
        (list :kind
-         (proofread-languagetool--diagnostic-kind issue-type)
-         :message message
-         :suggestions
-         (proofread-languagetool--replacement-values match)
-         :source 'languagetool)))))
+             (proofread-languagetool--diagnostic-kind issue-type)
+             :message message
+             :suggestions
+             (proofread-languagetool--replacement-values match)
+             :source 'languagetool)))))
 
 (defun proofread-languagetool--parse-response
     (request request-data response)
@@ -1178,8 +1178,8 @@ Signal an error when STATUS is not a URL callback status plist."
           (let ((status-result
                  (condition-case err
                      (list :ok
-		       (proofread-languagetool--callback-status-error
-                        status))
+		           (proofread-languagetool--callback-status-error
+                            status))
                    (error
                     (list :error (error-message-string err))))))
             (if (eq (car status-result) :error)
@@ -1225,7 +1225,7 @@ Signal an error when STATUS is not a URL callback status plist."
                               (proofread-languagetool--http-body))
                            (error
                             (list :error
-			      (error-message-string err))))))
+			          (error-message-string err))))))
                     (if (eq (car decoded) :error)
                         (let ((message
                                (proofread-languagetool--bounded-message
