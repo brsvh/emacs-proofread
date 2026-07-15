@@ -79,6 +79,14 @@ Automatically generated identities now differ across loads of
 cache entries.  Explicit ':provider-identity' values remain stable for
 intentional cache reuse.
 
+---
+*** LLM requests now have a Proofread-owned timeout watchdog.
+The new option 'proofread-llm-request-timeout' defaults to 120 seconds; nil
+disables it.  A checker-local ':request-timeout' takes precedence whenever the
+key is present, including nil.  A timeout cancels provider work and releases
+the core scheduler slot.  Timeout settings affect liveness, not cache
+compatibility.
+
 ** User interface
 
 ---

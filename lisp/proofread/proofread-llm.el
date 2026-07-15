@@ -38,6 +38,18 @@
 
 ;;;; Options
 
+(defun proofread-llm--validate-request-timeout (value)
+  "Return request timeout VALUE, or signal an error when invalid."
+  (unless (or (null value)
+              (and (numberp value) (> value 0)))
+    (error "Proofread LLM request timeout must be nil or a positive number"))
+  value)
+
+(defun proofread-llm--set-request-timeout-option (symbol value)
+  "Set SYMBOL to request timeout VALUE as a Customize option."
+  (proofread-llm--validate-request-timeout value)
+  (set-default symbol value))
+
 (defcustom proofread-llm-provider nil
   "Default provider object used by the LLM backend.
 Users should configure this with a provider constructor from the GNU
@@ -74,6 +86,18 @@ Additional passes ask only for problems not already reported.  A value
 of 1 uses a single LLM call."
   :type 'natnum
   :set #'proofread-set-positive-integer-option
+  :group 'proofread)
+
+(defcustom proofread-llm-request-timeout 120
+  "Seconds before Proofread cancels one LLM backend request.
+The timeout covers all diagnostic passes for that request.  A non-nil
+value must be a positive number; set it to nil to disable the
+Proofread-owned watchdog.  A checker-local `:request-timeout' option
+overrides this value for that checker."
+  :type '(choice
+          (const :tag "Disabled" nil)
+          (number :tag "Seconds"))
+  :set #'proofread-llm--set-request-timeout-option
   :group 'proofread)
 
 (defcustom proofread-llm-instructions-function nil
@@ -804,6 +828,12 @@ SOURCE may be a backend request or a normalized profile checker."
     source :diagnostic-passes
     proofread-llm-max-diagnostic-passes)))
 
+(defun proofread-llm--effective-request-timeout (source)
+  "Return the validated request timeout effective for SOURCE."
+  (proofread-llm--validate-request-timeout
+   (proofread-llm--option
+    source :request-timeout proofread-llm-request-timeout)))
+
 (defun proofread-llm--effective-instructions-function (source)
   "Return the extra-instructions function effective for SOURCE."
   (proofread-llm--option
@@ -908,21 +938,33 @@ capability fallback."
 
 ;;;; Request execution
 
-(defun proofread-llm--new-handle (request callback)
-  "Return and register an LLM backend handle for REQUEST and CALLBACK."
+(defun proofread-llm--new-handle
+    (request callback request-timeout)
+  "Return and register an LLM handle for REQUEST and CALLBACK.
+REQUEST-TIMEOUT is the snapshotted Proofread watchdog duration."
   (let ((handle (list :backend 'llm
                       :request request
                       :callback callback
+                      :request-timeout request-timeout
                       :requests nil
                       :timer nil
+                      :watchdog-timer nil
                       :delivered nil
                       :settled nil
                       :cancelled nil)))
     (push handle proofread-llm--live-handles)
     handle))
 
+(defun proofread-llm--cancel-watchdog (handle)
+  "Cancel and clear HANDLE's watchdog timer."
+  (let ((timer (plist-get handle :watchdog-timer)))
+    (setf (plist-get handle :watchdog-timer) nil)
+    (when (timerp timer)
+      (ignore-errors
+        (cancel-timer timer)))))
+
 (defun proofread-llm--cancel-handle-work (handle)
-  "Cancel and clear provider requests and the timer in HANDLE."
+  "Cancel and clear provider requests and timers in HANDLE."
   (let ((request-handles (plist-get handle :requests))
         (timer (plist-get handle :timer))
         (warning-minimum-level :error)
@@ -932,9 +974,62 @@ capability fallback."
     (when (timerp timer)
       (ignore-errors
         (cancel-timer timer)))
+    (proofread-llm--cancel-watchdog handle)
     (dolist (request-handle request-handles)
       (ignore-errors
         (llm-cancel-request request-handle)))))
+
+(defun proofread-llm--watchdog-expired (handle)
+  "Cancel and settle HANDLE after its request watchdog expires."
+  (unless (or (plist-get handle :cancelled)
+              (plist-get handle :delivered)
+              (plist-get handle :settled))
+    ;; Claim the terminal state before provider cancellation because
+    ;; cancellation may invoke provider callbacks synchronously.
+    (setf (plist-get handle :cancelled) t)
+    (setf (plist-get handle :delivered) t)
+    (setf (plist-get handle :settled) t)
+    (setq proofread-llm--live-handles
+          (delq handle proofread-llm--live-handles))
+    (proofread-llm--cancel-handle-work handle)
+    (let* ((request (plist-get handle :request))
+           (message "LLM request timed out")
+           (result
+            (proofread--backend-error-result
+             request 'llm-request-timeout message)))
+      (proofread--record-request-event
+       request 'backend-response
+       :backend 'llm
+       :error 'llm-request-timeout
+       :message message)
+      (proofread--record-request-event
+       request 'backend-result
+       :backend 'llm
+       :result result)
+      (when-let* ((callback (plist-get handle :callback)))
+        (funcall callback result)))))
+
+(defun proofread-llm--arm-watchdog (handle)
+  "Arm HANDLE's Proofread-owned request watchdog."
+  (when-let* ((timeout (plist-get handle :request-timeout)))
+    (let ((timer
+           (run-at-time
+            timeout nil
+            (lambda ()
+              ;; This closure may outlive the unloaded feature.  Do
+              ;; not call a library function before the inline guard.
+              (unless (or (plist-get handle :cancelled)
+                          (plist-get handle :delivered)
+                          (plist-get handle :settled))
+                (proofread-llm--watchdog-expired handle))))))
+      (if (or (plist-get handle :cancelled)
+              (plist-get handle :delivered)
+              (plist-get handle :settled))
+          (when (timerp timer)
+            (ignore-errors
+              (cancel-timer timer)))
+        (setf (plist-get handle :watchdog-timer) timer))))
+  handle)
 
 (defun proofread-llm--settle-handle (handle result)
   "Deliver RESULT through HANDLE at most once."
@@ -943,6 +1038,7 @@ capability fallback."
     (setf (plist-get handle :settled) t)
     (setf (plist-get handle :timer) nil)
     (setf (plist-get handle :requests) nil)
+    (proofread-llm--cancel-watchdog handle)
     (setq proofread-llm--live-handles
           (delq handle proofread-llm--live-handles))
     (when-let* ((callback (plist-get handle :callback)))
@@ -954,6 +1050,7 @@ capability fallback."
               (plist-get handle :delivered)
               (plist-get handle :settled))
     (setf (plist-get handle :delivered) t)
+    (proofread-llm--cancel-watchdog handle)
     (setf (plist-get handle :timer)
           (proofread--defer-backend-callback
            (lambda (deferred-result)
@@ -1055,65 +1152,70 @@ MAX-PASSES is the request-local diagnostic pass limit."
                       (proofread-llm--finish-or-continue
                        request callback #'submit max-passes pass
                        diagnostics candidate-issues repairs
-                       result handle))))
+                       result handle)))
+                  (start-provider (prompt)
+                    (let ((request-handle
+                           (llm-chat-async
+                            provider prompt
+                            (lambda (response)
+                              ;; Provider callbacks can outlive this
+                              ;; library.  Check HANDLE before calling
+                              ;; any library function, and check again
+                              ;; in case request logging unloads it.
+                              (unless (or pass-finished
+                                          (plist-get handle :cancelled)
+                                          (plist-get handle :settled))
+                                (let ((result
+                                       (proofread-llm--success-result
+                                        request response pass)))
+                                  (unless (or pass-finished
+                                              (plist-get handle :cancelled)
+                                              (plist-get handle :settled))
+                                    (finish result)))))
+                            (lambda (error &optional message &rest _)
+                              ;; Keep this guard inline for callbacks
+                              ;; invoked after the feature is unloaded.
+                              (unless (or pass-finished
+                                          (plist-get handle :cancelled)
+                                          (plist-get handle :settled))
+                                (let ((result
+                                       (proofread-llm--error-result
+                                        request error message pass)))
+                                  (unless (or pass-finished
+                                              (plist-get handle :cancelled)
+                                              (plist-get handle :settled))
+                                    (finish result))))))))
+                      ;; A synchronous provider callback may have settled
+                      ;; HANDLE before `llm-chat-async' returns its handle.
+                      (if (or (plist-get handle :cancelled)
+                              (plist-get handle :settled))
+                          (ignore-errors
+                            (llm-cancel-request request-handle))
+                        (push request-handle
+                              (plist-get handle :requests))))))
                (condition-case err
                    (let ((prompt
                           (proofread-llm--prompt
                            request strategy diagnostics)))
-                     (proofread--record-request-event
-                      request 'backend-request
-                      :backend 'llm
-                      :pass pass
-                      :max-passes max-passes
-                      :strategy strategy
-                      :prompt prompt
-                      :prompt-text
-                      (proofread-llm--request-log-prompt-text
-                       prompt)
-                      :schema
-                      (when (llm-chat-prompt-response-format prompt)
-                        (proofread-llm--structured-response-schema-text))
-                      :reported-diagnostics diagnostics)
-                     (let ((request-handle
-                            (llm-chat-async
-                             provider prompt
-                             (lambda (response)
-                               ;; Provider callbacks can outlive this
-                               ;; library.  Check HANDLE before calling
-                               ;; any library function, and check again
-                               ;; in case request logging unloads it.
-                               (unless (or pass-finished
-                                           (plist-get handle :cancelled)
-                                           (plist-get handle :settled))
-                                 (let ((result
-                                        (proofread-llm--success-result
-                                         request response pass)))
-                                   (unless
-                                       (or pass-finished
-                                           (plist-get handle :cancelled)
-                                           (plist-get handle :settled))
-                                     (finish result)))))
-                             (lambda
-                               (error &optional message &rest _)
-                               ;; Keep this guard inline for callbacks
-                               ;; invoked after the feature is unloaded.
-                               (unless (or pass-finished
-                                           (plist-get handle :cancelled)
-                                           (plist-get handle :settled))
-                                 (let ((result
-                                        (proofread-llm--error-result
-                                         request error message pass)))
-                                   (unless
-                                       (or pass-finished
-                                           (plist-get handle :cancelled)
-                                           (plist-get handle :settled))
-                                     (finish result))))))))
-                       (if (or (plist-get handle :cancelled)
-                               (plist-get handle :settled))
-                           (ignore-errors
-                             (llm-cancel-request request-handle))
-                         (push request-handle
-                               (plist-get handle :requests)))))
+                     (unless (or (plist-get handle :cancelled)
+                                 (plist-get handle :settled))
+                       (proofread--record-request-event
+                        request 'backend-request
+                        :backend 'llm
+                        :pass pass
+                        :max-passes max-passes
+                        :strategy strategy
+                        :prompt prompt
+                        :prompt-text
+                        (proofread-llm--request-log-prompt-text
+                         prompt)
+                        :schema
+                        (when (llm-chat-prompt-response-format prompt)
+                          (proofread-llm--structured-response-schema-text))
+                        :reported-diagnostics diagnostics)
+                       (unless (or (plist-get handle :cancelled)
+                                   (plist-get handle :settled))
+                         (start-provider prompt))))
                  (error
                   (unless (or pass-finished
                               (plist-get handle :cancelled)
@@ -1148,7 +1250,10 @@ MAX-PASSES is the request-local diagnostic pass limit."
                strategy
                (proofread-llm--effective-diagnostic-passes
                 request)))
-         (handle (proofread-llm--new-handle request callback)))
+         (request-timeout
+          (proofread-llm--effective-request-timeout request))
+         (handle (proofread-llm--new-handle
+                  request callback request-timeout)))
     (cond
      ((not provider)
       (proofread-llm--deliver-result
@@ -1163,8 +1268,23 @@ MAX-PASSES is the request-local diagnostic pass limit."
         request 'llm-structured-output-unavailable
         "The configured llm response strategy is unavailable")))
      (t
-      (proofread-llm--submit-passes
-       provider strategy max-passes request callback handle)))
+      (condition-case err
+          (progn
+            (proofread-llm--arm-watchdog handle)
+            (unless (or (plist-get handle :cancelled)
+                        (plist-get handle :settled))
+              (proofread-llm--submit-passes
+               provider strategy max-passes request callback handle)))
+        (error
+         (let ((result
+                (proofread--backend-error-result
+                 request 'llm-submit-error
+                 (error-message-string err))))
+           (proofread--record-request-event
+            request 'backend-result
+            :backend 'llm
+            :result result)
+           (proofread-llm--deliver-result handle result))))))
     handle))
 
 (defun proofread-llm--cancel-request-handle (handle)

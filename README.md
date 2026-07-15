@@ -164,7 +164,17 @@ identity that does not contain the key:
 the provider advertises that capability, and otherwise falls back to prompt-only
 JSON. If you provide `:instructions-function`, also provide a stable
 `:instructions-identity` so cache identity changes when your instructions
-change. For provider-specific setup details, see the upstream
+change.
+
+`proofread-llm-request-timeout` is a Proofread-owned request watchdog. It
+defaults to `120` seconds. Every non-`nil` value must be a positive number; set
+it to `nil` to disable the watchdog globally. A checker-local `:request-timeout`
+overrides the global value whenever that key is present, so an explicit `nil`
+disables the watchdog for that checker. The timeout controls request liveness
+only and is not part of cache compatibility; changing it does not invalidate
+otherwise compatible cached results.
+
+For provider-specific setup details, see the upstream
 [`llm.el` provider documentation](https://github.com/ahyatt/llm#setting-up-providers).
 
 #### `languagetool` backend configuration
@@ -505,6 +515,7 @@ Run `M-x customize-group RET proofread RET` to edit the core options:
 | `proofread-profile`                       | `nil`   | Select a named profile                                                            |
 | `proofread-llm-provider`                  | `nil`   | Default provider when an LLM checker omits `:provider`                            |
 | `proofread-llm-response-strategy`         | `auto`  | Default response strategy when an LLM checker omits `:response-strategy`          |
+| `proofread-llm-request-timeout`           | `120`   | Limit LLM request lifetime; `nil` disables the watchdog                           |
 | `proofread-llm-provider-identity`         | `nil`   | Default stable provider identity when an LLM checker omits `:provider-identity`   |
 | `proofread-llm-max-diagnostic-passes`     | `3`     | Default pass limit when an LLM checker omits `:diagnostic-passes`                 |
 | `proofread-llm-instructions-function`     | `nil`   | Default extra instructions when an LLM checker omits `:instructions-function`     |

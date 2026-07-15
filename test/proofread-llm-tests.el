@@ -114,10 +114,15 @@ When PROFILE is nil, use the current profile."
       (accept-process-output nil 0.01))
     result))
 
+(defun proofread-llm-test--invoke-timer-callback (timer)
+  "Invoke TIMER's callback even when TIMER has been cancelled."
+  (apply (timer--function timer) (timer--args timer)))
+
 (defun proofread-llm-test--assert-handle-shape (handle)
   "Assert that HANDLE has the canonical LLM backend shape."
   (should (eq (plist-get handle :backend) 'llm))
-  (dolist (key '( :requests :timer :delivered :cancelled :settled))
+  (dolist (key '( :request-timeout :watchdog-timer
+                  :requests :timer :delivered :cancelled :settled))
     (should (plist-member handle key))))
 
 (defun proofread-llm-test--capabilities (_provider)
@@ -216,6 +221,103 @@ When PROFILE is nil, use the current profile."
                 #'proofread-set-positive-integer-option))
     (should-error
      (funcall (get symbol 'custom-set) symbol 0))))
+
+(ert-deftest proofread-llm-test-request-timeout-configuration ()
+  "Validate global and checker-local LLM watchdog configuration."
+  (let ((symbol 'proofread-llm-request-timeout))
+    (should (= (default-value symbol) 120))
+    (should (functionp (get symbol 'custom-set)))
+    (dolist (invalid '(0 -1 "120"))
+      (should-error
+       (funcall (get symbol 'custom-set) symbol invalid))))
+  (let ((proofread-llm-request-timeout nil))
+    (should-not (proofread-llm--effective-request-timeout nil)))
+  (let ((proofread-llm-request-timeout 120))
+    (should (= (proofread-llm--effective-request-timeout nil)
+               120))
+    (should (= (proofread-llm--effective-request-timeout
+                '( :options ( :request-timeout 2.5)))
+               2.5))
+    (should-not
+     (proofread-llm--effective-request-timeout
+      '( :options ( :request-timeout nil))))
+    (dolist (invalid '(0 -0.5 invalid))
+      (should-error
+       (proofread-llm--effective-request-timeout
+        `( :options ( :request-timeout ,invalid))))))
+  (with-temp-buffer
+    (insert "helo")
+    (let* ((proofread-llm-provider proofread-llm-test--provider)
+           (proofread-llm-provider-identity
+            proofread-llm-test--provider-identity)
+           (proofread-llm-request-timeout nil)
+           (proofread-llm--live-handles nil)
+           (chunk (proofread-llm-test--whole-buffer-chunk))
+           (request (proofread--make-backend-request chunk 'llm))
+           handle)
+      (proofread-llm-test--with-capabilities
+       (cl-letf (((symbol-function 'llm-chat-async)
+                  (lambda (&rest _ignored)
+                    'proofread-llm-test-request)))
+         (setq handle
+               (proofread-llm--backend-check request #'ignore))
+         (should-not (plist-get handle :request-timeout))
+         (should-not (plist-get handle :watchdog-timer))
+         (proofread-llm--cancel-request-handle handle)
+         (should-not proofread-llm--live-handles))))))
+
+(ert-deftest proofread-llm-test-timeout-does-not-change-identity ()
+  "Keep backend and cache identity independent of watchdog timeout."
+  (with-temp-buffer
+    (insert "Alpha")
+    (proofread-mode 1)
+    (proofread-llm-test--with-profile nil
+                                      (let* ((proofread-llm-provider proofread-llm-test--provider)
+                                             (proofread-llm-provider-identity
+                                              proofread-llm-test--provider-identity)
+                                             (profile '( :name llm-test :language nil))
+                                             (first-checker
+                                              '( :profile llm-test
+                                                 :name local
+                                                 :checker-ordinal 0
+                                                 :backend llm
+                                                 :options ( :request-timeout 1)))
+                                             (second-checker
+                                              '( :profile llm-test
+                                                 :name local
+                                                 :checker-ordinal 0
+                                                 :backend llm
+                                                 :options ( :request-timeout nil)))
+                                             (chunk (proofread-llm-test--whole-buffer-chunk))
+                                             (diagnostic
+                                              (proofread-llm-test--diagnostic-for-range
+                                               1 6 "Alpha"))
+                                             first-request second-request)
+                                        (proofread-llm-test--with-capabilities
+                                         (let ((proofread-llm-request-timeout 20))
+                                           (setq first-request
+                                                 (proofread--make-backend-request
+                                                  chunk 'llm first-checker profile)))
+                                         (let ((proofread-llm-request-timeout nil))
+                                           (setq second-request
+                                                 (proofread--make-backend-request
+                                                  chunk 'llm second-checker profile))))
+                                        (should (= (proofread-llm--effective-request-timeout
+                                                    first-request)
+                                                   1))
+                                        (should-not
+                                         (proofread-llm--effective-request-timeout second-request))
+                                        (should
+                                         (equal (plist-get first-request :backend-identity)
+                                                (plist-get second-request :backend-identity)))
+                                        (should
+                                         (equal (plist-get first-request :checker-identity)
+                                                (plist-get second-request :checker-identity)))
+                                        (should (equal (plist-get first-request :cache-key)
+                                                       (plist-get second-request :cache-key)))
+                                        (proofread--cache-write-request
+                                         first-request (list diagnostic))
+                                        (should (proofread--cache-read-request second-request))))))
 
 (ert-deftest proofread-llm-test-backend-identity-is-cache-compatible
     ()
@@ -398,6 +500,82 @@ When PROFILE is nil, use the current profile."
     (should (equal (nreverse cancelled)
                    '( provider-request-a provider-request-b)))))
 
+(ert-deftest
+    proofread-llm-test-never-callback-times-out-and-releases-slot ()
+  "Timeout a silent provider and retire all request lifecycle state."
+  (with-temp-buffer
+    (insert "helo")
+    (setq-local proofread-auto-check nil)
+    (proofread-mode 1)
+    (let* ((proofread-max-concurrent-requests 1)
+           (proofread-llm-provider proofread-llm-test--provider)
+           (proofread-llm-provider-identity
+            proofread-llm-test--provider-identity)
+           (proofread-llm-max-diagnostic-passes 1)
+           (proofread-llm-request-timeout 0.01)
+           (proofread-llm--live-handles nil)
+           (chunk (proofread-llm-test--whole-buffer-chunk))
+           request handle provider-success provider-error result
+           cancelled
+           (callbacks 0))
+      (proofread-llm-test--with-capabilities
+       (setq request (proofread--make-backend-request chunk 'llm))
+       (cl-letf
+           (((symbol-function 'llm-chat-async)
+             (lambda (_provider _prompt success error
+                                &optional _multi-output)
+               (setq provider-success success)
+               (setq provider-error error)
+               'provider-request-a))
+            ((symbol-function 'llm-cancel-request)
+             (lambda (provider-handle)
+               (push provider-handle cancelled))))
+         (setq handle
+               (proofread--dispatch-backend-request
+                request
+                (lambda (value)
+                  (cl-incf callbacks)
+                  (setq result value))
+                'llm))
+         (push 'provider-request-b
+               (plist-get handle :requests))
+         (should (timerp (plist-get handle :watchdog-timer)))
+         (should (proofread--active-request-p request))
+         (should (proofread--request-work-pending-p request))
+         (should (= (proofread--active-request-slots) 0))
+         (should (proofread-llm-test--wait-for
+                  (lambda () result)))
+         (should (= callbacks 1))
+         (should (eq (plist-get result :status) 'error))
+         (should (eq (plist-get result :error)
+                     'llm-request-timeout))
+         (should (eq (plist-get result :request) request))
+         (should (plist-get handle :cancelled))
+         (should (plist-get handle :delivered))
+         (should (plist-get handle :settled))
+         (should-not (plist-get handle :watchdog-timer))
+         (should-not (plist-get handle :timer))
+         (should-not (plist-get handle :requests))
+         (should-not proofread-llm--live-handles)
+         (dolist (provider-handle
+                  '( provider-request-a provider-request-b))
+           (should (= (cl-count provider-handle cancelled) 1)))
+         (should-not (proofread--active-request-p request))
+         (should-not proofread--active-requests)
+         (should-not
+          (proofread--request-work-pending-p request))
+         (should (= (proofread--active-request-slots) 1))
+         (funcall provider-success
+                  (proofread-llm-test--response-content nil))
+         (funcall provider-error 'late-provider-error "Late error")
+         (proofread-llm--watchdog-expired handle)
+         (proofread-llm--cancel-request-handle handle)
+         (accept-process-output nil 0.02)
+         (should (= callbacks 1))
+         (dolist (provider-handle
+                  '( provider-request-a provider-request-b))
+           (should (= (cl-count provider-handle cancelled) 1))))))))
+
 (ert-deftest proofread-llm-test-success-settles-live-handle ()
   "Settle and forget a live handle after normal success delivery."
   (with-temp-buffer
@@ -406,9 +584,10 @@ When PROFILE is nil, use the current profile."
            (proofread-llm-provider-identity
             proofread-llm-test--provider-identity)
            (proofread-llm-max-diagnostic-passes 1)
+           (proofread-llm-request-timeout 60)
            (proofread-llm--live-handles nil)
            (chunk (proofread-llm-test--whole-buffer-chunk))
-           request handle provider-success provider-error result
+           request handle watchdog provider-success provider-error result
            (callbacks 0))
       (proofread-llm-test--with-capabilities
        (setq request (proofread--make-backend-request chunk 'llm))
@@ -428,14 +607,20 @@ When PROFILE is nil, use the current profile."
          (proofread-llm-test--assert-handle-shape handle)
          (should (memq handle proofread-llm--live-handles))
          (should-not (plist-get handle :settled))
+         (setq watchdog (plist-get handle :watchdog-timer))
+         (should (timerp watchdog))
          (should (functionp provider-success))
          (should (functionp provider-error))
          (funcall provider-success
                   (proofread-llm-test--response-content nil))
          (should (plist-get handle :delivered))
          (should-not (plist-get handle :settled))
+         (should-not (plist-get handle :watchdog-timer))
          (should (timerp (plist-get handle :timer)))
          (should (memq handle proofread-llm--live-handles))
+         (proofread-llm-test--invoke-timer-callback watchdog)
+         (should (= callbacks 0))
+         (should-not result)
          (should (proofread-llm-test--wait-for
                   (lambda () result)))
          (should (= callbacks 1))
@@ -448,6 +633,62 @@ When PROFILE is nil, use the current profile."
                   (proofread-llm-test--response-content nil))
          (should (= callbacks 1)))))))
 
+(ert-deftest proofread-llm-test-error-beats-late-watchdog ()
+  "Deliver one provider error when its cancelled watchdog runs late."
+  (with-temp-buffer
+    (insert "helo")
+    (let* ((proofread-llm-provider proofread-llm-test--provider)
+           (proofread-llm-provider-identity
+            proofread-llm-test--provider-identity)
+           (proofread-llm-max-diagnostic-passes 1)
+           (proofread-llm-request-timeout 60)
+           (proofread-llm--live-handles nil)
+           (chunk (proofread-llm-test--whole-buffer-chunk))
+           request handle watchdog provider-success provider-error result
+           (callbacks 0))
+      (proofread-llm-test--with-capabilities
+       (setq request (proofread--make-backend-request chunk 'llm))
+       (cl-letf
+           (((symbol-function 'llm-chat-async)
+             (lambda (_provider _prompt success error
+                                &optional _multi-output)
+               (setq provider-success success)
+               (setq provider-error error)
+               'proofread-llm-test-request)))
+         (setq handle
+               (proofread-llm--backend-check
+                request
+                (lambda (value)
+                  (cl-incf callbacks)
+                  (setq result value))))
+         (setq watchdog (plist-get handle :watchdog-timer))
+         (should (timerp watchdog))
+         (funcall provider-error
+                  'provider-failure "Provider failed")
+         (should (plist-get handle :delivered))
+         (should-not (plist-get handle :settled))
+         (should-not (plist-get handle :watchdog-timer))
+         (should (timerp (plist-get handle :timer)))
+         (proofread-llm-test--invoke-timer-callback watchdog)
+         (should (= callbacks 0))
+         (should-not result)
+         (should (proofread-llm-test--wait-for
+                  (lambda () result)))
+         (should (= callbacks 1))
+         (should (eq (plist-get result :status) 'error))
+         (should (eq (plist-get result :error) 'provider-failure))
+         (should (plist-get handle :settled))
+         (should-not (plist-get handle :watchdog-timer))
+         (should-not (plist-get handle :timer))
+         (should-not proofread-llm--live-handles)
+         (funcall provider-success
+                  (proofread-llm-test--response-content nil))
+         (funcall provider-error
+                  'late-provider-error "Late error")
+         (proofread-llm-test--invoke-timer-callback watchdog)
+         (proofread-llm--cancel-request-handle handle)
+         (should (= callbacks 1)))))))
+
 (ert-deftest
     proofread-llm-test-explicit-cancel-ignores-late-callbacks ()
   "Explicit cancellation settles once and ignores provider callbacks."
@@ -457,9 +698,10 @@ When PROFILE is nil, use the current profile."
            (proofread-llm-provider-identity
             proofread-llm-test--provider-identity)
            (proofread-llm-max-diagnostic-passes 1)
+           (proofread-llm-request-timeout 60)
            (proofread-llm--live-handles nil)
            (chunk (proofread-llm-test--whole-buffer-chunk))
-           request handle provider-success provider-error result
+           request handle watchdog provider-success provider-error result
            cancelled
            (callbacks 0))
       (proofread-llm-test--with-capabilities
@@ -481,15 +723,19 @@ When PROFILE is nil, use the current profile."
                   (cl-incf callbacks)
                   (setq result value))))
          (should (memq handle proofread-llm--live-handles))
+         (setq watchdog (plist-get handle :watchdog-timer))
+         (should (timerp watchdog))
          (proofread-llm--cancel-request-handle handle)
          (should (plist-get handle :cancelled))
          (should (plist-get handle :settled))
          (should-not (plist-get handle :delivered))
          (should-not (plist-get handle :requests))
          (should-not (plist-get handle :timer))
+         (should-not (plist-get handle :watchdog-timer))
          (should-not proofread-llm--live-handles)
          (should (equal cancelled
                         '( proofread-llm-test-request)))
+         (proofread-llm-test--invoke-timer-callback watchdog)
          (funcall provider-success
                   (proofread-llm-test--response-content nil))
          (funcall provider-error 'late-provider-error "Late error")
@@ -511,9 +757,10 @@ When PROFILE is nil, use the current profile."
            (proofread-llm-provider-identity
             proofread-llm-test--provider-identity)
            (proofread-llm-max-diagnostic-passes 1)
+           (proofread-llm-request-timeout 60)
            (proofread-llm--live-handles nil)
            (chunk (proofread-llm-test--whole-buffer-chunk))
-           request handle provider-success provider-error result
+           request handle watchdog provider-success provider-error result
            settled-result callback-saw-provider-cancel cancelled
            (callbacks 0))
       (unwind-protect
@@ -544,6 +791,8 @@ When PROFILE is nil, use the current profile."
              (should (proofread--request-work-pending-p request))
              (should (= (proofread--active-request-slots) 0))
              (should (memq handle proofread-llm--live-handles))
+             (setq watchdog (plist-get handle :watchdog-timer))
+             (should (timerp watchdog))
              (should (functionp provider-success))
              (should (functionp provider-error))
              (unload-feature 'proofread-llm t)
@@ -558,6 +807,7 @@ When PROFILE is nil, use the current profile."
              (should (plist-get handle :settled))
              (should-not (plist-get handle :requests))
              (should-not (plist-get handle :timer))
+             (should-not (plist-get handle :watchdog-timer))
              (should (equal cancelled
                             '( proofread-llm-test-request)))
              (should-not (proofread--active-request-p request))
@@ -568,6 +818,7 @@ When PROFILE is nil, use the current profile."
                          proofread--pending-request-keys)
                         0))
              (should (= (proofread--active-request-slots) 1))
+             (proofread-llm-test--invoke-timer-callback watchdog)
              (funcall provider-success
                       (proofread-llm-test--response-content nil))
              (funcall provider-error
@@ -576,6 +827,69 @@ When PROFILE is nil, use the current profile."
              (should (eq result settled-result))
              (should (equal cancelled
                             '( proofread-llm-test-request)))))
+        (ignore-errors
+          (unload-feature 'proofread-llm t))
+        (require 'proofread-llm))
+      (should (proofread--supported-backend-p 'llm))
+      (should-not proofread-llm--live-handles))))
+
+(ert-deftest
+    proofread-llm-test-log-hook-unload-skips-provider-submit ()
+  "Skip provider submission when request logging unloads the backend."
+  (with-temp-buffer
+    (insert "helo")
+    (let* ((proofread-llm-provider proofread-llm-test--provider)
+           (proofread-llm-provider-identity
+            proofread-llm-test--provider-identity)
+           (proofread-llm-max-diagnostic-passes 1)
+           (proofread-llm-request-timeout 60)
+           (proofread-llm--live-handles nil)
+           (chunk (proofread-llm-test--whole-buffer-chunk))
+           request handle watchdog result
+           (callbacks 0)
+           (provider-calls 0)
+           unloaded)
+      (unwind-protect
+          (proofread-llm-test--with-capabilities
+           (setq request
+                 (proofread--make-backend-request chunk 'llm))
+           (cl-letf
+               (((symbol-function 'llm-chat-async)
+                 (lambda (&rest _ignored)
+                   (cl-incf provider-calls)
+                   'unexpected-provider-request)))
+             (let ((proofread-request-log-hook
+                    (list
+                     (lambda (event)
+                       (when (and
+                              (not unloaded)
+                              (eq (plist-get event :type)
+                                  'backend-request))
+                         (setq unloaded t)
+                         (setq watchdog
+                               (plist-get
+                                (car proofread-llm--live-handles)
+                                :watchdog-timer))
+                         (unload-feature 'proofread-llm t))))))
+               (setq handle
+                     (proofread-llm--backend-check
+                      request
+                      (lambda (value)
+                        (cl-incf callbacks)
+                        (setq result value))))))
+           (should unloaded)
+           (should-not (featurep 'proofread-llm))
+           (should (= provider-calls 0))
+           (should (= callbacks 1))
+           (should (eq (plist-get result :error) 'llm-unloaded))
+           (should (timerp watchdog))
+           (should (plist-get handle :cancelled))
+           (should (plist-get handle :delivered))
+           (should (plist-get handle :settled))
+           (should-not (plist-get handle :watchdog-timer))
+           (proofread-llm-test--invoke-timer-callback watchdog)
+           (should (= provider-calls 0))
+           (should (= callbacks 1)))
         (ignore-errors
           (unload-feature 'proofread-llm t))
         (require 'proofread-llm))

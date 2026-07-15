@@ -144,7 +144,14 @@ key 的稳定 provider 标识：
 
 `proofread-llm-response-strategy` 的默认值是 `auto`：当 provider 声明支持 JSON 响应时使用 JSON
 Schema，否则回退到仅由提示词约束的 JSON。如果提供 `:instructions-function`，也应提供稳定的
-`:instructions-identity`，以便指令变化时缓存身份同步变化。更完整的 provider 配置请参考上游
+`:instructions-identity`，以便指令变化时缓存身份同步变化。
+
+`proofread-llm-request-timeout` 是由 Proofread 管理的请求 watchdog，默认值为 `120` 秒；将其设为
+`nil` 可在全局禁用 watchdog，所有非 `nil` 值都必须是正数。只要 checker 局部 `:options` 中存在
+`:request-timeout` 键，就会覆盖全局值，因此显式的 `nil` 会只为该 checker 禁用 watchdog。超时设置只控制请求的
+存活时间，不参与缓存兼容性；修改它不会使其他方面仍兼容的缓存结果失效。
+
+更完整的 provider 配置请参考上游
 [`llm.el` provider 文档](https://github.com/ahyatt/llm#setting-up-providers)。
 
 #### `languagetool` backend 的配置
@@ -435,6 +442,7 @@ https://github.com/user-attachments/assets/2dda228e-f85c-4500-aea0-549500628c6e
 | `proofread-profile`                       | `nil`  | 选择命名 profile                                               |
 | `proofread-llm-provider`                  | `nil`  | LLM checker 省略 `:provider` 时使用的默认提供程序              |
 | `proofread-llm-response-strategy`         | `auto` | LLM checker 省略 `:response-strategy` 时使用的默认响应策略     |
+| `proofread-llm-request-timeout`           | `120`  | 限制 LLM 请求的存活时间；`nil` 表示禁用 watchdog               |
 | `proofread-llm-provider-identity`         | `nil`  | LLM checker 省略 `:provider-identity` 时使用的默认稳定标识     |
 | `proofread-llm-max-diagnostic-passes`     | `3`    | LLM checker 省略 `:diagnostic-passes` 时使用的默认诊断轮数     |
 | `proofread-llm-instructions-function`     | `nil`  | LLM checker 省略 `:instructions-function` 时使用的默认附加说明 |
