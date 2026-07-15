@@ -39,7 +39,7 @@
 ;;;; Options
 
 (defcustom proofread-llm-provider nil
-  "Provider object used when `proofread-backend' is `llm'.
+  "Default provider object used by the LLM backend.
 Users should configure this with a provider constructor from the GNU
 ELPA `llm' package."
   :type 'sexp

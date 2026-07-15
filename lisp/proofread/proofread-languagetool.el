@@ -121,7 +121,8 @@ The value `picky' enables additional style rules."
 (defcustom proofread-languagetool-preferred-variants nil
   "Specify preferred variants for automatic language detection.
 Each value is a LanguageTool long language code such as `en-US' or
-`de-DE'.  Send these values only when `proofread-language' is nil."
+`de-DE'.  Send these values only when the effective LanguageTool
+language uses automatic detection."
   :type '(repeat string)
   :local t
   :group 'proofread-languagetool)

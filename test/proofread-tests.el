@@ -97,7 +97,7 @@
   (mapcar #'proofread--create-overlay diagnostics))
 
 (defconst proofread-test--diagnostic-provenance-keys
-  '( :profile :binding-name :binding-owner)
+  '( :language :profile :binding-name :binding-owner)
   "Diagnostic provenance keys added by the Proofread core.")
 
 (defun proofread-test--diagnostic-without-provenance
@@ -155,10 +155,12 @@
                 (equal (plist-get chunk :text) text))
               chunks))
 
-(defun proofread-test--request-ready-chunks-for-ranges (ranges)
-  "Return request-ready chunks from islands selected by RANGES."
+(defun proofread-test--request-ready-chunks-for-ranges
+    (ranges &optional language)
+  "Return request-ready chunks from islands selected by RANGES.
+LANGUAGE is the language hint snapshotted for the chunks."
   (proofread--request-ready-chunks-for-islands
-   (proofread--target-islands-for-ranges ranges)))
+   (proofread--target-islands-for-ranges ranges) language))
 
 (defun proofread-test--flush-request-log-refresh (source)
   "Refresh SOURCE's pending request listings immediately."
@@ -335,6 +337,16 @@ When PROFILE is nil, use the current profile."
              (proofread--backend-error-result
               request ,error ,message)))))
      ,@body))
+
+(defmacro proofread-test--with-legacy-options
+    (backend language &rest body)
+  "Run BODY with legacy BACKEND and LANGUAGE."
+  (declare (indent 2) (debug (form form body)))
+  `(with-suppressed-warnings
+       ((obsolete proofread-backend proofread-language))
+     (let ((proofread-backend ,backend)
+           (proofread-language ,language))
+       ,@body)))
 
 ;;;; Range and diagnostic tests
 
@@ -1449,24 +1461,23 @@ range; no available backend"))))))
             (setq-local proofread-auto-check nil)
             (proofread-mode 1)
             (let (dispatched)
-              (cl-letf (((symbol-function 'window-start)
-                         (lambda (&optional _window) (point-min)))
-                        ((symbol-function 'window-end)
-                         (lambda (&optional _window _update)
-                           (point-max)))
-                        ((symbol-function
-                          'proofread--supported-backend-p)
-                         (lambda () t))
-                        ((symbol-function
-                          'proofread--request-ready-chunks-for-islands)
-                         (lambda (_islands) '(( :text "Alpha"))))
-                        ((symbol-function
-                          'proofread--dispatch-request-ready-chunks)
-                         (lambda (chunks)
-                           (setq dispatched chunks)
-                           '( proofread-test-request))))
-                (proofread-check-visible-range)
-                (should (equal dispatched '(( :text "Alpha")))))))
+              (proofread-test--with-profile
+               (cl-letf (((symbol-function 'window-start)
+                          (lambda (&optional _window) (point-min)))
+                         ((symbol-function 'window-end)
+                          (lambda (&optional _window _update)
+                            (point-max)))
+                         ((symbol-function
+                           'proofread--request-ready-chunks-for-islands)
+                          (lambda (_islands &optional _language)
+                            '(( :text "Alpha"))))
+                         ((symbol-function
+                           'proofread--dispatch-profile-request-ready-chunks)
+                          (lambda (chunks _profile)
+                            (setq dispatched chunks)
+                            '( proofread-test-request))))
+                 (proofread-check-visible-range)
+                 (should (equal dispatched '(( :text "Alpha"))))))))
         (kill-buffer buffer)))))
 
 (ert-deftest
@@ -2095,16 +2106,15 @@ range; no available backend"))))))
                '( "Alpha " " Beta"))))))
 
 (ert-deftest
-    proofread-test-legacy-language-is-copied-to-request-ready-chunks
+    proofread-test-request-ready-chunks-copy-explicit-language
     ()
-  "Preserve legacy language metadata while preparing filtered chunks."
+  "Snapshot explicit language metadata in filtered chunks."
   (with-temp-buffer
     (text-mode)
-    (let ((proofread-language "en")
-          (proofread-context-size 80))
+    (let ((proofread-context-size 80))
       (insert "Keep http://example.com TARGET tail")
       (let ((chunks (proofread-test--request-ready-chunks-for-ranges
-                     (list (cons (point-min) (point-max))))))
+                     (list (cons (point-min) (point-max))) "en")))
         (should (equal (proofread-test--chunk-texts chunks)
                        '( "Keep " " TARGET tail")))
         (dolist (chunk chunks)
@@ -2605,33 +2615,33 @@ This covers URLs, email, invisible text, faces, and properties."
   (with-temp-buffer
     (insert "helo wrld")
     (proofread-mode 1)
-    (let* ((chunk
-            (car (proofread-test--request-ready-chunks-for-ranges
-                  (list (cons (point-min) (point-max))))))
-           (request (proofread--make-backend-request
-                     chunk proofread-test--backend))
-           (diagnostic
-            (proofread-test--diagnostic-for-range 1 5 "helo")))
-      (should (eq (proofread--handle-backend-result
-                   (proofread--backend-success-result
-                    request (list diagnostic)))
-                  'applied))
-      (should (= (length proofread--diagnostics) 1))
-      (should (= (length proofread--overlays) 1))
-      (should (eq (proofread--handle-backend-result
-                   (proofread--backend-success-result
-                    request (list diagnostic)))
-                  'applied))
-      (should
-       (equal (proofread-test--diagnostics-without-provenance
-               proofread--diagnostics)
-              (list diagnostic)))
-      (should (= (length proofread--overlays) 1))
-      (should (eq (proofread--handle-backend-result
-                   (proofread--backend-success-result request nil))
-                  'applied))
-      (should-not proofread--diagnostics)
-      (should-not proofread--overlays))))
+    (proofread-test--with-profile
+     (let* ((chunk
+             (car (proofread-test--request-ready-chunks-for-ranges
+                   (list (cons (point-min) (point-max))))))
+            (request (proofread-test--make-profile-request chunk))
+            (diagnostic
+             (proofread-test--diagnostic-for-range 1 5 "helo")))
+       (should (eq (proofread--handle-backend-result
+                    (proofread--backend-success-result
+                     request (list diagnostic)))
+                   'applied))
+       (should (= (length proofread--diagnostics) 1))
+       (should (= (length proofread--overlays) 1))
+       (should (eq (proofread--handle-backend-result
+                    (proofread--backend-success-result
+                     request (list diagnostic)))
+                   'applied))
+       (should
+        (equal (proofread-test--diagnostics-without-provenance
+                proofread--diagnostics)
+               (list diagnostic)))
+       (should (= (length proofread--overlays) 1))
+       (should (eq (proofread--handle-backend-result
+                    (proofread--backend-success-result request nil))
+                   'applied))
+       (should-not proofread--diagnostics)
+       (should-not proofread--overlays)))))
 
 (ert-deftest
     proofread-test-partial-backend-result-merges-without-caching ()
@@ -2639,56 +2649,55 @@ This covers URLs, email, invisible text, faces, and properties."
   (with-temp-buffer
     (insert "helo bad wrld")
     (proofread-mode 1)
-    (let* ((chunk
-            (car (proofread-test--request-ready-chunks-for-ranges
-                  (list (cons (point-min) (point-max))))))
-           (request (proofread--make-backend-request
-                     chunk proofread-test--backend))
-           (old (proofread-test--diagnostic-for-range 1 5 "helo"))
-           (later-range
-            (proofread-test--diagnostic-for-range 10 14 "wrld"))
-           (earlier-range
-            (proofread-test--diagnostic-for-range 6 9 "bad"))
-           (partial
-            (proofread--backend-partial-success-result
-             request
-             (list later-range (copy-sequence old) earlier-range
-                   (copy-sequence later-range)
-                   (copy-sequence earlier-range))))
-           (original-create-overlay
-            (symbol-function 'proofread--create-overlay))
-           (created 0)
-           (changed 0))
-      (should (eq (proofread--handle-backend-result
-                   (proofread--backend-success-result request (list
-                                                               old)))
-                  'applied))
-      (proofread-clear-cache)
-      (add-hook 'proofread-diagnostics-changed-hook
-                (lambda () (setq changed (1+ changed))) nil t)
-      (cl-letf (((symbol-function 'proofread--create-overlay)
-                 (lambda (diagnostic)
-                   (setq created (1+ created))
-                   (funcall original-create-overlay diagnostic))))
-        (should (eq (proofread--handle-backend-result partial)
-                    'applied))
-        (should
-         (equal (proofread-test--diagnostics-without-provenance
-                 proofread--diagnostics)
-                (list old later-range earlier-range)))
-        (should (= (length proofread--overlays) 3))
-        (should (= created 2))
-        (should (= changed 1))
-        (should (= (hash-table-count proofread--cache) 0))
-        (should (eq (proofread--handle-backend-result partial)
-                    'applied))
-        (should
-         (equal (proofread-test--diagnostics-without-provenance
-                 proofread--diagnostics)
-                (list old later-range earlier-range)))
-        (should (= (length proofread--overlays) 3))
-        (should (= created 2))
-        (should (= changed 1))))))
+    (proofread-test--with-profile
+     (let* ((chunk
+             (car (proofread-test--request-ready-chunks-for-ranges
+                   (list (cons (point-min) (point-max))))))
+            (request (proofread-test--make-profile-request chunk))
+            (old (proofread-test--diagnostic-for-range 1 5 "helo"))
+            (later-range
+             (proofread-test--diagnostic-for-range 10 14 "wrld"))
+            (earlier-range
+             (proofread-test--diagnostic-for-range 6 9 "bad"))
+            (partial
+             (proofread--backend-partial-success-result
+              request
+              (list later-range (copy-sequence old) earlier-range
+                    (copy-sequence later-range)
+                    (copy-sequence earlier-range))))
+            (original-create-overlay
+             (symbol-function 'proofread--create-overlay))
+            (created 0)
+            (changed 0))
+       (should (eq (proofread--handle-backend-result
+                    (proofread--backend-success-result request (list old)))
+                   'applied))
+       (proofread-clear-cache)
+       (add-hook 'proofread-diagnostics-changed-hook
+                 (lambda () (setq changed (1+ changed))) nil t)
+       (cl-letf (((symbol-function 'proofread--create-overlay)
+                  (lambda (diagnostic)
+                    (setq created (1+ created))
+                    (funcall original-create-overlay diagnostic))))
+         (should (eq (proofread--handle-backend-result partial)
+                     'applied))
+         (should
+          (equal (proofread-test--diagnostics-without-provenance
+                  proofread--diagnostics)
+                 (list old later-range earlier-range)))
+         (should (= (length proofread--overlays) 3))
+         (should (= created 2))
+         (should (= changed 1))
+         (should (= (hash-table-count proofread--cache) 0))
+         (should (eq (proofread--handle-backend-result partial)
+                     'applied))
+         (should
+          (equal (proofread-test--diagnostics-without-provenance
+                  proofread--diagnostics)
+                 (list old later-range earlier-range)))
+         (should (= (length proofread--overlays) 3))
+         (should (= created 2))
+         (should (= changed 1)))))))
 
 (ert-deftest proofread-test-cache-miss-calls-backend ()
   "A visible chunk with no cache entry is sent to the backend."
@@ -2795,30 +2804,29 @@ This covers URLs, email, invisible text, faces, and properties."
   (with-temp-buffer
     (insert "helo")
     (proofread-mode 1)
-    (let* ((chunk
-            (car (proofread-test--request-ready-chunks-for-ranges
-                  (list (cons (point-min) (point-max))))))
-           (request (proofread--make-backend-request
-                     chunk proofread-test--backend))
-           (diagnostic
-            (proofread-test--diagnostic-for-range 1 5 "helo")))
-      (insert "!")
-      (should (eq (proofread--handle-backend-result
-                   (proofread--backend-success-result
-                    request (list diagnostic)))
-                  'stale))
-      (should (= (hash-table-count proofread--cache) 0))
-      (let ((fresh-request
-             (proofread--make-backend-request
-              (car (proofread-test--request-ready-chunks-for-ranges
-                    (list (cons (point-min) (point-max)))))
-              proofread-test--backend)))
-        (should (eq (proofread--handle-backend-result
-                     (proofread--backend-error-result
-                      fresh-request 'proofread-test-backend-failure
-                      "Test backend failure"))
-                    'error))
-        (should (= (hash-table-count proofread--cache) 0))))))
+    (proofread-test--with-profile
+     (let* ((chunk
+             (car (proofread-test--request-ready-chunks-for-ranges
+                   (list (cons (point-min) (point-max))))))
+            (request (proofread-test--make-profile-request chunk))
+            (diagnostic
+             (proofread-test--diagnostic-for-range 1 5 "helo")))
+       (insert "!")
+       (should (eq (proofread--handle-backend-result
+                    (proofread--backend-success-result
+                     request (list diagnostic)))
+                   'stale))
+       (should (= (hash-table-count proofread--cache) 0))
+       (let ((fresh-request
+              (proofread-test--make-profile-request
+               (car (proofread-test--request-ready-chunks-for-ranges
+                     (list (cons (point-min) (point-max))))))))
+         (should (eq (proofread--handle-backend-result
+                      (proofread--backend-error-result
+                       fresh-request 'proofread-test-backend-failure
+                       "Test backend failure"))
+                     'error))
+         (should (= (hash-table-count proofread--cache) 0)))))))
 
 (ert-deftest proofread-test-cache-hit-validates-current-text ()
   "Drop cached diagnostics when their source text has changed."
@@ -2842,37 +2850,225 @@ This covers URLs, email, invisible text, faces, and properties."
 
 ;;;; Profile configuration tests
 
+(ert-deftest proofread-test-legacy-options-are-obsolete ()
+  "Mark both legacy configuration options obsolete in version 0.2.0."
+  (dolist (case
+           '((proofread-backend
+              "proofread-profiles" "proofread-profile")
+             (proofread-language ":language")))
+    (let* ((variable (car case))
+           (required-fragments (cdr case))
+           (metadata (get variable 'byte-obsolete-variable)))
+      (should (= (length metadata) 3))
+      (let ((replacement (car metadata))
+            (access-type (cadr metadata))
+            (version (caddr metadata)))
+        (should (stringp replacement))
+        (dolist (fragment required-fragments)
+          (should (string-match-p (regexp-quote fragment)
+                                  replacement)))
+        (should-not access-type)
+        (should (equal version "0.2.0"))))))
+
 (ert-deftest proofread-test-legacy-profile-normalizes-backend-settings
     ()
   "Normalize legacy backend settings as one synthetic profile."
-  (let ((proofread-profile nil)
-        (proofread-backend proofread-test--backend)
-        (proofread-language "zh-Hans"))
-    (should
-     (equal
-      (proofread--current-profile)
-      `( :name legacy
-         :language "zh-Hans"
-         :display-language nil
-         :bindings
-         (( :profile legacy
-            :name legacy
-            :backend ,proofread-test--backend
-            :options nil)))))))
+  (proofread-test--with-legacy-options
+   proofread-test--backend "zh-Hans"
+   (let ((proofread-profile nil))
+     (should
+      (equal
+       (proofread--current-profile)
+       `( :name legacy
+          :language "zh-Hans"
+          :display-language nil
+          :bindings
+          (( :profile legacy
+             :name legacy
+             :backend ,proofread-test--backend
+             :options nil
+             :legacy t))))))))
 
 (ert-deftest proofread-test-legacy-profile-allows-disabled-backend
     ()
   "Normalize disabled legacy backend settings as an empty profile."
-  (let ((proofread-profile nil)
-        (proofread-backend nil)
-        (proofread-language nil))
-    (should
-     (equal
-      (proofread--current-profile)
-      '( :name legacy
-         :language nil
-         :display-language nil
-         :bindings nil)))))
+  (proofread-test--with-legacy-options nil nil
+                                       (let ((proofread-profile nil))
+                                         (should
+                                          (equal
+                                           (proofread--current-profile)
+                                           '( :name legacy
+                                              :language nil
+                                              :display-language nil
+                                              :bindings nil))))))
+
+(ert-deftest proofread-test-legacy-dispatch-warns-once-per-session ()
+  "Warn once when repeated checks dispatch through legacy options."
+  (proofread-test--with-legacy-options
+   proofread-test--backend "en-US"
+   (with-temp-buffer
+     (insert "Alpha")
+     (let ((proofread-profile nil)
+           (proofread-auto-check nil)
+           (proofread-cache-max-entries 0)
+           (proofread-context-size 0)
+           (proofread--legacy-dispatch-warning-issued-p nil)
+           (recorder (proofread-test--make-backend-recorder))
+           warnings)
+       (proofread-mode 1)
+       (cl-letf (((symbol-function 'display-warning)
+                  (lambda (&rest args)
+                    (push args warnings)))
+                 ((symbol-function 'message) #'ignore)
+                 ((symbol-function 'proofread--backend-check)
+                  (plist-get recorder :function)))
+         (proofread-check-buffer)
+         (let* ((requests (funcall (plist-get recorder :requests)))
+                (callbacks (funcall (plist-get recorder :callbacks))))
+           (should (= (length requests) 1))
+           (should
+            (eq (funcall
+                 (car callbacks)
+                 (proofread--backend-success-result
+                  (car requests) nil))
+                'applied)))
+         (proofread-check-buffer)
+         (let* ((requests (funcall (plist-get recorder :requests)))
+                (callbacks (funcall (plist-get recorder :callbacks))))
+           (should (= (length requests) 2))
+           (should
+            (eq (funcall
+                 (cadr callbacks)
+                 (proofread--backend-success-result
+                  (cadr requests) nil))
+                'applied))))
+       (should proofread--legacy-dispatch-warning-issued-p)
+       (should (= (length warnings) 1))
+       (let ((warning (car warnings)))
+         (should (eq (car warning) 'proofread))
+         (should (eq (nth 2 warning) :warning))
+         (dolist (fragment
+                  '("proofread-backend" "proofread-language"
+                    "proofread-profiles" "proofread-profile"))
+           (should (string-match-p
+                    (regexp-quote fragment) (nth 1 warning)))))))))
+
+(ert-deftest proofread-test-unavailable-legacy-backend-still-warns ()
+  "Warn when a check selects an unavailable legacy backend."
+  (proofread-test--with-legacy-options
+   'proofread-test-unavailable-backend "en-US"
+   (with-temp-buffer
+     (insert "Alpha")
+     (let ((proofread-profile nil)
+           (proofread-auto-check nil)
+           (proofread--legacy-dispatch-warning-issued-p nil)
+           warnings)
+       (proofread-mode 1)
+       (cl-letf (((symbol-function 'display-warning)
+                  (lambda (&rest args)
+                    (push args warnings)))
+                 ((symbol-function 'message) #'ignore))
+         (proofread-check-buffer))
+       (should (= (length warnings) 1))
+       (should proofread--legacy-dispatch-warning-issued-p)
+       (should-not proofread--active-requests)))))
+
+(ert-deftest proofread-test-legacy-dispatch-warning-is-session-global
+    ()
+  "Warn only once when legacy checks run in two buffers."
+  (proofread-test--with-legacy-options
+   proofread-test--backend "en-US"
+   (let ((first-buffer
+          (generate-new-buffer " *proofread-legacy-warning-a*"))
+         (second-buffer
+          (generate-new-buffer " *proofread-legacy-warning-b*"))
+         (proofread-profile nil)
+         (proofread--legacy-dispatch-warning-issued-p nil)
+         requests
+         warnings)
+     (unwind-protect
+         (cl-letf (((symbol-function 'display-warning)
+                    (lambda (&rest args)
+                      (push args warnings)))
+                   ((symbol-function 'message) #'ignore)
+                   ((symbol-function 'proofread--backend-check)
+                    (lambda (request _callback &optional _backend)
+                      (push request requests)
+                      'proofread-test-handle)))
+           (dolist (entry `((,first-buffer . "Alpha")
+                            (,second-buffer . "Beta")))
+             (with-current-buffer (car entry)
+               (insert (cdr entry))
+               (setq-local proofread-auto-check nil)
+               (proofread-mode 1)
+               (proofread-check-buffer)))
+           (should (= (length requests) 2))
+           (should (= (length warnings) 1))
+           (should proofread--legacy-dispatch-warning-issued-p))
+       (kill-buffer first-buffer)
+       (kill-buffer second-buffer)))))
+
+(ert-deftest
+    proofread-test-legacy-inspection-preserves-language-and-identity
+    ()
+  "Inspect legacy provenance and freshness without a runtime warning."
+  (proofread-test--with-legacy-options
+   proofread-test--backend "en-US"
+   (with-temp-buffer
+     (insert "Alpha")
+     (let ((proofread-profile nil)
+           (proofread-auto-check nil)
+           (proofread-context-size 0)
+           (proofread-test--backend-identity-token 'identity-a)
+           (proofread--legacy-dispatch-warning-issued-p nil)
+           warnings)
+       (proofread-mode 1)
+       (cl-letf (((symbol-function 'display-warning)
+                  (lambda (&rest args)
+                    (push args warnings)))
+                 ((symbol-function 'message) #'ignore))
+         (let* ((profile (proofread--current-profile))
+                (binding (car (plist-get profile :bindings)))
+                (chunk
+                 (car
+                  (proofread-test--request-ready-chunks-for-ranges
+                   (list (cons (point-min) (point-max)))
+                   (plist-get profile :language))))
+                (request
+                 (proofread--make-backend-request
+                  chunk proofread-test--backend binding profile))
+                (binding-identity
+                 (plist-get request :binding-identity)))
+           (should (eq (plist-get request :profile) 'legacy))
+           (should (eq (plist-get request :binding-name) 'legacy))
+           (should (equal (plist-get request :binding-owner)
+                          '( :profile legacy
+                             :binding-name legacy
+                             :legacy t)))
+           (should (equal (plist-get request :language) "en-US"))
+           (should (equal (plist-get request :backend-identity)
+                          (proofread-test--backend-identity)))
+           (should (equal
+                    (plist-get binding-identity :backend-identity)
+                    (proofread-test--backend-identity)))
+           (should (plist-get binding-identity :legacy))
+           (should (proofread--fresh-request-p request))
+           (let ((proofread-language "fr"))
+             (should-not (proofread--fresh-request-p request)))
+           (let ((proofread-backend
+                  'proofread-test-other-backend))
+             (should-not (proofread--fresh-request-p request))
+             (should-not
+              (proofread--request-ready-to-submit-p request)))
+           (let ((proofread-backend nil))
+             (should-not (proofread--fresh-request-p request))
+             (should-not
+              (proofread--request-ready-to-submit-p request)))
+           (let ((proofread-test--backend-identity-token 'identity-b))
+             (should-not (proofread--fresh-request-p request)))
+           (should (proofread--fresh-request-p request))))
+       (should-not warnings)
+       (should-not proofread--legacy-dispatch-warning-issued-p)))))
 
 (ert-deftest proofread-test-profile-normalizes-checkers ()
   "Normalize an explicitly selected profile and its checkers."
@@ -2948,39 +3144,316 @@ This covers URLs, email, invisible text, faces, and properties."
 
 (ert-deftest proofread-test-buffer-local-nil-selects-legacy-profile ()
   "Keep buffer-local nil on the compatibility profile during migration."
-  (let ((proofread-profile 'english)
-        (proofread-backend proofread-test--backend)
-        (proofread-language "legacy-language")
-        (proofread-profiles
-         `((english
-            :language "en-US"
-            :checkers (( :name primary
-                         :backend ,proofread-test--backend))))))
-    (with-temp-buffer
-      (setq-local proofread-profile nil)
-      (let ((profile (proofread--current-profile)))
-        (should (eq (plist-get profile :name) 'legacy))
-        (should (equal (plist-get profile :language)
-                       "legacy-language"))))))
+  (proofread-test--with-legacy-options
+   proofread-test--backend "legacy-language"
+   (let ((proofread-profile 'english)
+         (proofread-profiles
+          `((english
+             :language "en-US"
+             :checkers (( :name primary
+                          :backend ,proofread-test--backend))))))
+     (with-temp-buffer
+       (setq-local proofread-profile nil)
+       (let ((profile (proofread--current-profile)))
+         (should (eq (plist-get profile :name) 'legacy))
+         (should (equal (plist-get profile :language)
+                        "legacy-language")))))))
 
 (ert-deftest proofread-test-buffer-local-empty-profile-disables-dispatch
     ()
   "Let one buffer select an explicitly disabled profile."
-  (let ((proofread-profile 'enabled)
-        (proofread-backend proofread-test--backend)
-        (proofread-profiles
-         `((enabled
-            :checkers (( :name primary
-                         :backend ,proofread-test--backend)))
-           (disabled
-            :checkers nil))))
-    (with-temp-buffer
-      (setq-local proofread-profile 'disabled)
-      (let ((profile (proofread--current-profile)))
-        (should (eq (plist-get profile :name) 'disabled))
-        (should-not (plist-get profile :bindings))
-        (should-not
-         (proofread--current-profile-supported-bindings profile))))))
+  (proofread-test--with-legacy-options proofread-test--backend nil
+                                       (let ((proofread-profile 'enabled)
+                                             (proofread-profiles
+                                              `((enabled
+                                                 :checkers (( :name primary
+                                                              :backend ,proofread-test--backend)))
+                                                (disabled
+                                                 :checkers nil)))
+                                             (proofread--legacy-dispatch-warning-issued-p nil)
+                                             (backend-calls 0)
+                                             warnings)
+                                         (with-temp-buffer
+                                           (insert "Alpha")
+                                           (setq-local proofread-profile 'disabled)
+                                           (setq-local proofread-auto-check nil)
+                                           (proofread-mode 1)
+                                           (cl-letf (((symbol-function 'display-warning)
+                                                      (lambda (&rest args)
+                                                        (push args warnings)))
+                                                     ((symbol-function 'message) #'ignore)
+                                                     ((symbol-function 'proofread--backend-check)
+                                                      (lambda (_request _callback &optional _backend)
+                                                        (setq backend-calls (1+ backend-calls))
+                                                        'proofread-test-handle)))
+                                             (let ((profile (proofread--current-profile)))
+                                               (should (eq (plist-get profile :name) 'disabled))
+                                               (should-not (plist-get profile :bindings))
+                                               (should-not
+                                                (proofread--current-profile-supported-bindings profile)))
+                                             (proofread-check-buffer))
+                                           (should (= backend-calls 0))
+                                           (should-not proofread--active-requests)
+                                           (should-not warnings)
+                                           (should-not proofread--legacy-dispatch-warning-issued-p)))))
+
+(ert-deftest
+    proofread-test-explicit-legacy-named-profile-precedes-old-options
+    ()
+  "Treat an explicitly selected profile named legacy as non-legacy."
+  (proofread-test--with-legacy-options
+   'proofread-test-unavailable-backend "legacy-language"
+   (with-temp-buffer
+     (insert "Alpha")
+     (let ((proofread-profile 'legacy)
+           (proofread-profiles
+            `((legacy
+               :language "profile-language"
+               :checkers (( :name legacy
+                            :backend ,proofread-test--backend)))))
+           (proofread-auto-check nil)
+           (proofread-context-size 0)
+           (proofread--legacy-dispatch-warning-issued-p nil)
+           (recorder (proofread-test--make-backend-recorder))
+           warnings)
+       (proofread-mode 1)
+       (cl-letf (((symbol-function 'display-warning)
+                  (lambda (&rest args)
+                    (push args warnings)))
+                 ((symbol-function 'message) #'ignore)
+                 ((symbol-function 'proofread--backend-check)
+                  (plist-get recorder :function)))
+         (proofread-check-buffer))
+       (let ((requests (funcall (plist-get recorder :requests))))
+         (should (= (length requests) 1))
+         (let ((request (car requests)))
+           (should (eq (plist-get request :profile) 'legacy))
+           (should (eq (plist-get request :binding-name) 'legacy))
+           (should (eq (plist-get request :backend)
+                       proofread-test--backend))
+           (should (equal (plist-get request :language)
+                          "profile-language"))
+           (should-not
+            (plist-get (plist-get request :binding-owner)
+                       :legacy))))
+       (should-not warnings)
+       (should-not proofread--legacy-dispatch-warning-issued-p)))))
+
+(ert-deftest proofread-test-explicit-legacy-names-do-not-alias-old-options
+    ()
+  "Keep explicit, synthetic legacy, and ad-hoc ownership distinct."
+  (proofread-test--with-legacy-options
+   proofread-test--backend "en-US"
+   (with-temp-buffer
+     (insert "Alpha")
+     (let ((proofread-profiles
+            `((legacy
+               :language "en-US"
+               :checkers (( :name legacy
+                            :backend ,proofread-test--backend)))))
+           (proofread-auto-check nil)
+           (proofread-context-size 0))
+       (proofread-mode 1)
+       (let* ((chunk
+               (car
+                (proofread-test--request-ready-chunks-for-ranges
+                 (list (cons (point-min) (point-max))) "en-US")))
+              (explicit-profile
+               (let ((proofread-profile 'legacy))
+                 (proofread--current-profile)))
+              (explicit-binding
+               (car (plist-get explicit-profile :bindings)))
+              (explicit-request
+               (proofread--make-backend-request
+                chunk proofread-test--backend
+                explicit-binding explicit-profile))
+              (legacy-profile
+               (let ((proofread-profile nil))
+                 (proofread--current-profile)))
+              (legacy-binding
+               (car (plist-get legacy-profile :bindings)))
+              (legacy-request
+               (proofread--make-backend-request
+                chunk proofread-test--backend
+                legacy-binding legacy-profile))
+              (ad-hoc-request
+               (proofread--make-backend-request
+                chunk proofread-test--backend)))
+         (dolist (pair
+                  (list (list explicit-request legacy-request)
+                        (list explicit-request ad-hoc-request)
+                        (list legacy-request ad-hoc-request)))
+           (dolist (key
+                    '( :binding-owner :binding-identity :cache-key))
+             (should-not
+              (equal (plist-get (car pair) key)
+                     (plist-get (cadr pair) key))))
+           (should
+            (= (hash-table-count
+                (proofread--conflicting-request-table
+                 (list (car pair)) (list (cadr pair))))
+               0))
+           (should
+            (= (hash-table-count
+                (proofread--conflicting-request-table
+                 (list (cadr pair)) (list (car pair))))
+               0)))
+         (let ((proofread-profile 'legacy))
+           (should (proofread--fresh-request-p explicit-request))
+           (should-not (proofread--fresh-request-p legacy-request))
+           (should (proofread--fresh-request-p ad-hoc-request)))
+         (let ((proofread-profile nil))
+           (should (proofread--fresh-request-p legacy-request))
+           (should-not
+            (proofread--fresh-request-p explicit-request))
+           (should (proofread--fresh-request-p ad-hoc-request))))))))
+
+(ert-deftest proofread-test-invalid-profile-never-falls-back-to-legacy
+    ()
+  "Reject missing and malformed profiles without legacy dispatch."
+  (dolist (case
+           '((missing nil)
+             (malformed ((malformed :checkers invalid)))))
+    (proofread-test--with-legacy-options proofread-test--backend "en-US"
+                                         (with-temp-buffer
+                                           (insert "Alpha")
+                                           (let ((proofread-profile (car case))
+                                                 (proofread-profiles (cadr case))
+                                                 (proofread-auto-check nil)
+                                                 (proofread--legacy-dispatch-warning-issued-p nil)
+                                                 (backend-calls 0)
+                                                 warnings)
+                                             (proofread-mode 1)
+                                             (cl-letf (((symbol-function 'display-warning)
+                                                        (lambda (&rest args)
+                                                          (push args warnings)))
+                                                       ((symbol-function 'message) #'ignore)
+                                                       ((symbol-function 'proofread--backend-check)
+                                                        (lambda (_request _callback &optional _backend)
+                                                          (setq backend-calls (1+ backend-calls))
+                                                          'proofread-test-handle)))
+                                               (should-error (proofread-check-buffer)))
+                                             (should (= backend-calls 0))
+                                             (should-not warnings)
+                                             (should-not proofread--legacy-dispatch-warning-issued-p))))))
+
+(ert-deftest proofread-test-nil-profile-and-backend-disable-dispatch
+    ()
+  "Dispatch nothing and warn about nothing when both selectors are nil."
+  (proofread-test--with-legacy-options nil nil
+                                       (with-temp-buffer
+                                         (insert "Alpha")
+                                         (let ((proofread-profile nil)
+                                               (proofread-auto-check nil)
+                                               (proofread--legacy-dispatch-warning-issued-p nil)
+                                               (backend-calls 0)
+                                               warnings)
+                                           (proofread-mode 1)
+                                           (cl-letf (((symbol-function 'display-warning)
+                                                      (lambda (&rest args)
+                                                        (push args warnings)))
+                                                     ((symbol-function 'message) #'ignore)
+                                                     ((symbol-function 'proofread--backend-check)
+                                                      (lambda (_request _callback &optional _backend)
+                                                        (setq backend-calls (1+ backend-calls))
+                                                        'proofread-test-handle)))
+                                             (proofread-check-buffer))
+                                           (should (= backend-calls 0))
+                                           (should-not proofread--active-requests)
+                                           (should-not warnings)
+                                           (should-not proofread--legacy-dispatch-warning-issued-p)))))
+
+(ert-deftest proofread-test-legacy-result-is-cached-with-provenance ()
+  "Cache legacy results with their original language and ownership."
+  (proofread-test--with-legacy-options
+   proofread-test--backend "en-US"
+   (with-temp-buffer
+     (insert "helo")
+     (let ((proofread-profile nil)
+           (proofread-auto-check nil)
+           (proofread-context-size 0)
+           (proofread--legacy-dispatch-warning-issued-p nil)
+           (recorder (proofread-test--make-backend-recorder))
+           warnings)
+       (proofread-mode 1)
+       (cl-letf (((symbol-function 'display-warning)
+                  (lambda (&rest args)
+                    (push args warnings)))
+                 ((symbol-function 'message) #'ignore)
+                 ((symbol-function 'proofread--backend-check)
+                  (plist-get recorder :function)))
+         (proofread-check-buffer)
+         (let* ((requests (funcall (plist-get recorder :requests)))
+                (callbacks (funcall (plist-get recorder :callbacks)))
+                (request (car requests))
+                (diagnostic
+                 (proofread-test--diagnostic-for-range 1 5 "helo")))
+           (should (= (length requests) 1))
+           (should (equal (plist-get request :language) "en-US"))
+           (should (eq (plist-get request :profile) 'legacy))
+           (should (eq (plist-get request :binding-name) 'legacy))
+           (should
+            (eq (funcall
+                 (car callbacks)
+                 (proofread--backend-success-result
+                  request (list diagnostic)))
+                'applied))
+           (should (= (hash-table-count proofread--cache) 1))
+           (let ((live (car proofread--diagnostics)))
+             (should (equal (plist-get live :language) "en-US"))
+             (should (eq (plist-get live :profile) 'legacy))
+             (should (eq (plist-get live :binding-name) 'legacy))
+             (should (equal (plist-get live :binding-owner)
+                            (plist-get request :binding-owner))))
+           (proofread-check-buffer)
+           (should (= (length
+                       (funcall (plist-get recorder :requests)))
+                      1))
+           (let ((live (car proofread--diagnostics)))
+             (should (equal (plist-get live :language) "en-US"))
+             (let ((proofread-language "fr"))
+               (should
+                (equal
+                 (plist-get
+                  (proofread--diagnostic-ignore-key live) :language)
+                 "en-US"))))))
+       (should (= (length warnings) 1))
+       (should proofread--legacy-dispatch-warning-issued-p)))))
+
+(ert-deftest proofread-test-legacy-request-is-cancelled-with-buffer ()
+  "Cancel an active legacy-owned request when disabling its buffer."
+  (proofread-test--with-legacy-options
+   proofread-test--backend "en-US"
+   (with-temp-buffer
+     (insert "Alpha")
+     (let ((proofread-profile nil)
+           (proofread-auto-check nil)
+           (proofread-context-size 0)
+           (proofread--legacy-dispatch-warning-issued-p nil)
+           request
+           handle
+           warnings)
+       (proofread-mode 1)
+       (cl-letf (((symbol-function 'display-warning)
+                  (lambda (&rest args)
+                    (push args warnings)))
+                 ((symbol-function 'message) #'ignore)
+                 ((symbol-function 'proofread--backend-check)
+                  (lambda (backend-request _callback &optional _backend)
+                    (setq request backend-request)
+                    (setq handle
+                          (list :backend proofread-test--backend
+                                :cancelled nil)))))
+         (proofread-check-buffer)
+         (should request)
+         (should (eq (plist-get request :profile) 'legacy))
+         (should (eq (plist-get request :binding-name) 'legacy))
+         (should (proofread--active-request-p request))
+         (proofread-mode -1))
+       (should (plist-get handle :cancelled))
+       (should (proofread--request-state-flag-p request :cancelled))
+       (should-not proofread--active-requests)
+       (should (= (length warnings) 1))))))
 
 (ert-deftest proofread-test-profile-rejects-unknown-selection ()
   "Reject a selected profile that is not configured."
@@ -3195,7 +3668,9 @@ This covers URLs, email, invisible text, faces, and properties."
                       request (list diagnostic)))
                     'applied))
         (should-not (plist-member diagnostic :profile))
+        (should-not (plist-member diagnostic :language))
         (let ((live (car proofread--diagnostics)))
+          (should (equal (plist-get live :language) "en-US"))
           (should (equal (plist-get live :profile) 'multi))
           (should (equal (plist-get live :binding-name) 'strict))
           (should (equal (plist-get live :binding-owner)
@@ -3295,11 +3770,13 @@ This covers URLs, email, invisible text, faces, and properties."
         (proofread--cache-write-request request (list diagnostic))
         (let* ((entry (proofread--cache-read-request request))
                (cached (car (plist-get entry :diagnostics))))
+          (should (equal (plist-get cached :language) "en-US"))
           (should (equal (plist-get cached :binding-owner)
                          (plist-get request :binding-owner)))
           (should (eq (proofread--apply-cache-entry request entry)
                       'applied))
           (let ((live (car proofread--diagnostics)))
+            (should (equal (plist-get live :language) "en-US"))
             (should (equal (plist-get live :profile) 'multi))
             (should (equal (plist-get live :binding-name) 'strict))
             (should (equal (plist-get live :binding-owner)
@@ -3488,8 +3965,8 @@ This covers URLs, email, invisible text, faces, and properties."
              (request
               (proofread--make-backend-request
                chunk proofread-test--backend binding profile)))
-        (let ((proofread-language "global-change"))
-          (should (proofread--fresh-request-p request)))
+        (proofread-test--with-legacy-options nil "global-change"
+                                             (should (proofread--fresh-request-p request)))
         (let ((proofread-profiles
                `((multi
                   :language "en-US"
@@ -4054,27 +4531,29 @@ This covers URLs, email, invisible text, faces, and properties."
   (with-temp-buffer
     (insert "helo")
     (proofread-mode 1)
-    (let* ((chunk
-            (car (proofread-test--request-ready-chunks-for-ranges
-                  (list (cons (point-min) (point-max))))))
-           (request (proofread--make-backend-request
-                     chunk proofread-test--backend))
-           (diagnostic
-            (proofread-test--diagnostic-for-range 1 5 "helo"))
-           (result
-            (proofread--backend-success-result request (list
-                                                        diagnostic))))
-      (should (eq (proofread--handle-backend-result result) 'applied))
-      (let ((live (car proofread--diagnostics)))
-        (should-not (eq live diagnostic))
-        (goto-char (point-min))
-        (insert "x")
-        (should (equal (proofread--diagnostic-range live) '( 2 . 6)))
-        (should
-         (equal (proofread--diagnostic-range diagnostic)
-                '( 1 . 5)))
-        (should (eq (car (plist-get result :diagnostics))
-                    diagnostic))))))
+    (proofread-test--with-profile
+     (let* ((chunk
+             (car (proofread-test--request-ready-chunks-for-ranges
+                   (list (cons (point-min) (point-max))))))
+            (request (proofread-test--make-profile-request chunk))
+            (diagnostic
+             (proofread-test--diagnostic-for-range 1 5 "helo"))
+            (result
+             (proofread--backend-success-result
+              request (list diagnostic))))
+       (should (eq (proofread--handle-backend-result result)
+                   'applied))
+       (let ((live (car proofread--diagnostics)))
+         (should-not (eq live diagnostic))
+         (goto-char (point-min))
+         (insert "x")
+         (should (equal (proofread--diagnostic-range live)
+                        '( 2 . 6)))
+         (should
+          (equal (proofread--diagnostic-range diagnostic)
+                 '( 1 . 5)))
+         (should (eq (car (plist-get result :diagnostics))
+                     diagnostic)))))))
 
 (ert-deftest
     proofread-test-context-does-not-shift-diagnostic-overlays ()
@@ -6381,38 +6860,71 @@ This covers URLs, email, invisible text, faces, and properties."
 
 ;;;; Ignore tests
 
-(ert-deftest proofread-test-ignore-key-uses-legacy-language ()
-  "Include legacy language and diagnostic meaning in ignore keys."
+(ert-deftest proofread-test-ignore-key-uses-diagnostic-origin-language
+    ()
+  "Prefer diagnostic origin language in ignore keys."
   (let ((proofread--ignored-diagnostics (make-hash-table :test
-                                                         #'equal)))
-    (let ((proofread-language "en")
-          (diagnostic
-           (proofread-test--diagnostic-with-kind
-            1 5 "helo" 'spelling))
-          (same
-           (proofread-test--diagnostic-with-kind
-            10 14 "helo" 'spelling))
-          (different-kind
-           (proofread-test--diagnostic-with-kind
-            10 14 "helo" 'grammar))
-          (different-text
-           (proofread-test--diagnostic-with-kind
-            10 14 "wrld" 'spelling))
-          (different-message
-           (proofread--make-diagnostic
-            :beg 10 :end 14 :text "helo" :kind 'spelling
-            :message "Different issue" :suggestions '( "hello")
-            :source 'test)))
-      (should (equal (proofread--diagnostic-ignore-key diagnostic)
-                     '( :language "en" :text "helo" :kind spelling
-                        :message "Possible issue" :source
-                        test)))
-      (proofread--record-ignored-diagnostic diagnostic)
-      (should (proofread--diagnostic-ignored-p same))
-      (should-not (proofread--diagnostic-ignored-p different-kind))
-      (should-not (proofread--diagnostic-ignored-p different-text))
-      (should-not (proofread--diagnostic-ignored-p
-                   different-message)))))
+                                                         #'equal))
+        (proofread-profile 'current)
+        (proofread-profiles
+         '((current :language "fr" :checkers nil))))
+    (cl-labels
+        ((with-language
+           (diagnostic language)
+           (plist-put diagnostic :language language)))
+      (let ((diagnostic
+             (with-language
+              (proofread-test--diagnostic-with-kind
+               1 5 "helo" 'spelling)
+              "en"))
+            (same
+             (with-language
+              (proofread-test--diagnostic-with-kind
+               10 14 "helo" 'spelling)
+              "en"))
+            (different-language
+             (with-language
+              (proofread-test--diagnostic-with-kind
+               10 14 "helo" 'spelling)
+              "fr"))
+            (different-kind
+             (with-language
+              (proofread-test--diagnostic-with-kind
+               10 14 "helo" 'grammar)
+              "en"))
+            (different-text
+             (with-language
+              (proofread-test--diagnostic-with-kind
+               10 14 "wrld" 'spelling)
+              "en"))
+            (different-message
+             (with-language
+              (proofread--make-diagnostic
+               :beg 10 :end 14 :text "helo" :kind 'spelling
+               :message "Different issue" :suggestions '( "hello")
+               :source 'test)
+              "en"))
+            (without-language
+             (proofread-test--diagnostic-with-kind
+              20 24 "word" 'spelling)))
+        (should (equal (proofread--diagnostic-ignore-key diagnostic)
+                       '( :language "en" :text "helo" :kind spelling
+                          :message "Possible issue" :source
+                          test)))
+        (should
+         (equal
+          (plist-get
+           (proofread--diagnostic-ignore-key without-language)
+           :language)
+          "fr"))
+        (proofread--record-ignored-diagnostic diagnostic)
+        (should (proofread--diagnostic-ignored-p same))
+        (should-not
+         (proofread--diagnostic-ignored-p different-language))
+        (should-not (proofread--diagnostic-ignored-p different-kind))
+        (should-not (proofread--diagnostic-ignored-p different-text))
+        (should-not (proofread--diagnostic-ignored-p
+                     different-message))))))
 
 (ert-deftest proofread-test-ignore-command-removes-matching-overlays
     ()
@@ -6509,27 +7021,27 @@ This covers URLs, email, invisible text, faces, and properties."
     (with-temp-buffer
       (insert "helo")
       (proofread-mode 1)
-      (let* ((chunk
-              (car (proofread-test--request-ready-chunks-for-ranges
-                    (list (cons (point-min) (point-max))))))
-             (request (proofread--make-backend-request
-                       chunk proofread-test--backend))
-             (diagnostic
-              (proofread-test--diagnostic-with-kind
-               1 5 "helo" 'spelling))
-             (entry (proofread--make-cache-entry
-                     request (list diagnostic))))
-        (proofread--record-ignored-diagnostic diagnostic)
-        (should (eq (proofread--handle-backend-result
-                     (proofread--backend-success-result
-                      request (list diagnostic)))
-                    'applied))
-        (should-not proofread--diagnostics)
-        (should-not proofread--overlays)
-        (should (eq (proofread--apply-cache-entry request entry)
-                    'applied))
-        (should-not proofread--diagnostics)
-        (should-not proofread--overlays)))))
+      (proofread-test--with-profile
+       (let* ((chunk
+               (car (proofread-test--request-ready-chunks-for-ranges
+                     (list (cons (point-min) (point-max))))))
+              (request (proofread-test--make-profile-request chunk))
+              (diagnostic
+               (proofread-test--diagnostic-with-kind
+                1 5 "helo" 'spelling))
+              (entry (proofread--make-cache-entry
+                      request (list diagnostic))))
+         (proofread--record-ignored-diagnostic diagnostic)
+         (should (eq (proofread--handle-backend-result
+                      (proofread--backend-success-result
+                       request (list diagnostic)))
+                     'applied))
+         (should-not proofread--diagnostics)
+         (should-not proofread--overlays)
+         (should (eq (proofread--apply-cache-entry request entry)
+                     'applied))
+         (should-not proofread--diagnostics)
+         (should-not proofread--overlays))))))
 
 ;;;; Listing tests
 
@@ -7369,22 +7881,22 @@ This covers URLs, email, invisible text, faces, and properties."
     (setq-local proofread-auto-check nil)
     (setq-local proofread-targets 'comments)
     (proofread-mode 1)
-    (let* ((proofread-context-size 0)
-           (chunk
-            (car (proofread-test--request-ready-chunks-for-ranges
-                  (list (cons (point-min) (point-max))))))
-           (request (proofread--make-backend-request
-                     chunk proofread-test--backend)))
-      (goto-char (point-min))
-      (search-forward "cursor_and_mark")
-      (push-mark (line-end-position) t t)
-      (let ((before-point (point))
-            (before-mark (mark t))
-            (before-mark-active mark-active))
-        (should (proofread--fresh-request-p request))
-        (should (= (point) before-point))
-        (should (= (mark t) before-mark))
-        (should (eq mark-active before-mark-active))))))
+    (proofread-test--with-profile
+     (let* ((proofread-context-size 0)
+            (chunk
+             (car (proofread-test--request-ready-chunks-for-ranges
+                   (list (cons (point-min) (point-max))))))
+            (request (proofread-test--make-profile-request chunk)))
+       (goto-char (point-min))
+       (search-forward "cursor_and_mark")
+       (push-mark (line-end-position) t t)
+       (let ((before-point (point))
+             (before-mark (mark t))
+             (before-mark-active mark-active))
+         (should (proofread--fresh-request-p request))
+         (should (= (point) before-point))
+         (should (= (mark t) before-mark))
+         (should (eq mark-active before-mark-active)))))))
 
 (ert-deftest
     proofread-test-backend-nil-prunes-checked-out-of-target-diagnostics
@@ -7632,30 +8144,30 @@ This covers URLs, email, invisible text, faces, and properties."
     (setq-local proofread-ignored-properties
                 '( proofread-test-ignore))
     (proofread-mode 1)
-    (let* ((chunk
-            (car (proofread-test--request-ready-chunks-for-ranges
-                  (list (cons (point-min) (point-max))))))
-           (request (proofread--make-backend-request
-                     chunk proofread-test--backend))
-           (chars-tick (buffer-chars-modified-tick)))
-      (add-text-properties
-       (plist-get request :beg)
-       (1+ (plist-get request :beg))
-       '( proofread-test-ignore t))
-      (should (= chars-tick (buffer-chars-modified-tick)))
-      (should-not (proofread--fresh-request-p request))))
+    (proofread-test--with-profile
+     (let* ((chunk
+             (car (proofread-test--request-ready-chunks-for-ranges
+                   (list (cons (point-min) (point-max))))))
+            (request (proofread-test--make-profile-request chunk))
+            (chars-tick (buffer-chars-modified-tick)))
+       (add-text-properties
+        (plist-get request :beg)
+        (1+ (plist-get request :beg))
+        '( proofread-test-ignore t))
+       (should (= chars-tick (buffer-chars-modified-tick)))
+       (should-not (proofread--fresh-request-p request)))))
   (with-temp-buffer
     (insert "Beta prose.")
     (setq-local proofread-auto-check nil)
     (proofread-mode 1)
-    (let* ((chunk
-            (car (proofread-test--request-ready-chunks-for-ranges
-                  (list (cons (point-min) (point-max))))))
-           (request (proofread--make-backend-request
-                     chunk proofread-test--backend)))
-      (setq-local proofread-ignored-properties
-                  '( proofread-test-ignore))
-      (should (proofread--fresh-request-p request)))))
+    (proofread-test--with-profile
+     (let* ((chunk
+             (car (proofread-test--request-ready-chunks-for-ranges
+                   (list (cons (point-min) (point-max))))))
+            (request (proofread-test--make-profile-request chunk)))
+       (setq-local proofread-ignored-properties
+                   '( proofread-test-ignore))
+       (should (proofread--fresh-request-p request))))))
 
 (ert-deftest
     proofread-test-python-docstring-predicate-receives-full-triple-string
