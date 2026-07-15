@@ -279,6 +279,9 @@ Switch profiles by setting `proofread-profile`:
 Diagnostics from different checkers remain separate internally. The user
 interface groups diagnostics that refer to the same live range and text,
 preserves each checker's message, and deduplicates identical suggestion text.
+Within each group, source labels, messages, suggestions, and correction choices
+follow the profile's declared `:checkers` order, regardless of asynchronous
+completion order.
 
 #### Selecting a profile for one buffer
 

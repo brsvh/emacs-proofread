@@ -97,7 +97,7 @@
   (mapcar #'proofread--create-overlay diagnostics))
 
 (defconst proofread-test--diagnostic-provenance-keys
-  '( :language :profile :checker-name :checker-owner)
+  '( :language :profile :checker-name :checker-ordinal :checker-owner)
   "Diagnostic provenance keys added by the Proofread core.")
 
 (defun proofread-test--diagnostic-without-provenance
@@ -191,6 +191,106 @@ LANGUAGE is the language hint snapshotted for the chunks."
           :callbacks
           (lambda ()
             (reverse callbacks)))))
+
+(defun proofread-test--ordered-profiles (&optional checker-order)
+  "Return a profile fixture with CHECKER-ORDER.
+CHECKER-ORDER defaults to first followed by second."
+  (list
+   (list
+    'multi
+    :language "en-US"
+    :checkers
+    (mapcar
+     (lambda (name)
+       (list :name name :backend proofread-test--backend))
+     (or checker-order '( first second))))))
+
+(defun proofread-test--ordered-checker-diagnostic (request)
+  "Return an order-sensitive diagnostic for REQUEST's checker."
+  (pcase (plist-get request :checker-name)
+    ('first
+     (proofread--make-diagnostic
+      :beg 4
+      :end 8
+      :text "helo"
+      :kind 'grammar
+      :message "First message"
+      :suggestions '( "first-fix" "shared")
+      :source 'first))
+    ('second
+     (proofread--make-diagnostic
+      :beg 4
+      :end 8
+      :text "helo"
+      :kind 'style
+      :message "Second message"
+      :suggestions '( "second-fix" "shared")
+      :source 'second))
+    (_
+     (error "Unexpected checker: %S"
+            (plist-get request :checker-name)))))
+
+(defun proofread-test--complete-recorded-checkers
+    (recorder checker-order)
+  "Complete RECORDER requests in CHECKER-ORDER."
+  (let ((pairs
+         (cl-mapcar
+          #'cons
+          (funcall (plist-get recorder :requests))
+          (funcall (plist-get recorder :callbacks))))
+        statuses)
+    (dolist (checker checker-order)
+      (let* ((pair
+              (cl-find
+               checker pairs
+               :key (lambda (entry)
+                      (plist-get (car entry) :checker-name))))
+             (request (car pair))
+             (callback (cdr pair)))
+        (unless pair
+          (error "No recorded request for checker: %S" checker))
+        (push
+         (funcall
+          callback
+          (proofread--backend-success-result
+           request
+           (list
+            (proofread-test--ordered-checker-diagnostic request))))
+         statuses)))
+    (nreverse statuses)))
+
+(defun proofread-test--public-diagnostic-signature (diagnostic)
+  "Return DIAGNOSTIC's signature through public accessors only."
+  (list (proofread-diagnostic-range diagnostic)
+        (proofread-diagnostic-message diagnostic)
+        (proofread-diagnostic-text diagnostic)))
+
+(defun proofread-test--aggregate-order-signature (diagnostic)
+  "Return order-sensitive presentation fields from DIAGNOSTIC."
+  (list
+   :members
+   (mapcar (lambda (member)
+             (plist-get member :checker-name))
+           (proofread--diagnostic-members diagnostic))
+   :kind (plist-get diagnostic :kind)
+   :sources (proofread--diagnostic-source-labels diagnostic)
+   :public (proofread-test--public-diagnostic-signature diagnostic)
+   :suggestions (proofread--diagnostic-suggestions diagnostic)))
+
+(defun proofread-test--ordered-raw-diagnostic-signatures ()
+  "Return semantic signatures for raw diagnostics in navigation order."
+  (mapcar
+   (lambda (entry)
+     (let ((diagnostic (car entry)))
+       (list
+        (plist-get diagnostic :checker-name)
+        (plist-get diagnostic :checker-ordinal)
+        (proofread-diagnostic-range diagnostic)
+        (proofread-diagnostic-text diagnostic)
+        (plist-get diagnostic :kind)
+        (proofread-diagnostic-message diagnostic)
+        (plist-get diagnostic :suggestions))))
+   (proofread--raw-navigation-entries)))
 
 (defun proofread-test--lifecycle-request
     (id beg end &optional handle)
@@ -2898,6 +2998,7 @@ This covers URLs, email, invisible text, faces, and properties."
           :checkers
           (( :profile legacy
              :name legacy
+             :checker-ordinal 0
              :backend ,proofread-test--backend
              :options nil
              :legacy t))))))))
@@ -3497,6 +3598,37 @@ This covers URLs, email, invisible text, faces, and properties."
                :backend languagetool))))))
     (should-error (proofread--current-profile) :type 'error)))
 
+(ert-deftest proofread-test-profile-ordinals-precede-backend-filtering
+    ()
+  "Assign checker ordinals before filtering unsupported backends."
+  (let ((proofread-profile 'multi)
+        (proofread-profiles
+         `((multi
+            :checkers
+            (( :name unavailable
+               :backend proofread-test-unavailable)
+             ( :name available
+               :backend ,proofread-test--backend))))))
+    (let* ((profile (proofread--current-profile))
+           (checkers (plist-get profile :checkers))
+           (supported
+            (proofread--current-profile-supported-checkers profile)))
+      (should
+       (equal (mapcar (lambda (checker)
+                        (plist-get checker :checker-ordinal))
+                      checkers)
+              '( 0 1)))
+      (should (= (length supported) 1))
+      (should (eq (plist-get (car supported) :name) 'available))
+      (should (= (plist-get (car supported) :checker-ordinal) 1))))
+  (proofread-test--with-legacy-options proofread-test--backend nil
+                                       (should (= (plist-get (proofread--legacy-profile-checker)
+                                                             :checker-ordinal)
+                                                  0)))
+  (should-not
+   (plist-member (proofread--ad-hoc-checker proofread-test--backend)
+                 :checker-ordinal)))
+
 (ert-deftest proofread-test-profile-dispatch-fans-out-checkers ()
   "Dispatch one request per request-ready chunk and profile checker."
   (with-temp-buffer
@@ -3529,6 +3661,11 @@ This covers URLs, email, invisible text, faces, and properties."
                                    (plist-get request :checker-name))
                                  requests)
                          '( strict gentle)))
+          (should (equal (mapcar (lambda (request)
+                                   (plist-get request
+                                              :checker-ordinal))
+                                 requests)
+                         '( 0 1)))
           (should (equal (mapcar (lambda (request)
                                    (plist-get request :checker-options))
                                  requests)
@@ -3686,6 +3823,7 @@ This covers URLs, email, invisible text, faces, and properties."
           (should (equal (plist-get live :language) "en-US"))
           (should (equal (plist-get live :profile) 'multi))
           (should (equal (plist-get live :checker-name) 'strict))
+          (should (= (plist-get live :checker-ordinal) 0))
           (should (equal (plist-get live :checker-owner)
                          (plist-get request :checker-owner))))))))
 
@@ -4038,6 +4176,264 @@ This covers URLs, email, invisible text, faces, and properties."
                   ad-hoc-overlay)))))
 
 (ert-deftest
+    proofread-test-profile-order-is-independent-of-callback-order
+    ()
+  "Present profile diagnostics in checker order after any completion order."
+  (let ((expected
+         '( :members (first second)
+            :kind grammar
+            :sources ("first" "second")
+            :public ((4 . 8)
+                     "first: First message; second: Second message"
+                     "helo")
+            :suggestions ("first-fix" "shared" "second-fix")))
+        signatures
+        diagnostic-signatures)
+    (dolist (completion-order '(( first second) ( second first)))
+      (with-temp-buffer
+        (insert "aa helo zz")
+        (let ((proofread-auto-check nil)
+              (proofread-cache-max-entries 0)
+              (proofread-context-size 0)
+              (proofread-max-concurrent-requests 2)
+              (proofread-profile 'multi)
+              (proofread-profiles
+               (proofread-test--ordered-profiles))
+              (recorder (proofread-test--make-backend-recorder)))
+          (proofread-mode 1)
+          (cl-letf (((symbol-function 'proofread--backend-check)
+                     (plist-get recorder :function)))
+            (proofread-check-buffer)
+            (let ((requests
+                   (funcall (plist-get recorder :requests))))
+              (should (= (length requests) 2))
+              (should (= (length proofread--active-requests) 2))
+              (should
+               (equal
+                (mapcar
+                 (lambda (request)
+                   (list (plist-get request :checker-name)
+                         (plist-get request :checker-ordinal)))
+                 requests)
+                '(( first 0) ( second 1)))))
+            (should
+             (equal
+              (proofread-test--complete-recorded-checkers
+               recorder completion-order)
+              '( applied applied))))
+          (should-not proofread--active-requests)
+          (let* ((navigation (proofread--navigation-diagnostics))
+                 (aggregate (car navigation)))
+            (should (= (length navigation) 1))
+            (push (proofread-test--ordered-raw-diagnostic-signatures)
+                  diagnostic-signatures)
+            (push
+             (proofread-test--aggregate-order-signature aggregate)
+             signatures)
+            (goto-char 5)
+            (let ((first-lookup (proofread-diagnostic-at-point))
+                  (second-lookup (proofread-diagnostic-at-point)))
+              (should
+               (equal
+                (proofread-test--public-diagnostic-signature
+                 first-lookup)
+                (proofread-test--public-diagnostic-signature
+                 second-lookup)))
+              (should
+               (equal
+                (proofread-test--public-diagnostic-signature
+                 first-lookup)
+                (plist-get expected :public))))
+            (goto-char (point-min))
+            (proofread-next)
+            (should
+             (equal
+              (proofread-test--aggregate-order-signature
+               proofread--current-diagnostic)
+              expected))
+            (goto-char 5)
+            (let (collection)
+              (cl-letf (((symbol-function 'completing-read)
+                         (lambda (_prompt candidates &rest _args)
+                           (setq collection candidates)
+                           (car candidates))))
+                (should (eq (proofread-correct-at-point) 'applied)))
+              (should
+               (equal collection
+                      '( "first-fix" "shared" "second-fix")))
+              (should (equal (buffer-string)
+                             "aa first-fix zz")))))))
+    (should
+     (equal
+      (nreverse diagnostic-signatures)
+      (make-list
+       2
+       '(( first 0 (4 . 8) "helo" grammar "First message"
+           ("first-fix" "shared"))
+         ( second 1 (4 . 8) "helo" style "Second message"
+           ("second-fix" "shared"))))))
+    (should (equal (nreverse signatures)
+                   (list expected expected)))))
+
+(ert-deftest
+    proofread-test-profile-order-controls-conflicting-correction
+    ()
+  "Prefer the first profile checker for equal-range batch corrections."
+  (dolist (completion-order '(( first second) ( second first)))
+    (with-temp-buffer
+      (insert "aa helo zz")
+      (let ((proofread-auto-check nil)
+            (proofread-cache-max-entries 0)
+            (proofread-context-size 0)
+            (proofread-max-concurrent-requests 2)
+            (proofread-profile 'multi)
+            (proofread-profiles
+             (proofread-test--ordered-profiles))
+            (recorder (proofread-test--make-backend-recorder)))
+        (proofread-mode 1)
+        (cl-letf (((symbol-function 'proofread--backend-check)
+                   (plist-get recorder :function)))
+          (proofread-check-buffer)
+          (proofread-test--complete-recorded-checkers
+           recorder completion-order))
+        (let (collection)
+          (cl-letf (((symbol-function 'completing-read)
+                     (lambda (_prompt candidates &rest _args)
+                       (setq collection candidates)
+                       (car candidates))))
+            (should (eq (proofread-correct-buffer) 'applied)))
+          (should (equal collection '( "first-fix" "shared")))
+          (should (equal (buffer-string) "aa first-fix zz")))))))
+
+(ert-deftest
+    proofread-test-profile-reorder-reuses-cache-and-reorders-presentation
+    ()
+  "Reuse checker cache entries after changing profile presentation order."
+  (with-temp-buffer
+    (insert "aa helo zz")
+    (let ((proofread-auto-check nil)
+          (proofread-cache-max-entries 10)
+          (proofread-context-size 0)
+          (proofread-max-concurrent-requests 2)
+          (proofread-profile 'multi)
+          (proofread-profiles
+           (proofread-test--ordered-profiles))
+          (warm-recorder (proofread-test--make-backend-recorder))
+          (cache-recorder (proofread-test--make-backend-recorder)))
+      (proofread-mode 1)
+      (cl-letf (((symbol-function 'proofread--backend-check)
+                 (plist-get warm-recorder :function)))
+        (proofread-check-buffer)
+        (should
+         (equal
+          (proofread-test--complete-recorded-checkers
+           warm-recorder '( second first))
+          '( applied applied))))
+      (should (= (hash-table-count proofread--cache) 2))
+      (proofread-clear)
+      (setq proofread-profiles
+            (proofread-test--ordered-profiles '( second first)))
+      (cl-letf (((symbol-function 'proofread--backend-check)
+                 (plist-get cache-recorder :function)))
+        (proofread-check-buffer))
+      (should-not (funcall (plist-get cache-recorder :requests)))
+      (should-not proofread--active-requests)
+      (should (= (hash-table-count proofread--cache) 2))
+      (should
+       (equal
+        (mapcar
+         (lambda (diagnostic)
+           (list (plist-get diagnostic :checker-name)
+                 (plist-get diagnostic :checker-ordinal)))
+         (proofread--diagnostic-members
+          (car (proofread--navigation-diagnostics))))
+        '(( second 0) ( first 1))))
+      (should
+       (equal
+        (proofread-test--aggregate-order-signature
+         (car (proofread--navigation-diagnostics)))
+        '( :members (second first)
+           :kind style
+           :sources ("second" "first")
+           :public ((4 . 8)
+                    "second: Second message; first: First message"
+                    "helo")
+           :suggestions ("second-fix" "shared" "first-fix")))))))
+
+(ert-deftest
+    proofread-test-profile-order-is-stable-for-mixed-cache-network
+    ()
+  "Keep profile order when one checker hits cache and one completes later."
+  (let ((expected
+         '( :members (first second)
+            :kind grammar
+            :sources ("first" "second")
+            :public ((4 . 8)
+                     "first: First message; second: Second message"
+                     "helo")
+            :suggestions ("first-fix" "shared" "second-fix")))
+        signatures)
+    (dolist (cached-checker '( first second))
+      (with-temp-buffer
+        (insert "aa helo zz")
+        (let ((proofread-auto-check nil)
+              (proofread-cache-max-entries 10)
+              (proofread-context-size 0)
+              (proofread-max-concurrent-requests 2)
+              (proofread-profile 'multi)
+              (proofread-profiles
+               (proofread-test--ordered-profiles))
+              (recorder (proofread-test--make-backend-recorder)))
+          (proofread-mode 1)
+          (let* ((profile (proofread--current-profile))
+                 (checker
+                  (cl-find
+                   cached-checker (plist-get profile :checkers)
+                   :key (lambda (candidate)
+                          (plist-get candidate :name))))
+                 (chunk
+                  (car
+                   (proofread-test--request-ready-chunks-for-ranges
+                    (list (cons (point-min) (point-max))))))
+                 (request
+                  (proofread--make-backend-request
+                   chunk proofread-test--backend checker profile)))
+            (proofread--cache-write-request
+             request
+             (list
+              (proofread-test--ordered-checker-diagnostic request))))
+          (cl-letf (((symbol-function 'proofread--backend-check)
+                     (plist-get recorder :function)))
+            (proofread-check-buffer)
+            (let* ((requests
+                    (funcall (plist-get recorder :requests)))
+                   (network-checker
+                    (if (eq cached-checker 'first)
+                        'second
+                      'first)))
+              (should (= (length requests) 1))
+              (should (eq (plist-get (car requests) :checker-name)
+                          network-checker))
+              (should (= (length proofread--active-requests) 1))
+              (should (= (length proofread--diagnostics) 1))
+              (should
+               (eq (plist-get (car proofread--diagnostics)
+                              :checker-name)
+                   cached-checker))
+              (should
+               (equal
+                (proofread-test--complete-recorded-checkers
+                 recorder (list network-checker))
+                '( applied)))))
+          (should (= (hash-table-count proofread--cache) 2))
+          (push
+           (proofread-test--aggregate-order-signature
+            (car (proofread--navigation-diagnostics)))
+           signatures))))
+    (should (equal (nreverse signatures)
+                   (list expected expected)))))
+
+(ert-deftest
     proofread-test-profile-cache-hit-preserves-diagnostic-provenance
     ()
   "Keep checker provenance when diagnostics are served from cache."
@@ -4067,6 +4463,7 @@ This covers URLs, email, invisible text, faces, and properties."
         (let* ((entry (proofread--cache-read-request request))
                (cached (car (plist-get entry :diagnostics))))
           (should (equal (plist-get cached :language) "en-US"))
+          (should (= (plist-get cached :checker-ordinal) 0))
           (should (equal (plist-get cached :checker-owner)
                          (plist-get request :checker-owner)))
           (should (eq (proofread--apply-cache-entry request entry)
@@ -4075,6 +4472,7 @@ This covers URLs, email, invisible text, faces, and properties."
             (should (equal (plist-get live :language) "en-US"))
             (should (equal (plist-get live :profile) 'multi))
             (should (equal (plist-get live :checker-name) 'strict))
+            (should (= (plist-get live :checker-ordinal) 0))
             (should (equal (plist-get live :checker-owner)
                            (plist-get request :checker-owner)))))))))
 
@@ -4174,7 +4572,8 @@ This covers URLs, email, invisible text, faces, and properties."
 (ert-deftest
     proofread-test-profile-cache-key-uses-backend-checker-identity ()
   "Let backend checker identity own raw checker options in cache keys."
-  (let ((proofread--backend-registry (make-hash-table :test #'eq)))
+  (let ((proofread--backend-registry (make-hash-table :test #'eq))
+        identity-checkers)
     (proofread--register-backend
      proofread-test--backend
      :check (lambda (_request _callback) nil)
@@ -4184,6 +4583,7 @@ This covers URLs, email, invisible text, faces, and properties."
           :contract-version 1))
      :checker-identity
      (lambda (checker)
+       (push (copy-sequence checker) identity-checkers)
        (list :backend proofread-test--backend
              :tone (plist-get (plist-get checker :options)
                               :tone)
@@ -4196,18 +4596,21 @@ This covers URLs, email, invisible text, faces, and properties."
              (formal-a
               `( :profile multi
                  :name local
+                 :checker-ordinal 0
                  :backend ,proofread-test--backend
                  :options ( :tone formal
                             :secret "secret-a")))
              (formal-b
               `( :profile multi
                  :name local
+                 :checker-ordinal 1
                  :backend ,proofread-test--backend
                  :options ( :tone formal
                             :secret "secret-b")))
              (relaxed
               `( :profile multi
                  :name local
+                 :checker-ordinal 2
                  :backend ,proofread-test--backend
                  :options ( :tone relaxed
                             :secret "secret-a")))
@@ -4228,6 +4631,11 @@ This covers URLs, email, invisible text, faces, and properties."
                        (plist-get formal-b-request :cache-key)))
         (should-not (equal (plist-get formal-a-request :cache-key)
                            (plist-get relaxed-request :cache-key)))
+        (should
+         (cl-every
+          (lambda (checker)
+            (not (plist-member checker :checker-ordinal)))
+          identity-checkers))
         (should-not
          (string-match-p
           (regexp-quote "secret-a")
@@ -5278,6 +5686,34 @@ This covers URLs, email, invisible text, faces, and properties."
 
 ;;;; Navigation and presentation tests
 
+(ert-deftest
+    proofread-test-navigation-preserves-equal-checker-ordinal-order
+    ()
+  "Preserve backend order for equal-range diagnostics from one checker."
+  (with-temp-buffer
+    (insert "helo")
+    (proofread-mode 1)
+    (let ((first
+           (proofread-test--diagnostic-with-checker
+            (proofread--make-diagnostic
+             :beg 1 :end 5 :text "helo" :kind 'grammar
+             :message "First" :suggestions nil :source 'test)
+            'same))
+          (second
+           (proofread-test--diagnostic-with-checker
+            (proofread--make-diagnostic
+             :beg 1 :end 5 :text "helo" :kind 'style
+             :message "Second" :suggestions nil :source 'test)
+            'same)))
+      (setq first (plist-put first :checker-ordinal 0))
+      (setq second (plist-put second :checker-ordinal 0))
+      (proofread-test--install-diagnostics (list first second))
+      (should
+       (equal
+        (proofread--diagnostic-members
+         (car (proofread--navigation-diagnostics)))
+        (list first second))))))
+
 (ert-deftest proofread-test-navigation-sorts-and-filters-diagnostics
     ()
   "Sort valid navigation diagnostics by start and end."
@@ -5784,8 +6220,13 @@ This covers URLs, email, invisible text, faces, and properties."
             'second)))
       (proofread-test--install-diagnostics (list first second))
       (goto-char 2)
-      (let ((diagnostic (proofread-diagnostic-at-point)))
+      (let ((diagnostic (proofread-diagnostic-at-point))
+            (repeated (proofread-diagnostic-at-point)))
         (should (proofread--aggregate-diagnostic-p diagnostic))
+        (should
+         (equal
+          (proofread-test--public-diagnostic-signature diagnostic)
+          (proofread-test--public-diagnostic-signature repeated)))
         (should (equal (plist-get diagnostic :diagnostics)
                        (list first second)))
         (should (equal (proofread--diagnostic-suggestions

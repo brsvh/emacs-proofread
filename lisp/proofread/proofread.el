@@ -290,7 +290,7 @@ request-ready chunks."
      :beg :end :text
      :context-before :context-after
      :language
-     :profile :checker-name :checker-owner
+     :profile :checker-name :checker-ordinal :checker-owner
      :checker-options :checker-identity
      :major-mode
      :target-policy :target-kind
@@ -628,10 +628,10 @@ duplicate names."
     definition))
 
 (defun proofread--normalize-profile-checker
-    (profile-name checker seen-names)
+    (profile-name checker ordinal seen-names)
   "Return normalized CHECKER for PROFILE-NAME.
-SEEN-NAMES is an eq hash table used to reject duplicate checker
-names inside the profile."
+ORDINAL is CHECKER's position in the profile.  SEEN-NAMES is an eq
+hash table used to reject duplicate checker names inside the profile."
   (let ((context (format "Proofread profile %S checker" profile-name)))
     (proofread--validate-known-plist
      checker context proofread--profile-checker-keys)
@@ -652,6 +652,7 @@ names inside the profile."
          (format "%s %S :options" context name)))
       (list :profile profile-name
             :name name
+            :checker-ordinal ordinal
             :backend backend
             :options (proofread--snapshot-value options)))))
 
@@ -663,11 +664,13 @@ names inside the profile."
            profile-name))
   (let ((seen-names (make-hash-table :test #'eq))
         normalized)
-    (dolist (checker checkers)
-      (push
-       (proofread--normalize-profile-checker
-        profile-name checker seen-names)
-       normalized))
+    (cl-loop for checker in checkers
+             for ordinal from 0
+             do
+             (push
+              (proofread--normalize-profile-checker
+               profile-name checker ordinal seen-names)
+              normalized))
     (nreverse normalized)))
 
 (defun proofread--normalize-profile (name definition)
@@ -699,6 +702,7 @@ so it cannot alias an explicitly named profile and checker."
       (error "Proofread backend must be nil or a symbol"))
     (list :profile proofread--legacy-profile-name
           :name proofread--legacy-checker-name
+          :checker-ordinal 0
           :backend proofread-backend
           :options nil
           :legacy t)))
@@ -768,7 +772,12 @@ Internal checker kinds include their provenance discriminator."
           (proofread--backend-checker-identity-function backend))
          (value
           (if identity-function
-              (funcall identity-function checker)
+              (let ((identity-checker (copy-sequence checker)))
+                ;; Checker order is presentation metadata.  Keep it out
+                ;; of backend-owned cache identities even when a backend
+                ;; snapshots its complete input.
+                (cl-remf identity-checker :checker-ordinal)
+                (funcall identity-function identity-checker))
             (proofread--backend-identity backend))))
     (cond
      ((null value)
@@ -1065,7 +1074,8 @@ The returned plist contains the keys in `proofread--diagnostic-keys'."
     (request diagnostic)
   "Return DIAGNOSTIC annotated with provenance from REQUEST."
   (let ((diagnostic (copy-sequence diagnostic)))
-    (dolist (key '( :language :profile :checker-name :checker-owner))
+    (dolist (key '( :language :profile :checker-name
+                    :checker-ordinal :checker-owner))
       (setq diagnostic
             (plist-put
              diagnostic key
@@ -2266,6 +2276,9 @@ that is independent of profile selection."
                      ( :checker-name
                        (proofread--snapshot-value
                         (plist-get checker :name)))
+                     ( :checker-ordinal
+                       (proofread--snapshot-value
+                        (plist-get checker :checker-ordinal)))
                      ( :checker-owner checker-owner)
                      ( :checker-options
                        (proofread--snapshot-value
@@ -4144,7 +4157,8 @@ Each record has the keys `:text', `:sources', and `:diagnostics'."
 
 (defun proofread--make-aggregate-diagnostic
     (diagnostics beg end)
-  "Return a UI aggregate for DIAGNOSTICS covering BEG to END."
+  "Return a UI aggregate for DIAGNOSTICS covering BEG to END.
+DIAGNOSTICS must be in navigation order."
   (let* ((first (car diagnostics))
          (aggregate
           (list :proofread-aggregate t
@@ -4190,12 +4204,24 @@ using their printed representation."
         (a-end (nth 2 a))
         (b-end (nth 2 b))
         (a-index (nth 3 a))
-        (b-index (nth 3 b)))
+        (b-index (nth 3 b))
+        (a-ordinal
+         (plist-get (car a) :checker-ordinal))
+        (b-ordinal
+         (plist-get (car b) :checker-ordinal)))
     (cond
      ((< a-beg b-beg) t)
      ((> a-beg b-beg) nil)
      ((< a-end b-end) t)
      ((> a-end b-end) nil)
+     ((and (natnump a-ordinal) (natnump b-ordinal)
+           (< a-ordinal b-ordinal))
+      t)
+     ((and (natnump a-ordinal) (natnump b-ordinal)
+           (> a-ordinal b-ordinal))
+      nil)
+     ((and (natnump a-ordinal) (not (natnump b-ordinal))) t)
+     ((and (natnump b-ordinal) (not (natnump a-ordinal))) nil)
      (t (< a-index b-index)))))
 
 (defun proofread--raw-navigation-entries (&optional accessible-only)
@@ -4463,7 +4489,11 @@ restriction."
 (defun proofread-diagnostic-at-point (&optional position)
   "Return the live proofreading diagnostic at POSITION or point.
 A diagnostic is live only while its proofread-owned overlay exists in
-the current buffer."
+the current buffer.  An aggregate may be freshly allocated on every
+call, so callers must not rely on `eq' identity across calls.  Compare
+values from `proofread-diagnostic-range',
+`proofread-diagnostic-message', and `proofread-diagnostic-text'
+instead."
   (when-let* ((point-position
                (proofread--position-integer (or position (point)))))
     (save-restriction

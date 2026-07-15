@@ -68,7 +68,9 @@ checkers remain visible until their replacement results are applied.
 *** Matching diagnostics from multiple checkers are aggregated.
 Diagnostics for the same text and range remain independent internally but
 are presented as one source-aware diagnostic for navigation, descriptions,
-suggestions, correction, and ignoring.
+suggestions, correction, and ignoring.  Grouped sources, messages,
+suggestions, and correction choices follow the profile's declared checker
+order, regardless of asynchronous completion order.
 
 ** Packaging and development
 
