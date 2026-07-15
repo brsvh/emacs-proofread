@@ -97,7 +97,7 @@
   (mapcar #'proofread--create-overlay diagnostics))
 
 (defconst proofread-test--diagnostic-provenance-keys
-  '( :language :profile :binding-name :binding-owner)
+  '( :language :profile :checker-name :checker-owner)
   "Diagnostic provenance keys added by the Proofread core.")
 
 (defun proofread-test--diagnostic-without-provenance
@@ -108,14 +108,14 @@
       (cl-remf diagnostic key))
     diagnostic))
 
-(defun proofread-test--diagnostic-with-binding
-    (diagnostic binding)
-  "Return DIAGNOSTIC annotated as owned by BINDING."
+(defun proofread-test--diagnostic-with-checker
+    (diagnostic checker)
+  "Return DIAGNOSTIC annotated as owned by CHECKER."
   (let ((diagnostic (copy-sequence diagnostic)))
     (setq diagnostic (plist-put diagnostic :profile 'multi))
-    (setq diagnostic (plist-put diagnostic :binding-name binding))
-    (plist-put diagnostic :binding-owner
-               (list :profile 'multi :binding-name binding))))
+    (setq diagnostic (plist-put diagnostic :checker-name checker))
+    (plist-put diagnostic :checker-owner
+               (list :profile 'multi :checker-name checker))))
 
 (defun proofread-test--diagnostics-without-provenance
     (diagnostics)
@@ -250,7 +250,7 @@ BACKEND is nil, use the generic test backend."
   "Return the first normalized checker from PROFILE.
 When PROFILE is nil, use the current profile."
   (car (plist-get (or profile (proofread--current-profile))
-                  :bindings)))
+                  :checkers)))
 
 (defun proofread-test--make-profile-request (chunk)
   "Return a backend request for CHUNK owned by the current profile."
@@ -2882,7 +2882,7 @@ This covers URLs, email, invisible text, faces, and properties."
        `( :name legacy
           :language "zh-Hans"
           :display-language nil
-          :bindings
+          :checkers
           (( :profile legacy
              :name legacy
              :backend ,proofread-test--backend
@@ -2900,7 +2900,7 @@ This covers URLs, email, invisible text, faces, and properties."
                                            '( :name legacy
                                               :language nil
                                               :display-language nil
-                                              :bindings nil))))))
+                                              :checkers nil))))))
 
 (ert-deftest proofread-test-legacy-dispatch-warns-once-per-session ()
   "Warn once when repeated checks dispatch through legacy options."
@@ -3028,7 +3028,7 @@ This covers URLs, email, invisible text, faces, and properties."
                     (push args warnings)))
                  ((symbol-function 'message) #'ignore))
          (let* ((profile (proofread--current-profile))
-                (binding (car (plist-get profile :bindings)))
+                (checker (car (plist-get profile :checkers)))
                 (chunk
                  (car
                   (proofread-test--request-ready-chunks-for-ranges
@@ -3036,22 +3036,22 @@ This covers URLs, email, invisible text, faces, and properties."
                    (plist-get profile :language))))
                 (request
                  (proofread--make-backend-request
-                  chunk proofread-test--backend binding profile))
-                (binding-identity
-                 (plist-get request :binding-identity)))
+                  chunk proofread-test--backend checker profile))
+                (checker-identity
+                 (plist-get request :checker-identity)))
            (should (eq (plist-get request :profile) 'legacy))
-           (should (eq (plist-get request :binding-name) 'legacy))
-           (should (equal (plist-get request :binding-owner)
+           (should (eq (plist-get request :checker-name) 'legacy))
+           (should (equal (plist-get request :checker-owner)
                           '( :profile legacy
-                             :binding-name legacy
+                             :checker-name legacy
                              :legacy t)))
            (should (equal (plist-get request :language) "en-US"))
            (should (equal (plist-get request :backend-identity)
                           (proofread-test--backend-identity)))
            (should (equal
-                    (plist-get binding-identity :backend-identity)
+                    (plist-get checker-identity :backend-identity)
                     (proofread-test--backend-identity)))
-           (should (plist-get binding-identity :legacy))
+           (should (plist-get checker-identity :legacy))
            (should (proofread--fresh-request-p request))
            (let ((proofread-language "fr"))
              (should-not (proofread--fresh-request-p request)))
@@ -3092,27 +3092,27 @@ This covers URLs, email, invisible text, faces, and properties."
                ( :language "zh-CN"
                  :level picky)))))))
     (let* ((profile (proofread--current-profile))
-           (bindings (plist-get profile :bindings))
-           (llm-binding (car bindings))
-           (languagetool-binding (cadr bindings)))
+           (checkers (plist-get profile :checkers))
+           (llm-checker (car checkers))
+           (languagetool-checker (cadr checkers)))
       (should (eq (plist-get profile :name) 'zh-hans))
       (should (equal (plist-get profile :language) "zh-Hans"))
       (should (equal (plist-get profile :display-language)
                      "Simplified Chinese"))
-      (should (= (length bindings) 2))
-      (should (eq (plist-get llm-binding :profile) 'zh-hans))
-      (should (eq (plist-get llm-binding :name) 'llm-primary))
-      (should (eq (plist-get llm-binding :backend)
+      (should (= (length checkers) 2))
+      (should (eq (plist-get llm-checker :profile) 'zh-hans))
+      (should (eq (plist-get llm-checker :name) 'llm-primary))
+      (should (eq (plist-get llm-checker :backend)
                   proofread-test--backend))
-      (should (equal (plist-get llm-binding :options)
+      (should (equal (plist-get llm-checker :options)
                      '( :provider proofread-test-provider
                         :provider-identity "test-provider"
                         :instructions-function
                         proofread-test-instructions
                         :instructions-identity "instructions:v1")))
-      (should (eq (plist-get languagetool-binding :name)
+      (should (eq (plist-get languagetool-checker :name)
                   'languagetool))
-      (should (eq (plist-get languagetool-binding :backend)
+      (should (eq (plist-get languagetool-checker :backend)
                   'languagetool)))))
 
 (ert-deftest proofread-test-profile-can-be-buffer-local ()
@@ -3188,9 +3188,9 @@ This covers URLs, email, invisible text, faces, and properties."
                                                         'proofread-test-handle)))
                                              (let ((profile (proofread--current-profile)))
                                                (should (eq (plist-get profile :name) 'disabled))
-                                               (should-not (plist-get profile :bindings))
+                                               (should-not (plist-get profile :checkers))
                                                (should-not
-                                                (proofread--current-profile-supported-bindings profile)))
+                                                (proofread--current-profile-supported-checkers profile)))
                                              (proofread-check-buffer))
                                            (should (= backend-calls 0))
                                            (should-not proofread--active-requests)
@@ -3228,13 +3228,13 @@ This covers URLs, email, invisible text, faces, and properties."
          (should (= (length requests) 1))
          (let ((request (car requests)))
            (should (eq (plist-get request :profile) 'legacy))
-           (should (eq (plist-get request :binding-name) 'legacy))
+           (should (eq (plist-get request :checker-name) 'legacy))
            (should (eq (plist-get request :backend)
                        proofread-test--backend))
            (should (equal (plist-get request :language)
                           "profile-language"))
            (should-not
-            (plist-get (plist-get request :binding-owner)
+            (plist-get (plist-get request :checker-owner)
                        :legacy))))
        (should-not warnings)
        (should-not proofread--legacy-dispatch-warning-issued-p)))))
@@ -3261,21 +3261,21 @@ This covers URLs, email, invisible text, faces, and properties."
               (explicit-profile
                (let ((proofread-profile 'legacy))
                  (proofread--current-profile)))
-              (explicit-binding
-               (car (plist-get explicit-profile :bindings)))
+              (explicit-checker
+               (car (plist-get explicit-profile :checkers)))
               (explicit-request
                (proofread--make-backend-request
                 chunk proofread-test--backend
-                explicit-binding explicit-profile))
+                explicit-checker explicit-profile))
               (legacy-profile
                (let ((proofread-profile nil))
                  (proofread--current-profile)))
-              (legacy-binding
-               (car (plist-get legacy-profile :bindings)))
+              (legacy-checker
+               (car (plist-get legacy-profile :checkers)))
               (legacy-request
                (proofread--make-backend-request
                 chunk proofread-test--backend
-                legacy-binding legacy-profile))
+                legacy-checker legacy-profile))
               (ad-hoc-request
                (proofread--make-backend-request
                 chunk proofread-test--backend)))
@@ -3284,7 +3284,7 @@ This covers URLs, email, invisible text, faces, and properties."
                         (list explicit-request ad-hoc-request)
                         (list legacy-request ad-hoc-request)))
            (dolist (key
-                    '( :binding-owner :binding-identity :cache-key))
+                    '( :checker-owner :checker-identity :cache-key))
              (should-not
               (equal (plist-get (car pair) key)
                      (plist-get (cadr pair) key))))
@@ -3391,7 +3391,7 @@ This covers URLs, email, invisible text, faces, and properties."
            (should (= (length requests) 1))
            (should (equal (plist-get request :language) "en-US"))
            (should (eq (plist-get request :profile) 'legacy))
-           (should (eq (plist-get request :binding-name) 'legacy))
+           (should (eq (plist-get request :checker-name) 'legacy))
            (should
             (eq (funcall
                  (car callbacks)
@@ -3402,9 +3402,9 @@ This covers URLs, email, invisible text, faces, and properties."
            (let ((live (car proofread--diagnostics)))
              (should (equal (plist-get live :language) "en-US"))
              (should (eq (plist-get live :profile) 'legacy))
-             (should (eq (plist-get live :binding-name) 'legacy))
-             (should (equal (plist-get live :binding-owner)
-                            (plist-get request :binding-owner))))
+             (should (eq (plist-get live :checker-name) 'legacy))
+             (should (equal (plist-get live :checker-owner)
+                            (plist-get request :checker-owner))))
            (proofread-check-buffer)
            (should (= (length
                        (funcall (plist-get recorder :requests)))
@@ -3447,7 +3447,7 @@ This covers URLs, email, invisible text, faces, and properties."
          (proofread-check-buffer)
          (should request)
          (should (eq (plist-get request :profile) 'legacy))
-         (should (eq (plist-get request :binding-name) 'legacy))
+         (should (eq (plist-get request :checker-name) 'legacy))
          (should (proofread--active-request-p request))
          (proofread-mode -1))
        (should (plist-get handle :cancelled))
@@ -3513,11 +3513,11 @@ This covers URLs, email, invisible text, faces, and properties."
                                  requests)
                          '( multi multi)))
           (should (equal (mapcar (lambda (request)
-                                   (plist-get request :binding-name))
+                                   (plist-get request :checker-name))
                                  requests)
                          '( strict gentle)))
           (should (equal (mapcar (lambda (request)
-                                   (plist-get request :binding-options))
+                                   (plist-get request :checker-options))
                                  requests)
                          '(( :tone strict) ( :tone gentle))))
           (should (equal (mapcar (lambda (request)
@@ -3557,7 +3557,7 @@ This covers URLs, email, invisible text, faces, and properties."
                        proofread--request-queue)))
           (should (= (length queued) 2))
           (should (equal (mapcar (lambda (request)
-                                   (plist-get request :binding-name))
+                                   (plist-get request :checker-name))
                                  queued)
                          '( first second)))
           (should-not (equal (proofread--request-work-key
@@ -3589,11 +3589,11 @@ This covers URLs, email, invisible text, faces, and properties."
       (cl-letf (((symbol-function 'proofread--backend-check)
                  (lambda (request _callback &optional _backend)
                    (list :backend proofread-test--backend
-                         :binding-name
-                         (plist-get request :binding-name)))))
+                         :checker-name
+                         (plist-get request :checker-name)))))
         (let* ((profile (proofread--current-profile))
-               (bindings (plist-get profile :bindings))
-               (first-binding (car bindings))
+               (checkers (plist-get profile :checkers))
+               (first-checker (car checkers))
                (old-chunk
                 (car
                  (proofread-test--request-ready-chunks-for-ranges
@@ -3608,21 +3608,21 @@ This covers URLs, email, invisible text, faces, and properties."
                   (cl-find
                    'first proofread--active-requests
                    :key (lambda (request)
-                          (plist-get request :binding-name))))
+                          (plist-get request :checker-name))))
                  (old-second
                   (cl-find
                    'second proofread--active-requests
                    :key (lambda (request)
-                          (plist-get request :binding-name)))))
+                          (plist-get request :checker-name)))))
             (should old-first)
             (should old-second)
             (proofread--dispatch-request-ready-chunks
              (list new-chunk) proofread-test--backend
-             first-binding profile)
+             first-checker profile)
             (let ((new-first
                    (cl-find-if
                     (lambda (request)
-                      (and (eq (plist-get request :binding-name)
+                      (and (eq (plist-get request :checker-name)
                                'first)
                            (equal (plist-get request :text)
                                   "bcde")))
@@ -3652,14 +3652,14 @@ This covers URLs, email, invisible text, faces, and properties."
                  :backend ,proofread-test--backend))))))
       (proofread-mode 1)
       (let* ((profile (proofread--current-profile))
-             (binding (car (plist-get profile :bindings)))
+             (checker (car (plist-get profile :checkers)))
              (chunk
               (car
                (proofread-test--request-ready-chunks-for-ranges
                 (list (cons (point-min) (point-max))))))
              (request
               (proofread--make-backend-request
-               chunk proofread-test--backend binding profile))
+               chunk proofread-test--backend checker profile))
              (diagnostic
               (proofread-test--diagnostic-for-range
                1 5 "helo")))
@@ -3672,9 +3672,9 @@ This covers URLs, email, invisible text, faces, and properties."
         (let ((live (car proofread--diagnostics)))
           (should (equal (plist-get live :language) "en-US"))
           (should (equal (plist-get live :profile) 'multi))
-          (should (equal (plist-get live :binding-name) 'strict))
-          (should (equal (plist-get live :binding-owner)
-                         (plist-get request :binding-owner))))))))
+          (should (equal (plist-get live :checker-name) 'strict))
+          (should (equal (plist-get live :checker-owner)
+                         (plist-get request :checker-owner))))))))
 
 (ert-deftest
     proofread-test-profile-result-replaces-only-same-checker
@@ -3693,19 +3693,19 @@ This covers URLs, email, invisible text, faces, and properties."
                  :backend ,proofread-test--backend))))))
       (proofread-mode 1)
       (let* ((profile (proofread--current-profile))
-             (bindings (plist-get profile :bindings))
-             (first-binding (car bindings))
-             (second-binding (cadr bindings))
+             (checkers (plist-get profile :checkers))
+             (first-checker (car checkers))
+             (second-checker (cadr checkers))
              (chunk
               (car
                (proofread-test--request-ready-chunks-for-ranges
                 (list (cons (point-min) (point-max))))))
              (first-request
               (proofread--make-backend-request
-               chunk proofread-test--backend first-binding profile))
+               chunk proofread-test--backend first-checker profile))
              (second-request
               (proofread--make-backend-request
-               chunk proofread-test--backend second-binding profile))
+               chunk proofread-test--backend second-checker profile))
              (first-diagnostic
               (proofread-test--diagnostic-with-suggestions
                1 5 "helo" '( "hello")))
@@ -3726,7 +3726,7 @@ This covers URLs, email, invisible text, faces, and properties."
                 (list second-diagnostic first-diagnostic)))
         (should
          (equal (mapcar (lambda (diagnostic)
-                          (plist-get diagnostic :binding-name))
+                          (plist-get diagnostic :checker-name))
                         proofread--diagnostics)
                 '( second first)))
         (should (eq (proofread--handle-backend-result
@@ -3738,8 +3738,8 @@ This covers URLs, email, invisible text, faces, and properties."
                  proofread--diagnostics)
                 (list second-diagnostic)))
         (should (equal (plist-get (car proofread--diagnostics)
-                                  :binding-owner)
-                       (plist-get second-request :binding-owner)))))))
+                                  :checker-owner)
+                       (plist-get second-request :checker-owner)))))))
 
 (ert-deftest
     proofread-test-profile-cache-hit-preserves-diagnostic-provenance
@@ -3756,14 +3756,14 @@ This covers URLs, email, invisible text, faces, and properties."
                  :backend ,proofread-test--backend))))))
       (proofread-mode 1)
       (let* ((profile (proofread--current-profile))
-             (binding (car (plist-get profile :bindings)))
+             (checker (car (plist-get profile :checkers)))
              (chunk
               (car
                (proofread-test--request-ready-chunks-for-ranges
                 (list (cons (point-min) (point-max))))))
              (request
               (proofread--make-backend-request
-               chunk proofread-test--backend binding profile))
+               chunk proofread-test--backend checker profile))
              (diagnostic
               (proofread-test--diagnostic-for-range
                1 5 "helo")))
@@ -3771,16 +3771,16 @@ This covers URLs, email, invisible text, faces, and properties."
         (let* ((entry (proofread--cache-read-request request))
                (cached (car (plist-get entry :diagnostics))))
           (should (equal (plist-get cached :language) "en-US"))
-          (should (equal (plist-get cached :binding-owner)
-                         (plist-get request :binding-owner)))
+          (should (equal (plist-get cached :checker-owner)
+                         (plist-get request :checker-owner)))
           (should (eq (proofread--apply-cache-entry request entry)
                       'applied))
           (let ((live (car proofread--diagnostics)))
             (should (equal (plist-get live :language) "en-US"))
             (should (equal (plist-get live :profile) 'multi))
-            (should (equal (plist-get live :binding-name) 'strict))
-            (should (equal (plist-get live :binding-owner)
-                           (plist-get request :binding-owner)))))))))
+            (should (equal (plist-get live :checker-name) 'strict))
+            (should (equal (plist-get live :checker-owner)
+                           (plist-get request :checker-owner)))))))))
 
 (ert-deftest
     proofread-test-profile-partial-results-keep-checker-duplicates
@@ -3799,18 +3799,18 @@ This covers URLs, email, invisible text, faces, and properties."
                  :backend ,proofread-test--backend))))))
       (proofread-mode 1)
       (let* ((profile (proofread--current-profile))
-             (bindings (plist-get profile :bindings))
+             (checkers (plist-get profile :checkers))
              (chunk
               (car
                (proofread-test--request-ready-chunks-for-ranges
                 (list (cons (point-min) (point-max))))))
              (first-request
               (proofread--make-backend-request
-               chunk proofread-test--backend (car bindings)
+               chunk proofread-test--backend (car checkers)
                profile))
              (second-request
               (proofread--make-backend-request
-               chunk proofread-test--backend (cadr bindings)
+               chunk proofread-test--backend (cadr checkers)
                profile))
              (diagnostic
               (proofread-test--diagnostic-for-range
@@ -3829,14 +3829,14 @@ This covers URLs, email, invisible text, faces, and properties."
                 (list diagnostic diagnostic)))
         (should
          (equal (mapcar (lambda (live-diagnostic)
-                          (plist-get live-diagnostic :binding-name))
+                          (plist-get live-diagnostic :checker-name))
                         proofread--diagnostics)
                 '( first second)))))))
 
 (ert-deftest
-    proofread-test-profile-cache-key-distinguishes-binding-identity
+    proofread-test-profile-cache-key-distinguishes-checker-identity
     ()
-  "Include binding names and options in diagnostic cache keys."
+  "Include checker names and options in diagnostic cache keys."
   (with-temp-buffer
     (insert "Alpha")
     (proofread-mode 1)
@@ -3876,9 +3876,8 @@ This covers URLs, email, invisible text, faces, and properties."
                                     :cache-key))))))
 
 (ert-deftest
-    proofread-test-profile-cache-key-uses-backend-binding-identity ()
-  ()
-  "Let backend binding identity own raw binding options in cache keys."
+    proofread-test-profile-cache-key-uses-backend-checker-identity ()
+  "Let backend checker identity own raw checker options in cache keys."
   (let ((proofread--backend-registry (make-hash-table :test #'eq)))
     (proofread--register-backend
      proofread-test--backend
@@ -3887,10 +3886,10 @@ This covers URLs, email, invisible text, faces, and properties."
      (lambda ()
        '( :backend proofread-test-backend
           :contract-version 1))
-     :binding-identity
-     (lambda (binding)
+     :checker-identity
+     (lambda (checker)
        (list :backend proofread-test--backend
-             :tone (plist-get (plist-get binding :options)
+             :tone (plist-get (plist-get checker :options)
                               :tone)
              :contract-version 1)))
     (with-temp-buffer
@@ -3939,6 +3938,71 @@ This covers URLs, email, invisible text, faces, and properties."
           (prin1-to-string
            (plist-get formal-a-request :cache-key))))))))
 
+(ert-deftest proofread-test-cache-contract-v3-isolates-old-namespace
+    ()
+  "Keep version 2 cache entries out of the renamed version 3 namespace."
+  (with-temp-buffer
+    (insert "Alpha")
+    (let ((proofread-auto-check nil)
+          (proofread-context-size 0))
+      (proofread-mode 1)
+      (proofread-test--with-profile
+       (let* ((chunk
+               (car
+                (proofread-test--request-ready-chunks-for-ranges
+                 (list (cons (point-min) (point-max))))))
+              (request
+               (proofread-test--make-profile-request chunk))
+              (new-key (plist-get request :cache-key))
+              (old-key
+               (cl-substitute :binding :checker
+                              (copy-tree new-key) :test #'eq)))
+         (setf (plist-get old-key :contract-version) 2)
+         (should (= proofread--contract-version 3))
+         (should (= (plist-get new-key :contract-version) 3))
+         (should (plist-member new-key :checker))
+         (should-not (plist-member new-key :binding))
+         (should (plist-member old-key :binding))
+         (should-not (plist-member old-key :checker))
+         (should (proofread--cache-write old-key 'old-value))
+         (should (eq (proofread--cache-read old-key) 'old-value))
+         (should-not (proofread--cache-read new-key)))))))
+
+(ert-deftest proofread-test-old-provenance-request-is-stale ()
+  "Reject version 2 requests carrying only binding provenance."
+  (with-temp-buffer
+    (insert "Alpha")
+    (let ((proofread-auto-check nil)
+          (proofread-context-size 0))
+      (proofread-mode 1)
+      (proofread-test--with-profile
+       (let* ((chunk
+               (car
+                (proofread-test--request-ready-chunks-for-ranges
+                 (list (cons (point-min) (point-max))))))
+              (request
+               (proofread-test--make-profile-request chunk))
+              (old-request (copy-tree request)))
+         (dolist (fields
+                  '(( :checker-name :binding-name)
+                    ( :checker-owner :binding-owner)
+                    ( :checker-options :binding-options)
+                    ( :checker-identity :binding-identity)))
+           (let ((value (plist-get old-request (car fields))))
+             (cl-remf old-request (car fields))
+             (setq old-request
+                   (plist-put old-request (cadr fields) value))))
+         (should-not (plist-member request :contract-version))
+         (should-not (plist-member old-request :checker-name))
+         (should (plist-member old-request :binding-name))
+         (should
+          (proofread--request-current-backend-identity-p old-request))
+         (should (proofread--request-current-checker-p request))
+         (should-not
+          (proofread--request-current-checker-p old-request))
+         (should (proofread--fresh-request-p request))
+         (should-not (proofread--fresh-request-p old-request)))))))
+
 (ert-deftest
     proofread-test-profile-checker-change-makes-request-stale
     ()
@@ -3957,14 +4021,14 @@ This covers URLs, email, invisible text, faces, and properties."
                  :options ( :tone formal)))))))
       (proofread-mode 1)
       (let* ((profile (proofread--current-profile))
-             (binding (car (plist-get profile :bindings)))
+             (checker (car (plist-get profile :checkers)))
              (chunk
               (car
                (proofread-test--request-ready-chunks-for-ranges
                 (list (cons (point-min) (point-max))))))
              (request
               (proofread--make-backend-request
-               chunk proofread-test--backend binding profile)))
+               chunk proofread-test--backend checker profile)))
         (proofread-test--with-legacy-options nil "global-change"
                                              (should (proofread--fresh-request-p request)))
         (let ((proofread-profiles
@@ -4005,7 +4069,7 @@ This covers URLs, email, invisible text, faces, and properties."
         (let ((owners
                (mapcar
                 (lambda (request)
-                  (plist-get request :binding-name))
+                  (plist-get request :checker-name))
                 (append
                  proofread--active-requests
                  (mapcar (lambda (entry)
@@ -4465,7 +4529,7 @@ This covers URLs, email, invisible text, faces, and properties."
               (should (eq (plist-get request :buffer) first-buffer))
               (should (eq (plist-get request :profile)
                           'first-profile))
-              (should (eq (plist-get request :binding-name)
+              (should (eq (plist-get request :checker-name)
                           'first-checker))))
           (with-current-buffer second-buffer
             (should (= (length proofread--active-requests) 1))
@@ -4473,7 +4537,7 @@ This covers URLs, email, invisible text, faces, and properties."
               (should (eq (plist-get request :buffer) second-buffer))
               (should (eq (plist-get request :profile)
                           'second-profile))
-              (should (eq (plist-get request :binding-name)
+              (should (eq (plist-get request :checker-name)
                           'second-checker)))))
       (kill-buffer first-buffer)
       (kill-buffer second-buffer))))
@@ -5206,15 +5270,15 @@ This covers URLs, email, invisible text, faces, and properties."
             (kill-buffer buffer)))))))
 
 (ert-deftest
-    proofread-test-diagnostics-list-aggregates-bindings ()
-  "List one row for same-range diagnostics from multiple bindings."
+    proofread-test-diagnostics-list-aggregates-checkers ()
+  "List one row for same-range diagnostics from multiple checkers."
   (save-window-excursion
     (with-temp-buffer
       (switch-to-buffer (current-buffer))
       (insert "aa helo")
       (proofread-mode 1)
       (let* ((first
-              (proofread-test--diagnostic-with-binding
+              (proofread-test--diagnostic-with-checker
                (proofread--make-diagnostic
                 :beg 4
                 :end 8
@@ -5225,7 +5289,7 @@ This covers URLs, email, invisible text, faces, and properties."
                 :source 'test)
                'first))
              (second
-              (proofread-test--diagnostic-with-binding
+              (proofread-test--diagnostic-with-checker
                (proofread--make-diagnostic
                 :beg 4
                 :end 8
@@ -5266,15 +5330,15 @@ This covers URLs, email, invisible text, faces, and properties."
     (insert "helo hallo")
     (proofread-mode 1)
     (let ((same-range-different-text
-           (proofread-test--diagnostic-with-binding
+           (proofread-test--diagnostic-with-checker
             (proofread-test--diagnostic-for-range 1 5 "helo")
             'first))
           (different-text
-           (proofread-test--diagnostic-with-binding
+           (proofread-test--diagnostic-with-checker
             (proofread-test--diagnostic-for-range 1 5 "hallo")
             'second))
           (different-range
-           (proofread-test--diagnostic-with-binding
+           (proofread-test--diagnostic-with-checker
             (proofread-test--diagnostic-for-range 6 11 "hallo")
             'third)))
       (proofread-test--install-diagnostics
@@ -5292,11 +5356,11 @@ This covers URLs, email, invisible text, faces, and properties."
       (insert "aa helo")
       (proofread-mode 1)
       (let* ((first
-              (proofread-test--diagnostic-with-binding
+              (proofread-test--diagnostic-with-checker
                (proofread-test--diagnostic-for-range 4 8 "helo")
                'first))
              (second
-              (proofread-test--diagnostic-with-binding
+              (proofread-test--diagnostic-with-checker
                (proofread-test--diagnostic-for-range 4 8 "helo")
                'second))
              (name (proofread--diagnostics-buffer-name)))
@@ -5406,19 +5470,19 @@ This covers URLs, email, invisible text, faces, and properties."
       (goto-char 4)
       (should (eq (proofread-diagnostic-at-point) short)))))
 
-(ert-deftest proofread-test-diagnostic-at-point-aggregates-bindings
+(ert-deftest proofread-test-diagnostic-at-point-aggregates-checkers
     ()
-  "Point lookup aggregates same-range diagnostics from bindings."
+  "Point lookup aggregates same-range diagnostics from checkers."
   (with-temp-buffer
     (insert "helo")
     (proofread-mode 1)
     (let ((first
-           (proofread-test--diagnostic-with-binding
+           (proofread-test--diagnostic-with-checker
             (proofread-test--diagnostic-with-suggestions
              1 5 "helo" '( "hello"))
             'first))
           (second
-           (proofread-test--diagnostic-with-binding
+           (proofread-test--diagnostic-with-checker
             (proofread-test--diagnostic-with-suggestions
              1 5 "helo" '( "hello" "hullo"))
             'second)))
@@ -5643,14 +5707,14 @@ This covers URLs, email, invisible text, faces, and properties."
             (should (< first second))
             (should (< second third))))))))
 
-(ert-deftest proofread-test-describe-aggregates-binding-details ()
+(ert-deftest proofread-test-describe-aggregates-checker-details ()
   "`proofread-describe' preserves aggregate messages and sources."
   (save-window-excursion
     (with-temp-buffer
       (insert "helo")
       (proofread-mode 1)
       (let ((first
-             (proofread-test--diagnostic-with-binding
+             (proofread-test--diagnostic-with-checker
               (proofread--make-diagnostic
                :beg 1
                :end 5
@@ -5661,7 +5725,7 @@ This covers URLs, email, invisible text, faces, and properties."
                :source 'test)
               'first))
             (second
-             (proofread-test--diagnostic-with-binding
+             (proofread-test--diagnostic-with-checker
               (proofread--make-diagnostic
                :beg 1
                :end 5
@@ -5837,12 +5901,12 @@ This covers URLs, email, invisible text, faces, and properties."
     (insert "aa helo zz")
     (proofread-mode 1)
     (let ((first
-           (proofread-test--diagnostic-with-binding
+           (proofread-test--diagnostic-with-checker
             (proofread-test--diagnostic-with-suggestions
              4 8 "helo" '( "hello" "hullo"))
             'first))
           (second
-           (proofread-test--diagnostic-with-binding
+           (proofread-test--diagnostic-with-checker
             (proofread-test--diagnostic-with-suggestions
              4 8 "helo" '( "hello"))
             'second))

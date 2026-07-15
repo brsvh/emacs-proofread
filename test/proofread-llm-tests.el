@@ -46,7 +46,7 @@
   "Return the first normalized checker from PROFILE.
 When PROFILE is nil, use the current profile."
   (car (plist-get (or profile (proofread--current-profile))
-                  :bindings)))
+                  :checkers)))
 
 (defun proofread-llm-test--make-profile-request (chunk)
   "Return an LLM backend request for CHUNK under the current profile."
@@ -252,8 +252,9 @@ When PROFILE is nil, use the current profile."
                 #'proofread-llm--backend-check))
     (should (eq (plist-get descriptor :identity)
                 #'proofread-llm--provider-identity))
-    (should (eq (plist-get descriptor :binding-identity)
-                #'proofread-llm--binding-identity))
+    (should (eq (plist-get descriptor :checker-identity)
+                #'proofread-llm--checker-identity))
+    (should-not (plist-member descriptor :binding-identity))
     (should (eq (plist-get descriptor :cancel)
                 #'proofread-llm--cancel-request-handle))))
 
@@ -568,8 +569,8 @@ When PROFILE is nil, use the current profile."
                                                         'llm))))))))
 
 (ert-deftest
-    proofread-llm-test-binding-options-build-local-prompt ()
-  "Binding-local LLM options select provider and prompt extras."
+    proofread-llm-test-checker-options-build-local-prompt ()
+  "Checker-local LLM options select provider and prompt extras."
   (with-temp-buffer
     (text-mode)
     (insert "helo")
@@ -577,12 +578,12 @@ When PROFILE is nil, use the current profile."
            (proofread-llm-provider-identity "global-provider")
            (proofread-llm-response-strategy 'provider-json)
            (proofread-llm-max-diagnostic-passes 3)
-           (binding
+           (checker
             '( :profile multi
                :name local
                :backend llm
-               :options ( :provider proofread-binding-provider
-                          :provider-identity "binding-provider"
+               :options ( :provider proofread-checker-provider
+                          :provider-identity "checker-provider"
                           :response-strategy prompt-json
                           :diagnostic-passes 1
                           :instructions-function
@@ -599,7 +600,7 @@ When PROFILE is nil, use the current profile."
                             (plist-get backend-request
                                        :target-kind)))))
               (proofread--make-backend-request
-               chunk 'llm binding profile)))
+               chunk 'llm checker profile)))
            (content
             (proofread-llm-test--response-for-range 0 4 "helo"))
            captured-provider
@@ -609,7 +610,7 @@ When PROFILE is nil, use the current profile."
        (equal
         (plist-get request :backend-identity)
         '( :backend llm
-           :provider "binding-provider"
+           :provider "checker-provider"
            :response-strategy prompt-json
            :diagnostic-passes 1
            :instructions-identity "instructions-v1"
@@ -633,7 +634,7 @@ When PROFILE is nil, use the current profile."
                 (lambda (backend-result)
                   (setq result backend-result)))))
           (proofread-llm-test--assert-handle-shape handle)
-          (should (eq captured-provider 'proofread-binding-provider))
+          (should (eq captured-provider 'proofread-checker-provider))
           (should (equal (llm-chat-prompt-response-format
                           captured-prompt)
                          nil))
@@ -1892,53 +1893,53 @@ When PROFILE is nil, use the current profile."
                                                         chunk))))))))
 
 (ert-deftest
-    proofread-llm-test-binding-instructions-identity-cache-miss ()
-  "Binding-local instruction identity participates in cache keys."
+    proofread-llm-test-checker-instructions-identity-cache-miss ()
+  "Checker-local instruction identity participates in cache keys."
   (with-temp-buffer
     (insert "helo")
     (proofread-mode 1)
     (let* ((proofread-llm-provider proofread-llm-test--provider)
            (proofread-llm-provider-identity "global-provider")
            (profile '( :name multi :language "en-US"))
-           (base-binding
+           (base-checker
             '( :profile multi
                :name local
                :backend llm
                :options ( :provider proofread-llm-test-provider
-                          :provider-identity "binding-provider"
+                          :provider-identity "checker-provider"
                           :instructions-function ignore
                           :instructions-identity "instructions-a")))
-           (changed-function-binding
+           (changed-function-checker
             '( :profile multi
                :name local
                :backend llm
                :options ( :provider proofread-llm-test-provider
-                          :provider-identity "binding-provider"
+                          :provider-identity "checker-provider"
                           :instructions-function identity
                           :instructions-identity "instructions-a")))
-           (changed-identity-binding
+           (changed-identity-checker
             '( :profile multi
                :name local
                :backend llm
                :options ( :provider proofread-llm-test-provider
-                          :provider-identity "binding-provider"
+                          :provider-identity "checker-provider"
                           :instructions-function ignore
                           :instructions-identity "instructions-b")))
            (chunk (proofread-llm-test--whole-buffer-chunk))
            (request
             (proofread--make-backend-request
-             chunk 'llm base-binding profile))
+             chunk 'llm base-checker profile))
            (diagnostic
             (proofread-llm-test--diagnostic-for-range 1 5 "helo")))
       (proofread--cache-write-request request (list diagnostic))
       (should
        (proofread--cache-read-request
         (proofread--make-backend-request
-         chunk 'llm changed-function-binding profile)))
+         chunk 'llm changed-function-checker profile)))
       (should-not
        (proofread--cache-read-request
         (proofread--make-backend-request
-         chunk 'llm changed-identity-binding profile)))
+         chunk 'llm changed-identity-checker profile)))
       (should-not
        (string-match-p
         (regexp-quote "instructions-function")

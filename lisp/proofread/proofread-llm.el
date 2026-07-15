@@ -754,13 +754,13 @@ PASS identifies the diagnostic pass for request logging."
     (error nil)))
 
 (defun proofread-llm--source-options (source)
-  "Return binding-local options from SOURCE, or nil.
-SOURCE may be a backend request or a normalized profile binding."
-  (or (plist-get source :binding-options)
+  "Return checker-local options from SOURCE, or nil.
+SOURCE may be a backend request or a normalized profile checker."
+  (or (plist-get source :checker-options)
       (plist-get source :options)))
 
 (defun proofread-llm--option (source key fallback)
-  "Return SOURCE binding option KEY, or FALLBACK when absent."
+  "Return SOURCE checker option KEY, or FALLBACK when absent."
   (let ((options (proofread-llm--source-options source)))
     (if (plist-member options key)
         (plist-get options key)
@@ -885,9 +885,9 @@ capability fallback."
   "Return stable cache identity for the configured LLM provider."
   (proofread-llm--identity-for-source nil))
 
-(defun proofread-llm--binding-identity (binding)
-  "Return stable cache identity for normalized profile BINDING."
-  (proofread-llm--identity-for-source binding))
+(defun proofread-llm--checker-identity (checker)
+  "Return stable cache identity for normalized profile CHECKER."
+  (proofread-llm--identity-for-source checker))
 
 ;;;; Request execution
 
@@ -1086,7 +1086,7 @@ MAX-PASSES is the request-local diagnostic pass limit."
    'llm
    :check #'proofread-llm--backend-check
    :identity #'proofread-llm--provider-identity
-   :binding-identity #'proofread-llm--binding-identity
+   :checker-identity #'proofread-llm--checker-identity
    :cancel #'proofread-llm--cancel-request-handle))
 
 (provide 'proofread-llm)

@@ -147,8 +147,9 @@ CALLBACK-STATUS is the status plist passed to the URL callback."
                 #'proofread-languagetool--check))
     (should (eq (plist-get descriptor :identity)
                 #'proofread-languagetool--identity))
-    (should (eq (plist-get descriptor :binding-identity)
-                #'proofread-languagetool--binding-identity))
+    (should (eq (plist-get descriptor :checker-identity)
+                #'proofread-languagetool--checker-identity))
+    (should-not (plist-member descriptor :binding-identity))
     (should (eq (plist-get descriptor :cancel)
                 #'proofread-languagetool--cancel))))
 
@@ -435,8 +436,8 @@ The identity does not expose arguments."
         (should (string-match-p (regexp-quote part) body))))))
 
 (ert-deftest
-    proofread-languagetool-test-binding-options-override-parameters ()
-  "Binding-local LanguageTool request options override defcustoms."
+    proofread-languagetool-test-checker-options-override-parameters ()
+  "Checker-local LanguageTool request options override defcustoms."
   (let ((proofread-languagetool-level 'default)
         (proofread-languagetool-preferred-variants nil)
         (proofread-languagetool-mother-tongue nil)
@@ -448,7 +449,7 @@ The identity does not expose arguments."
     (let* ((request
             (proofread-languagetool-test--request
              :language "fr-FR"
-             :binding-options
+             :checker-options
              '( :language nil
                 :level picky
                 :preferred-variants ( "en-US")
@@ -478,8 +479,8 @@ The identity does not expose arguments."
                    body)))))
 
 (ert-deftest
-    proofread-languagetool-test-binding-identity-covers-options ()
-  "Binding identity covers request options and ignores binding URL."
+    proofread-languagetool-test-checker-identity-covers-options ()
+  "Checker identity covers request options and ignores checker URL."
   (let ((proofread-languagetool-server-url
          "http://127.0.0.1:8081/v2/")
         (proofread-languagetool-level 'default)
@@ -510,7 +511,7 @@ The identity does not expose arguments."
                           :enabled-rules ( "RULE_B" "RULE_A")
                           :url "http://127.0.0.1:9999/v2")))
            (identity
-            (proofread-languagetool--binding-identity base)))
+            (proofread-languagetool--checker-identity base)))
       (should (equal (plist-get identity :server-url)
                      "http://127.0.0.1:8081/v2"))
       (should (equal (plist-get identity :language) "auto"))
@@ -518,11 +519,11 @@ The identity does not expose arguments."
       (should (equal (plist-get identity :enabled-rules)
                      '( "RULE_A" "RULE_B")))
       (should (equal identity
-                     (proofread-languagetool--binding-identity
+                     (proofread-languagetool--checker-identity
                       same-url-changed)))
       (should-not (equal
                    identity
-                   (proofread-languagetool--binding-identity
+                   (proofread-languagetool--checker-identity
                     changed-option)))
       (should-not (string-match-p
                    (regexp-quote "9999")

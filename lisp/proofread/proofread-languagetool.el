@@ -389,13 +389,13 @@ When BASE-URL is nil, validate and use the configured server URL."
     (error (format "%S" values))))
 
 (defun proofread-languagetool--source-options (source)
-  "Return binding-local options from SOURCE, or nil.
-SOURCE may be a backend request or a normalized profile binding."
-  (or (plist-get source :binding-options)
+  "Return checker-local options from SOURCE, or nil.
+SOURCE may be a backend request or a normalized profile checker."
+  (or (plist-get source :checker-options)
       (plist-get source :options)))
 
 (defun proofread-languagetool--option (source key fallback)
-  "Return SOURCE binding option KEY, or FALLBACK when absent."
+  "Return SOURCE checker option KEY, or FALLBACK when absent."
   (let ((options (proofread-languagetool--source-options source)))
     (if (plist-member options key)
         (plist-get options key)
@@ -722,9 +722,9 @@ startup even when automatic startup is disabled."
   "Return the stable, non-secret LanguageTool backend identity."
   (proofread-languagetool--identity-for-source nil))
 
-(defun proofread-languagetool--binding-identity (binding)
-  "Return stable cache identity for normalized profile BINDING."
-  (proofread-languagetool--identity-for-source binding))
+(defun proofread-languagetool--checker-identity (checker)
+  "Return stable cache identity for normalized profile CHECKER."
+  (proofread-languagetool--identity-for-source checker))
 
 ;;;; Request encoding and response parsing
 
@@ -1898,7 +1898,7 @@ An external server reused by this backend is never stopped."
    'languagetool
    :check #'proofread-languagetool--check
    :identity #'proofread-languagetool--identity
-   :binding-identity #'proofread-languagetool--binding-identity
+   :checker-identity #'proofread-languagetool--checker-identity
    :cancel #'proofread-languagetool--cancel))
 
 (provide 'proofread-languagetool)
