@@ -83,8 +83,16 @@ test symbols are aligned with their feature namespaces.
 The core library does not load GNU ELPA "llm" until the LLM backend is
 selected or required explicitly.
 
+** Compatibility
+
+---
+*** proofread 0.2.0 remains compatible with proofread-popup 0.1.0.
+The core retains the compatibility entry points used by the released
+popup.  Users may therefore upgrade proofread before upgrading the
+optional popup frontend.
+
 
-* Changes in proofread 0.1.0 (2026-07-13)
+* Changes in proofread 0.1.0
 
 Initial release.
 
@@ -147,7 +155,25 @@ Proofread can record and inspect complete request lifecycles on demand,
 including queued, active, completed, failed, and stale requests.
 
 
-* Changes in proofread-popup 0.1.0 (2026-07-13)
+* Changes in proofread-popup 0.1.1
+
+** Compatibility
+
+---
+*** proofread-popup now requires proofread 0.2.0.
+This release uses the public frontend integration interfaces introduced
+in proofread 0.2.0.  Update the core package before installing this
+version of proofread-popup.
+
+** Packaging
+
+---
+*** The source file now lives in its package directory.
+Source-checkout installations should add "lisp/proofread-popup" to
+'load-path'.
+
+
+* Changes in proofread-popup 0.1.0
 
 Initial release.
 

@@ -61,6 +61,12 @@
     (error "%s must be a positive integer" symbol))
   (set-default symbol value))
 
+;; Compatibility for proofread-popup 0.1.0.
+(define-obsolete-function-alias
+  'proofread--set-positive-integer-option
+  'proofread-set-positive-integer-option
+  "0.2.0")
+
 (defcustom proofread-language nil
   "Legacy language hint used when `proofread-profile' is nil.
 When nil, the selected legacy backend may infer the language from
@@ -912,6 +918,12 @@ effective backend identity."
   (let ((warning-minimum-level :error))
     (display-warning 'proofread message :warning))
   (proofread--message-without-resizing "proofread: %s" summary))
+
+;; Compatibility for proofread-popup 0.1.0.
+(define-obsolete-function-alias
+  'proofread--report-warning-without-window
+  'proofread-report-warning-without-window
+  "0.2.0")
 
 (defun proofread--warn-about-legacy-dispatch ()
   "Warn once per session about legacy configuration use."

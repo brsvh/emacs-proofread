@@ -2850,6 +2850,19 @@ This covers URLs, email, invisible text, faces, and properties."
 
 ;;;; Profile configuration tests
 
+(ert-deftest proofread-test-popup-0.1-compatibility-aliases ()
+  "Retain the two core helper aliases required by popup 0.1.0."
+  (dolist (case
+           '((proofread--set-positive-integer-option
+              . proofread-set-positive-integer-option)
+             (proofread--report-warning-without-window
+              . proofread-report-warning-without-window)))
+    (let ((old-name (car case))
+          (replacement (cdr case)))
+      (should (eq (symbol-function old-name) replacement))
+      (should (equal (get old-name 'byte-obsolete-info)
+                     (list replacement nil "0.2.0"))))))
+
 (ert-deftest proofread-test-legacy-options-are-obsolete ()
   "Mark both legacy configuration options obsolete in version 0.2.0."
   (dolist (case

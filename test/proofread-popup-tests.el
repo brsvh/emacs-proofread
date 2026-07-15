@@ -12,6 +12,7 @@
 
 (require 'cl-lib)
 (require 'ert)
+(require 'package)
 (require 'proofread)
 (require 'proofread-popup)
 
@@ -71,6 +72,19 @@ SUGGESTIONS and MESSAGE supply the optional field values."
        ,@body)))
 
 ;;;; Configuration and messages
+
+(ert-deftest proofread-popup-test-package-metadata ()
+  "Package metadata requires proofread 0.2.0 for popup 0.1.1."
+  (let ((source (locate-file "proofread-popup.el" load-path)))
+    (should source)
+    (with-temp-buffer
+      (insert-file-contents source)
+      (let ((description (package-buffer-info)))
+        (should (equal (package-desc-version description)
+                       '(0 1 1)))
+        (should (equal (cadr (assq 'proofread
+                                   (package-desc-reqs description)))
+                       '(0 2 0)))))))
 
 (ert-deftest proofread-popup-test-faces-have-package-defaults ()
   "Proofread popup faces use the package defaults."

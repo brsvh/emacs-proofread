@@ -270,7 +270,72 @@ EXTRA-FILES maps additional relative file names to their contents."
             proofread-release-test--other-commit))
     (should
      (equal (proofread-release--package-release-tag popup)
-            "proofread-popup-v0.1.0"))))
+            "proofread-popup-v0.1.0"))
+    (should
+     (equal (proofread-release--package-version popup)
+            "0.1.0"))
+    (should
+     (equal (proofread-release--package-requires popup)
+            '(("proofread" . "0.1.0"))))))
+
+(ert-deftest proofread-release-test-updates-popup-after-core ()
+  "Popup 0.1.1 can follow a core 0.2.0 package release."
+  (let* ((core
+          (proofread-release-test--package
+           "proofread" "0.2.0" ?a))
+         (old-popup
+          (proofread-release-test--package
+           "proofread-popup" "0.1.0" ?b
+           '(("proofread" . "0.1.0"))))
+         (previous
+          (proofread-release-test--manifest
+           "proofread-v0.2.0"
+           proofread-release-test--commit
+           "proofread"
+           (list core old-popup)
+           "proofread-popup-v0.1.0"))
+         (new-popup
+          (proofread-release-test--package
+           "proofread-popup" "0.1.1" ?c
+           '(("proofread" . "0.2.0"))
+           nil proofread-release-test--other-commit))
+         (manifest
+          (proofread-release--new-manifest
+           "proofread-popup-v0.1.1"
+           proofread-release-test--other-commit
+           previous
+           new-popup))
+         (manifest-core
+          (proofread-release-test--manifest-package
+           manifest "proofread"))
+         (manifest-popup
+          (proofread-release-test--manifest-package
+           manifest "proofread-popup")))
+    (should
+     (equal (proofread-release--field manifest 'released_package)
+            "proofread-popup"))
+    (should
+     (equal (proofread-release--field manifest 'previous)
+            "proofread-v0.2.0"))
+    (should
+     (equal (proofread-release--package-version manifest-core)
+            "0.2.0"))
+    (should
+     (equal (proofread-release--package-release-tag manifest-core)
+            "proofread-v0.2.0"))
+    (should
+     (equal (proofread-release--package-version manifest-popup)
+            "0.1.1"))
+    (should
+     (equal (proofread-release--package-requires manifest-popup)
+            '(("proofread" . "0.2.0"))))
+    (should
+     (equal
+      (mapcar
+       #'proofread-release--package-name
+       (proofread-release--required-dependencies
+        previous new-popup))
+      '("proofread")))))
 
 (ert-deftest proofread-release-test-does-not-retire-absent-package ()
   "A package release preserves unrelated package records."

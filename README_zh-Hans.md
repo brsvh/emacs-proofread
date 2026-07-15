@@ -29,7 +29,8 @@ https://github.com/user-attachments/assets/3c77758b-00ab-48e2-9e23-e54e8845d251
 `proofread` 包依赖 GNU Emacs 和 GNU ELPA `llm`，其中同时包含核心、LLM 和 LanguageTool
 库。LanguageTool 本身是可选运行时依赖，仅在使用 LanguageTool checker 时需要；核心与 LLM
 后端不会加载或启动它。LanguageTool 后端可以复用任意兼容的本地 v2 HTTP 服务；只有自动启动功能额外要求
-`languagetool-http-server` 位于 `exec-path`。可选的 `proofread-popup` 包还依赖 `posframe`。
+`languagetool-http-server` 位于 `exec-path`。可选的 `proofread-popup` 0.1.1 包还要求
+`proofread` 0.2.0 或更高版本，并依赖 `posframe`。
 
 克隆本仓库并将其中的软件包目录加入 `load-path`：
 

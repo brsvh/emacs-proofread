@@ -122,7 +122,7 @@
                     src =
                       projectRoot
                       + /lisp/proofread-popup/proofread-popup.el;
-                    version = "0.1.0";
+                    version = "0.1.1";
                   };
 
                 scope = finalAttrs: _: {
@@ -342,6 +342,7 @@
                             coreInitdir="$testRoot/core"
                             llmInitdir="$testRoot/llm"
                             languageToolInitdir="$testRoot/languagetool"
+                            popupCompatInitdir="$testRoot/popup-0.1-compat"
                             popupInitdir="$testRoot/popup"
                             releaseInitdir="$testRoot/release"
 
@@ -349,6 +350,7 @@
                               "$coreInitdir" \
                               "$llmInitdir" \
                               "$languageToolInitdir" \
+                              "$popupCompatInitdir" \
                               "$popupInitdir" \
                               "$releaseInitdir"
 
@@ -369,6 +371,18 @@
                               -l "${
                                 projectRoot
                                 + /test/proofread-languagetool-tests.el
+                              }" \
+                              -f ert-run-tests-batch-and-exit
+
+                            PROOFREAD_POPUP_V0_1_0_FIXTURE="${
+                              projectRoot
+                              + /test/fixtures/proofread-popup-v0.1.0.el.in
+                            }" \
+                            "${emacs-with-proofread-popup}/bin/emacs" --batch \
+                              --init-directory "$popupCompatInitdir" \
+                              -l "${
+                                projectRoot
+                                + /test/proofread-popup-v0.1.0-tests.el
                               }" \
                               -f ert-run-tests-batch-and-exit
 

@@ -35,7 +35,8 @@ runtime dependency used only by LanguageTool checkers; the core and LLM backend
 neither load nor start it. The LanguageTool backend can reuse any compatible
 local v2 HTTP server; automatic startup additionally requires a
 `languagetool-http-server` executable on `exec-path`. The optional
-`proofread-popup` package additionally requires `posframe`.
+`proofread-popup` 0.1.1 package additionally requires `proofread` 0.2.0 or later
+and `posframe`.
 
 Clone this repository and add its package directories to `load-path`:
 
