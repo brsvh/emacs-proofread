@@ -60,9 +60,11 @@ model to return only JSON."
 
 (defcustom proofread-llm-provider-identity nil
   "Stable cache identity for `proofread-llm-provider'.
-When nil, proofread combines `llm-name' with a session-local provider
-identity.  Set this to a stable, non-secret value to share cache
-entries across equivalent provider objects in the same buffer."
+When nil, proofread combines `llm-name' with a non-secret identity
+local to the current provider object and `proofread-llm' feature load.
+Set this to a stable, non-secret value to reuse compatible cache
+entries across equivalent provider objects and feature reloads in the
+same buffer."
   :type 'sexp
   :group 'proofread)
 
@@ -100,6 +102,10 @@ is non-nil, because extra instructions can change LLM diagnostics."
 (defvar proofread-llm--provider-session-identities
   (make-hash-table :test #'eq :weakness 'key)
   "Session-local identities for LLM provider objects.")
+
+(defvar proofread-llm--provider-load-discriminator
+  (gensym "proofread-llm-provider-load-")
+  "Non-secret discriminator for fallback identities from this load.")
 
 (defvar proofread-llm--live-handles nil
   "LLM backend handles that have not settled or been cancelled.")
@@ -881,6 +887,7 @@ capability fallback."
                    :name
                    (or (proofread-llm--provider-name provider)
                        'unknown)
+                   :load proofread-llm--provider-load-discriminator
                    :session
                    (proofread-llm--provider-session-identity
                     provider)))

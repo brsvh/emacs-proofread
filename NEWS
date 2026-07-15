@@ -72,6 +72,13 @@ settles the related core requests exactly once.  Late provider callbacks are
 ignored, preventing void-function errors and occupied scheduler slots during
 unload or reload.
 
+---
+*** Fallback LLM provider identities no longer collide after reload.
+Automatically generated identities now differ across loads of
+"proofread-llm", so a different provider with the same name cannot reuse stale
+cache entries.  Explicit ':provider-identity' values remain stable for
+intentional cache reuse.
+
 ** User interface
 
 ---

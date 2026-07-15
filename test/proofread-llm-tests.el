@@ -634,6 +634,9 @@ When PROFILE is nil, use the current profile."
                  "qwen3:1.7b")))
       (let ((identity (proofread--backend-identity 'llm)))
         (should (eq (plist-get identity :backend) 'llm))
+        (should-not
+         (proofread-llm-test--tree-member-p
+          proofread-llm-provider identity))
         (let ((provider (plist-get identity :provider)))
           (should (equal (plist-get provider :name) "qwen3:1.7b"))
           (should (integerp (plist-get provider :session))))
@@ -647,6 +650,109 @@ When PROFILE is nil, use the current profile."
                  '( :id :buffer :callback :timer :process
                     :request :requests))
           (should-not (plist-member identity volatile-key)))))))
+
+(ert-deftest
+    proofread-llm-test-fallback-identity-changes-after-reload ()
+  "Distinguish same-named fallback providers across feature reloads."
+  (let ((first-provider
+         [:provider-a :api-key "first-secret-token"])
+        (second-provider
+         [:provider-b :api-key "second-secret-token"])
+        first-identity second-identity)
+    (unwind-protect
+        (proofread-llm-test--with-capabilities
+         (cl-letf (((symbol-function 'llm-name)
+                    (lambda (_provider) "same-provider-name")))
+           (let ((proofread-llm-provider first-provider)
+                 (proofread-llm-provider-identity nil))
+             (setq first-identity
+                   (proofread--backend-identity 'llm)))
+           (unload-feature 'proofread-llm t)
+           (require 'proofread-llm)
+           (let ((proofread-llm-provider second-provider)
+                 (proofread-llm-provider-identity nil))
+             (setq second-identity
+                   (proofread--backend-identity 'llm)))
+           (should-not (eq first-provider second-provider))
+           (should
+            (equal
+             (plist-get
+              (plist-get first-identity :provider) :name)
+             (plist-get
+              (plist-get second-identity :provider) :name)))
+           (should-not (equal first-identity second-identity))
+           (dolist (entry
+                    `((,first-provider
+                       "first-secret-token" ,first-identity)
+                      (,second-provider
+                       "second-secret-token" ,second-identity)))
+             (let ((provider (nth 0 entry))
+                   (secret (nth 1 entry))
+                   (identity (nth 2 entry)))
+               (should-not
+                (proofread-llm-test--tree-member-p
+                 provider identity))
+               (should-not
+                (string-match-p
+                 (regexp-quote secret)
+                 (prin1-to-string identity)))))))
+      (ignore-errors
+        (unload-feature 'proofread-llm t))
+      (require 'proofread-llm))))
+
+(ert-deftest
+    proofread-llm-test-explicit-identity-reuses-cache-after-reload ()
+  "Reuse cache across reload for an explicitly stable provider identity."
+  (with-temp-buffer
+    (insert "Alpha")
+    (setq-local proofread-auto-check nil)
+    (proofread-mode 1)
+    (proofread-llm-test--with-profile nil
+                                      (let* ((first-provider [:provider-a :api-key "first-secret"])
+                                             (second-provider
+                                              [:provider-b :api-key "second-secret"])
+                                             (stable-identity "shared-provider")
+                                             (unrelated-key
+                                              '( proofread-llm-test-unrelated-cache))
+                                             (unrelated-entry '( :source unrelated-backend))
+                                             (chunk (proofread-llm-test--whole-buffer-chunk))
+                                             (diagnostic
+                                              (proofread-llm-test--diagnostic-for-range
+                                               1 6 "Alpha"))
+                                             first-request first-backend-identity)
+                                        (unwind-protect
+                                            (proofread-llm-test--with-capabilities
+                                             (let ((proofread-llm-provider first-provider)
+                                                   (proofread-llm-provider-identity
+                                                    stable-identity))
+                                               (setq first-request
+                                                     (proofread-llm-test--make-profile-request
+                                                      chunk))
+                                               (setq first-backend-identity
+                                                     (plist-get first-request :backend-identity))
+                                               (proofread--cache-write-request
+                                                first-request (list diagnostic)))
+                                             (proofread--cache-write unrelated-key unrelated-entry)
+                                             (unload-feature 'proofread-llm t)
+                                             (require 'proofread-llm)
+                                             (let* ((proofread-llm-provider second-provider)
+                                                    (proofread-llm-provider-identity
+                                                     stable-identity)
+                                                    (second-request
+                                                     (proofread-llm-test--make-profile-request
+                                                      chunk)))
+                                               (should
+                                                (equal first-backend-identity
+                                                       (plist-get
+                                                        second-request :backend-identity)))
+                                               (should
+                                                (proofread--cache-read-request second-request)))
+                                             (should
+                                              (equal (proofread--cache-read unrelated-key)
+                                                     unrelated-entry)))
+                                          (ignore-errors
+                                            (unload-feature 'proofread-llm t))
+                                          (require 'proofread-llm))))))
 
 (ert-deftest proofread-llm-test-provider-identity-cache-miss ()
   "Changing stable LLM provider identity misses old cache entries."
