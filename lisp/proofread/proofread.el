@@ -584,7 +584,7 @@ duplicate names."
   (unless (symbolp name)
     (error "Proofread profile name must be a symbol: %S" name))
   (unless (listp proofread-profiles)
-    (error "proofread-profiles must be a list"))
+    (error "Proofread profiles must be a list"))
   (let (definition found)
     (dolist (entry proofread-profiles)
       (unless (and (consp entry) (symbolp (car entry)))
@@ -668,7 +668,7 @@ selected legacy backend is nil."
   (let ((backend (or backend proofread-backend)))
     (when backend
       (unless (symbolp backend)
-        (error "proofread-backend must be nil or a symbol"))
+        (error "Proofread backend must be nil or a symbol"))
       (list :profile proofread--legacy-profile-name
             :name proofread--legacy-binding-name
             :backend backend
@@ -678,7 +678,7 @@ selected legacy backend is nil."
   "Return a normalized profile from legacy backend options."
   (unless (or (null proofread-backend)
               (symbolp proofread-backend))
-    (error "proofread-backend must be nil or a symbol"))
+    (error "Proofread backend must be nil or a symbol"))
   (proofread--validate-language-option
    proofread-language "proofread-language")
   (let ((binding (proofread--legacy-profile-binding)))
