@@ -51,6 +51,12 @@ The core now dispatches through a backend registry.  The registry supports
 lazy loading, backend-specific cache identities, and backend-specific
 request cancellation.
 
+---
+*** Checker dispatch failures are isolated within a profile.
+Failures while loading a backend, computing checker identity, constructing
+requests, or submitting them are reported for that checker.  Remaining
+checkers in the profile continue to run.
+
 ** User interface
 
 ---

@@ -1020,6 +1020,59 @@ effective backend identity."
        nil)
      event)))
 
+(defun proofread--checker-dispatch-phase-label (phase)
+  "Return a caller-readable label for checker dispatch PHASE."
+  (pcase phase
+    ('backend-loading "backend loading")
+    ('checker-identity "checker identity calculation")
+    ('request-construction "request construction")
+    (_ (format "%s" phase))))
+
+(defun proofread--make-checker-dispatch-failure
+    (profile checker phase err)
+  "Return a dispatch failure for CHECKER in PROFILE.
+PHASE identifies the failed preparation phase and ERR is the
+original error value."
+  (let* ((profile-name (plist-get profile :name))
+         (checker-name (plist-get checker :name))
+         (backend (plist-get checker :backend))
+         (message
+          (format
+           (concat "Proofread profile %S checker %S using backend %S "
+                   "failed during %s: %s")
+           profile-name checker-name backend
+           (proofread--checker-dispatch-phase-label phase)
+           (error-message-string err))))
+    (list :profile profile-name
+          :checker-name checker-name
+          :backend backend
+          :phase phase
+          :error err
+          :message message)))
+
+(defun proofread--report-checker-dispatch-failure (failure)
+  "Record and report one bounded checker dispatch FAILURE."
+  (let* ((message
+          (truncate-string-to-width
+           (replace-regexp-in-string
+            "[[:space:]]+" " "
+            (string-trim (plist-get failure :message)))
+           320 nil nil "..."))
+         (event
+          (append
+           (list :type 'checker-dispatch-failed
+                 :time (current-time)
+                 :log-id (cl-incf proofread--request-log-sequence)
+                 :buffer (current-buffer)
+                 :status 'error)
+           failure)))
+    (proofread--run-request-log-hook event)
+    (proofread-report-warning-without-window
+     message
+     (format "checker %S failed; see *Warnings*"
+             (plist-get failure :checker-name)))
+    event))
+
 (defun proofread--progress-message (format-string &rest args)
   "Display a routine progress message using FORMAT-STRING and ARGS."
   (unless proofread-inhibit-progress-messages
@@ -2233,28 +2286,42 @@ LANGUAGE is the language hint snapshotted for the check."
   "Return a fresh backend request id for the current buffer."
   (setq proofread--next-request-id (1+ proofread--next-request-id)))
 
+(defun proofread--checker-request-identities (checker)
+  "Return request identity snapshots for normalized CHECKER."
+  (let ((backend-identity
+         (proofread--backend-checker-identity checker)))
+    (list :backend-identity backend-identity
+          :checker-identity
+          (proofread--checker-identity checker backend-identity))))
+
 (defun proofread--make-backend-request
-    (chunk &optional backend checker profile)
+    (chunk &optional backend checker profile identities)
   "Return a backend request plist for request-ready CHUNK.
 When BACKEND is non-nil, store its canonical identity in the request.
 CHECKER and PROFILE, when non-nil, identify the profile checker that
 owns the request.  Without CHECKER, create an ad-hoc low-level owner
-that is independent of profile selection."
+that is independent of profile selection.  IDENTITIES, when non-nil,
+contains precomputed `:backend-identity' and `:checker-identity'
+snapshots for CHECKER."
   (let* ((checker (or checker
                       (proofread--ad-hoc-checker
                        (or backend proofread-backend))))
          (backend-name (or (plist-get checker :backend)
                            backend proofread-backend))
          (backend-identity
-          (if checker
-              (proofread--backend-checker-identity checker)
-            (proofread--backend-identity backend-name)))
+          (if identities
+              (plist-get identities :backend-identity)
+            (if checker
+                (proofread--backend-checker-identity checker)
+              (proofread--backend-identity backend-name))))
          (checker-owner (and checker
                              (proofread--checker-owner checker)))
          (checker-identity
-          (and checker
-               (proofread--checker-identity
-                checker backend-identity)))
+          (if identities
+              (plist-get identities :checker-identity)
+            (and checker
+                 (proofread--checker-identity
+                  checker backend-identity))))
          (profile-language
           (if profile
               (plist-get profile :language)
@@ -2655,6 +2722,22 @@ backend handle."
       (proofread--unsupported-backend-check
        backend request callback))))
 
+(defun proofread--backend-submission-error-result
+    (request error detail)
+  "Return a checker-aware submission error for REQUEST.
+ERROR identifies the failure and DETAIL describes it."
+  (let ((result
+         (proofread--backend-error-result
+          request error
+          (format
+           (concat "Proofread profile %S checker %S using backend %S "
+                   "failed during submission: %s")
+           (plist-get request :profile)
+           (plist-get request :checker-name)
+           (plist-get request :backend)
+           detail))))
+    (plist-put result :phase 'submission)))
+
 (defun proofread--dispatch-backend-request
     (request callback &optional backend)
   "Register and submit REQUEST to BACKEND, then invoke CALLBACK.
@@ -2670,49 +2753,75 @@ When BACKEND is nil, use `proofread-backend'."
           (progn
             (proofread--retire-active-request request)
             proofread--stale-dispatch-result)
-        (let* ((wrapped-callback
+        (let* ((callback-state 'pending)
+               (lifecycle-callback
                 (proofread--wrap-backend-callback request callback))
+               (wrapped-callback
+                (lambda (result)
+                  (when (eq callback-state 'pending)
+                    (setq callback-state 'running)
+                    (unwind-protect
+                        (prog1
+                            (proofread--invoke-backend-callback
+                             lifecycle-callback result)
+                          (setq callback-state 'completed))
+                      (when (eq callback-state 'running)
+                        (setq callback-state 'failed))))))
                (handle
                 (condition-case err
                     (proofread--backend-check
                      request wrapped-callback backend)
                   (error
-                   (proofread--invoke-backend-callback
-                    wrapped-callback
-                    (proofread--backend-error-result
-                     request err (error-message-string err)))
-                   nil)))
-               (active
-                (and (buffer-live-p buffer)
-                     (with-current-buffer buffer
-                       (proofread--active-request-p request))))
-               (stale
-                (or (not (buffer-live-p buffer))
-                    (and active
-                         (not
-                          (proofread--request-ready-to-submit-p
-                           request)))
-                    (and (not active)
-                         (proofread--request-state-flag-p
-                          request :cancelled)))))
-          (cond
-           (stale
-            (proofread--retire-active-request request handle)
-            proofread--stale-dispatch-result)
-           ((and active (not handle))
-            (proofread--retire-active-request request nil 'error)
-            nil)
-           (t
-            (when handle
-              (when active
-                (with-current-buffer buffer
-                  (proofread--record-active-request-handle
-                   request handle)))
-              (proofread--record-request-event
-               request 'backend-dispatched
-               :backend (or backend proofread-backend)
-               :handle handle))
-            handle)))))))
+                   (pcase callback-state
+                     ('pending
+                      (proofread--invoke-backend-callback
+                       wrapped-callback
+                       (proofread--backend-submission-error-result
+                        request err (error-message-string err)))
+                      nil)
+                     ('completed
+                      ;; The request already settled at most once.  A
+                      ;; backend error after a synchronous callback
+                      ;; must not abort later profile checkers.
+                      nil)
+                     (_
+                      ;; Do not misclassify an error from the core
+                      ;; callback/result path as a backend failure.
+                      (signal (car err) (cdr err))))))))
+          (when (and (null handle) (eq callback-state 'pending))
+            (proofread--invoke-backend-callback
+             wrapped-callback
+             (proofread--backend-submission-error-result
+              request 'backend-returned-no-handle
+              "backend returned no handle without delivering a result")))
+          (let* ((active
+                  (and (buffer-live-p buffer)
+                       (with-current-buffer buffer
+                         (proofread--active-request-p request))))
+                 (stale
+                  (or (not (buffer-live-p buffer))
+                      (and active
+                           (not
+                            (proofread--request-ready-to-submit-p
+                             request)))
+                      (and (not active)
+                           (proofread--request-state-flag-p
+                            request :cancelled)))))
+            (cond
+             (stale
+              (proofread--retire-active-request request handle)
+              proofread--stale-dispatch-result)
+             (t
+              (when handle
+                (when active
+                  (with-current-buffer buffer
+                    (proofread--record-active-request-handle
+                     request handle)))
+                (proofread--record-request-event
+                 request 'backend-dispatched
+                 :backend (or backend proofread-backend)
+                 :handle handle))
+              handle))))))))
 
 ;;;; Request scheduling
 
@@ -3655,71 +3764,156 @@ range."
         (proofread--forget-request-work request)))
     status))
 
+(defun proofread--prepare-checker-request-work
+    (chunks backend checker profile identities)
+  "Prepare unpublished request work for CHECKER.
+CHUNKS, BACKEND, PROFILE, and IDENTITIES describe the work.  Return
+`(REQUEST . CHUNK)' pairs after removing duplicate pending work."
+  (let ((new-work-keys (make-hash-table :test #'equal))
+        prepared)
+    (dolist (chunk chunks)
+      (let* ((request
+              (proofread--make-backend-request
+               chunk backend checker profile identities))
+             (work-key (proofread--request-work-key request)))
+        (unless (or (proofread--request-work-pending-p request)
+                    (gethash work-key new-work-keys))
+          (puthash work-key t new-work-keys)
+          (push (cons request chunk) prepared))))
+    (nreverse prepared)))
+
+(defun proofread--dispatch-prepared-checker-work (prepared backend)
+  "Publish and dispatch PREPARED request work through BACKEND."
+  (let* ((requests (mapcar #'car prepared))
+         (superseded
+          (proofread--supersede-conflicting-requests requests)))
+    ;; Publish the complete batch before lifecycle hooks or
+    ;; cancellation callbacks can edit the buffer or enqueue more work.
+    (let ((enqueued
+           (proofread--enqueue-requests requests backend)))
+      (when enqueued
+        (proofread--attach-request-batch requests))
+      (let ((proofread--inhibit-queue-dispatch (current-buffer)))
+        (proofread--finish-superseded-requests superseded)
+        (if enqueued
+            (dolist (work prepared)
+              (let ((request (car work)))
+                (proofread--record-request-event
+                 request 'chunk-request
+                 :chunk (cdr work))
+                (proofread--record-request-event
+                 request 'queued-request
+                 :backend backend)))
+          (dolist (request requests)
+            (proofread--reject-request-during-clear request))))
+      (when enqueued
+        (proofread--dispatch-queued-requests t)))))
+
 (defun proofread--dispatch-request-ready-chunks
     (chunks &optional backend checker profile)
   "Dispatch request-ready CHUNKS through BACKEND.
 When BACKEND is nil, use `proofread-backend'.  CHECKER and PROFILE,
 when non-nil, identify the selected profile checker.  Return
 dispatched requests."
-  (let ((backend (or backend
-                     (plist-get checker :backend)
-                     proofread-backend)))
+  (let* ((backend (or backend
+                      (plist-get checker :backend)
+                      proofread-backend))
+         (checker (or checker (proofread--ad-hoc-checker backend))))
     (when (proofread--supported-backend-p backend)
-      (let ((new-work-keys (make-hash-table :test #'equal))
-            prepared)
-        (dolist (chunk chunks)
-          (let* ((request
-                  (proofread--make-backend-request
-                   chunk backend checker profile))
-                 (work-key (proofread--request-work-key request)))
-            (unless (or (proofread--request-work-pending-p request)
-                        (gethash work-key new-work-keys))
-              (puthash work-key t new-work-keys)
-              (push (cons request chunk) prepared))))
-        (setq prepared (nreverse prepared))
-        (let* ((requests (mapcar #'car prepared))
-               (superseded
-                (proofread--supersede-conflicting-requests
-                 requests)))
-          ;; Publish the complete batch before lifecycle hooks or
-          ;; cancellation callbacks can edit the buffer or enqueue more
-          ;; work.
-          (let
-              ((enqueued
-                (proofread--enqueue-requests requests backend)))
-            (when enqueued
-              (proofread--attach-request-batch requests))
-            (let ((proofread--inhibit-queue-dispatch
-                   (current-buffer)))
-              (proofread--finish-superseded-requests
-               superseded)
-              (if enqueued
-                  (dolist (work prepared)
-                    (let ((request (car work)))
-                      (proofread--record-request-event
-                       request 'chunk-request
-                       :chunk (cdr work))
-                      (proofread--record-request-event
-                       request 'queued-request
-                       :backend backend)))
-                (dolist (request requests)
-                  (proofread--reject-request-during-clear
-                   request))))
-            (when enqueued
-              (proofread--dispatch-queued-requests t))))))))
+      (when chunks
+        (proofread--dispatch-prepared-checker-work
+         (proofread--prepare-checker-request-work
+          chunks backend checker profile
+          (proofread--checker-request-identities checker))
+         backend)))))
+
+(defun proofread--prepare-profile-checker-dispatch
+    (chunks profile checker)
+  "Prepare CHUNKS for CHECKER in PROFILE and return isolated state.
+The returned plist has `:status' set to `prepared', `unsupported', or
+`failed'.  Prepared state includes unpublished `:work'; failed state
+includes one checker-level `:failure'."
+  (let ((backend (plist-get checker :backend)))
+    (catch 'result
+      (condition-case err
+          (unless (proofread--supported-backend-p backend)
+            (throw 'result '( :status unsupported)))
+        (error
+         (throw
+          'result
+          (list
+           :status 'failed
+           :failure
+           (proofread--make-checker-dispatch-failure
+            profile checker 'backend-loading err)))))
+      (unless chunks
+        (throw 'result
+               '( :status prepared :supported t :work nil)))
+      (let ((identities
+             (condition-case err
+                 (proofread--checker-request-identities checker)
+               (error
+                (throw
+                 'result
+                 (list
+                  :status 'failed
+                  :supported t
+                  :failure
+                  (proofread--make-checker-dispatch-failure
+                   profile checker 'checker-identity err)))))))
+        (condition-case err
+            (list
+             :status 'prepared
+             :supported t
+             :work
+             (proofread--prepare-checker-request-work
+              chunks backend checker profile identities))
+          (error
+           (list
+            :status 'failed
+            :supported t
+            :failure
+            (proofread--make-checker-dispatch-failure
+             profile checker 'request-construction err))))))))
+
+(defun proofread--dispatch-profile-request-ready-chunks-result
+    (chunks profile)
+  "Dispatch CHUNKS for PROFILE and return checker dispatch state.
+The result contains `:requests', `:supported-count', and `:failures'."
+  (let ((supported-count 0)
+        failures
+        requests)
+    (dolist (checker (plist-get profile :checkers))
+      (let ((preparation
+             (proofread--prepare-profile-checker-dispatch
+              chunks profile checker)))
+        (when (plist-get preparation :supported)
+          (setq supported-count (1+ supported-count)))
+        (pcase (plist-get preparation :status)
+          ('prepared
+           (setq requests
+                 (nconc
+                  requests
+                  (proofread--dispatch-prepared-checker-work
+                   (plist-get preparation :work)
+                   (plist-get checker :backend)))))
+          ('failed
+           (let ((failure (plist-get preparation :failure)))
+             (push failure failures)
+             (proofread--report-checker-dispatch-failure failure))))))
+    (list :requests requests
+          :supported-count supported-count
+          :failures (nreverse failures))))
 
 (defun proofread--dispatch-profile-request-ready-chunks
     (chunks profile)
-  "Dispatch request-ready CHUNKS for every supported checker in PROFILE."
-  (let (requests)
-    (dolist (checker
-             (proofread--current-profile-supported-checkers profile))
-      (setq requests
-            (nconc
-             requests
-             (proofread--dispatch-request-ready-chunks
-              chunks (plist-get checker :backend) checker profile))))
-    requests))
+  "Dispatch CHUNKS for every supported checker in PROFILE.
+Return requests sent to backends.  Preparation failures are reported
+per checker without preventing later checkers from running."
+  (plist-get
+   (proofread--dispatch-profile-request-ready-chunks-result
+    chunks profile)
+   :requests))
 
 ;;;; Cancellation and automatic checks
 
@@ -4599,6 +4793,7 @@ instead."
     ('cache-hit 'cache)
     ('cancelled 'cancelled)
     ('final-result (plist-get event :status))
+    ('checker-dispatch-failed 'error)
     (_ nil)))
 
 (defun proofread--request-log-record-request-fields
@@ -4658,7 +4853,14 @@ instead."
        (setq record (plist-put record :final-status
                                (plist-get event :status)))
        (setq record (plist-put record :final-result
-                               (plist-get event :result)))))
+                               (plist-get event :result))))
+      ('checker-dispatch-failed
+       (dolist (property
+                '( :profile :checker-name :backend :phase
+                   :error :message))
+         (setq record
+               (plist-put record property
+                          (plist-get event property))))))
     record))
 
 (defun proofread--request-log-source-enabled-p (source)
@@ -4778,7 +4980,8 @@ instead."
 (defun proofread--request-log-backend-label (record)
   "Return a short backend label for RECORD."
   (let* ((request (plist-get record :request))
-         (backend (plist-get request :backend)))
+         (backend (or (plist-get request :backend)
+                      (plist-get record :backend))))
     (if backend
         (proofread--format-list-field backend 10)
       "-")))
@@ -5078,6 +5281,10 @@ instead."
     (list :log-id (plist-get record :log-id)
           :request-id (plist-get record :request-id)
           :status (plist-get record :status)
+          :profile (plist-get record :profile)
+          :checker-name (plist-get record :checker-name)
+          :backend (plist-get record :backend)
+          :phase (plist-get record :phase)
           :source-buffer (plist-get record :source-buffer)
           :beg (plist-get record :beg)
           :end (plist-get record :end)
@@ -6176,8 +6383,6 @@ progress messages are inhibited."
          (profile (proofread--current-profile))
          (legacy-profile-p
           (null proofread-profile))
-         (supported-checkers
-          (proofread--current-profile-supported-checkers profile))
          (islands
           (proofread--target-islands-for-ranges
            normalized-ranges))
@@ -6196,31 +6401,34 @@ progress messages are inhibited."
      normalized-ranges domains)
     (proofread--prune-inactive-checker-diagnostics
      normalized-ranges profile)
-    (if supported-checkers
-        (let* ((chunks
-                (proofread--request-ready-chunks-for-islands
-                 islands (plist-get profile :language)))
-               (requests
-                (proofread--dispatch-profile-request-ready-chunks
-                 chunks profile))
-               (queued (length proofread--request-queue)))
-          (funcall
-           progress-message
-           "proofread: dispatched %d request%s%s from %d %s range%s"
-           (length requests)
-           (if (= (length requests) 1) "" "s")
-           (if (> queued 0)
-               (format "; queued %d" queued)
-             "")
-           (length normalized-ranges)
-           scope
-           (if (= (length normalized-ranges) 1) "" "s")))
-      (funcall
-       progress-message
-       "proofread: collected %d %s range%s; no available backend"
-       (length normalized-ranges)
-       scope
-       (if (= (length normalized-ranges) 1) "" "s")))))
+    (let* ((dispatch-result
+            (when (plist-get profile :checkers)
+              (proofread--dispatch-profile-request-ready-chunks-result
+               (proofread--request-ready-chunks-for-islands
+                islands (plist-get profile :language))
+               profile)))
+           (supported-count
+            (or (plist-get dispatch-result :supported-count) 0)))
+      (if (> supported-count 0)
+          (let ((requests (plist-get dispatch-result :requests))
+                (queued (length proofread--request-queue)))
+            (funcall
+             progress-message
+             "proofread: dispatched %d request%s%s from %d %s range%s"
+             (length requests)
+             (if (= (length requests) 1) "" "s")
+             (if (> queued 0)
+                 (format "; queued %d" queued)
+               "")
+             (length normalized-ranges)
+             scope
+             (if (= (length normalized-ranges) 1) "" "s")))
+        (funcall
+         progress-message
+         "proofread: collected %d %s range%s; no available backend"
+         (length normalized-ranges)
+         scope
+         (if (= (length normalized-ranges) 1) "" "s"))))))
 
 (defun proofread--span-at-position (spans position)
   "Return the most useful member of sorted SPANS for POSITION.

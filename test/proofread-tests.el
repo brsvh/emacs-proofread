@@ -259,6 +259,135 @@ CHECKER-ORDER defaults to first followed by second."
          statuses)))
     (nreverse statuses)))
 
+(defun proofread-test--complete-recorded-requests (recorder)
+  "Complete every request in RECORDER with one diagnostic."
+  (cl-mapcar
+   (lambda (request callback)
+     (funcall
+      callback
+      (proofread--backend-success-result
+       request
+       (list
+        (proofread--make-diagnostic
+         :beg (proofread--position-integer
+               (plist-get request :beg))
+         :end (proofread--position-integer
+               (plist-get request :end))
+         :text (plist-get request :text)
+         :kind 'spelling
+         :message
+         (format "%s result" (plist-get request :checker-name))
+         :suggestions nil
+         :source (plist-get request :checker-name))))))
+   (funcall (plist-get recorder :requests))
+   (funcall (plist-get recorder :callbacks))))
+
+(defun proofread-test--failure-checker-names (position)
+  "Return checker names with a failure at POSITION."
+  (pcase position
+    ('first '( failed later))
+    ('middle '( earlier failed later))
+    (_ (error "Unexpected failure position: %S" position))))
+
+(defun proofread-test--scheduled-checker-names ()
+  "Return checker names in all current scheduler states."
+  (mapcar
+   (lambda (request)
+     (plist-get request :checker-name))
+   (append
+    proofread--active-requests
+    proofread--claimed-requests
+    (mapcar (lambda (entry)
+              (plist-get entry :request))
+            proofread--request-queue))))
+
+(defun proofread-test--assert-requests-settled (requests)
+  "Assert that REQUESTS and current scheduler state are settled."
+  (dolist (request requests)
+    (let ((state (plist-get request :state)))
+      (should (plist-get state :batch))
+      (should (plist-get state :batch-settled))))
+  (dolist (batch
+           (delete-dups
+            (mapcar (lambda (request)
+                      (plist-get (plist-get request :state) :batch))
+                    requests)))
+    (should (zerop (plist-get batch :pending))))
+  (should-not proofread--active-requests)
+  (should-not proofread--claimed-requests)
+  (should-not proofread--request-queue)
+  (should-not proofread--request-queue-tail)
+  (should-not proofread--queue-dispatch-active-p)
+  (should-not proofread--queue-dispatch-requested-p)
+  (should-not proofread--queue-cache-scan-requested-p)
+  (should (zerop (hash-table-count proofread--pending-request-keys))))
+
+(defun proofread-test--assert-one-checker-report (reports)
+  "Require one bounded `failed' checker report in REPORTS."
+  (should (= (length reports) 1))
+  (let ((detail (caar reports))
+        (summary (cadar reports)))
+    (should (<= (string-width detail) 320))
+    (should (string-match-p "multi" detail))
+    (should (string-match-p "failed" detail))
+    (should (string-match-p "failed" summary))))
+
+(defun proofread-test--assert-checker-dispatch-failure-event
+    (events phase)
+  "Assert EVENTS contain one `failed' checker event for PHASE."
+  (let ((failures
+         (cl-remove-if-not
+          (lambda (event)
+            (eq (plist-get event :type)
+                'checker-dispatch-failed))
+          events)))
+    (should (= (length failures) 1))
+    (let ((event (car failures)))
+      (should (eq (plist-get event :profile) 'multi))
+      (should (eq (plist-get event :checker-name) 'failed))
+      (should (eq (plist-get event :phase) phase))
+      (should (eq (plist-get event :status) 'error))
+      event)))
+
+(defun proofread-test--assert-successful-checker-requests
+    (requests checker-names)
+  "Assert REQUESTS contain two requests for each CHECKER-NAMES member."
+  (let ((names
+         (mapcar (lambda (request)
+                   (plist-get request :checker-name))
+                 requests)))
+    (should (= (length requests) (* 2 (length checker-names))))
+    (dolist (name checker-names)
+      (should (= (cl-count name names) 2)))
+    (should-not (memq 'failed names))))
+
+(defun proofread-test--assert-dispatch-progress
+    (progress request-count)
+  "Assert PROGRESS reports REQUEST-COUNT dispatched buffer requests."
+  (should
+   (equal
+    progress
+    (list
+     (format "proofread: dispatched %d requests from 1 buffer range"
+             request-count)))))
+
+(defun proofread-test--assert-request-diagnostics (requests)
+  "Assert current diagnostics correspond exactly to REQUESTS."
+  (let ((request-names
+         (mapcar (lambda (request)
+                   (plist-get request :checker-name))
+                 requests))
+        (diagnostic-names
+         (mapcar (lambda (diagnostic)
+                   (plist-get diagnostic :checker-name))
+                 proofread--diagnostics)))
+    (should (= (length request-names) (length diagnostic-names)))
+    (dolist (name (delete-dups (copy-sequence request-names)))
+      (should (= (cl-count name request-names)
+                 (cl-count name diagnostic-names))))
+    (should-not (memq 'failed diagnostic-names))
+    (should (memq 'later diagnostic-names))))
+
 (defun proofread-test--public-diagnostic-signature (diagnostic)
   "Return DIAGNOSTIC's signature through public accessors only."
   (list (proofread-diagnostic-range diagnostic)
@@ -1572,10 +1701,12 @@ range; no available backend"))))))
                           (lambda (_islands &optional _language)
                             '(( :text "Alpha"))))
                          ((symbol-function
-                           'proofread--dispatch-profile-request-ready-chunks)
+                           'proofread--dispatch-profile-request-ready-chunks-result)
                           (lambda (chunks _profile)
                             (setq dispatched chunks)
-                            '( proofread-test-request))))
+                            '( :requests nil
+                               :supported-count 1
+                               :failures nil))))
                  (proofread-check-visible-range)
                  (should (equal dispatched '(( :text "Alpha"))))))))
         (kill-buffer buffer)))))
@@ -3427,7 +3558,14 @@ This covers URLs, email, invisible text, faces, and properties."
   "Reject missing and malformed profiles without legacy dispatch."
   (dolist (case
            '((missing nil)
-             (malformed ((malformed :checkers invalid)))))
+             (malformed ((malformed :checkers invalid)))
+             (duplicate
+              ((duplicate
+                :checkers
+                (( :name repeated
+                   :backend proofread-test-backend)
+                 ( :name repeated
+                   :backend proofread-test-backend)))))))
     (proofread-test--with-legacy-options proofread-test--backend "en-US"
                                          (with-temp-buffer
                                            (insert "Alpha")
@@ -3448,6 +3586,13 @@ This covers URLs, email, invisible text, faces, and properties."
                                                           'proofread-test-handle)))
                                                (should-error (proofread-check-buffer)))
                                              (should (= backend-calls 0))
+                                             (should-not proofread--active-requests)
+                                             (should-not proofread--claimed-requests)
+                                             (should-not proofread--request-queue)
+                                             (should
+                                              (zerop
+                                               (hash-table-count
+                                                proofread--pending-request-keys)))
                                              (should-not warnings)
                                              (should-not proofread--legacy-dispatch-warning-issued-p))))))
 
@@ -3675,6 +3820,500 @@ This covers URLs, email, invisible text, faces, and properties."
                                  requests)
                          '( "en-US" "en-US")))
           (should (= (length proofread--active-requests) 2)))))))
+
+(ert-deftest proofread-test-profile-empty-chunks-skip-checker-identity
+    ()
+  "Treat no chunks as an empty dispatch for a supported checker."
+  (let ((proofread-profile 'multi)
+        (proofread-profiles
+         (proofread-test--ordered-profiles '( only)))
+        (identity-calls 0)
+        reports)
+    (cl-letf
+        (((symbol-function 'proofread--checker-request-identities)
+          (lambda (_checker)
+            (setq identity-calls (1+ identity-calls))
+            (error "Identity must not be requested for empty chunks")))
+         ((symbol-function 'proofread-report-warning-without-window)
+          (lambda (detail summary)
+            (push (list detail summary) reports))))
+      (should
+       (equal
+        (proofread--dispatch-profile-request-ready-chunks-result
+         nil (proofread--current-profile))
+        '( :requests nil :supported-count 1 :failures nil))))
+    (should (zerop identity-calls))
+    (should-not reports)))
+
+(ert-deftest
+    proofread-test-profile-feature-load-error-isolates-checker ()
+  "Continue later profile checkers after one feature fails to load."
+  (dolist (position '( first middle))
+    (with-temp-buffer
+      (text-mode)
+      (insert "First. Second.")
+      (let* ((proofread-auto-check nil)
+             (proofread-cache-max-entries 0)
+             (proofread-context-size 0)
+             (proofread-max-concurrent-requests 20)
+             (proofread-profile 'multi)
+             (checker-names
+              (proofread-test--failure-checker-names position))
+             (successful-names (remq 'failed checker-names))
+             (failed-backend 'proofread-test-feature-load-failure)
+             (failed-feature 'proofread-test-feature-load-error)
+             (proofread-profiles
+              (list
+               (list
+                'multi
+                :language "en-US"
+                :checkers
+                (mapcar
+                 (lambda (name)
+                   (list :name name
+                         :backend
+                         (if (eq name 'failed)
+                             failed-backend
+                           proofread-test--backend)))
+                 checker-names))))
+             (proofread--backend-features
+              (cons (cons failed-backend failed-feature)
+                    proofread--backend-features))
+             (recorder (proofread-test--make-backend-recorder))
+             (original-require (symbol-function 'require))
+             (require-calls 0)
+             events
+             progress
+             reports)
+        (proofread-mode 1)
+        (let ((proofread-request-log-hook
+               (list (lambda (event)
+                       (push event events)))))
+          (cl-letf
+              (((symbol-function 'require)
+                (lambda (feature &optional filename noerror)
+                  (if (eq feature failed-feature)
+                      (progn
+                        (setq require-calls (1+ require-calls))
+                        (error "Simulated feature load failure"))
+                    (funcall original-require feature filename noerror))))
+               ((symbol-function 'proofread--backend-check)
+                (plist-get recorder :function))
+               ((symbol-function
+                 'proofread-report-warning-without-window)
+                (lambda (detail summary)
+                  (push (list detail summary) reports)))
+               ((symbol-function 'proofread--progress-message)
+                (lambda (format-string &rest args)
+                  (push (apply #'format format-string args)
+                        progress))))
+            (proofread-check-buffer)
+            (let ((requests
+                   (funcall (plist-get recorder :requests))))
+              (should (= require-calls 1))
+              (proofread-test--assert-checker-dispatch-failure-event
+               events 'backend-loading)
+              (proofread-test--assert-one-checker-report reports)
+              (proofread-test--assert-successful-checker-requests
+               requests successful-names)
+              (proofread-test--assert-dispatch-progress
+               progress (length requests))
+              (should-not
+               (memq 'failed
+                     (proofread-test--scheduled-checker-names)))
+              (should
+               (equal
+                (proofread-test--complete-recorded-requests recorder)
+                (make-list (length requests) 'applied)))
+              (proofread-test--assert-request-diagnostics requests)
+              (proofread-test--assert-requests-settled requests)
+              (proofread-test--assert-one-checker-report reports))))))))
+
+(ert-deftest
+    proofread-test-profile-checker-identity-error-isolates-checker ()
+  "Continue later profile checkers after one identity calculation fails."
+  (dolist (position '( first middle))
+    (with-temp-buffer
+      (text-mode)
+      (insert "First. Second.")
+      (let* ((proofread-auto-check nil)
+             (proofread-cache-max-entries 0)
+             (proofread-context-size 0)
+             (proofread-max-concurrent-requests 20)
+             (proofread-profile 'multi)
+             (checker-names
+              (proofread-test--failure-checker-names position))
+             (successful-names (remq 'failed checker-names))
+             (proofread-profiles
+              (proofread-test--ordered-profiles checker-names))
+             (proofread--backend-registry
+              (make-hash-table :test #'eq))
+             (recorder (proofread-test--make-backend-recorder))
+             (failed-identity-calls 0)
+             events
+             progress
+             reports)
+        (proofread--register-backend
+         proofread-test--backend
+         :check (plist-get recorder :function)
+         :identity #'proofread-test--backend-identity
+         :checker-identity
+         (lambda (checker)
+           (if (eq (plist-get checker :name) 'failed)
+               (progn
+                 (setq failed-identity-calls
+                       (1+ failed-identity-calls))
+                 (error "Simulated checker identity failure"))
+             (list :backend proofread-test--backend
+                   :checker-name (plist-get checker :name)
+                   :contract-version 1))))
+        (proofread-mode 1)
+        (let ((proofread-request-log-hook
+               (list (lambda (event)
+                       (push event events)))))
+          (cl-letf
+              (((symbol-function
+                 'proofread-report-warning-without-window)
+                (lambda (detail summary)
+                  (push (list detail summary) reports)))
+               ((symbol-function 'proofread--progress-message)
+                (lambda (format-string &rest args)
+                  (push (apply #'format format-string args)
+                        progress))))
+            (proofread-check-buffer)
+            (let ((requests
+                   (funcall (plist-get recorder :requests))))
+              (should (= failed-identity-calls 1))
+              (proofread-test--assert-checker-dispatch-failure-event
+               events 'checker-identity)
+              (proofread-test--assert-one-checker-report reports)
+              (proofread-test--assert-successful-checker-requests
+               requests successful-names)
+              (proofread-test--assert-dispatch-progress
+               progress (length requests))
+              (should-not
+               (memq 'failed
+                     (proofread-test--scheduled-checker-names)))
+              (should
+               (equal
+                (proofread-test--complete-recorded-requests recorder)
+                (make-list (length requests) 'applied)))
+              (proofread-test--assert-request-diagnostics requests)
+              (proofread-test--assert-requests-settled requests)
+              (proofread-test--assert-one-checker-report reports))))))))
+
+(ert-deftest
+    proofread-test-profile-request-construction-error-isolates-checker
+    ()
+  "Continue later profile checkers after one request construction fails."
+  (dolist (position '( first middle))
+    (with-temp-buffer
+      (text-mode)
+      (insert "First. Second.")
+      (let* ((proofread-auto-check nil)
+             (proofread-cache-max-entries 0)
+             (proofread-context-size 0)
+             (proofread-max-concurrent-requests 20)
+             (proofread-profile 'multi)
+             (checker-names
+              (proofread-test--failure-checker-names position))
+             (successful-names (remq 'failed checker-names))
+             (proofread-profiles
+              (proofread-test--ordered-profiles checker-names))
+             (recorder (proofread-test--make-backend-recorder))
+             (original-make-request
+              (symbol-function 'proofread--make-backend-request))
+             (failed-construction-calls 0)
+             events
+             progress
+             reports)
+        (proofread-mode 1)
+        (let ((proofread-request-log-hook
+               (list (lambda (event)
+                       (push event events)))))
+          (cl-letf
+              (((symbol-function 'proofread--make-backend-request)
+                (lambda (chunk &optional backend checker profile
+                               identities)
+                  (if (eq (plist-get checker :name) 'failed)
+                      (progn
+                        (setq failed-construction-calls
+                              (1+ failed-construction-calls))
+                        (error "Simulated request construction failure"))
+                    (funcall original-make-request
+                             chunk backend checker profile identities))))
+               ((symbol-function 'proofread--backend-check)
+                (plist-get recorder :function))
+               ((symbol-function
+                 'proofread-report-warning-without-window)
+                (lambda (detail summary)
+                  (push (list detail summary) reports)))
+               ((symbol-function 'proofread--progress-message)
+                (lambda (format-string &rest args)
+                  (push (apply #'format format-string args)
+                        progress))))
+            (proofread-check-buffer)
+            (let ((requests
+                   (funcall (plist-get recorder :requests))))
+              (should (= failed-construction-calls 1))
+              (proofread-test--assert-checker-dispatch-failure-event
+               events 'request-construction)
+              (proofread-test--assert-one-checker-report reports)
+              (proofread-test--assert-successful-checker-requests
+               requests successful-names)
+              (proofread-test--assert-dispatch-progress
+               progress (length requests))
+              (should-not
+               (memq 'failed
+                     (proofread-test--scheduled-checker-names)))
+              (should
+               (equal
+                (proofread-test--complete-recorded-requests recorder)
+                (make-list (length requests) 'applied)))
+              (proofread-test--assert-request-diagnostics requests)
+              (proofread-test--assert-requests-settled requests)
+              (proofread-test--assert-one-checker-report reports))))))))
+
+(ert-deftest
+    proofread-test-profile-synchronous-submission-error-isolates-checker
+    ()
+  "Continue later checkers after synchronous submission failures."
+  (dolist (failure-mode '( signal nil-handle))
+    (dolist (position '( first middle))
+      (with-temp-buffer
+        (text-mode)
+        (insert "First. Second.")
+        (let* ((proofread-auto-check nil)
+               (proofread-cache-max-entries 0)
+               (proofread-context-size 0)
+               (proofread-max-concurrent-requests 20)
+               (proofread-profile 'multi)
+               (checker-names
+                (proofread-test--failure-checker-names position))
+               (successful-names (remq 'failed checker-names))
+               (proofread-profiles
+                (proofread-test--ordered-profiles checker-names))
+               (recorder (proofread-test--make-backend-recorder))
+               (recorder-function (plist-get recorder :function))
+               all-requests
+               events
+               progress
+               reports)
+          (proofread-mode 1)
+          (let ((proofread-request-log-hook
+                 (list (lambda (event)
+                         (push event events)))))
+            (cl-letf
+                (((symbol-function 'proofread--backend-check)
+                  (lambda (request callback &optional backend)
+                    (push request all-requests)
+                    (if (eq (plist-get request :checker-name) 'failed)
+                        (pcase failure-mode
+                          ('signal
+                           (error "Simulated submission failure"))
+                          ('nil-handle nil))
+                      (funcall recorder-function
+                               request callback backend))))
+                 ((symbol-function
+                   'proofread-report-warning-without-window)
+                  (lambda (detail summary)
+                    (push (list detail summary) reports)))
+                 ((symbol-function 'proofread--progress-message)
+                  (lambda (format-string &rest args)
+                    (push (apply #'format format-string args)
+                          progress))))
+              (proofread-check-buffer)
+              (setq all-requests (nreverse all-requests))
+              (let* ((requests
+                      (funcall (plist-get recorder :requests)))
+                     (failed-requests
+                      (cl-remove-if-not
+                       (lambda (request)
+                         (eq (plist-get request :checker-name)
+                             'failed))
+                       all-requests))
+                     (failure-events
+                      (cl-remove-if-not
+                       (lambda (event)
+                         (let ((request
+                                (plist-get event :request)))
+                           (and
+                            (eq (plist-get event :type) 'final-result)
+                            (eq (plist-get request :checker-name)
+                                'failed))))
+                       events)))
+                (should (= (length failed-requests) 2))
+                (should (= (length failure-events) 2))
+                (dolist (event failure-events)
+                  (let ((result (plist-get event :result)))
+                    (should (eq (plist-get event :status) 'error))
+                    (should (eq (plist-get result :status) 'error))
+                    (should (eq (plist-get result :phase) 'submission))
+                    (when (eq failure-mode 'nil-handle)
+                      (should
+                       (eq (plist-get result :error)
+                           'backend-returned-no-handle)))))
+                (should-not
+                 (cl-find-if
+                  (lambda (event)
+                    (eq (plist-get event :type)
+                        'checker-dispatch-failed))
+                  events))
+                (proofread-test--assert-one-checker-report reports)
+                (proofread-test--assert-successful-checker-requests
+                 requests successful-names)
+                (proofread-test--assert-dispatch-progress
+                 progress (length requests))
+                (should-not
+                 (memq 'failed
+                       (proofread-test--scheduled-checker-names)))
+                (dolist (request failed-requests)
+                  (should-not (plist-get request :handle))
+                  (should-not
+                   (proofread--request-work-pending-p request)))
+                (should
+                 (equal
+                  (proofread-test--complete-recorded-requests recorder)
+                  (make-list (length requests) 'applied)))
+                (proofread-test--assert-request-diagnostics requests)
+                (proofread-test--assert-requests-settled all-requests)
+                (proofread-test--assert-one-checker-report
+                 reports)))))))))
+
+(ert-deftest
+    proofread-test-synchronous-callback-then-signal-settles-once ()
+  "Ignore a backend error after its synchronous callback has settled."
+  (with-temp-buffer
+    (text-mode)
+    (insert "First. Second.")
+    (let* ((proofread-auto-check nil)
+           (proofread-cache-max-entries 0)
+           (proofread-context-size 0)
+           (proofread-max-concurrent-requests 20)
+           (proofread-profile 'multi)
+           (proofread-profiles
+            (proofread-test--ordered-profiles '( completed later)))
+           (recorder (proofread-test--make-backend-recorder))
+           (recorder-function (plist-get recorder :function))
+           all-requests
+           events
+           reports)
+      (proofread-mode 1)
+      (let ((proofread-request-log-hook
+             (list (lambda (event)
+                     (push event events)))))
+        (cl-letf
+            (((symbol-function 'proofread--backend-check)
+              (lambda (request callback &optional backend)
+                (push request all-requests)
+                (if (eq (plist-get request :checker-name) 'completed)
+                    (progn
+                      (funcall
+                       callback
+                       (proofread--backend-success-result
+                        request
+                        (list
+                         (proofread--make-diagnostic
+                          :beg (proofread--position-integer
+                                (plist-get request :beg))
+                          :end (proofread--position-integer
+                                (plist-get request :end))
+                          :text (plist-get request :text)
+                          :kind 'spelling
+                          :message "completed result"
+                          :suggestions nil
+                          :source 'completed))))
+                      (error "Simulated error after callback"))
+                  (funcall recorder-function request callback backend))))
+             ((symbol-function
+               'proofread-report-warning-without-window)
+              (lambda (detail summary)
+                (push (list detail summary) reports))))
+          (proofread-check-buffer)
+          (setq all-requests (nreverse all-requests))
+          (let* ((later-requests
+                  (funcall (plist-get recorder :requests)))
+                 (completed-events
+                  (cl-remove-if-not
+                   (lambda (event)
+                     (let ((request (plist-get event :request)))
+                       (and
+                        (eq (plist-get event :type) 'final-result)
+                        (eq (plist-get request :checker-name)
+                            'completed))))
+                   events)))
+            (should (= (length completed-events) 2))
+            (dolist (event completed-events)
+              (should (eq (plist-get event :status) 'applied))
+              (should-not
+               (plist-member (plist-get event :result) :phase)))
+            (should-not reports)
+            (should (= (length later-requests) 2))
+            (should
+             (equal
+              (proofread-test--complete-recorded-requests recorder)
+              '( applied applied)))
+            (proofread-test--assert-request-diagnostics all-requests)
+            (proofread-test--assert-requests-settled all-requests)
+            (should-not reports)))))))
+
+(ert-deftest
+    proofread-test-synchronous-core-callback-error-is-resignalled ()
+  "Re-signal core errors raised inside a synchronous backend callback."
+  (with-temp-buffer
+    (insert "Alpha")
+    (let* ((proofread-auto-check nil)
+           (proofread-cache-max-entries 0)
+           (proofread-context-size 0)
+           (proofread-profile 'multi)
+           (proofread-profiles
+            (proofread-test--ordered-profiles '( only)))
+           request
+           events
+           reports)
+      (proofread-mode 1)
+      (let ((proofread-request-log-hook
+             (list (lambda (event)
+                     (push event events)))))
+        (cl-letf
+            (((symbol-function 'proofread--backend-check)
+              (lambda (backend-request callback &optional _backend)
+                (setq request backend-request)
+                (funcall
+                 callback
+                 (proofread--backend-success-result
+                  backend-request nil))
+                nil))
+             ((symbol-function 'proofread--cache-write-request)
+              (lambda (&rest _)
+                (error "Simulated core callback failure")))
+             ((symbol-function
+               'proofread-report-warning-without-window)
+              (lambda (detail summary)
+                (push (list detail summary) reports))))
+          (let ((condition
+                 (should-error (proofread-check-buffer) :type 'error)))
+            (should
+             (equal (error-message-string condition)
+                    "Simulated core callback failure"))))
+        (should request)
+        (should-not (plist-get request :handle))
+        (should-not reports)
+        (should-not
+         (cl-find-if
+          (lambda (event)
+            (and
+             (eq (plist-get event :type) 'final-result)
+             (eq (plist-get (plist-get event :result) :phase)
+                 'submission)))
+          events))
+        (should-not (proofread--request-work-pending-p request))
+        (should-not proofread--active-requests)
+        (should-not proofread--claimed-requests)
+        (should-not proofread--request-queue)
+        (should
+         (zerop
+          (hash-table-count proofread--pending-request-keys)))))))
 
 (ert-deftest
     proofread-test-profile-pending-work-distinguishes-checkers
