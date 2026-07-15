@@ -264,6 +264,8 @@ request-ready chunks."
      :beg :end :text
      :context-before :context-after
      :language
+     :profile :binding-name :binding-owner
+     :binding-options :binding-identity
      :major-mode
      :target-policy :target-kind
      :domain-beg :domain-end :accessible-beg :accessible-end
@@ -653,6 +655,19 @@ names inside the profile."
             (proofread--normalize-profile-bindings
              name bindings)))))
 
+(defun proofread--legacy-profile-binding (&optional backend)
+  "Return a normalized legacy binding for BACKEND.
+When BACKEND is nil, use `proofread-backend'.  Return nil when the
+selected legacy backend is nil."
+  (let ((backend (or backend proofread-backend)))
+    (when backend
+      (unless (symbolp backend)
+        (error "proofread-backend must be nil or a symbol"))
+      (list :profile proofread--legacy-profile-name
+            :name proofread--legacy-binding-name
+            :backend backend
+            :options nil))))
+
 (defun proofread--legacy-profile ()
   "Return a normalized profile from legacy backend options."
   (unless (or (null proofread-backend)
@@ -660,17 +675,11 @@ names inside the profile."
     (error "proofread-backend must be nil or a symbol"))
   (proofread--validate-language-option
    proofread-language "proofread-language")
-  (let ((bindings
-         (and proofread-backend
-              (list
-               (list :profile proofread--legacy-profile-name
-                     :name proofread--legacy-binding-name
-                     :backend proofread-backend
-                     :options nil)))))
+  (let ((binding (proofread--legacy-profile-binding)))
     (list :name proofread--legacy-profile-name
           :language (proofread--snapshot-value proofread-language)
           :display-language nil
-          :bindings bindings)))
+          :bindings (and binding (list binding)))))
 
 (defun proofread--current-profile ()
   "Return the normalized selected proofreading profile."
@@ -683,6 +692,74 @@ names inside the profile."
 (defun proofread--current-profile-bindings ()
   "Return normalized bindings from the selected proofreading profile."
   (plist-get (proofread--current-profile) :bindings))
+
+(defun proofread--binding-owner (binding)
+  "Return the stable owner identity for BINDING."
+  (list :profile (plist-get binding :profile)
+        :binding-name (plist-get binding :name)))
+
+(defun proofread--binding-identity
+    (binding &optional backend-identity)
+  "Return the cache and freshness identity for BINDING.
+BACKEND-IDENTITY, when non-nil, is used instead of recomputing the
+selected backend identity."
+  (let ((backend (plist-get binding :backend)))
+    (list :profile (proofread--snapshot-value
+                    (plist-get binding :profile))
+          :binding-name (proofread--snapshot-value
+                         (plist-get binding :name))
+          :backend (proofread--snapshot-value backend)
+          :backend-identity
+          (proofread--snapshot-value
+           (or backend-identity
+               (proofread--backend-identity backend)))
+          :options (proofread--snapshot-value
+                    (plist-get binding :options)))))
+
+(defun proofread--current-profile-supported-bindings (profile)
+  "Return PROFILE bindings whose backends are registered."
+  (cl-remove-if-not
+   (lambda (binding)
+     (proofread--supported-backend-p
+      (plist-get binding :backend)))
+   (plist-get profile :bindings)))
+
+(defun proofread--request-current-binding-p (request)
+  "Return non-nil when REQUEST's binding is still current."
+  (condition-case nil
+      (let ((profile-name (plist-get request :profile))
+            (binding-name (plist-get request :binding-name)))
+        (if (and (eq profile-name proofread--legacy-profile-name)
+                 (eq binding-name proofread--legacy-binding-name))
+            (and (not proofread-profile)
+                 (equal (plist-get request :language)
+                        proofread-language)
+                 (when-let* ((binding
+                              (proofread--legacy-profile-binding
+                               (plist-get request :backend))))
+                   (and (equal (plist-get request :binding-owner)
+                               (proofread--binding-owner binding))
+                        (equal
+                         (plist-get request :binding-identity)
+                         (proofread--binding-identity
+                          binding
+                          (plist-get request
+                                     :backend-identity))))))
+          (let* ((profile (proofread--current-profile))
+                 (binding
+                  (cl-find binding-name
+                           (plist-get profile :bindings)
+                           :key (lambda (candidate)
+                                  (plist-get candidate :name)))))
+            (and (eq profile-name (plist-get profile :name))
+                 (equal (plist-get request :language)
+                        (plist-get profile :language))
+                 binding
+                 (equal (plist-get request :binding-owner)
+                        (proofread--binding-owner binding))
+                 (equal (plist-get request :binding-identity)
+                        (proofread--binding-identity binding))))))
+    (error nil)))
 
 ;;;; State predicates
 
@@ -2000,11 +2077,27 @@ when sentence context is too large for `proofread-context-size'."
   "Return a fresh backend request id for the current buffer."
   (setq proofread--next-request-id (1+ proofread--next-request-id)))
 
-(defun proofread--make-backend-request (chunk &optional backend)
+(defun proofread--make-backend-request
+    (chunk &optional backend binding profile)
   "Return a backend request plist for request-ready CHUNK.
-When BACKEND is non-nil, store its canonical identity in the request."
-  (let* ((backend-name (or backend proofread-backend))
+When BACKEND is non-nil, store its canonical identity in the request.
+BINDING and PROFILE, when non-nil, identify the profile binding that
+owns the request."
+  (let* ((binding (or binding
+                      (proofread--legacy-profile-binding backend)))
+         (backend-name (or (plist-get binding :backend)
+                           backend proofread-backend))
          (backend-identity (proofread--backend-identity backend-name))
+         (binding-owner (and binding
+                             (proofread--binding-owner binding)))
+         (binding-identity
+          (and binding
+               (proofread--binding-identity
+                binding backend-identity)))
+         (profile-language
+          (if profile
+              (plist-get profile :language)
+            (plist-get chunk :language)))
          (request
           (mapcan
            (lambda (key)
@@ -2016,6 +2109,20 @@ When BACKEND is non-nil, store its canonical identity in the request."
                      ( :backend
                        (proofread--snapshot-value backend-name))
                      ( :backend-identity backend-identity)
+                     ( :profile
+                       (proofread--snapshot-value
+                        (plist-get binding :profile)))
+                     ( :binding-name
+                       (proofread--snapshot-value
+                        (plist-get binding :name)))
+                     ( :binding-owner binding-owner)
+                     ( :binding-options
+                       (proofread--snapshot-value
+                        (plist-get binding :options)))
+                     ( :binding-identity binding-identity)
+                     ( :language
+                       (proofread--snapshot-value
+                        profile-language))
                      (_ (proofread--snapshot-value
                          (plist-get chunk key))))))
            proofread--backend-request-keys)))
@@ -2030,7 +2137,7 @@ When BACKEND is non-nil, store its canonical identity in the request."
                            :batch nil
                            :batch-settled nil)))
     (plist-put request :cache-key
-               (proofread--cache-key request backend-identity))))
+               (proofread--cache-key request backend-name))))
 
 (defun proofread--backend-success-result (request diagnostics)
   "Return a successful backend result for REQUEST and DIAGNOSTICS."
@@ -2575,6 +2682,7 @@ Return one of the symbols `sent', `cached', `full', `stale', or
 (defun proofread--request-work-key (request)
   "Return the identity of REQUEST's proofreading work."
   (list (plist-get request :generation)
+        (plist-get request :binding-owner)
         (proofread--position-integer (plist-get request :beg))
         (proofread--position-integer (plist-get request :end))
         (plist-get request :accessible-beg)
@@ -2621,22 +2729,28 @@ Return one of the symbols `sent', `cached', `full', `stale', or
     (when (and beg end (<= beg end))
       (cons beg end))))
 
+(defun proofread--same-request-owner-p (left right)
+  "Return non-nil when LEFT and RIGHT belong to the same binding."
+  (equal (plist-get left :binding-owner)
+         (plist-get right :binding-owner)))
+
 (defun proofread--conflicting-request-table (requests candidates)
   "Return an eq table of CANDIDATES conflicting with REQUESTS."
-  (let ((ranges
-         (delq nil (mapcar #'proofread--request-range requests)))
-        (entries
-         (delq nil
-               (mapcar
-                (lambda (candidate)
-                  (when-let* ((range
-                               (proofread--request-range candidate)))
-                    (cons candidate range)))
-                candidates)))
-        (table (make-hash-table :test #'eq)))
-    (dolist (entry
-             (proofread--range-conflicting-entries ranges entries))
-      (puthash (car entry) t table))
+  (let ((table (make-hash-table :test #'eq)))
+    (dolist (request requests)
+      (when-let* ((range (proofread--request-range request)))
+        (let (entries)
+          (dolist (candidate candidates)
+            (when (proofread--same-request-owner-p
+                   request candidate)
+              (when-let* ((candidate-range
+                           (proofread--request-range candidate)))
+                (push (cons candidate candidate-range)
+                      entries))))
+          (dolist (entry
+                   (proofread--range-conflicting-entries
+                    (list range) entries))
+            (puthash (car entry) t table)))))
     table))
 
 (defun proofread--partition-pending-requests (predicate)
@@ -2924,7 +3038,6 @@ documented by `proofread--drain-request-queue'."
     (and beg end domain-beg domain-end kind policy
          domain
          (eq major-mode (plist-get request :major-mode))
-         (equal proofread-language (plist-get request :language))
          (eq policy (proofread--effective-target-policy))
          (<= domain-beg beg)
          (<= end domain-end)
@@ -2970,6 +3083,7 @@ documented by `proofread--drain-request-queue'."
                 (equal (plist-get request :backend-identity)
                        (proofread--backend-identity
                         (plist-get request :backend)))
+                (proofread--request-current-binding-p request)
                 (proofread--request-range-valid-p request)
                 (proofread--request-text-matches-p request)
                 (let ((domain
@@ -3059,6 +3173,19 @@ When BACKEND is nil, use the selected `proofread-backend'."
         (proofread--chunk-text-hash
          (plist-get chunk :context-after))))
 
+(defun proofread--cache-binding-identity (chunk &optional backend)
+  "Return binding identity for cache key CHUNK and BACKEND."
+  (or (plist-get chunk :binding-identity)
+      (when-let* ((backend-name (or backend
+                                    (plist-get chunk :backend)
+                                    proofread-backend))
+                  (binding
+                   (proofread--legacy-profile-binding backend-name)))
+        (proofread--binding-identity
+         binding
+         (or (plist-get chunk :backend-identity)
+             (proofread--backend-identity backend-name))))))
+
 (defun proofread--cache-key (chunk &optional backend)
   "Return diagnostic cache key for CHUNK and BACKEND."
   (list :text-hash
@@ -3070,6 +3197,7 @@ When BACKEND is nil, use the selected `proofread-backend'."
         :target-kind (plist-get chunk :target-kind)
         :backend (or (plist-get chunk :backend-identity)
                      (proofread--backend-identity backend))
+        :binding (proofread--cache-binding-identity chunk backend)
         :contract-version proofread--contract-version
         :context (proofread--context-cache-identity chunk)))
 
@@ -3330,48 +3458,68 @@ range."
     status))
 
 (defun proofread--dispatch-request-ready-chunks
-    (chunks &optional backend)
+    (chunks &optional backend binding profile)
   "Dispatch request-ready CHUNKS through BACKEND.
-When BACKEND is nil, use `proofread-backend'.  Return dispatched
-requests."
-  (when (proofread--supported-backend-p backend)
-    (let ((new-work-keys (make-hash-table :test #'equal))
-          prepared)
-      (dolist (chunk chunks)
-        (let* ((request
-                (proofread--make-backend-request chunk backend))
-               (work-key (proofread--request-work-key request)))
-          (unless (or (proofread--request-work-pending-p request)
-                      (gethash work-key new-work-keys))
-            (puthash work-key t new-work-keys)
-            (push (cons request chunk) prepared))))
-      (setq prepared (nreverse prepared))
-      (let* ((requests (mapcar #'car prepared))
-             (superseded
-              (proofread--supersede-conflicting-requests requests)))
-        ;; Publish the complete batch before lifecycle hooks or
-        ;; cancellation callbacks can edit the buffer or enqueue more
-        ;; work.
-        (let
-            ((enqueued
-              (proofread--enqueue-requests requests backend)))
-          (when enqueued
-            (proofread--attach-request-batch requests))
-          (let ((proofread--inhibit-queue-dispatch (current-buffer)))
-            (proofread--finish-superseded-requests superseded)
-            (if enqueued
-                (dolist (work prepared)
-                  (let ((request (car work)))
-                    (proofread--record-request-event
-                     request 'chunk-request
-                     :chunk (cdr work))
-                    (proofread--record-request-event
-                     request 'queued-request
-                     :backend backend)))
-              (dolist (request requests)
-                (proofread--reject-request-during-clear request))))
-          (when enqueued
-            (proofread--dispatch-queued-requests t)))))))
+When BACKEND is nil, use `proofread-backend'.  BINDING and PROFILE,
+when non-nil, identify the selected profile binding.  Return
+dispatched requests."
+  (let ((backend (or backend (plist-get binding :backend))))
+    (when (proofread--supported-backend-p backend)
+      (let ((new-work-keys (make-hash-table :test #'equal))
+            prepared)
+        (dolist (chunk chunks)
+          (let* ((request
+                  (proofread--make-backend-request
+                   chunk backend binding profile))
+                 (work-key (proofread--request-work-key request)))
+            (unless (or (proofread--request-work-pending-p request)
+                        (gethash work-key new-work-keys))
+              (puthash work-key t new-work-keys)
+              (push (cons request chunk) prepared))))
+        (setq prepared (nreverse prepared))
+        (let* ((requests (mapcar #'car prepared))
+               (superseded
+                (proofread--supersede-conflicting-requests
+                 requests)))
+          ;; Publish the complete batch before lifecycle hooks or
+          ;; cancellation callbacks can edit the buffer or enqueue more
+          ;; work.
+          (let
+              ((enqueued
+                (proofread--enqueue-requests requests backend)))
+            (when enqueued
+              (proofread--attach-request-batch requests))
+            (let ((proofread--inhibit-queue-dispatch
+                   (current-buffer)))
+              (proofread--finish-superseded-requests
+               superseded)
+              (if enqueued
+                  (dolist (work prepared)
+                    (let ((request (car work)))
+                      (proofread--record-request-event
+                       request 'chunk-request
+                       :chunk (cdr work))
+                      (proofread--record-request-event
+                       request 'queued-request
+                       :backend backend)))
+                (dolist (request requests)
+                  (proofread--reject-request-during-clear
+                   request))))
+            (when enqueued
+              (proofread--dispatch-queued-requests t))))))))
+
+(defun proofread--dispatch-profile-request-ready-chunks
+    (chunks profile)
+  "Dispatch request-ready CHUNKS for every supported binding in PROFILE."
+  (let (requests)
+    (dolist (binding
+             (proofread--current-profile-supported-bindings profile))
+      (setq requests
+            (nconc
+             requests
+             (proofread--dispatch-request-ready-chunks
+              chunks (plist-get binding :backend) binding profile))))
+    requests))
 
 ;;;; Cancellation and automatic checks
 
@@ -5511,6 +5659,13 @@ progress messages are inhibited."
             #'proofread--progress-message))
          (normalized-ranges
           (proofread--normalize-accessible-ranges ranges))
+         (profile (proofread--current-profile))
+         (legacy-profile-p
+          (eq (plist-get profile :name)
+              proofread--legacy-profile-name))
+         (supported-bindings
+          (unless legacy-profile-p
+            (proofread--current-profile-supported-bindings profile)))
          (islands
           (proofread--target-islands-for-ranges
            normalized-ranges))
@@ -5525,11 +5680,16 @@ progress messages are inhibited."
            :test #'equal)))
     (proofread--prune-diagnostics-outside-targets
      normalized-ranges domains)
-    (if (proofread--supported-backend-p)
+    (if (if legacy-profile-p
+            (proofread--supported-backend-p)
+          supported-bindings)
         (let* ((chunks
                 (proofread--request-ready-chunks-for-islands islands))
                (requests
-                (proofread--dispatch-request-ready-chunks chunks))
+                (if legacy-profile-p
+                    (proofread--dispatch-request-ready-chunks chunks)
+                  (proofread--dispatch-profile-request-ready-chunks
+                   chunks profile)))
                (queued (length proofread--request-queue)))
           (funcall
            progress-message

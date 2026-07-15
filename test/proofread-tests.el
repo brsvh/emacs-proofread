@@ -2867,6 +2867,279 @@ This covers URLs, email, invisible text, faces, and properties."
                :backend languagetool))))))
     (should-error (proofread--current-profile) :type 'error)))
 
+(ert-deftest proofread-test-profile-dispatch-fans-out-bindings ()
+  "Dispatch one request per request-ready chunk and profile binding."
+  (with-temp-buffer
+    (insert "Alpha")
+    (let ((proofread-auto-check nil)
+          (proofread-context-size 0)
+          (proofread-profile 'multi)
+          (proofread-profiles
+           `((multi
+              :language "en-US"
+              :bindings
+              (( :name strict
+                 :backend ,proofread-test--backend
+                 :options ( :tone strict))
+               ( :name gentle
+                 :backend ,proofread-test--backend
+                 :options ( :tone gentle))))))
+          (recorder (proofread-test--make-backend-recorder)))
+      (proofread-mode 1)
+      (cl-letf (((symbol-function 'proofread--backend-check)
+                 (plist-get recorder :function)))
+        (proofread-check-region (point-min) (point-max))
+        (let ((requests (funcall (plist-get recorder :requests))))
+          (should (= (length requests) 2))
+          (should (equal (mapcar (lambda (request)
+                                   (plist-get request :profile))
+                                 requests)
+                         '( multi multi)))
+          (should (equal (mapcar (lambda (request)
+                                   (plist-get request :binding-name))
+                                 requests)
+                         '( strict gentle)))
+          (should (equal (mapcar (lambda (request)
+                                   (plist-get request :binding-options))
+                                 requests)
+                         '(( :tone strict) ( :tone gentle))))
+          (should (equal (mapcar (lambda (request)
+                                   (plist-get request :language))
+                                 requests)
+                         '( "en-US" "en-US")))
+          (should (= (length proofread--active-requests) 2)))))))
+
+(ert-deftest
+    proofread-test-profile-pending-work-distinguishes-bindings
+    ()
+  "Keep same-range work from different profile bindings distinct."
+  (with-temp-buffer
+    (insert "Alpha")
+    (let ((proofread-auto-check nil)
+          (proofread-context-size 0)
+          (proofread-max-concurrent-requests 0)
+          (proofread-profile 'multi)
+          (proofread-profiles
+           `((multi
+              :language "en-US"
+              :bindings
+              (( :name first
+                 :backend ,proofread-test--backend)
+               ( :name second
+                 :backend ,proofread-test--backend))))))
+      (proofread-mode 1)
+      (let* ((profile (proofread--current-profile))
+             (chunks
+              (proofread-test--request-ready-chunks-for-ranges
+               (list (cons (point-min) (point-max))))))
+        (proofread--dispatch-profile-request-ready-chunks
+         chunks profile)
+        (let ((queued
+               (mapcar (lambda (entry)
+                         (plist-get entry :request))
+                       proofread--request-queue)))
+          (should (= (length queued) 2))
+          (should (equal (mapcar (lambda (request)
+                                   (plist-get request :binding-name))
+                                 queued)
+                         '( first second)))
+          (should-not (equal (proofread--request-work-key
+                              (car queued))
+                             (proofread--request-work-key
+                              (cadr queued))))
+          (should (= (hash-table-count
+                      proofread--pending-request-keys)
+                     2)))))))
+
+(ert-deftest
+    proofread-test-profile-supersedes-only-same-binding
+    ()
+  "Overlapping work supersedes only requests owned by the same binding."
+  (with-temp-buffer
+    (insert "abcdef")
+    (let ((proofread-auto-check nil)
+          (proofread-context-size 0)
+          (proofread-max-concurrent-requests 8)
+          (proofread-profile 'multi)
+          (proofread-profiles
+           `((multi
+              :bindings
+              (( :name first
+                 :backend ,proofread-test--backend)
+               ( :name second
+                 :backend ,proofread-test--backend))))))
+      (proofread-mode 1)
+      (cl-letf (((symbol-function 'proofread--backend-check)
+                 (lambda (request _callback &optional _backend)
+                   (list :backend proofread-test--backend
+                         :binding-name
+                         (plist-get request :binding-name)))))
+        (let* ((profile (proofread--current-profile))
+               (bindings (plist-get profile :bindings))
+               (first-binding (car bindings))
+               (old-chunk
+                (car
+                 (proofread-test--request-ready-chunks-for-ranges
+                  '((1 . 7)))))
+               (new-chunk
+                (car
+                 (proofread-test--request-ready-chunks-for-ranges
+                  '((2 . 6))))))
+          (proofread--dispatch-profile-request-ready-chunks
+           (list old-chunk) profile)
+          (let* ((old-first
+                  (cl-find
+                   'first proofread--active-requests
+                   :key (lambda (request)
+                          (plist-get request :binding-name))))
+                 (old-second
+                  (cl-find
+                   'second proofread--active-requests
+                   :key (lambda (request)
+                          (plist-get request :binding-name)))))
+            (should old-first)
+            (should old-second)
+            (proofread--dispatch-request-ready-chunks
+             (list new-chunk) proofread-test--backend
+             first-binding profile)
+            (let ((new-first
+                   (cl-find-if
+                    (lambda (request)
+                      (and (eq (plist-get request :binding-name)
+                               'first)
+                           (equal (plist-get request :text)
+                                  "bcde")))
+                    proofread--active-requests)))
+              (should (proofread--request-state-flag-p
+                       old-first :superseded))
+              (should-not (proofread--active-request-p old-first))
+              (should-not (proofread--request-state-flag-p
+                           old-second :superseded))
+              (should (proofread--active-request-p old-second))
+              (should (proofread--active-request-p new-first))
+              (should (= (length proofread--active-requests)
+                         2)))))))))
+
+(ert-deftest
+    proofread-test-profile-cache-key-distinguishes-binding-identity
+    ()
+  "Include binding names and options in diagnostic cache keys."
+  (with-temp-buffer
+    (insert "Alpha")
+    (proofread-mode 1)
+    (let* ((profile '( :name multi :language "en-US"))
+           (strict
+            `( :profile multi
+               :name strict
+               :backend ,proofread-test--backend
+               :options ( :tone formal)))
+           (gentle
+            `( :profile multi
+               :name gentle
+               :backend ,proofread-test--backend
+               :options ( :tone formal)))
+           (strict-relaxed
+            `( :profile multi
+               :name strict
+               :backend ,proofread-test--backend
+               :options ( :tone relaxed)))
+           (chunk
+            (car
+             (proofread-test--request-ready-chunks-for-ranges
+              (list (cons (point-min) (point-max))))))
+           (strict-request
+            (proofread--make-backend-request
+             chunk proofread-test--backend strict profile))
+           (gentle-request
+            (proofread--make-backend-request
+             chunk proofread-test--backend gentle profile))
+           (strict-relaxed-request
+            (proofread--make-backend-request
+             chunk proofread-test--backend strict-relaxed profile)))
+      (should-not (equal (plist-get strict-request :cache-key)
+                         (plist-get gentle-request :cache-key)))
+      (should-not (equal (plist-get strict-request :cache-key)
+                         (plist-get strict-relaxed-request
+                                    :cache-key))))))
+
+(ert-deftest
+    proofread-test-profile-binding-change-makes-request-stale
+    ()
+  "Reject results when the owning profile binding identity changes."
+  (with-temp-buffer
+    (insert "Alpha")
+    (let ((proofread-auto-check nil)
+          (proofread-context-size 0)
+          (proofread-profile 'multi)
+          (proofread-profiles
+           `((multi
+              :language "en-US"
+              :bindings
+              (( :name strict
+                 :backend ,proofread-test--backend
+                 :options ( :tone formal)))))))
+      (proofread-mode 1)
+      (let* ((profile (proofread--current-profile))
+             (binding (car (plist-get profile :bindings)))
+             (chunk
+              (car
+               (proofread-test--request-ready-chunks-for-ranges
+                (list (cons (point-min) (point-max))))))
+             (request
+              (proofread--make-backend-request
+               chunk proofread-test--backend binding profile)))
+        (let ((proofread-language "global-change"))
+          (should (proofread--fresh-request-p request)))
+        (let ((proofread-profiles
+               `((multi
+                  :language "en-US"
+                  :bindings
+                  (( :name strict
+                     :backend ,proofread-test--backend
+                     :options ( :tone relaxed)))))))
+          (should-not (proofread--fresh-request-p request)))))))
+
+(ert-deftest
+    proofread-test-profile-bindings-share-global-concurrency-limit
+    ()
+  "Apply the buffer-wide request limit across profile bindings."
+  (with-temp-buffer
+    (insert "Alpha")
+    (let ((proofread-auto-check nil)
+          (proofread-context-size 0)
+          (proofread-max-concurrent-requests 1)
+          (proofread-profile 'multi)
+          (proofread-profiles
+           `((multi
+              :language "en-US"
+              :bindings
+              (( :name first
+                 :backend ,proofread-test--backend)
+               ( :name second
+                 :backend ,proofread-test--backend))))))
+      (proofread-mode 1)
+      (cl-letf (((symbol-function 'proofread--backend-check)
+                 (lambda (request _callback &optional _backend)
+                   (list :backend proofread-test--backend
+                         :request-id (plist-get request :id)))))
+        (proofread-check-region (point-min) (point-max))
+        (should (= (length proofread--active-requests) 1))
+        (should (= (length proofread--request-queue) 1))
+        (let ((owners
+               (mapcar
+                (lambda (request)
+                  (plist-get request :binding-name))
+                (append
+                 proofread--active-requests
+                 (mapcar (lambda (entry)
+                           (plist-get entry :request))
+                         proofread--request-queue)))))
+          (should (equal (sort owners
+                               (lambda (left right)
+                                 (string< (symbol-name left)
+                                          (symbol-name right))))
+                         '( first second))))))))
+
 ;;;; Backend and scheduler tests
 
 (ert-deftest proofread-test-backend-registry-routes-adapter-functions
