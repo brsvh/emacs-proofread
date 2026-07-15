@@ -1068,11 +1068,20 @@ MAX-PASSES is the request-local diagnostic pass limit."
 
 (defun proofread-llm--cancel-request-handle (handle)
   "Cancel the LLM requests recorded in backend HANDLE."
-  (let ((warning-minimum-level :error)
-        (warning-minimum-log-level :error))
-    (dolist (request-handle (plist-get handle :requests))
-      (ignore-errors
-        (llm-cancel-request request-handle)))))
+  (unless (plist-get handle :cancelled)
+    (setf (plist-get handle :cancelled) t)
+    (let ((request-handles (plist-get handle :requests))
+          (timer (plist-get handle :timer))
+          (warning-minimum-level :error)
+          (warning-minimum-log-level :error))
+      (setf (plist-get handle :requests) nil)
+      (setf (plist-get handle :timer) nil)
+      (when (timerp timer)
+        (ignore-errors
+          (cancel-timer timer)))
+      (dolist (request-handle request-handles)
+        (ignore-errors
+          (llm-cancel-request request-handle))))))
 
 (defun proofread-llm-unload-function ()
   "Unregister the LLM backend before unloading this library."

@@ -526,6 +526,41 @@ When PROFILE is nil, use the current profile."
         (cancel-timer timer)))
     (setf (plist-get handle :timer) nil)))
 
+(defun proofread-test--opaque-handle-cases ()
+  "Return fresh provider-neutral backend handle fixtures."
+  (list
+   (list :kind 'symbol
+         :handle (make-symbol "proofread-test-symbol-handle"))
+   (list :kind 'vector
+         :handle (vector 'proofread-test-vector-handle 'payload))
+   (list :kind 'record
+         :handle (record 'proofread-test-record-handle 'payload))
+   (list :kind 'plist
+         :handle
+         (list :backend 'proofread-test-decoy-backend
+               :cancelled 'backend-owned
+               :timer 'backend-owned))))
+
+(defun proofread-test--register-cancellable-backend
+    (backend check cancel)
+  "Register BACKEND with CHECK, CANCEL, and a minimal identity."
+  (proofread--register-backend
+   backend
+   :check check
+   :identity
+   (lambda ()
+     (list :backend backend :contract-version 1))
+   :cancel cancel))
+
+(defun proofread-test--assert-no-pending-request-work ()
+  "Assert that the current buffer has no pending request work."
+  (should-not proofread--active-requests)
+  (should-not proofread--claimed-requests)
+  (should-not proofread--request-queue)
+  (should-not proofread--request-queue-tail)
+  (should
+   (zerop (hash-table-count proofread--pending-request-keys))))
+
 (defmacro proofread-test--with-profile (&rest body)
   "Run BODY with the generic test backend selected by a profile."
   (declare (indent 0) (debug (body)))
@@ -3691,25 +3726,29 @@ This covers URLs, email, invisible text, faces, and properties."
            (proofread--legacy-dispatch-warning-issued-p nil)
            request
            handle
+           cancelled
            warnings)
        (proofread-mode 1)
        (cl-letf (((symbol-function 'display-warning)
                   (lambda (&rest args)
                     (push args warnings)))
                  ((symbol-function 'message) #'ignore)
+                 ((symbol-function 'proofread-test--backend-cancel)
+                  (lambda (backend-handle)
+                    (push backend-handle cancelled)))
                  ((symbol-function 'proofread--backend-check)
                   (lambda (backend-request _callback &optional _backend)
                     (setq request backend-request)
                     (setq handle
-                          (list :backend proofread-test--backend
-                                :cancelled nil)))))
+                          'proofread-test-legacy-handle))))
          (proofread-check-buffer)
          (should request)
          (should (eq (plist-get request :profile) 'legacy))
          (should (eq (plist-get request :checker-name) 'legacy))
          (should (proofread--active-request-p request))
          (proofread-mode -1))
-       (should (plist-get handle :cancelled))
+       (should (= (length cancelled) 1))
+       (should (eq (car cancelled) handle))
        (should (proofread--request-state-flag-p request :cancelled))
        (should-not proofread--active-requests)
        (should (= (length warnings) 1))))))
@@ -5426,13 +5465,240 @@ This covers URLs, email, invisible text, faces, and properties."
 
 ;;;; Backend and scheduler tests
 
+(ert-deftest proofread-test-backend-handles-are-opaque ()
+  "Pass provider-neutral backend handles unchanged to their adapter."
+  (dolist (case (proofread-test--opaque-handle-cases))
+    (let* ((backend 'proofread-test-opaque-backend)
+           (kind (plist-get case :kind))
+           (handle (plist-get case :handle))
+           (printed-handle (prin1-to-string handle))
+           (proofread--backend-registry
+            (make-hash-table :test #'eq))
+           cancelled)
+      (pcase kind
+        ('symbol (should (symbolp handle)))
+        ('vector
+         (should (vectorp handle))
+         (should-not (recordp handle)))
+        ('record (should (recordp handle)))
+        ('plist (should (listp handle))))
+      (proofread-test--register-cancellable-backend
+       backend
+       (lambda (_request _callback)
+         handle)
+       (lambda (backend-handle)
+         (push backend-handle cancelled)))
+      (with-temp-buffer
+        (text-mode)
+        (insert "Alpha")
+        (let ((proofread-auto-check nil)
+              (proofread-cache-max-entries 0)
+              (proofread-context-size 0)
+              (proofread-profile 'opaque)
+              (proofread-profiles
+               (list
+                (list
+                 'opaque
+                 :language "en-US"
+                 :checkers
+                 (list (list :name 'opaque :backend backend))))))
+          (proofread-mode 1)
+          (proofread-check-buffer)
+          (should (= (length proofread--active-requests) 1))
+          (let ((request (car proofread--active-requests)))
+            (proofread--clear-request-work)
+            (should (= (length cancelled) 1))
+            (should (eq (car cancelled) handle))
+            (should (equal (prin1-to-string handle)
+                           printed-handle))
+            (should
+             (proofread--request-state-flag-p request :cancelled))
+            (proofread-test--assert-no-pending-request-work)
+            (proofread--clear-request-work)
+            (should (= (length cancelled) 1))))))))
+
+(ert-deftest
+    proofread-test-cancellation-keeps-submission-adapter ()
+  "Use the captured cancel adapter after registry replacement or removal."
+  (dolist (transition '( unregister reregister))
+    (let* ((backend 'proofread-test-snapshot-backend)
+           (handle (make-symbol "proofread-test-snapshot-handle"))
+           (proofread--backend-registry
+            (make-hash-table :test #'eq))
+           old-cancelled
+           new-cancelled)
+      (proofread-test--register-cancellable-backend
+       backend
+       (lambda (_request _callback)
+         handle)
+       (lambda (backend-handle)
+         (push backend-handle old-cancelled)))
+      (with-temp-buffer
+        (insert "Alpha")
+        (let ((proofread-auto-check nil)
+              (proofread-cache-max-entries 0)
+              (proofread-context-size 0)
+              (proofread-profile 'snapshot)
+              (proofread-profiles
+               (list
+                (list
+                 'snapshot
+                 :language "en-US"
+                 :checkers
+                 (list (list :name 'snapshot :backend backend))))))
+          (proofread-mode 1)
+          (proofread-check-buffer)
+          (should (= (length proofread--active-requests) 1))
+          (let ((request (car proofread--active-requests)))
+            (pcase transition
+              ('unregister
+               (proofread--unregister-backend backend))
+              ('reregister
+               (proofread-test--register-cancellable-backend
+                backend
+                (lambda (&rest _)
+                  (error "Replacement backend must not run"))
+                (lambda (backend-handle)
+                  (push backend-handle new-cancelled)))))
+            (proofread--clear-request-work)
+            (should (= (length old-cancelled) 1))
+            (should (eq (car old-cancelled) handle))
+            (should-not new-cancelled)
+            (should
+             (proofread--request-state-flag-p request :cancelled))
+            (proofread-test--assert-no-pending-request-work)))))))
+
+(ert-deftest
+    proofread-test-cancel-error-does-not-block-or-repeat-cleanup ()
+  "Continue cleanup after one cancel error and never retry it."
+  (let* ((backend 'proofread-test-throwing-cancel-backend)
+         (proofread--backend-registry
+          (make-hash-table :test #'eq))
+         submitted
+         cancelled
+         raised)
+    (proofread-test--register-cancellable-backend
+     backend
+     (lambda (_request _callback)
+       (let ((handle
+              (make-symbol "proofread-test-throwing-handle")))
+         (push handle submitted)
+         handle))
+     (lambda (handle)
+       (push handle cancelled)
+       (unless raised
+         (setq raised t)
+         (error "Simulated cancellation failure"))))
+    (with-temp-buffer
+      (text-mode)
+      (insert "One. Two. Three.")
+      (let ((proofread-auto-check nil)
+            (proofread-cache-max-entries 0)
+            (proofread-context-size 0)
+            (proofread-max-concurrent-requests 20)
+            (proofread-profile 'throwing)
+            (proofread-profiles
+             (list
+              (list
+               'throwing
+               :language "en-US"
+               :checkers
+               (list (list :name 'throwing :backend backend))))))
+        (proofread-mode 1)
+        (proofread-check-buffer)
+        (should (= (length submitted) 3))
+        (should (= (length proofread--active-requests) 3))
+        (let ((requests (copy-sequence proofread--active-requests)))
+          (cl-letf
+              (((symbol-function
+                 'proofread-report-warning-without-window)
+                #'ignore))
+            (proofread--clear-request-work)
+            (should (= (length cancelled) 3))
+            (dolist (handle submitted)
+              (should (= (cl-count handle cancelled :test #'eq) 1)))
+            (let ((cancel-count (length cancelled)))
+              (proofread--clear-request-work)
+              (should (= (length cancelled) cancel-count))))
+          (should raised)
+          (dolist (request requests)
+            (should
+             (proofread--request-state-flag-p request :cancelled)))
+          (proofread-test--assert-no-pending-request-work))))))
+
+(ert-deftest proofread-test-core-timers-stay-core-owned ()
+  "Cancel core timers directly and backend timers through their adapter."
+  (let* ((backend 'proofread-test-timer-backend)
+         (backend-timer 'proofread-test-backend-timer)
+         (core-idle-timer 'proofread-test-core-idle-timer)
+         (core-queue-timer 'proofread-test-core-queue-timer)
+         (proofread--backend-registry
+          (make-hash-table :test #'eq))
+         adapter-cancelled
+         directly-cancelled)
+    (proofread-test--register-cancellable-backend
+     backend
+     (lambda (_request _callback)
+       backend-timer)
+     (lambda (handle)
+       (push handle adapter-cancelled)))
+    (with-temp-buffer
+      (insert "Alpha")
+      (let ((proofread-auto-check nil)
+            (proofread-cache-max-entries 0)
+            (proofread-context-size 0)
+            (proofread-profile 'timers)
+            (proofread-profiles
+             (list
+              (list
+               'timers
+               :language "en-US"
+               :checkers
+               (list (list :name 'timers :backend backend))))))
+        (proofread-mode 1)
+        (proofread-check-buffer)
+        (should (= (length proofread--active-requests) 1))
+        (let ((request (car proofread--active-requests)))
+          (setq proofread--idle-timer core-idle-timer)
+          (setq proofread--queue-dispatch-timer core-queue-timer)
+          (cl-letf (((symbol-function 'timerp)
+                     (lambda (object)
+                       (memq object
+                             (list backend-timer
+                                   core-idle-timer
+                                   core-queue-timer))))
+                    ((symbol-function 'cancel-timer)
+                     (lambda (timer)
+                       (push timer directly-cancelled))))
+            (proofread--clear-request-work)
+            (proofread--clear-request-work))
+          (should (= (length adapter-cancelled) 1))
+          (should (eq (car adapter-cancelled) backend-timer))
+          (should (= (length directly-cancelled) 2))
+          (should
+           (= (cl-count core-idle-timer directly-cancelled
+                        :test #'eq)
+              1))
+          (should
+           (= (cl-count core-queue-timer directly-cancelled
+                        :test #'eq)
+              1))
+          (should-not (memq backend-timer directly-cancelled))
+          (should
+           (proofread--request-state-flag-p request :cancelled))
+          (should-not proofread--idle-timer)
+          (should-not proofread--queue-dispatch-timer)
+          (proofread-test--assert-no-pending-request-work))))))
+
 (ert-deftest proofread-test-backend-registry-routes-adapter-functions
     ()
   "Route backend operations through a registered adapter descriptor."
-  (let ((proofread--backend-registry (make-hash-table :test #'eq))
-        checked
-        cancelled
-        result)
+  (let* ((proofread--backend-registry
+          (make-hash-table :test #'eq))
+         (cancel (lambda (_handle)
+                   (error "Unexpected cancellation")))
+         checked
+         result)
     (proofread--register-backend
      proofread-test--backend
      :check
@@ -5441,14 +5707,19 @@ This covers URLs, email, invisible text, faces, and properties."
        (run-at-time
         0 nil callback
         (proofread--backend-success-result request nil))
-       (list :backend proofread-test--backend :cancelled nil))
+       'proofread-test-registry-handle)
      :identity
      (lambda ()
        '( :backend proofread-test-backend :contract-version 1))
-     :cancel
-     (lambda (handle)
-       (setq cancelled handle)))
+     :cancel cancel)
     (should (proofread--supported-backend-p proofread-test--backend))
+    (should
+     (eq
+      (plist-get
+       (gethash proofread-test--backend
+                proofread--backend-registry)
+       :cancel)
+      cancel))
     (should (equal (proofread--backend-identity
                     proofread-test--backend)
                    '( :backend proofread-test-backend
@@ -5461,12 +5732,10 @@ This covers URLs, email, invisible text, faces, and properties."
                (setq result backend-result))
              proofread-test--backend)))
       (should (eq checked request))
+      (should (eq handle 'proofread-test-registry-handle))
       (should-not result)
       (should (proofread-test--wait-for (lambda () result)))
-      (should (eq (plist-get result :status) 'ok))
-      (proofread--cancel-request-handle handle)
-      (should (plist-get handle :cancelled))
-      (should (eq cancelled handle)))
+      (should (eq (plist-get result :status) 'ok)))
     (proofread--unregister-backend proofread-test--backend)
     (should-not
      (proofread--supported-backend-p proofread-test--backend))))

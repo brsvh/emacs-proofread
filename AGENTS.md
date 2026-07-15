@@ -26,8 +26,12 @@
   backends require no core conditional or first-party loading metadata. Keep the
   shared contract public, and do not add cross-package `proofread--`
   dependencies. Submission is non-blocking and settles at most once; handles are
-  opaque, cleanup is idempotent, and per-checker identities are stable,
-  non-secret, and complete for cache compatibility.
+  opaque. At submission the core captures any backend cancel operation
+  associated with a returned handle and, when cancelling, passes the handle to
+  that operation unchanged. Only timers created by the core may be cancelled
+  directly by the core. Cleanup is idempotent, cancellation errors are isolated,
+  and per-checker identities are stable, non-secret, and complete for cache
+  compatibility.
 - Test generic registration and multi-backend behavior with provider-neutral
   fake backends in the core suite; keep implementation tests with their backend.
   Update build, test, packaging, documentation, and release metadata together

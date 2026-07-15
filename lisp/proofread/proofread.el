@@ -530,12 +530,24 @@ interrupting proofreading.")
 
 ;;;; Backend registry
 
+(cl-defstruct
+    (proofread--request-handle
+     (:constructor proofread--make-request-handle (value cancel)))
+  "Core-owned cancellation state for an opaque backend handle."
+  value
+  cancel
+  cancelled)
+
+(defvar proofread--backend-descriptor-snapshot nil
+  "Dynamically captured `(BACKEND . DESCRIPTOR)' for submission.")
+
 (defun proofread--register-backend (backend &rest descriptor)
   "Register BACKEND using functions in DESCRIPTOR.
 DESCRIPTOR must contain callable `:check' and `:identity' entries.  An
 optional callable `:checker-identity' entry returns the effective
 identity for one normalized profile checker, and an optional callable
-`:cancel' entry cancels backend-specific handles."
+`:cancel' entry receives unchanged the opaque handle returned by
+`:check'."
   (unless (symbolp backend)
     (error "Proofread backend name must be a symbol: %S" backend))
   (dolist (key '( :check :identity))
@@ -2425,18 +2437,19 @@ When MESSAGE is non-nil, include it as caller-readable error text."
            proofread--pending-request-keys)
   request)
 
-(defun proofread--record-active-request-handle (request handle)
-  "Record backend HANDLE for active REQUEST in the current buffer."
+(defun proofread--record-active-request-handle (request request-handle)
+  "Record REQUEST-HANDLE for active REQUEST in the current buffer."
   (let ((log-id (plist-get request :log-id))
         retained)
     (dolist (candidate proofread--active-requests)
       (push
        (if (equal log-id (plist-get candidate :log-id))
-           (plist-put (copy-sequence candidate) :handle handle)
+           (plist-put (copy-sequence candidate)
+                      :handle request-handle)
          candidate)
        retained))
     (setq proofread--active-requests (nreverse retained)))
-  handle)
+  request-handle)
 
 (defun proofread--remove-active-request (request)
   "Remove REQUEST from active request state in the current buffer."
@@ -2715,7 +2728,12 @@ The report is delivered asynchronously."
 When BACKEND is nil, use `proofread-backend'.  The return value is a
 backend handle."
   (let* ((backend (or backend proofread-backend))
-         (descriptor (proofread--backend-descriptor backend))
+         (descriptor
+          (if (and (consp proofread--backend-descriptor-snapshot)
+                   (eq (car proofread--backend-descriptor-snapshot)
+                       backend))
+              (cdr proofread--backend-descriptor-snapshot)
+            (proofread--backend-descriptor backend)))
          (check (plist-get descriptor :check)))
     (if check
         (funcall check request callback)
@@ -2742,13 +2760,14 @@ ERROR identifies the failure and DETAIL describes it."
     (request callback &optional backend)
   "Register and submit REQUEST to BACKEND, then invoke CALLBACK.
 When BACKEND is nil, use `proofread-backend'."
-  (let ((buffer (plist-get request :buffer)))
+  (let ((backend (or backend proofread-backend))
+        (buffer (plist-get request :buffer)))
     (when (buffer-live-p buffer)
       (with-current-buffer buffer
         (proofread--register-active-request request))
       (proofread--record-request-event
        request 'active-request
-       :backend (or backend proofread-backend))
+       :backend backend)
       (if (not (proofread--request-ready-to-submit-p request))
           (progn
             (proofread--retire-active-request request)
@@ -2767,10 +2786,24 @@ When BACKEND is nil, use `proofread-backend'."
                           (setq callback-state 'completed))
                       (when (eq callback-state 'running)
                         (setq callback-state 'failed))))))
-               (handle
+               (submission
                 (condition-case err
-                    (proofread--backend-check
-                     request wrapped-callback backend)
+                    (let* (;; Capture one adapter snapshot before
+                           ;; submission.  Later registry changes must
+                           ;; not redirect cleanup for its handle.
+                           (descriptor
+                            (proofread--backend-descriptor backend))
+                           (cancel
+                            (if descriptor
+                                (plist-get descriptor :cancel)
+                              ;; This fallback timer is core-owned.
+                              #'cancel-timer))
+                           (proofread--backend-descriptor-snapshot
+                            (cons backend descriptor))
+                           (handle
+                            (proofread--backend-check
+                             request wrapped-callback backend)))
+                      (list :handle handle :cancel cancel))
                   (error
                    (pcase callback-state
                      ('pending
@@ -2787,7 +2820,13 @@ When BACKEND is nil, use `proofread-backend'."
                      (_
                       ;; Do not misclassify an error from the core
                       ;; callback/result path as a backend failure.
-                      (signal (car err) (cdr err))))))))
+                      (signal (car err) (cdr err)))))))
+               (handle (plist-get submission :handle))
+               (cancel (plist-get submission :cancel))
+               (request-handle
+                (and handle
+                     (proofread--make-request-handle
+                      handle cancel))))
           (when (and (null handle) (eq callback-state 'pending))
             (proofread--invoke-backend-callback
              wrapped-callback
@@ -2809,17 +2848,18 @@ When BACKEND is nil, use `proofread-backend'."
                             request :cancelled)))))
             (cond
              (stale
-              (proofread--retire-active-request request handle)
+              (proofread--retire-active-request
+               request request-handle)
               proofread--stale-dispatch-result)
              (t
               (when handle
                 (when active
                   (with-current-buffer buffer
                     (proofread--record-active-request-handle
-                     request handle)))
+                     request request-handle)))
                 (proofread--record-request-event
                  request 'backend-dispatched
-                 :backend (or backend proofread-backend)
+                 :backend backend
                  :handle handle))
               handle))))))))
 
@@ -2847,8 +2887,8 @@ When BACKEND is nil, use `proofread-backend'."
        (proofread--request-lifecycle-current-p request)))
 
 (defun proofread--retire-active-request
-    (request &optional handle reason)
-  "Remove active REQUEST and cancel its optional backend HANDLE.
+    (request &optional request-handle reason)
+  "Remove active REQUEST and cancel optional core REQUEST-HANDLE.
 Record REASON as the cancellation reason, defaulting to `stale'."
   (let ((buffer (plist-get request :buffer)))
     (when (buffer-live-p buffer)
@@ -2858,7 +2898,7 @@ Record REASON as the cancellation reason, defaulting to `stale'."
     (let ((proofread--inhibit-queue-dispatch buffer))
       (proofread--record-request-cancellation
        request (or reason 'stale))
-      (proofread--cancel-request-handle handle))))
+      (proofread--cancel-request-handle request-handle))))
 
 (defun proofread--prune-stale-active-requests ()
   "Cancel active requests that no longer match this buffer."
@@ -3917,21 +3957,30 @@ per checker without preventing later checkers from running."
 
 ;;;; Cancellation and automatic checks
 
-(defun proofread--cancel-request-handle (handle)
-  "Cancel backend HANDLE when the backend supports cancellation."
-  (cond
-   ((timerp handle)
-    (cancel-timer handle))
-   ((listp handle)
-    (when (plist-member handle :cancelled)
-      (setf (plist-get handle :cancelled) t))
-    (when-let* ((timer (plist-get handle :timer))
-                ((timerp timer)))
-      (cancel-timer timer))
-    (when-let* ((backend (plist-get handle :backend))
-                (descriptor (proofread--backend-descriptor backend))
-                (cancel (plist-get descriptor :cancel)))
-      (funcall cancel handle)))))
+(defun proofread--cancel-request-handle (request-handle)
+  "Cancel REQUEST-HANDLE once through its captured operation.
+The backend handle value is opaque and is passed unchanged.  Errors
+from one cancel operation are reported without escaping, so cleanup
+of later requests can continue."
+  (when (and (proofread--request-handle-p request-handle)
+             (not
+              (proofread--request-handle-cancelled request-handle)))
+    ;; Mark first so reentrant and repeated cleanup stays idempotent.
+    (setf (proofread--request-handle-cancelled request-handle) t)
+    (when-let* ((cancel
+                 (proofread--request-handle-cancel request-handle)))
+      (condition-case err
+          (funcall
+           cancel
+           (proofread--request-handle-value request-handle))
+        (error
+         (condition-case nil
+             (proofread-report-warning-without-window
+              (format "Proofread backend cancellation failed: %s"
+                      (error-message-string err))
+              "backend cancellation failed; see *Warnings*")
+           (error nil)))))
+    t))
 
 (defun proofread--cancel-active-requests ()
   "Cancel cancellable active backend requests for the current buffer."

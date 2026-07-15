@@ -365,7 +365,7 @@ When PROFILE is nil, use the current profile."
             (proofread-llm--backend-check
              request (lambda (value) (setq result value)))))
       (proofread-llm-test--assert-handle-shape handle)
-      (proofread--cancel-request-handle handle)
+      (proofread-llm--cancel-request-handle handle)
       (should (plist-get handle :cancelled))
       (accept-process-output nil 0.02)
       (should-not result)))
@@ -381,7 +381,7 @@ When PROFILE is nil, use the current profile."
                  (push request-handle cancelled)
                  (when (eq request-handle 'provider-request-a)
                    (error "Cancellation failed")))))
-      (proofread--cancel-request-handle handle))
+      (proofread-llm--cancel-request-handle handle))
     (should (plist-get handle :cancelled))
     (should (equal (nreverse cancelled)
                    '( provider-request-a provider-request-b)))))
