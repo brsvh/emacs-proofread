@@ -54,6 +54,17 @@ request cancellation.
 ** User interface
 
 ---
+*** Explicit checks now retire diagnostics owned by inactive checkers.
+After a profile switch or checker removal, explicitly checking a range
+removes diagnostics in that range that belong to checkers absent from the
+current profile, even if no replacement diagnostics are reported.  An
+empty profile similarly retires profile-owned diagnostics from the checked
+range without dispatching backend requests.  Diagnostics outside the
+checked range remain unchanged.  Profile-owner retirement does not affect
+otherwise-valid ad-hoc low-level diagnostics, while diagnostics from current
+checkers remain visible until their replacement results are applied.
+
+---
 *** Matching diagnostics from multiple checkers are aggregated.
 Diagnostics for the same text and range remain independent internally but
 are presented as one source-aware diagnostic for navigation, descriptions,

@@ -290,6 +290,13 @@ buffer-locally:
 (setq-local proofread-profile 'chinese)
 ```
 
+Changing a buffer's selected profile, or removing a checker from that profile,
+does not itself clear diagnostics. On the next explicit check, Proofread removes
+diagnostics in the checked range that belong to checkers absent from the
+selected profile, even if its current checkers report no findings. Diagnostics
+outside the checked range remain unchanged, and diagnostics from checkers still
+in the profile remain visible until their replacement results are applied.
+
 File-local and directory-local values use Emacs's normal confirmation flow. If
 you trust one exact profile value, you can explicitly allow only that value:
 
@@ -311,6 +318,11 @@ profile whose `:checkers` list is empty:
 (add-to-list 'proofread-profiles '(disabled :checkers nil))
 (setq-local proofread-profile 'disabled)
 ```
+
+An explicit check with this profile removes profile-owned diagnostics from the
+checked range without dispatching backend requests. Diagnostics outside that
+range remain unchanged. This profile-owner retirement does not affect
+otherwise-valid ad-hoc diagnostics added through the low-level API.
 
 #### Migrating from version 0.1
 

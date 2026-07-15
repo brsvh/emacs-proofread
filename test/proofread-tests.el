@@ -3755,6 +3755,289 @@ This covers URLs, email, invisible text, faces, and properties."
                        (plist-get second-request :checker-owner)))))))
 
 (ert-deftest
+    proofread-test-profile-switch-retires-only-checked-diagnostics
+    ()
+  "Retire the old profile only inside the newly checked range."
+  (with-temp-buffer
+    (insert "helo and wrld")
+    (setq-local proofread-profile 'profile-a)
+    (let ((proofread-auto-check nil)
+          (proofread-cache-max-entries 0)
+          (proofread-context-size 0)
+          (proofread-profiles
+           `((profile-a
+              :checkers (( :name checker
+                           :backend ,proofread-test--backend)))
+             (profile-b
+              :checkers (( :name checker
+                           :backend ,proofread-test--backend)))))
+          (profile-a-recorder
+           (proofread-test--make-backend-recorder))
+          (profile-b-recorder
+           (proofread-test--make-backend-recorder)))
+      (proofread-mode 1)
+      (cl-letf (((symbol-function 'proofread--backend-check)
+                 (plist-get profile-a-recorder :function)))
+        (proofread-check-buffer)
+        (let ((requests
+               (funcall (plist-get profile-a-recorder :requests)))
+              (callbacks
+               (funcall (plist-get profile-a-recorder :callbacks))))
+          (should (= (length requests) 1))
+          (should (= (length callbacks) 1))
+          (should
+           (eq
+            (funcall
+             (car callbacks)
+             (proofread--backend-success-result
+              (car requests)
+              (list
+               (proofread-test--diagnostic-for-range
+                1 5 "helo")
+               (proofread-test--diagnostic-for-range
+                10 14 "wrld"))))
+            'applied))))
+      (let* ((inside
+              (cl-find 1 proofread--diagnostics
+                       :key (lambda (diagnostic)
+                              (plist-get diagnostic :beg))))
+             (outside
+              (cl-find 10 proofread--diagnostics
+                       :key (lambda (diagnostic)
+                              (plist-get diagnostic :beg))))
+             (inside-overlay
+              (proofread--overlay-for-diagnostic inside))
+             (outside-overlay
+              (proofread--overlay-for-diagnostic outside)))
+        (should inside)
+        (should outside)
+        (setq-local proofread-profile 'profile-b)
+        (cl-letf (((symbol-function 'proofread--backend-check)
+                   (plist-get profile-b-recorder :function)))
+          (proofread-check-region 1 5)
+          (should-not (memq inside proofread--diagnostics))
+          (should-not (overlay-buffer inside-overlay))
+          (should (memq outside proofread--diagnostics))
+          (should (overlay-buffer outside-overlay))
+          (should (eq (proofread--overlay-for-diagnostic outside)
+                      outside-overlay))
+          (let ((requests
+                 (funcall (plist-get profile-b-recorder :requests)))
+                (callbacks
+                 (funcall (plist-get profile-b-recorder :callbacks))))
+            (should (= (length requests) 1))
+            (should (= (length callbacks) 1))
+            (should (eq (plist-get (car requests) :profile)
+                        'profile-b))
+            (should
+             (eq (funcall
+                  (car callbacks)
+                  (proofread--backend-success-result
+                   (car requests) nil))
+                 'applied)))
+          (should (equal proofread--diagnostics (list outside)))
+          (should (eq (proofread--overlay-for-diagnostic outside)
+                      outside-overlay)))))))
+
+(ert-deftest
+    proofread-test-profile-checker-removal-keeps-current-until-replaced
+    ()
+  "Retire a removed checker but keep current diagnostics until result."
+  (with-temp-buffer
+    (insert "helo")
+    (setq-local proofread-profile 'multi)
+    (let ((proofread-auto-check nil)
+          (proofread-cache-max-entries 0)
+          (proofread-context-size 0)
+          (proofread-profiles
+           `((multi
+              :checkers
+              (( :name first
+                 :backend ,proofread-test--backend)
+               ( :name second
+                 :backend ,proofread-test--backend)))))
+          (initial-recorder
+           (proofread-test--make-backend-recorder))
+          (replacement-recorder
+           (proofread-test--make-backend-recorder)))
+      (proofread-mode 1)
+      (cl-letf (((symbol-function 'proofread--backend-check)
+                 (plist-get initial-recorder :function)))
+        (proofread-check-buffer)
+        (let* ((requests
+                (funcall (plist-get initial-recorder :requests)))
+               (callbacks
+                (funcall (plist-get initial-recorder :callbacks)))
+               (pairs (cl-mapcar #'cons requests callbacks)))
+          (should (= (length pairs) 2))
+          (dolist (checker '( second first))
+            (let* ((pair
+                    (cl-find
+                     checker pairs
+                     :key
+                     (lambda (entry)
+                       (plist-get (car entry) :checker-name))))
+                   (request (car pair))
+                   (callback (cdr pair))
+                   (suggestions
+                    (if (eq checker 'first)
+                        '( "hello")
+                      '( "hullo"))))
+              (should pair)
+              (should
+               (eq
+                (funcall
+                 callback
+                 (proofread--backend-success-result
+                  request
+                  (list
+                   (proofread-test--diagnostic-with-suggestions
+                    1 5 "helo" suggestions))))
+                'applied))))))
+      (let* ((first
+              (cl-find 'first proofread--diagnostics
+                       :key (lambda (diagnostic)
+                              (plist-get diagnostic :checker-name))))
+             (second
+              (cl-find 'second proofread--diagnostics
+                       :key (lambda (diagnostic)
+                              (plist-get diagnostic :checker-name))))
+             (first-overlay
+              (proofread--overlay-for-diagnostic first))
+             (second-overlay
+              (proofread--overlay-for-diagnostic second)))
+        (should first)
+        (should second)
+        (setq proofread-profiles
+              `((multi
+                 :checkers
+                 (( :name second
+                    :backend ,proofread-test--backend)))))
+        (cl-letf (((symbol-function 'proofread--backend-check)
+                   (plist-get replacement-recorder :function)))
+          (proofread-check-buffer)
+          (should-not (memq first proofread--diagnostics))
+          (should-not (overlay-buffer first-overlay))
+          (should (memq second proofread--diagnostics))
+          (should (overlay-buffer second-overlay))
+          (should (eq (proofread--overlay-for-diagnostic second)
+                      second-overlay))
+          (let ((requests
+                 (funcall (plist-get replacement-recorder :requests)))
+                (callbacks
+                 (funcall (plist-get replacement-recorder :callbacks))))
+            (should (= (length requests) 1))
+            (should (= (length callbacks) 1))
+            (should (eq (plist-get (car requests) :checker-name)
+                        'second))
+            (should
+             (eq (funcall
+                  (car callbacks)
+                  (proofread--backend-success-result
+                   (car requests) nil))
+                 'applied)))
+          (should-not proofread--diagnostics)
+          (should-not (overlay-buffer second-overlay)))))))
+
+(ert-deftest
+    proofread-test-empty-profile-retires-profile-diagnostics-only
+    ()
+  "An empty profile retires profile diagnostics but keeps ad-hoc ones."
+  (with-temp-buffer
+    (insert "helo")
+    (setq-local proofread-profile 'enabled)
+    (let ((proofread-auto-check nil)
+          (proofread-cache-max-entries 0)
+          (proofread-context-size 0)
+          (proofread-profiles
+           `((enabled
+              :checkers (( :name profile-checker
+                           :backend ,proofread-test--backend)))
+             (disabled :checkers nil)))
+          (profile-recorder
+           (proofread-test--make-backend-recorder))
+          (ad-hoc-recorder
+           (proofread-test--make-backend-recorder))
+          (disabled-recorder
+           (proofread-test--make-backend-recorder))
+          profile-diagnostic
+          profile-overlay
+          ad-hoc-diagnostic
+          ad-hoc-overlay)
+      (proofread-mode 1)
+      (cl-letf (((symbol-function 'proofread--backend-check)
+                 (plist-get profile-recorder :function)))
+        (proofread-check-buffer)
+        (let ((requests
+               (funcall (plist-get profile-recorder :requests)))
+              (callbacks
+               (funcall (plist-get profile-recorder :callbacks))))
+          (should (= (length requests) 1))
+          (should (= (length callbacks) 1))
+          (should
+           (eq
+            (funcall
+             (car callbacks)
+             (proofread--backend-success-result
+              (car requests)
+              (list
+               (proofread-test--diagnostic-with-suggestions
+                1 5 "helo" '( "hello")))))
+            'applied))))
+      (setq profile-diagnostic (car proofread--diagnostics))
+      (setq profile-overlay
+            (proofread--overlay-for-diagnostic profile-diagnostic))
+      (cl-letf (((symbol-function 'proofread--backend-check)
+                 (plist-get ad-hoc-recorder :function)))
+        (let* ((chunks
+                (proofread-test--request-ready-chunks-for-ranges
+                 (list (cons (point-min) (point-max)))))
+               (dispatched
+                (proofread--dispatch-request-ready-chunks
+                 chunks proofread-test--backend))
+               (callbacks
+                (funcall (plist-get ad-hoc-recorder :callbacks))))
+          (should (= (length dispatched) 1))
+          (should (= (length callbacks) 1))
+          (should (plist-get
+                   (plist-get (car dispatched) :checker-owner)
+                   :ad-hoc))
+          (should
+           (eq
+            (funcall
+             (car callbacks)
+             (proofread--backend-success-result
+              (car dispatched)
+              (list
+               (proofread-test--diagnostic-with-suggestions
+                1 5 "helo" '( "hullo")))))
+            'applied))))
+      (setq ad-hoc-diagnostic
+            (cl-find-if
+             (lambda (diagnostic)
+               (plist-get
+                (plist-get diagnostic :checker-owner) :ad-hoc))
+             proofread--diagnostics))
+      (setq ad-hoc-overlay
+            (proofread--overlay-for-diagnostic ad-hoc-diagnostic))
+      (should profile-diagnostic)
+      (should ad-hoc-diagnostic)
+      (setq-local proofread-profile 'disabled)
+      (cl-letf (((symbol-function 'proofread--backend-check)
+                 (plist-get disabled-recorder :function)))
+        (proofread-check-buffer))
+      (should-not
+       (funcall (plist-get disabled-recorder :requests)))
+      (should-not (memq profile-diagnostic proofread--diagnostics))
+      (should-not (overlay-buffer profile-overlay))
+      (should (equal proofread--diagnostics
+                     (list ad-hoc-diagnostic)))
+      (should (overlay-buffer ad-hoc-overlay))
+      (should (eq (proofread--overlay-for-diagnostic
+                   ad-hoc-diagnostic)
+                  ad-hoc-overlay)))))
+
+(ert-deftest
     proofread-test-profile-cache-hit-preserves-diagnostic-provenance
     ()
   "Keep checker provenance when diagnostics are served from cache."

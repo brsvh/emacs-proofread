@@ -6082,6 +6082,28 @@ DIAGNOSTICS must be in navigation order.  Return `applied'."
           (lambda (left right)
             (< (cadr left) (cadr right))))))
 
+(defun proofread--prune-inactive-checker-diagnostics
+    (ranges profile)
+  "Remove checked diagnostics whose checker is absent from PROFILE.
+Only remove diagnostics intersecting RANGES.  Keep unowned
+diagnostics and diagnostics owned by explicit ad-hoc requests."
+  (let ((owners
+         (mapcar #'proofread--checker-owner
+                 (plist-get profile :checkers)))
+        diagnostics)
+    (dolist (entry (proofread--checked-diagnostic-entries ranges))
+      (let* ((diagnostic (car entry))
+             (owner (plist-get diagnostic :checker-owner)))
+        (when (and owner
+                   (not (plist-get owner :ad-hoc))
+                   (not (member owner owners)))
+          (push diagnostic diagnostics))))
+    (when diagnostics
+      (proofread--invalidate-affected-diagnostics
+       (delq nil
+             (mapcar #'proofread--overlay-for-diagnostic diagnostics))
+       diagnostics))))
+
 (defun proofread--prune-diagnostics-outside-targets (ranges domains)
   "Remove checked diagnostics in RANGES that are invalid in DOMAINS."
   (let ((remaining-domains (proofread--sorted-target-domains domains))
@@ -6142,6 +6164,8 @@ progress messages are inhibited."
       (proofread--warn-about-legacy-dispatch))
     (proofread--prune-diagnostics-outside-targets
      normalized-ranges domains)
+    (proofread--prune-inactive-checker-diagnostics
+     normalized-ranges profile)
     (if supported-checkers
         (let* ((chunks
                 (proofread--request-ready-chunks-for-islands
