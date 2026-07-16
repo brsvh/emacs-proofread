@@ -1865,12 +1865,12 @@ current restriction, but returned containers may extend beyond it."
   (let ((ranges (proofread--normalize-accessible-ranges ranges))
         containers)
     (proofread--with-widened-syntax
-     (dolist (range ranges)
-       (setq containers
-             (nconc
-              (proofread--syntax-containers-for-range
-               range (point-max) kind)
-              containers))))
+      (dolist (range ranges)
+        (setq containers
+              (nconc
+               (proofread--syntax-containers-for-range
+                range (point-max) kind)
+               containers))))
     (proofread--normalize-overlapping-ranges containers)))
 
 (defun proofread--horizontally-adjacent-ranges-p (left right)
@@ -6919,26 +6919,26 @@ Return nil for diagnostics in ordinary text."
   (let ((kind (plist-get diagnostic :target-kind)))
     (when (memq kind '( comment docstring))
       (proofread--with-widened-syntax
-       (let* ((beg (car range))
-              (end (cdr range))
-              (beg-state (syntax-ppss beg))
-              (end-state (syntax-ppss end))
-              (container
-               (proofread--syntax-container-range beg-state kind)))
-         (unless (and container
-                      (proofread--syntax-state-in-container-p
-                       beg-state (car container) kind)
-                      (proofread--syntax-state-in-container-p
-                       end-state (car container) kind))
-           (user-error
-            "Proofread diagnostic left its source container"))
-         (list :kind kind
-               :range container
-               :open
-               (and (proofread--syntax-state-in-container-p
-                     (syntax-ppss (cdr container))
-                     (car container) kind)
-                    t)))))))
+        (let* ((beg (car range))
+               (end (cdr range))
+               (beg-state (syntax-ppss beg))
+               (end-state (syntax-ppss end))
+               (container
+                (proofread--syntax-container-range beg-state kind)))
+          (unless (and container
+                       (proofread--syntax-state-in-container-p
+                        beg-state (car container) kind)
+                       (proofread--syntax-state-in-container-p
+                        end-state (car container) kind))
+            (user-error
+             "Proofread diagnostic left its source container"))
+          (list :kind kind
+                :range container
+                :open
+                (and (proofread--syntax-state-in-container-p
+                      (syntax-ppss (cdr container))
+                      (car container) kind)
+                     t)))))))
 
 (defun proofread--validate-correction-container
     (container beg replacement-end delta)
@@ -6947,28 +6947,28 @@ REPLACEMENT-END is the end of the inserted text and DELTA is its
 length change."
   (when container
     (proofread--with-widened-syntax
-     (let* ((kind (plist-get container :kind))
-            (old-range (plist-get container :range))
-            (expected-range
-             (cons (car old-range) (+ (cdr old-range) delta)))
-            (beg-state (syntax-ppss beg))
-            (end-state (syntax-ppss replacement-end))
-            (new-range
-             (proofread--syntax-container-range beg-state kind))
-            (new-open
-             (and new-range
-                  (proofread--syntax-state-in-container-p
-                   (syntax-ppss (cdr new-range))
-                   (car new-range) kind)
-                  t)))
-       (unless (and (equal new-range expected-range)
-                    (eq new-open (plist-get container :open))
-                    (proofread--syntax-state-in-container-p
-                     beg-state (car expected-range) kind)
-                    (proofread--syntax-state-in-container-p
-                     end-state (car expected-range) kind))
-         (user-error
-          "Proofread suggestion would alter a source delimiter"))))))
+      (let* ((kind (plist-get container :kind))
+             (old-range (plist-get container :range))
+             (expected-range
+              (cons (car old-range) (+ (cdr old-range) delta)))
+             (beg-state (syntax-ppss beg))
+             (end-state (syntax-ppss replacement-end))
+             (new-range
+              (proofread--syntax-container-range beg-state kind))
+             (new-open
+              (and new-range
+                   (proofread--syntax-state-in-container-p
+                    (syntax-ppss (cdr new-range))
+                    (car new-range) kind)
+                   t)))
+        (unless (and (equal new-range expected-range)
+                     (eq new-open (plist-get container :open))
+                     (proofread--syntax-state-in-container-p
+                      beg-state (car expected-range) kind)
+                     (proofread--syntax-state-in-container-p
+                      end-state (car expected-range) kind))
+          (user-error
+           "Proofread suggestion would alter a source delimiter"))))))
 
 (defun proofread--ranges-intersect-p (beg end other-beg other-end)
   "Return non-nil if BEG to END intersects OTHER-BEG to OTHER-END."

@@ -390,156 +390,156 @@ POINT-OFFSET is a zero-based offset or the symbol `end'."
     proofread-languagetool-test-unchanged-config-is-stable-and-safe ()
   "Unchanged config content neither leaks nor restarts a ready server."
   (proofread-languagetool-test--with-state
-   (let* ((directory (make-temp-file "proofread-lt-stable-" t))
-          (config (expand-file-name "languagetool.properties" directory))
-          (secret "proofread-task12-stable-secret")
-          (content (format "apiKey=%s\n" secret)))
-     (unwind-protect
-         (progn
-           (write-region content nil config nil 'silent)
-           (let ((proofread-languagetool-auto-start t)
-                 (proofread-languagetool-command
-                  "proofread-languagetool-missing-test-command")
-                 (proofread-languagetool-config-file config))
-             (cl-letf (((symbol-function 'executable-find)
-                        (lambda (_command) nil)))
-               (let* ((identity (proofread-languagetool--identity))
-                      (config-identity
-                       (plist-get identity :server-config))
-                      (digest
-                       (plist-get config-identity :content-digest))
-                      (session
-                       (proofread-languagetool--server-session-snapshot))
-                      (proofread-languagetool--server-state 'ready)
-                      (proofread-languagetool--server-session session)
-                      (proofread-languagetool--server-process
-                       'owned-process)
-                      (proofread-languagetool--server-process-session
-                       session)
-                      call events handle)
-                 (should
-                  (string-match-p
-                   "\\`[[:xdigit:]]\\{64\\}\\'" digest))
-                 (set-file-times
-                  config
-                  (time-add
-                   (file-attribute-modification-time
-                    (file-attributes config))
-                   10))
-                 (should (equal identity
-                                (proofread-languagetool--identity)))
-                 (should
-                  (proofread-languagetool--same-session-p
-                   session
-                   (proofread-languagetool--server-session-snapshot)))
-                 (should-not
-                  (string-match-p
-                   (regexp-quote secret)
-                   (prin1-to-string identity)))
-                 (cl-letf
-                     (((symbol-function
-                        'proofread-languagetool--begin-readiness-check)
-                       (lambda (&rest _ignored)
-                         (ert-fail "Stable config restarted readiness")))
-                      ((symbol-function
-                        'proofread-languagetool--stop-owned-process)
-                       (lambda ()
-                         (ert-fail "Stable config stopped its process")))
-                      ((symbol-function 'url-retrieve)
-                       (lambda (url _callback _arguments &rest _ignored)
-                         (setq call
-                               (list :url url
-                                     :method url-request-method
-                                     :buffer
-                                     (generate-new-buffer
-                                      " *proofread-lt-stable-config*")))
-                         (plist-get call :buffer))))
-                   (with-temp-buffer
-                     (let ((proofread-request-log-hook
-                            (list
-                             (lambda (event) (push event events)))))
-                       (setq handle
-                             (proofread-languagetool--check
-                              (proofread-languagetool-test--request)
-                              #'ignore))))
-                   (should (equal (plist-get call :method) "POST"))
-                   (should (string-suffix-p
-                            "/check" (plist-get call :url)))
-                   (should
-                    (eq proofread-languagetool--server-state 'ready))
-                   (let ((printed-events (prin1-to-string events)))
-                     (should-not
-                      (string-match-p
-                       (regexp-quote secret) printed-events))
-                     (should-not
-                      (string-match-p
-                       (regexp-quote content) printed-events)))
-                   (proofread-languagetool--cancel handle))))))
-       (delete-directory directory t)))))
+    (let* ((directory (make-temp-file "proofread-lt-stable-" t))
+           (config (expand-file-name "languagetool.properties" directory))
+           (secret "proofread-task12-stable-secret")
+           (content (format "apiKey=%s\n" secret)))
+      (unwind-protect
+          (progn
+            (write-region content nil config nil 'silent)
+            (let ((proofread-languagetool-auto-start t)
+                  (proofread-languagetool-command
+                   "proofread-languagetool-missing-test-command")
+                  (proofread-languagetool-config-file config))
+              (cl-letf (((symbol-function 'executable-find)
+                         (lambda (_command) nil)))
+                (let* ((identity (proofread-languagetool--identity))
+                       (config-identity
+                        (plist-get identity :server-config))
+                       (digest
+                        (plist-get config-identity :content-digest))
+                       (session
+                        (proofread-languagetool--server-session-snapshot))
+                       (proofread-languagetool--server-state 'ready)
+                       (proofread-languagetool--server-session session)
+                       (proofread-languagetool--server-process
+                        'owned-process)
+                       (proofread-languagetool--server-process-session
+                        session)
+                       call events handle)
+                  (should
+                   (string-match-p
+                    "\\`[[:xdigit:]]\\{64\\}\\'" digest))
+                  (set-file-times
+                   config
+                   (time-add
+                    (file-attribute-modification-time
+                     (file-attributes config))
+                    10))
+                  (should (equal identity
+                                 (proofread-languagetool--identity)))
+                  (should
+                   (proofread-languagetool--same-session-p
+                    session
+                    (proofread-languagetool--server-session-snapshot)))
+                  (should-not
+                   (string-match-p
+                    (regexp-quote secret)
+                    (prin1-to-string identity)))
+                  (cl-letf
+                      (((symbol-function
+                         'proofread-languagetool--begin-readiness-check)
+                        (lambda (&rest _ignored)
+                          (ert-fail "Stable config restarted readiness")))
+                       ((symbol-function
+                         'proofread-languagetool--stop-owned-process)
+                        (lambda ()
+                          (ert-fail "Stable config stopped its process")))
+                       ((symbol-function 'url-retrieve)
+                        (lambda (url _callback _arguments &rest _ignored)
+                          (setq call
+                                (list :url url
+                                      :method url-request-method
+                                      :buffer
+                                      (generate-new-buffer
+                                       " *proofread-lt-stable-config*")))
+                          (plist-get call :buffer))))
+                    (with-temp-buffer
+                      (let ((proofread-request-log-hook
+                             (list
+                              (lambda (event) (push event events)))))
+                        (setq handle
+                              (proofread-languagetool--check
+                               (proofread-languagetool-test--request)
+                               #'ignore))))
+                    (should (equal (plist-get call :method) "POST"))
+                    (should (string-suffix-p
+                             "/check" (plist-get call :url)))
+                    (should
+                     (eq proofread-languagetool--server-state 'ready))
+                    (let ((printed-events (prin1-to-string events)))
+                      (should-not
+                       (string-match-p
+                        (regexp-quote secret) printed-events))
+                      (should-not
+                       (string-match-p
+                        (regexp-quote content) printed-events)))
+                    (proofread-languagetool--cancel handle))))))
+        (delete-directory directory t)))))
 
 (ert-deftest
     proofread-languagetool-test-config-rewrite-restarts-owned-server ()
   "Explicit startup replaces an owned server after a config rewrite."
   (proofread-languagetool-test--with-state
-   (let* ((directory (make-temp-file "proofread-lt-restart-" t))
-          (config (expand-file-name "languagetool.properties" directory))
-          (first-content "languageModel=alpha\n")
-          (second-content "languageModel=omega\n"))
-     (unwind-protect
-         (progn
-           (should (= (length first-content) (length second-content)))
-           (write-region first-content nil config nil 'silent)
-           (let ((proofread-languagetool-auto-start nil)
-                 (proofread-languagetool-command
-                  "proofread-languagetool-missing-test-command")
-                 (proofread-languagetool-config-file config))
-             (cl-letf (((symbol-function 'executable-find)
-                        (lambda (_command) nil)))
-               (let* ((old-session
-                       (proofread-languagetool--server-session-snapshot
-                        nil t))
-                      (attributes (file-attributes config))
-                      (mtime
-                       (file-attribute-modification-time attributes))
-                      (proofread-languagetool--server-state 'ready)
-                      (proofread-languagetool--server-session old-session)
-                      (proofread-languagetool--server-process
-                       'owned-process)
-                      (proofread-languagetool--server-process-session
-                       old-session)
-                      deleted scheduled)
-                 (write-region second-content nil config nil 'silent)
-                 (set-file-times config mtime)
-                 (cl-letf
-                     (((symbol-function 'process-live-p)
-                       (lambda (process) (eq process 'owned-process)))
-                      ((symbol-function 'set-process-query-on-exit-flag)
-                       #'ignore)
-                      ((symbol-function 'delete-process)
-                       (lambda (process) (setq deleted process)))
-                      ((symbol-function
-                        'proofread-languagetool--schedule-probe)
-                       (lambda (generation phase session delay)
-                         (setq scheduled
-                               (list generation phase session delay)))))
-                   (proofread-languagetool-start-server))
-                 (should (eq deleted 'owned-process))
-                 (should-not proofread-languagetool--server-process)
-                 (should-not
-                  proofread-languagetool--server-process-session)
-                 (should (eq proofread-languagetool--server-state
-                             'probing))
-                 (should proofread-languagetool--force-start-p)
-                 (should-not
-                  (proofread-languagetool--same-managed-session-p
-                   old-session proofread-languagetool--server-session))
-                 (should
-                  (equal scheduled
-                         (list
-                          proofread-languagetool--server-generation
-                          'external
-                          proofread-languagetool--server-session 0)))))))
-       (delete-directory directory t)))))
+    (let* ((directory (make-temp-file "proofread-lt-restart-" t))
+           (config (expand-file-name "languagetool.properties" directory))
+           (first-content "languageModel=alpha\n")
+           (second-content "languageModel=omega\n"))
+      (unwind-protect
+          (progn
+            (should (= (length first-content) (length second-content)))
+            (write-region first-content nil config nil 'silent)
+            (let ((proofread-languagetool-auto-start nil)
+                  (proofread-languagetool-command
+                   "proofread-languagetool-missing-test-command")
+                  (proofread-languagetool-config-file config))
+              (cl-letf (((symbol-function 'executable-find)
+                         (lambda (_command) nil)))
+                (let* ((old-session
+                        (proofread-languagetool--server-session-snapshot
+                         nil t))
+                       (attributes (file-attributes config))
+                       (mtime
+                        (file-attribute-modification-time attributes))
+                       (proofread-languagetool--server-state 'ready)
+                       (proofread-languagetool--server-session old-session)
+                       (proofread-languagetool--server-process
+                        'owned-process)
+                       (proofread-languagetool--server-process-session
+                        old-session)
+                       deleted scheduled)
+                  (write-region second-content nil config nil 'silent)
+                  (set-file-times config mtime)
+                  (cl-letf
+                      (((symbol-function 'process-live-p)
+                        (lambda (process) (eq process 'owned-process)))
+                       ((symbol-function 'set-process-query-on-exit-flag)
+                        #'ignore)
+                       ((symbol-function 'delete-process)
+                        (lambda (process) (setq deleted process)))
+                       ((symbol-function
+                         'proofread-languagetool--schedule-probe)
+                        (lambda (generation phase session delay)
+                          (setq scheduled
+                                (list generation phase session delay)))))
+                    (proofread-languagetool-start-server))
+                  (should (eq deleted 'owned-process))
+                  (should-not proofread-languagetool--server-process)
+                  (should-not
+                   proofread-languagetool--server-process-session)
+                  (should (eq proofread-languagetool--server-state
+                              'probing))
+                  (should proofread-languagetool--force-start-p)
+                  (should-not
+                   (proofread-languagetool--same-managed-session-p
+                    old-session proofread-languagetool--server-session))
+                  (should
+                   (equal scheduled
+                          (list
+                           proofread-languagetool--server-generation
+                           'external
+                           proofread-languagetool--server-session 0)))))))
+        (delete-directory directory t)))))
 
 (ert-deftest proofread-languagetool-test-snapshots-resolved-command ()
   "A resolvable managed command is fixed in the server session."
@@ -666,41 +666,41 @@ The identity does not expose arguments."
     proofread-languagetool-test-managed-start-validates-managed-options ()
   "Automatic and explicit managed startup validate managed settings."
   (proofread-languagetool-test--with-state
-   (let ((proofread-languagetool-server-url
-          "http://127.0.0.1:8081/v2")
-         (proofread-languagetool-auto-start nil)
-         (proofread-languagetool-command "languagetool-http-server")
-         (proofread-languagetool-config-file nil)
-         (proofread-languagetool-startup-timeout 15.0))
-     (let ((proofread-languagetool-command 42))
-       (let ((err (should-error
-                   (proofread-languagetool-start-server))))
-         (should (string-match-p "command must"
-                                 (error-message-string err)))))
-     (let ((proofread-languagetool-config-file "relative.properties"))
-       (let ((err (should-error
-                   (proofread-languagetool-start-server))))
-         (should (string-match-p "must be an absolute path"
-                                 (error-message-string err)))))
-     (let ((proofread-languagetool-startup-timeout 0))
-       (let ((err (should-error
-                   (proofread-languagetool-start-server))))
-         (should (string-match-p "must be a positive number"
-                                 (error-message-string err)))))
-     (with-temp-buffer
-       (let ((proofread-languagetool-auto-start t)
-             (proofread-languagetool-command 42)
-             result)
-         (proofread-languagetool--check
-          (proofread-languagetool-test--request)
-          (lambda (value) (setq result value)))
-         (should-not result)
-         (should
-          (proofread-languagetool-test--wait-for (lambda () result)))
-         (should (eq (plist-get result :error)
-                     'languagetool-configuration-error))
-         (should (string-match-p "command must"
-                                 (plist-get result :message))))))))
+    (let ((proofread-languagetool-server-url
+           "http://127.0.0.1:8081/v2")
+          (proofread-languagetool-auto-start nil)
+          (proofread-languagetool-command "languagetool-http-server")
+          (proofread-languagetool-config-file nil)
+          (proofread-languagetool-startup-timeout 15.0))
+      (let ((proofread-languagetool-command 42))
+        (let ((err (should-error
+                    (proofread-languagetool-start-server))))
+          (should (string-match-p "command must"
+                                  (error-message-string err)))))
+      (let ((proofread-languagetool-config-file "relative.properties"))
+        (let ((err (should-error
+                    (proofread-languagetool-start-server))))
+          (should (string-match-p "must be an absolute path"
+                                  (error-message-string err)))))
+      (let ((proofread-languagetool-startup-timeout 0))
+        (let ((err (should-error
+                    (proofread-languagetool-start-server))))
+          (should (string-match-p "must be a positive number"
+                                  (error-message-string err)))))
+      (with-temp-buffer
+        (let ((proofread-languagetool-auto-start t)
+              (proofread-languagetool-command 42)
+              result)
+          (proofread-languagetool--check
+           (proofread-languagetool-test--request)
+           (lambda (value) (setq result value)))
+          (should-not result)
+          (should
+           (proofread-languagetool-test--wait-for (lambda () result)))
+          (should (eq (plist-get result :error)
+                      'languagetool-configuration-error))
+          (should (string-match-p "command must"
+                                  (plist-get result :message))))))))
 
 ;;;; Request encoding and response parsing
 
@@ -1026,142 +1026,142 @@ Reject context-only and target-crossing matches."
 (ert-deftest proofread-languagetool-test-ready-server-posts-async ()
   "A ready external server receives an asynchronous POST request."
   (proofread-languagetool-test--with-state
-   (with-temp-buffer
-     (let ((proofread-languagetool--server-state 'ready)
-           (proofread-languagetool--server-session
-            (proofread-languagetool--server-session-snapshot))
-           call events result)
-       (cl-letf
-           (((symbol-function 'url-retrieve)
-             (lambda (url callback arguments &optional _silent
-                          _inhibit-cookies)
-               (let ((buffer
-                      (generate-new-buffer " *proofread-lt-http*")))
-                 (setq call
-                       (list :url url
-                             :callback callback
-                             :arguments arguments
-                             :buffer buffer
-                             :method url-request-method
-                             :data url-request-data
-                             :max-redirections
-                             (symbol-value 'url-max-redirections)
-                             :headers url-request-extra-headers))
-                 buffer))))
-         (let ((proofread-request-log-hook
-                (list (lambda (event) (push event events)))))
-           (let ((handle
-                  (proofread-languagetool--check
-                   (proofread-languagetool-test--request
-                    :display-language "American English")
-                   (lambda (value) (setq result value)))))
-             (should (listp handle))
-             (should-not result)
-             (should (equal (plist-get call :method) "POST"))
-             (should (= (plist-get call :max-redirections) 0))
-             (proofread-languagetool-test--assert-no-redirects
-              (plist-get call :buffer))
-             (should (string-suffix-p "/v2/check"
-                                      (plist-get call :url)))
-             (should (string-match-p "language=en-US"
-                                     (plist-get call :data)))
-             (should-not
-              (string-match-p "American%20English"
-                              (plist-get call :data)))
-             (proofread-languagetool-test--complete-call
-              call 200 "{\"matches\":[]}")
-             (should (eq (plist-get result :status) 'ok))
-             (should-not (plist-get result :diagnostics))
-             (should (plist-get handle :delivered))
-             (setq events (nreverse events))
-             (should
-              (equal (mapcar (lambda (event)
-                               (plist-get event :type))
-                             events)
-                     '( backend-request backend-response
-                        backend-result)))
-             (let ((request-event (nth 0 events))
-                   (response-event (nth 1 events))
-                   (result-event (nth 2 events)))
-               (should (eq (plist-get request-event :backend)
-                           'languagetool))
-               (should (equal (plist-get request-event :method)
-                              "POST"))
-               (let ((parameters
-                      (plist-get request-event :parameters)))
-                 (should (stringp parameters))
-                 (should (string-match-p
-                          "language=en-US" parameters))
-                 (should-not
-                  (string-match-p "American%20English"
-                                  parameters))
-                 (should (string-match-p
-                          (regexp-quote
-                           (concat
-                            "text=%F0%9F%98%80%20This%20are%20"
-                            "fine."))
-                          parameters)))
-               (should (= (plist-get response-event :http-status)
-                          200))
-               (should (equal (plist-get response-event :response)
-                              "{\"matches\":[]}"))
-               (let ((logged-result
-                      (plist-get result-event :result)))
-                 (should-not (eq logged-result result))
-                 (should (eq (plist-get logged-result :status) 'ok))
-                 (should-not
-                  (plist-get logged-result :diagnostics))
-                 (should
-                  (equal
-                   (plist-get
-                    (plist-get logged-result :request) :text)
-                   "This are")))))))))))
+    (with-temp-buffer
+      (let ((proofread-languagetool--server-state 'ready)
+            (proofread-languagetool--server-session
+             (proofread-languagetool--server-session-snapshot))
+            call events result)
+        (cl-letf
+            (((symbol-function 'url-retrieve)
+              (lambda (url callback arguments &optional _silent
+                           _inhibit-cookies)
+                (let ((buffer
+                       (generate-new-buffer " *proofread-lt-http*")))
+                  (setq call
+                        (list :url url
+                              :callback callback
+                              :arguments arguments
+                              :buffer buffer
+                              :method url-request-method
+                              :data url-request-data
+                              :max-redirections
+                              (symbol-value 'url-max-redirections)
+                              :headers url-request-extra-headers))
+                  buffer))))
+          (let ((proofread-request-log-hook
+                 (list (lambda (event) (push event events)))))
+            (let ((handle
+                   (proofread-languagetool--check
+                    (proofread-languagetool-test--request
+                     :display-language "American English")
+                    (lambda (value) (setq result value)))))
+              (should (listp handle))
+              (should-not result)
+              (should (equal (plist-get call :method) "POST"))
+              (should (= (plist-get call :max-redirections) 0))
+              (proofread-languagetool-test--assert-no-redirects
+               (plist-get call :buffer))
+              (should (string-suffix-p "/v2/check"
+                                       (plist-get call :url)))
+              (should (string-match-p "language=en-US"
+                                      (plist-get call :data)))
+              (should-not
+               (string-match-p "American%20English"
+                               (plist-get call :data)))
+              (proofread-languagetool-test--complete-call
+               call 200 "{\"matches\":[]}")
+              (should (eq (plist-get result :status) 'ok))
+              (should-not (plist-get result :diagnostics))
+              (should (plist-get handle :delivered))
+              (setq events (nreverse events))
+              (should
+               (equal (mapcar (lambda (event)
+                                (plist-get event :type))
+                              events)
+                      '( backend-request backend-response
+                         backend-result)))
+              (let ((request-event (nth 0 events))
+                    (response-event (nth 1 events))
+                    (result-event (nth 2 events)))
+                (should (eq (plist-get request-event :backend)
+                            'languagetool))
+                (should (equal (plist-get request-event :method)
+                               "POST"))
+                (let ((parameters
+                       (plist-get request-event :parameters)))
+                  (should (stringp parameters))
+                  (should (string-match-p
+                           "language=en-US" parameters))
+                  (should-not
+                   (string-match-p "American%20English"
+                                   parameters))
+                  (should (string-match-p
+                           (regexp-quote
+                            (concat
+                             "text=%F0%9F%98%80%20This%20are%20"
+                             "fine."))
+                           parameters)))
+                (should (= (plist-get response-event :http-status)
+                           200))
+                (should (equal (plist-get response-event :response)
+                               "{\"matches\":[]}"))
+                (let ((logged-result
+                       (plist-get result-event :result)))
+                  (should-not (eq logged-result result))
+                  (should (eq (plist-get logged-result :status) 'ok))
+                  (should-not
+                   (plist-get logged-result :diagnostics))
+                  (should
+                   (equal
+                    (plist-get
+                     (plist-get logged-result :request) :text)
+                    "This are")))))))))))
 
 (ert-deftest proofread-languagetool-test-http-error-is-not-json ()
   "A non-success response produces a bounded backend error."
   (proofread-languagetool-test--with-state
-   (with-temp-buffer
-     (let ((proofread-languagetool--server-state 'ready)
-           (proofread-languagetool--server-session
-            (proofread-languagetool--server-session-snapshot))
-           (legacy-error-name "languagetool-http-599")
-           call events result)
-       (cl-letf
-           (((symbol-function 'url-retrieve)
-             (lambda (_url callback arguments &rest _ignored)
-               (let ((buffer (generate-new-buffer
-                              " *proofread-lt-error*")))
-                 (setq call (list :callback callback
-                                  :arguments arguments
-                                  :buffer buffer))
-                 buffer))))
-         (let ((proofread-request-log-hook
-                (list (lambda (event) (push event events)))))
-           (proofread-languagetool--check
-            (proofread-languagetool-test--request)
-            (lambda (value) (setq result value)))
-           (should-not (intern-soft legacy-error-name))
-           (proofread-languagetool-test--complete-call
-            call 599 "Error: invalid language")
-           (should (eq (plist-get result :status) 'error))
-           (should (eq (plist-get result :error)
-                       'languagetool-http-error))
-           (should (equal (plist-get result :message)
-                          (concat "LanguageTool HTTP status 599: "
-                                  "Error: invalid language")))
-           (should-not (intern-soft legacy-error-name))
-           (let ((response-event
-                  (cl-find-if
-                   (lambda (event)
-                     (eq (plist-get event :type)
-                         'backend-response))
-                   events)))
-             (should (= (plist-get response-event :http-status)
-                        599))
-             (should (eq (plist-get response-event :error)
-                         'languagetool-http-error))
-             (should (equal (plist-get response-event :message)
-                            "Backend request failed")))))))))
+    (with-temp-buffer
+      (let ((proofread-languagetool--server-state 'ready)
+            (proofread-languagetool--server-session
+             (proofread-languagetool--server-session-snapshot))
+            (legacy-error-name "languagetool-http-599")
+            call events result)
+        (cl-letf
+            (((symbol-function 'url-retrieve)
+              (lambda (_url callback arguments &rest _ignored)
+                (let ((buffer (generate-new-buffer
+                               " *proofread-lt-error*")))
+                  (setq call (list :callback callback
+                                   :arguments arguments
+                                   :buffer buffer))
+                  buffer))))
+          (let ((proofread-request-log-hook
+                 (list (lambda (event) (push event events)))))
+            (proofread-languagetool--check
+             (proofread-languagetool-test--request)
+             (lambda (value) (setq result value)))
+            (should-not (intern-soft legacy-error-name))
+            (proofread-languagetool-test--complete-call
+             call 599 "Error: invalid language")
+            (should (eq (plist-get result :status) 'error))
+            (should (eq (plist-get result :error)
+                        'languagetool-http-error))
+            (should (equal (plist-get result :message)
+                           (concat "LanguageTool HTTP status 599: "
+                                   "Error: invalid language")))
+            (should-not (intern-soft legacy-error-name))
+            (let ((response-event
+                   (cl-find-if
+                    (lambda (event)
+                      (eq (plist-get event :type)
+                          'backend-response))
+                    events)))
+              (should (= (plist-get response-event :http-status)
+                         599))
+              (should (eq (plist-get response-event :error)
+                          'languagetool-http-error))
+              (should (equal (plist-get response-event :message)
+                             "Backend request failed")))))))))
 
 (ert-deftest
     proofread-languagetool-test-http-callback-errors-retain-response ()
@@ -1169,403 +1169,403 @@ Reject context-only and target-crossing matches."
 They leave a reachable server ready without scheduling a probe."
   (dolist (http-status '( 400 500))
     (proofread-languagetool-test--with-state
-     (with-temp-buffer
-       (let* ((proofread-languagetool--server-state 'ready)
-              (proofread-languagetool--server-session
-               (proofread-languagetool--server-session-snapshot))
-              (long-body-p (= http-status 500))
-              (body
-               (if long-body-p
-                   (concat "Internal\nserver\tfailure "
-                           (make-string 600 ?x)
-                           " tail-marker")
-                 "Bad request: unsupported language"))
-              call events handle result response-buffer
-              (probes 0))
-         (cl-letf
-             (((symbol-function 'url-retrieve)
-               (lambda (_url callback arguments &rest _ignored)
-                 (let ((buffer
-                        (generate-new-buffer
-                         " *proofread-lt-http-callback-error*")))
-                   (setq call (list :callback callback
-                                    :arguments arguments
-                                    :buffer buffer))
-                   buffer)))
-              ((symbol-function
-                'proofread-languagetool--schedule-probe)
-               (lambda (&rest _ignored) (cl-incf probes))))
-           (let ((proofread-request-log-hook
-                  (list (lambda (event) (push event events)))))
-             (setq handle
-                   (proofread-languagetool--check
-                    (proofread-languagetool-test--request)
-                    (lambda (value) (setq result value))))
-             (setq response-buffer (plist-get call :buffer))
-             (proofread-languagetool-test--complete-call
-              call http-status body
-              `( :error (error http ,http-status)))
-             (should (eq (plist-get result :status) 'error))
-             (should (eq (plist-get result :error)
-                         'languagetool-http-error))
-             (should (= (plist-get result :http-status)
-                        http-status))
-             (let ((response (plist-get result :response))
-                   (message (plist-get result :message)))
-               (should (stringp response))
-               (should (stringp message))
-               (should (<= (string-width response) 500))
-               (should (<= (string-width message) 500))
-               (should
-                (string-prefix-p
-                 (format "LanguageTool HTTP status %d: "
-                         http-status)
-                 message))
-               (if long-body-p
-                   (progn
-                     (should
-                      (string-prefix-p
-                       "Internal server failure " response))
-                     (should-not (string-match-p "[\n\t]" response))
-                     (should-not
-                      (string-match-p "tail-marker" response))
-                     (should-not
-                      (string-match-p "tail-marker" message)))
-                 (should (equal response body))
-                 (should
-                  (equal message
-                         (format
-                          "LanguageTool HTTP status %d: %s"
-                          http-status body)))))
-             (should (eq proofread-languagetool--server-state
-                         'ready))
-             (should (= probes 0))
-             (should (plist-get handle :delivered))
-             (should-not (buffer-live-p response-buffer))
-             (let* ((response-event
-                     (cl-find-if
-                      (lambda (event)
-                        (eq (plist-get event :type)
-                            'backend-response))
-                      events))
-                    (result-event
-                     (cl-find-if
-                      (lambda (event)
-                        (eq (plist-get event :type)
-                            'backend-result))
-                      events))
-                    (logged-result
-                     (plist-get result-event :result)))
-               (should (= (plist-get response-event :http-status)
-                          http-status))
-               (should (eq (plist-get response-event :error)
-                           'languagetool-http-error))
-               (should
-                (equal (plist-get response-event :response)
-                       (plist-get result :response)))
-               (should
-                (equal (plist-get response-event :message)
-                       "Backend request failed"))
-               (should (eq (plist-get logged-result :status) 'error))
-               (should (eq (plist-get logged-result :error)
-                           'languagetool-http-error))
-               (should
-                (equal (plist-get logged-result :message)
-                       "Backend request failed"))))))))))
+      (with-temp-buffer
+        (let* ((proofread-languagetool--server-state 'ready)
+               (proofread-languagetool--server-session
+                (proofread-languagetool--server-session-snapshot))
+               (long-body-p (= http-status 500))
+               (body
+                (if long-body-p
+                    (concat "Internal\nserver\tfailure "
+                            (make-string 600 ?x)
+                            " tail-marker")
+                  "Bad request: unsupported language"))
+               call events handle result response-buffer
+               (probes 0))
+          (cl-letf
+              (((symbol-function 'url-retrieve)
+                (lambda (_url callback arguments &rest _ignored)
+                  (let ((buffer
+                         (generate-new-buffer
+                          " *proofread-lt-http-callback-error*")))
+                    (setq call (list :callback callback
+                                     :arguments arguments
+                                     :buffer buffer))
+                    buffer)))
+               ((symbol-function
+                 'proofread-languagetool--schedule-probe)
+                (lambda (&rest _ignored) (cl-incf probes))))
+            (let ((proofread-request-log-hook
+                   (list (lambda (event) (push event events)))))
+              (setq handle
+                    (proofread-languagetool--check
+                     (proofread-languagetool-test--request)
+                     (lambda (value) (setq result value))))
+              (setq response-buffer (plist-get call :buffer))
+              (proofread-languagetool-test--complete-call
+               call http-status body
+               `( :error (error http ,http-status)))
+              (should (eq (plist-get result :status) 'error))
+              (should (eq (plist-get result :error)
+                          'languagetool-http-error))
+              (should (= (plist-get result :http-status)
+                         http-status))
+              (let ((response (plist-get result :response))
+                    (message (plist-get result :message)))
+                (should (stringp response))
+                (should (stringp message))
+                (should (<= (string-width response) 500))
+                (should (<= (string-width message) 500))
+                (should
+                 (string-prefix-p
+                  (format "LanguageTool HTTP status %d: "
+                          http-status)
+                  message))
+                (if long-body-p
+                    (progn
+                      (should
+                       (string-prefix-p
+                        "Internal server failure " response))
+                      (should-not (string-match-p "[\n\t]" response))
+                      (should-not
+                       (string-match-p "tail-marker" response))
+                      (should-not
+                       (string-match-p "tail-marker" message)))
+                  (should (equal response body))
+                  (should
+                   (equal message
+                          (format
+                           "LanguageTool HTTP status %d: %s"
+                           http-status body)))))
+              (should (eq proofread-languagetool--server-state
+                          'ready))
+              (should (= probes 0))
+              (should (plist-get handle :delivered))
+              (should-not (buffer-live-p response-buffer))
+              (let* ((response-event
+                      (cl-find-if
+                       (lambda (event)
+                         (eq (plist-get event :type)
+                             'backend-response))
+                       events))
+                     (result-event
+                      (cl-find-if
+                       (lambda (event)
+                         (eq (plist-get event :type)
+                             'backend-result))
+                       events))
+                     (logged-result
+                      (plist-get result-event :result)))
+                (should (= (plist-get response-event :http-status)
+                           http-status))
+                (should (eq (plist-get response-event :error)
+                            'languagetool-http-error))
+                (should
+                 (equal (plist-get response-event :response)
+                        (plist-get result :response)))
+                (should
+                 (equal (plist-get response-event :message)
+                        "Backend request failed"))
+                (should (eq (plist-get logged-result :status) 'error))
+                (should (eq (plist-get logged-result :error)
+                            'languagetool-http-error))
+                (should
+                 (equal (plist-get logged-result :message)
+                        "Backend request failed"))))))))))
 
 (ert-deftest
     proofread-languagetool-test-invalid-http-status-is-transport-error ()
   "Callback errors with invalid HTTP statuses are transport errors."
   (dolist (http-status '( 0 600))
     (proofread-languagetool-test--with-state
-     (with-temp-buffer
-       (let ((proofread-languagetool--server-state 'ready)
-             (proofread-languagetool--server-session
-              (proofread-languagetool--server-session-snapshot))
-             call result response-buffer)
-         (cl-letf
-             (((symbol-function 'url-retrieve)
-               (lambda (_url callback arguments &rest _ignored)
-                 (let ((buffer
-                        (generate-new-buffer
-                         " *proofread-lt-invalid-http-status*")))
-                   (setq call (list :callback callback
-                                    :arguments arguments
-                                    :buffer buffer))
-                   buffer))))
-           (proofread-languagetool--check
-            (proofread-languagetool-test--request)
-            (lambda (value) (setq result value)))
-           (setq response-buffer (plist-get call :buffer))
-           (proofread-languagetool-test--complete-call
-            call http-status "Unusable response status"
-            `( :error (error http ,http-status)))
-           (should (eq (plist-get result :status) 'error))
-           (should (eq (plist-get result :error)
-                       'languagetool-transport-error))
-           (should-not (plist-member result :http-status))
-           (should (eq proofread-languagetool--server-state
-                       'unknown))
-           (should-not (buffer-live-p response-buffer))))))))
+      (with-temp-buffer
+        (let ((proofread-languagetool--server-state 'ready)
+              (proofread-languagetool--server-session
+               (proofread-languagetool--server-session-snapshot))
+              call result response-buffer)
+          (cl-letf
+              (((symbol-function 'url-retrieve)
+                (lambda (_url callback arguments &rest _ignored)
+                  (let ((buffer
+                         (generate-new-buffer
+                          " *proofread-lt-invalid-http-status*")))
+                    (setq call (list :callback callback
+                                     :arguments arguments
+                                     :buffer buffer))
+                    buffer))))
+            (proofread-languagetool--check
+             (proofread-languagetool-test--request)
+             (lambda (value) (setq result value)))
+            (setq response-buffer (plist-get call :buffer))
+            (proofread-languagetool-test--complete-call
+             call http-status "Unusable response status"
+             `( :error (error http ,http-status)))
+            (should (eq (plist-get result :status) 'error))
+            (should (eq (plist-get result :error)
+                        'languagetool-transport-error))
+            (should-not (plist-member result :http-status))
+            (should (eq proofread-languagetool--server-state
+                        'unknown))
+            (should-not (buffer-live-p response-buffer))))))))
 
 (ert-deftest
     proofread-languagetool-test-request-timeout-cleans-buffer ()
   "A current timeout invalidates readiness.
 A stale timeout leaves readiness unchanged."
   (proofread-languagetool-test--with-state
-   (with-temp-buffer
-     (let ((proofread-languagetool--server-state 'ready)
-           (proofread-languagetool--server-session
-            (proofread-languagetool--server-session-snapshot))
-           url-buffers current-result stale-result)
-       (cl-letf
-           (((symbol-function 'url-retrieve)
-             (lambda (&rest _ignored)
-               (let ((buffer
-                      (generate-new-buffer
-                       " *proofread-lt-timeout*")))
-                 (push buffer url-buffers)
-                 buffer))))
-         (let ((current-handle
-                (proofread-languagetool--check
-                 (proofread-languagetool-test--request)
-                 (lambda (value) (setq current-result value)))))
-           (proofread-languagetool--request-timeout current-handle)
-           (should (eq (plist-get current-result :error)
-                       'languagetool-request-timeout))
-           (should (eq proofread-languagetool--server-state
-                       'unknown))
-           (proofread-languagetool--request-timeout current-handle)
-           (should (plist-get current-handle :delivered)))
-         (setq proofread-languagetool--server-state 'ready)
-         (let ((stale-handle
-                (proofread-languagetool--check
-                 (proofread-languagetool-test--request)
-                 (lambda (value) (setq stale-result value)))))
-           (cl-incf proofread-languagetool--server-generation)
-           (proofread-languagetool--request-timeout stale-handle)
-           (should (eq (plist-get stale-result :error)
-                       'languagetool-request-timeout))
-           (should (eq proofread-languagetool--server-state
-                       'ready)))
-         (dolist (buffer url-buffers)
-           (should-not (buffer-live-p buffer))))))))
+    (with-temp-buffer
+      (let ((proofread-languagetool--server-state 'ready)
+            (proofread-languagetool--server-session
+             (proofread-languagetool--server-session-snapshot))
+            url-buffers current-result stale-result)
+        (cl-letf
+            (((symbol-function 'url-retrieve)
+              (lambda (&rest _ignored)
+                (let ((buffer
+                       (generate-new-buffer
+                        " *proofread-lt-timeout*")))
+                  (push buffer url-buffers)
+                  buffer))))
+          (let ((current-handle
+                 (proofread-languagetool--check
+                  (proofread-languagetool-test--request)
+                  (lambda (value) (setq current-result value)))))
+            (proofread-languagetool--request-timeout current-handle)
+            (should (eq (plist-get current-result :error)
+                        'languagetool-request-timeout))
+            (should (eq proofread-languagetool--server-state
+                        'unknown))
+            (proofread-languagetool--request-timeout current-handle)
+            (should (plist-get current-handle :delivered)))
+          (setq proofread-languagetool--server-state 'ready)
+          (let ((stale-handle
+                 (proofread-languagetool--check
+                  (proofread-languagetool-test--request)
+                  (lambda (value) (setq stale-result value)))))
+            (cl-incf proofread-languagetool--server-generation)
+            (proofread-languagetool--request-timeout stale-handle)
+            (should (eq (plist-get stale-result :error)
+                        'languagetool-request-timeout))
+            (should (eq proofread-languagetool--server-state
+                        'ready)))
+          (dolist (buffer url-buffers)
+            (should-not (buffer-live-p buffer))))))))
 
 (ert-deftest
     proofread-languagetool-test-sync-submit-error-is-deferred ()
   "A synchronous URL submission failure still calls back later."
   (proofread-languagetool-test--with-state
-   (with-temp-buffer
-     (let ((proofread-languagetool--server-state 'ready)
-           (proofread-languagetool--server-session
-            (proofread-languagetool--server-session-snapshot))
-           (callbacks 0)
-           result)
-       (cl-letf (((symbol-function 'url-retrieve)
-                  (lambda (&rest _ignored)
-                    (error "Synchronous URL failure"))))
-         (let ((handle
-                (proofread-languagetool--check
-                 (proofread-languagetool-test--request)
-                 (lambda (value)
-                   (cl-incf callbacks)
-                   (setq result value)))))
-           (should-not result)
-           (should-not (plist-get handle :delivered))
-           (should (memq handle
-                         proofread-languagetool--live-handles))
-           (should
-            (proofread-languagetool-test--wait-for
-             (lambda () result)))
-           (should (= callbacks 1))
-           (should (eq (plist-get result :error)
-                       'languagetool-request-error))
-           (should-not
-            (memq handle proofread-languagetool--live-handles))))))))
+    (with-temp-buffer
+      (let ((proofread-languagetool--server-state 'ready)
+            (proofread-languagetool--server-session
+             (proofread-languagetool--server-session-snapshot))
+            (callbacks 0)
+            result)
+        (cl-letf (((symbol-function 'url-retrieve)
+                   (lambda (&rest _ignored)
+                     (error "Synchronous URL failure"))))
+          (let ((handle
+                 (proofread-languagetool--check
+                  (proofread-languagetool-test--request)
+                  (lambda (value)
+                    (cl-incf callbacks)
+                    (setq result value)))))
+            (should-not result)
+            (should-not (plist-get handle :delivered))
+            (should (memq handle
+                          proofread-languagetool--live-handles))
+            (should
+             (proofread-languagetool-test--wait-for
+              (lambda () result)))
+            (should (= callbacks 1))
+            (should (eq (plist-get result :error)
+                        'languagetool-request-error))
+            (should-not
+             (memq handle proofread-languagetool--live-handles))))))))
 
 ;;;; Backend and server teardown
 
 (ert-deftest proofread-languagetool-test-stop-settles-live-handles ()
   "Stopping settles HTTP, waiting, deferred, and reentrant work."
   (proofread-languagetool-test--with-state
-   (with-temp-buffer
-     (let* ((session
-             (proofread-languagetool--server-session-snapshot))
-            (proofread-languagetool--server-state 'ready)
-            (proofread-languagetool--server-session session)
-            (original-kill
-             (symbol-function
-              'proofread-languagetool--kill-url-buffer))
-            call handle reentrant-handle waiting-handle
-            deferred-handle
-            result reentrant-result waiting-result deferred-result
-            scheduled)
-       (cl-letf
-           (((symbol-function 'url-retrieve)
-             (lambda (_url callback arguments &rest _ignored)
-               (let ((buffer
-                      (generate-new-buffer " *proofread-lt-stop*")))
-                 (setq call (list :callback callback
-                                  :arguments arguments
-                                  :buffer buffer))
-                 buffer)))
-            ((symbol-function
-              'proofread-languagetool--schedule-probe)
-             (lambda (&rest _ignored) (setq scheduled t)))
-            ((symbol-function
-              'proofread-languagetool--kill-url-buffer)
-             (lambda (buffer)
-               (funcall original-kill buffer)
-               (when (and buffer (eq buffer (plist-get call :buffer)))
-                 (setq reentrant-handle
-                       (proofread-languagetool--check
-                        (proofread-languagetool-test--request)
-                        (lambda (value)
-                          (setq reentrant-result value))))
-                 (proofread-languagetool--begin-readiness-check
-                  session)))))
-         (setq handle
-               (proofread-languagetool--check
-                (proofread-languagetool-test--request)
-                (lambda (value) (setq result value))))
-         (setq waiting-handle
-               (proofread-languagetool--new-handle
-                (proofread-languagetool-test--request)
-                (lambda (value) (setq waiting-result value))))
-         (push waiting-handle
-               proofread-languagetool--server-waiters)
-         (setq deferred-handle
-               (proofread-languagetool--new-handle
-                (proofread-languagetool-test--request)
-                (lambda (value) (setq deferred-result value))))
-         (proofread-languagetool--deliver-error-later
-          deferred-handle 'test-deferred "Deferred")
-         (proofread-languagetool-stop-server)
-         (dolist (settled-handle
-                  (list handle reentrant-handle waiting-handle
-                        deferred-handle))
-           (should (plist-get settled-handle :delivered))
-           (should-not (plist-get settled-handle :cancelled))
-           (should-not (plist-get settled-handle :timer)))
-         (dolist (settled-result
-                  (list result reentrant-result waiting-result
-                        deferred-result))
-           (should (eq (plist-get settled-result :error)
-                       'languagetool-stopped)))
-         (should-not scheduled)
-         (should-not proofread-languagetool--live-handles)
-         (should-not proofread-languagetool--server-waiters)
-         (should-not
-          (buffer-live-p (plist-get call :buffer)))
-         (let ((response
-                (proofread-languagetool-test--response-buffer
-                 200 "{\"matches\":[]}")))
-           (with-current-buffer response
-             (apply (plist-get call :callback)
-                    (cons nil (plist-get call :arguments)))))
-         (should (eq (plist-get result :error)
-                     'languagetool-stopped)))))))
+    (with-temp-buffer
+      (let* ((session
+              (proofread-languagetool--server-session-snapshot))
+             (proofread-languagetool--server-state 'ready)
+             (proofread-languagetool--server-session session)
+             (original-kill
+              (symbol-function
+               'proofread-languagetool--kill-url-buffer))
+             call handle reentrant-handle waiting-handle
+             deferred-handle
+             result reentrant-result waiting-result deferred-result
+             scheduled)
+        (cl-letf
+            (((symbol-function 'url-retrieve)
+              (lambda (_url callback arguments &rest _ignored)
+                (let ((buffer
+                       (generate-new-buffer " *proofread-lt-stop*")))
+                  (setq call (list :callback callback
+                                   :arguments arguments
+                                   :buffer buffer))
+                  buffer)))
+             ((symbol-function
+               'proofread-languagetool--schedule-probe)
+              (lambda (&rest _ignored) (setq scheduled t)))
+             ((symbol-function
+               'proofread-languagetool--kill-url-buffer)
+              (lambda (buffer)
+                (funcall original-kill buffer)
+                (when (and buffer (eq buffer (plist-get call :buffer)))
+                  (setq reentrant-handle
+                        (proofread-languagetool--check
+                         (proofread-languagetool-test--request)
+                         (lambda (value)
+                           (setq reentrant-result value))))
+                  (proofread-languagetool--begin-readiness-check
+                   session)))))
+          (setq handle
+                (proofread-languagetool--check
+                 (proofread-languagetool-test--request)
+                 (lambda (value) (setq result value))))
+          (setq waiting-handle
+                (proofread-languagetool--new-handle
+                 (proofread-languagetool-test--request)
+                 (lambda (value) (setq waiting-result value))))
+          (push waiting-handle
+                proofread-languagetool--server-waiters)
+          (setq deferred-handle
+                (proofread-languagetool--new-handle
+                 (proofread-languagetool-test--request)
+                 (lambda (value) (setq deferred-result value))))
+          (proofread-languagetool--deliver-error-later
+           deferred-handle 'test-deferred "Deferred")
+          (proofread-languagetool-stop-server)
+          (dolist (settled-handle
+                   (list handle reentrant-handle waiting-handle
+                         deferred-handle))
+            (should (plist-get settled-handle :delivered))
+            (should-not (plist-get settled-handle :cancelled))
+            (should-not (plist-get settled-handle :timer)))
+          (dolist (settled-result
+                   (list result reentrant-result waiting-result
+                         deferred-result))
+            (should (eq (plist-get settled-result :error)
+                        'languagetool-stopped)))
+          (should-not scheduled)
+          (should-not proofread-languagetool--live-handles)
+          (should-not proofread-languagetool--server-waiters)
+          (should-not
+           (buffer-live-p (plist-get call :buffer)))
+          (let ((response
+                 (proofread-languagetool-test--response-buffer
+                  200 "{\"matches\":[]}")))
+            (with-current-buffer response
+              (apply (plist-get call :callback)
+                     (cons nil (plist-get call :arguments)))))
+          (should (eq (plist-get result :error)
+                      'languagetool-stopped)))))))
 
 (ert-deftest proofread-languagetool-test-stop-retires-core-request ()
   "Stopping settles the core request lifecycle, not only its handle."
   (proofread-languagetool-test--with-state
-   (with-temp-buffer
-     (insert "This are")
-     (setq-local proofread-auto-check nil)
-     (proofread-mode 1)
-     (let ((proofread-languagetool--server-state 'ready)
-           (proofread-languagetool--server-session
-            (proofread-languagetool--server-session-snapshot))
-           call result)
-       (cl-letf
-           (((symbol-function 'url-retrieve)
-             (lambda (_url callback arguments &rest _ignored)
-               (let ((buffer
-                      (generate-new-buffer
-                       " *proofread-lt-core-stop*")))
-                 (with-current-buffer buffer
-                   (add-hook
-                    'kill-buffer-query-functions
-                    (lambda () nil) nil t)
-                   (add-hook
-                    'kill-buffer-hook
-                    (lambda () (error "Kill hook failure")) nil t))
-                 (setq call (list :callback callback
-                                  :arguments arguments
-                                  :buffer buffer))
-                 buffer))))
-         (let* ((chunk
-                 (car
-                  (proofread--request-ready-chunks-for-islands
-                   (proofread--target-islands-for-ranges
-                    (list (cons (point-min) (point-max)))))))
-                (request
-                 (proofread--make-backend-request
-                  chunk 'languagetool)))
-           (should
-            (proofread--dispatch-backend-request
-             request
-             (lambda (value) (setq result value))
-             'languagetool))
-           (should (proofread--active-request-p request))
-           (proofread-languagetool-stop-server)
-           (should (eq (plist-get result :error)
-                       'languagetool-stopped))
-           (should-not (proofread--active-request-p request))
-           (should-not proofread--active-requests)
-           (should-not proofread-languagetool--live-handles)
-           (should-not proofread-languagetool--server-waiters)
-           (should-not (buffer-live-p (plist-get call :buffer)))))))))
+    (with-temp-buffer
+      (insert "This are")
+      (setq-local proofread-auto-check nil)
+      (proofread-mode 1)
+      (let ((proofread-languagetool--server-state 'ready)
+            (proofread-languagetool--server-session
+             (proofread-languagetool--server-session-snapshot))
+            call result)
+        (cl-letf
+            (((symbol-function 'url-retrieve)
+              (lambda (_url callback arguments &rest _ignored)
+                (let ((buffer
+                       (generate-new-buffer
+                        " *proofread-lt-core-stop*")))
+                  (with-current-buffer buffer
+                    (add-hook
+                     'kill-buffer-query-functions
+                     (lambda () nil) nil t)
+                    (add-hook
+                     'kill-buffer-hook
+                     (lambda () (error "Kill hook failure")) nil t))
+                  (setq call (list :callback callback
+                                   :arguments arguments
+                                   :buffer buffer))
+                  buffer))))
+          (let* ((chunk
+                  (car
+                   (proofread--request-ready-chunks-for-islands
+                    (proofread--target-islands-for-ranges
+                     (list (cons (point-min) (point-max)))))))
+                 (request
+                  (proofread--make-backend-request
+                   chunk 'languagetool)))
+            (should
+             (proofread--dispatch-backend-request
+              request
+              (lambda (value) (setq result value))
+              'languagetool))
+            (should (proofread--active-request-p request))
+            (proofread-languagetool-stop-server)
+            (should (eq (plist-get result :error)
+                        'languagetool-stopped))
+            (should-not (proofread--active-request-p request))
+            (should-not proofread--active-requests)
+            (should-not proofread-languagetool--live-handles)
+            (should-not proofread-languagetool--server-waiters)
+            (should-not (buffer-live-p (plist-get call :buffer)))))))))
 
 (ert-deftest proofread-languagetool-test-teardown-clears-lifecycle ()
   "Teardown releases every readiness and owned-process resource."
   (proofread-languagetool-test--with-state
-   (let* ((session
-           (proofread-languagetool--server-session-snapshot))
-          (proofread-languagetool--server-session session)
-          (proofread-languagetool--server-generation 4)
-          (proofread-languagetool--server-state 'starting)
-          (proofread-languagetool--server-process 'owned-process)
-          (proofread-languagetool--server-process-session session)
-          (proofread-languagetool--force-start-p t)
-          (proofread-languagetool--startup-timer
-           (run-at-time 60 nil #'ignore))
-          (proofread-languagetool--probe-retry-timer
-           (run-at-time 60 nil #'ignore))
-          (proofread-languagetool--probe-retry-token '( retry))
-          (proofread-languagetool--probe-timeout-timer
-           (run-at-time 60 nil #'ignore))
-          (probe-buffer
-           (generate-new-buffer " *proofread-lt-teardown*"))
-          result
-          (waiter
-           (proofread-languagetool--new-handle
-            (proofread-languagetool-test--request)
-            (lambda (value) (setq result value))))
-          deleted)
-     (setq proofread-languagetool--probe-buffer probe-buffer)
-     (setq proofread-languagetool--server-waiters (list waiter))
-     (cl-letf
-         (((symbol-function 'process-live-p)
-           (lambda (process) (eq process 'owned-process)))
-          ((symbol-function 'set-process-query-on-exit-flag) #'ignore)
-          ((symbol-function 'delete-process)
-           (lambda (process) (setq deleted process))))
-       (proofread-languagetool--teardown
-        'languagetool-test-stop "Test stop"))
-     (should (= proofread-languagetool--server-generation 5))
-     (proofread-languagetool-test--assert-no-readiness-work)
-     (should-not (buffer-live-p probe-buffer))
-     (should (eq deleted 'owned-process))
-     (should-not proofread-languagetool--server-process)
-     (should-not proofread-languagetool--server-process-session)
-     (should-not proofread-languagetool--server-session)
-     (should-not proofread-languagetool--force-start-p)
-     (should-not proofread-languagetool--server-waiters)
-     (should-not proofread-languagetool--live-handles)
-     (should (eq proofread-languagetool--server-state 'unknown))
-     (should (eq (plist-get result :error)
-                 'languagetool-test-stop)))))
+    (let* ((session
+            (proofread-languagetool--server-session-snapshot))
+           (proofread-languagetool--server-session session)
+           (proofread-languagetool--server-generation 4)
+           (proofread-languagetool--server-state 'starting)
+           (proofread-languagetool--server-process 'owned-process)
+           (proofread-languagetool--server-process-session session)
+           (proofread-languagetool--force-start-p t)
+           (proofread-languagetool--startup-timer
+            (run-at-time 60 nil #'ignore))
+           (proofread-languagetool--probe-retry-timer
+            (run-at-time 60 nil #'ignore))
+           (proofread-languagetool--probe-retry-token '( retry))
+           (proofread-languagetool--probe-timeout-timer
+            (run-at-time 60 nil #'ignore))
+           (probe-buffer
+            (generate-new-buffer " *proofread-lt-teardown*"))
+           result
+           (waiter
+            (proofread-languagetool--new-handle
+             (proofread-languagetool-test--request)
+             (lambda (value) (setq result value))))
+           deleted)
+      (setq proofread-languagetool--probe-buffer probe-buffer)
+      (setq proofread-languagetool--server-waiters (list waiter))
+      (cl-letf
+          (((symbol-function 'process-live-p)
+            (lambda (process) (eq process 'owned-process)))
+           ((symbol-function 'set-process-query-on-exit-flag) #'ignore)
+           ((symbol-function 'delete-process)
+            (lambda (process) (setq deleted process))))
+        (proofread-languagetool--teardown
+         'languagetool-test-stop "Test stop"))
+      (should (= proofread-languagetool--server-generation 5))
+      (proofread-languagetool-test--assert-no-readiness-work)
+      (should-not (buffer-live-p probe-buffer))
+      (should (eq deleted 'owned-process))
+      (should-not proofread-languagetool--server-process)
+      (should-not proofread-languagetool--server-process-session)
+      (should-not proofread-languagetool--server-session)
+      (should-not proofread-languagetool--force-start-p)
+      (should-not proofread-languagetool--server-waiters)
+      (should-not proofread-languagetool--live-handles)
+      (should (eq proofread-languagetool--server-state 'unknown))
+      (should (eq (plist-get result :error)
+                  'languagetool-test-stop)))))
 
 (ert-deftest proofread-languagetool-test-unload-kills-server-log ()
   "Unloading kills the managed log despite buffer kill hooks."
@@ -1593,25 +1593,25 @@ A stale timeout leaves readiness unchanged."
     proofread-languagetool-test-failing-waiter-does-not-orphan-next ()
   "One signaling callback cannot prevent later waiter settlement."
   (proofread-languagetool-test--with-state
-   (let* ((bad
-           (proofread-languagetool--new-handle
-            (proofread-languagetool-test--request)
-            (lambda (_value) (error "Callback failure"))))
-          good-result
-          (good
-           (proofread-languagetool--new-handle
-            (proofread-languagetool-test--request)
-            (lambda (value) (setq good-result value)))))
-     (setq proofread-languagetool--server-waiters
-           (list good bad))
-     (proofread-languagetool--fail-waiters
-      'languagetool-test-error "Test error")
-     (should (plist-get bad :delivered))
-     (should (plist-get good :delivered))
-     (should (eq (plist-get good-result :error)
-                 'languagetool-test-error))
-     (should-not proofread-languagetool--server-waiters)
-     (should-not proofread-languagetool--live-handles))))
+    (let* ((bad
+            (proofread-languagetool--new-handle
+             (proofread-languagetool-test--request)
+             (lambda (_value) (error "Callback failure"))))
+           good-result
+           (good
+            (proofread-languagetool--new-handle
+             (proofread-languagetool-test--request)
+             (lambda (value) (setq good-result value)))))
+      (setq proofread-languagetool--server-waiters
+            (list good bad))
+      (proofread-languagetool--fail-waiters
+       'languagetool-test-error "Test error")
+      (should (plist-get bad :delivered))
+      (should (plist-get good :delivered))
+      (should (eq (plist-get good-result :error)
+                  'languagetool-test-error))
+      (should-not proofread-languagetool--server-waiters)
+      (should-not proofread-languagetool--live-handles))))
 
 ;;;; Server sessions and readiness
 
@@ -1619,131 +1619,131 @@ A stale timeout leaves readiness unchanged."
     proofread-languagetool-test-waiter-uses-check-time-snapshot ()
   "A waiting request posts the options and endpoint it captured."
   (proofread-languagetool-test--with-state
-   (with-temp-buffer
-     (let ((proofread-languagetool-server-url
-            "http://127.0.0.1:18081/v2")
-           (proofread-languagetool-level 'default)
-           calls result handle)
-       (cl-letf
-           (((symbol-function 'url-retrieve)
-             (lambda (url callback arguments &rest _ignored)
-               (let ((buffer
-                      (generate-new-buffer
-                       " *proofread-lt-snapshot*")))
-                 (setq calls
-                       (append calls
-                               (list (list :url url
-                                           :callback callback
-                                           :arguments arguments
-                                           :buffer buffer
-                                           :method url-request-method
-                                           :data url-request-data))))
-                 buffer))))
-         (setq handle
-               (proofread-languagetool--check
-                (proofread-languagetool-test--request)
-                (lambda (value) (setq result value))))
-         (setq proofread-languagetool-server-url
-               "http://127.0.0.1:18082/v2")
-         (setq proofread-languagetool-level 'picky)
-         (setq proofread-languagetool-command "changed-command")
-         (setq proofread-languagetool-config-file
-               "/tmp/changed-language-tool.properties")
-         (proofread-languagetool-test--run-scheduled-probe)
-         (proofread-languagetool-test--complete-call
-          (car calls) 200 "OK")
-         (should (= (length calls) 2))
-         (let ((post (cadr calls)))
-           (should (equal (plist-get post :method) "POST"))
-           (should
-            (string-prefix-p
-             "http://127.0.0.1:18081/v2/check"
-             (plist-get post :url)))
-           (should (string-match-p "level=default"
-                                   (plist-get post :data)))
-           (should-not (string-match-p "level=picky"
-                                       (plist-get post :data))))
-         (should
-          (equal (plist-get (plist-get handle :session) :base-url)
-                 "http://127.0.0.1:18081/v2"))
-         (proofread-languagetool-test--complete-call
-          (cadr calls) 200 "{\"matches\":[]}")
-         (should (eq (plist-get result :status) 'ok)))))))
+    (with-temp-buffer
+      (let ((proofread-languagetool-server-url
+             "http://127.0.0.1:18081/v2")
+            (proofread-languagetool-level 'default)
+            calls result handle)
+        (cl-letf
+            (((symbol-function 'url-retrieve)
+              (lambda (url callback arguments &rest _ignored)
+                (let ((buffer
+                       (generate-new-buffer
+                        " *proofread-lt-snapshot*")))
+                  (setq calls
+                        (append calls
+                                (list (list :url url
+                                            :callback callback
+                                            :arguments arguments
+                                            :buffer buffer
+                                            :method url-request-method
+                                            :data url-request-data))))
+                  buffer))))
+          (setq handle
+                (proofread-languagetool--check
+                 (proofread-languagetool-test--request)
+                 (lambda (value) (setq result value))))
+          (setq proofread-languagetool-server-url
+                "http://127.0.0.1:18082/v2")
+          (setq proofread-languagetool-level 'picky)
+          (setq proofread-languagetool-command "changed-command")
+          (setq proofread-languagetool-config-file
+                "/tmp/changed-language-tool.properties")
+          (proofread-languagetool-test--run-scheduled-probe)
+          (proofread-languagetool-test--complete-call
+           (car calls) 200 "OK")
+          (should (= (length calls) 2))
+          (let ((post (cadr calls)))
+            (should (equal (plist-get post :method) "POST"))
+            (should
+             (string-prefix-p
+              "http://127.0.0.1:18081/v2/check"
+              (plist-get post :url)))
+            (should (string-match-p "level=default"
+                                    (plist-get post :data)))
+            (should-not (string-match-p "level=picky"
+                                        (plist-get post :data))))
+          (should
+           (equal (plist-get (plist-get handle :session) :base-url)
+                  "http://127.0.0.1:18081/v2"))
+          (proofread-languagetool-test--complete-call
+           (cadr calls) 200 "{\"matches\":[]}")
+          (should (eq (plist-get result :status) 'ok)))))))
 
 (ert-deftest
     proofread-languagetool-test-session-change-invalidates-ready ()
   "Changing URL, config, or command invalidates a ready session."
   (proofread-languagetool-test--with-state
-   (with-temp-buffer
-     (let* ((proofread-languagetool-server-url
-             "http://127.0.0.1:18081/v2")
-            (proofread-languagetool-auto-start t)
-            (old-session
-             (proofread-languagetool--server-session-snapshot))
-            (proofread-languagetool--server-state 'ready)
-            (proofread-languagetool--server-session old-session)
-            (proofread-languagetool--server-process 'old-process)
-            (proofread-languagetool--server-process-session
-             old-session)
-            calls deleted result)
-       (setq proofread-languagetool-server-url
-             "http://127.0.0.1:18082/v2")
-       (setq proofread-languagetool-command "new-command")
-       (setq proofread-languagetool-config-file
-             "/tmp/new-language-tool.properties")
-       (cl-letf
-           (((symbol-function 'process-live-p)
-             (lambda (process) (eq process 'old-process)))
-            ((symbol-function 'set-process-query-on-exit-flag)
-             #'ignore)
-            ((symbol-function 'delete-process)
-             (lambda (process) (setq deleted process)))
-            ((symbol-function 'make-process)
-             (lambda (&rest _ignored)
-               (ert-fail
-                "A healthy changed endpoint was not reused")))
-            ((symbol-function 'url-retrieve)
-             (lambda (url callback arguments &rest _ignored)
-               (let ((buffer
-                      (generate-new-buffer
-                       " *proofread-lt-session-change*")))
-                 (setq calls
-                       (append calls
-                               (list (list :url url
-                                           :callback callback
-                                           :arguments arguments
-                                           :buffer buffer
-                                           :method url-request-method
-                                           :max-redirections
-                                           (symbol-value
-                                            'url-max-redirections)))))
-                 buffer))))
-         (proofread-languagetool--check
-          (proofread-languagetool-test--request)
-          (lambda (value) (setq result value)))
-         (should (eq deleted 'old-process))
-         (should (eq proofread-languagetool--server-state 'probing))
-         (should-not calls)
-         (proofread-languagetool-test--run-scheduled-probe)
-         (should (= (length calls) 1))
-         (should (equal (plist-get (car calls) :method) "GET"))
-         (should (= (plist-get (car calls) :max-redirections) 0))
-         (proofread-languagetool-test--assert-no-redirects
-          (plist-get (car calls) :buffer))
-         (should
-          (string-prefix-p
-           "http://127.0.0.1:18082/v2/healthcheck"
-           (plist-get (car calls) :url)))
-         (proofread-languagetool-test--complete-call
-          (car calls) 200 "OK")
-         (should (= (length calls) 2))
-         (should (equal (plist-get (cadr calls) :method) "POST"))
-         (should (= (plist-get (cadr calls) :max-redirections) 0))
-         (proofread-languagetool-test--assert-no-redirects
-          (plist-get (cadr calls) :buffer))
-         (proofread-languagetool-test--complete-call
-          (cadr calls) 200 "{\"matches\":[]}")
-         (should (eq (plist-get result :status) 'ok)))))))
+    (with-temp-buffer
+      (let* ((proofread-languagetool-server-url
+              "http://127.0.0.1:18081/v2")
+             (proofread-languagetool-auto-start t)
+             (old-session
+              (proofread-languagetool--server-session-snapshot))
+             (proofread-languagetool--server-state 'ready)
+             (proofread-languagetool--server-session old-session)
+             (proofread-languagetool--server-process 'old-process)
+             (proofread-languagetool--server-process-session
+              old-session)
+             calls deleted result)
+        (setq proofread-languagetool-server-url
+              "http://127.0.0.1:18082/v2")
+        (setq proofread-languagetool-command "new-command")
+        (setq proofread-languagetool-config-file
+              "/tmp/new-language-tool.properties")
+        (cl-letf
+            (((symbol-function 'process-live-p)
+              (lambda (process) (eq process 'old-process)))
+             ((symbol-function 'set-process-query-on-exit-flag)
+              #'ignore)
+             ((symbol-function 'delete-process)
+              (lambda (process) (setq deleted process)))
+             ((symbol-function 'make-process)
+              (lambda (&rest _ignored)
+                (ert-fail
+                 "A healthy changed endpoint was not reused")))
+             ((symbol-function 'url-retrieve)
+              (lambda (url callback arguments &rest _ignored)
+                (let ((buffer
+                       (generate-new-buffer
+                        " *proofread-lt-session-change*")))
+                  (setq calls
+                        (append calls
+                                (list (list :url url
+                                            :callback callback
+                                            :arguments arguments
+                                            :buffer buffer
+                                            :method url-request-method
+                                            :max-redirections
+                                            (symbol-value
+                                             'url-max-redirections)))))
+                  buffer))))
+          (proofread-languagetool--check
+           (proofread-languagetool-test--request)
+           (lambda (value) (setq result value)))
+          (should (eq deleted 'old-process))
+          (should (eq proofread-languagetool--server-state 'probing))
+          (should-not calls)
+          (proofread-languagetool-test--run-scheduled-probe)
+          (should (= (length calls) 1))
+          (should (equal (plist-get (car calls) :method) "GET"))
+          (should (= (plist-get (car calls) :max-redirections) 0))
+          (proofread-languagetool-test--assert-no-redirects
+           (plist-get (car calls) :buffer))
+          (should
+           (string-prefix-p
+            "http://127.0.0.1:18082/v2/healthcheck"
+            (plist-get (car calls) :url)))
+          (proofread-languagetool-test--complete-call
+           (car calls) 200 "OK")
+          (should (= (length calls) 2))
+          (should (equal (plist-get (cadr calls) :method) "POST"))
+          (should (= (plist-get (cadr calls) :max-redirections) 0))
+          (proofread-languagetool-test--assert-no-redirects
+           (plist-get (cadr calls) :buffer))
+          (proofread-languagetool-test--complete-call
+           (cadr calls) 200 "{\"matches\":[]}")
+          (should (eq (plist-get result :status) 'ok)))))))
 
 (ert-deftest
     proofread-languagetool-test-session-identity-covers-lifecycle ()
@@ -1792,168 +1792,168 @@ A stale timeout leaves readiness unchanged."
 (ert-deftest proofread-languagetool-test-probe-uses-health-timeout ()
   "A health probe uses the timeout captured in its server session."
   (proofread-languagetool-test--with-state
-   (let* ((proofread-languagetool-health-timeout 7.5)
-          (session
-           (proofread-languagetool--server-session-snapshot))
-          (proofread-languagetool--server-session session)
-          (proofread-languagetool--server-generation 1)
-          (proofread-languagetool--server-state 'probing)
-          (token (list 'probe-token))
-          buffer armed-delay)
-     (setq proofread-languagetool--probe-retry-token token)
-     (cl-letf
-         (((symbol-function 'url-retrieve)
-           (lambda (&rest _ignored)
-             (setq buffer
-                   (generate-new-buffer
-                    " *proofread-lt-health-timeout*"))))
-          ((symbol-function 'run-at-time)
-           (lambda (delay &rest _ignored)
-             (setq armed-delay delay)
-             'proofread-languagetool-test-timer)))
-       (proofread-languagetool--run-probe
-        1 'external session token))
-     (should (= armed-delay 7.5))
-     (proofread-languagetool--kill-url-buffer buffer))))
+    (let* ((proofread-languagetool-health-timeout 7.5)
+           (session
+            (proofread-languagetool--server-session-snapshot))
+           (proofread-languagetool--server-session session)
+           (proofread-languagetool--server-generation 1)
+           (proofread-languagetool--server-state 'probing)
+           (token (list 'probe-token))
+           buffer armed-delay)
+      (setq proofread-languagetool--probe-retry-token token)
+      (cl-letf
+          (((symbol-function 'url-retrieve)
+            (lambda (&rest _ignored)
+              (setq buffer
+                    (generate-new-buffer
+                     " *proofread-lt-health-timeout*"))))
+           ((symbol-function 'run-at-time)
+            (lambda (delay &rest _ignored)
+              (setq armed-delay delay)
+              'proofread-languagetool-test-timer)))
+        (proofread-languagetool--run-probe
+         1 'external session token))
+      (should (= armed-delay 7.5))
+      (proofread-languagetool--kill-url-buffer buffer))))
 
 (ert-deftest
     proofread-languagetool-test-probe-schedule-error-is-atomic ()
   "A timer error cannot publish half of a scheduled health probe."
   (proofread-languagetool-test--with-state
-   (let* ((session
-           (proofread-languagetool--server-session-snapshot))
-          (proofread-languagetool--server-session session)
-          (proofread-languagetool--server-generation 1)
-          (proofread-languagetool--server-state 'probing))
-     (cl-letf (((symbol-function 'run-at-time)
-                (lambda (&rest _ignored)
-                  (error "Timer creation failed"))))
-       (should-error
-        (proofread-languagetool--schedule-probe
-         1 'external session 0)))
-     (should-not proofread-languagetool--probe-retry-timer)
-     (should-not proofread-languagetool--probe-retry-token))))
+    (let* ((session
+            (proofread-languagetool--server-session-snapshot))
+           (proofread-languagetool--server-session session)
+           (proofread-languagetool--server-generation 1)
+           (proofread-languagetool--server-state 'probing))
+      (cl-letf (((symbol-function 'run-at-time)
+                 (lambda (&rest _ignored)
+                   (error "Timer creation failed"))))
+        (should-error
+         (proofread-languagetool--schedule-probe
+          1 'external session 0)))
+      (should-not proofread-languagetool--probe-retry-timer)
+      (should-not proofread-languagetool--probe-retry-token))))
 
 (ert-deftest
     proofread-languagetool-test-probe-schedule-error-rolls-back ()
   "A probe scheduling error leaves readiness retryable."
   (proofread-languagetool-test--with-state
-   (let* ((session
-           (proofread-languagetool--server-session-snapshot))
-          (proofread-languagetool--server-session session)
-          (proofread-languagetool--server-generation 1)
-          (proofread-languagetool--server-state 'unknown)
-          (proofread-languagetool--force-start-p t)
-          result
-          scheduled
-          (waiter
-           (proofread-languagetool--new-handle
-            (proofread-languagetool-test--request)
-            (lambda (value) (setq result value)))))
-     (setq proofread-languagetool--server-waiters (list waiter))
-     (cl-letf
-         (((symbol-function 'proofread-languagetool--schedule-probe)
-           (lambda (&rest _ignored)
-             (error "Timer creation failed"))))
-       (should-error
-        (proofread-languagetool--begin-readiness-check session)))
-     (should (eq proofread-languagetool--server-state 'unknown))
-     (should-not proofread-languagetool--force-start-p)
-     (should-not proofread-languagetool--server-waiters)
-     (should (eq (plist-get result :error)
-                 'languagetool-unavailable))
-     (proofread-languagetool-test--assert-no-readiness-work)
-     (cl-letf
-         (((symbol-function 'proofread-languagetool--schedule-probe)
-           (lambda (generation phase candidate delay)
-             (setq scheduled
-                   (list generation phase candidate delay)))))
-       (proofread-languagetool--begin-readiness-check session))
-     (should (eq proofread-languagetool--server-state 'probing))
-     (should
-      (equal scheduled
-             (list proofread-languagetool--server-generation
-                   'external session 0))))))
+    (let* ((session
+            (proofread-languagetool--server-session-snapshot))
+           (proofread-languagetool--server-session session)
+           (proofread-languagetool--server-generation 1)
+           (proofread-languagetool--server-state 'unknown)
+           (proofread-languagetool--force-start-p t)
+           result
+           scheduled
+           (waiter
+            (proofread-languagetool--new-handle
+             (proofread-languagetool-test--request)
+             (lambda (value) (setq result value)))))
+      (setq proofread-languagetool--server-waiters (list waiter))
+      (cl-letf
+          (((symbol-function 'proofread-languagetool--schedule-probe)
+            (lambda (&rest _ignored)
+              (error "Timer creation failed"))))
+        (should-error
+         (proofread-languagetool--begin-readiness-check session)))
+      (should (eq proofread-languagetool--server-state 'unknown))
+      (should-not proofread-languagetool--force-start-p)
+      (should-not proofread-languagetool--server-waiters)
+      (should (eq (plist-get result :error)
+                  'languagetool-unavailable))
+      (proofread-languagetool-test--assert-no-readiness-work)
+      (cl-letf
+          (((symbol-function 'proofread-languagetool--schedule-probe)
+            (lambda (generation phase candidate delay)
+              (setq scheduled
+                    (list generation phase candidate delay)))))
+        (proofread-languagetool--begin-readiness-check session))
+      (should (eq proofread-languagetool--server-state 'probing))
+      (should
+       (equal scheduled
+              (list proofread-languagetool--server-generation
+                    'external session 0))))))
 
 (ert-deftest
     proofread-languagetool-test-probe-timeout-setup-cleans-buffer ()
   "A probe timeout timer error cannot leak its retrieval buffer."
   (proofread-languagetool-test--with-state
-   (let* ((proofread-languagetool-auto-start nil)
-          (session
-           (proofread-languagetool--server-session-snapshot))
-          (proofread-languagetool--server-session session)
-          (proofread-languagetool--server-generation 1)
-          (proofread-languagetool--server-state 'probing)
-          (token (list 'probe-token))
-          buffer)
-     (setq proofread-languagetool--probe-retry-token token)
-     (cl-letf
-         (((symbol-function 'url-retrieve)
-           (lambda (&rest _ignored)
-             (setq buffer
-                   (generate-new-buffer
-                    " *proofread-lt-probe-timer-error*"))))
-          ((symbol-function 'run-at-time)
-           (lambda (&rest _ignored)
-             (error "Timer creation failed"))))
-       (proofread-languagetool--run-probe
-        1 'external session token))
-     (should (eq proofread-languagetool--server-state 'unknown))
-     (proofread-languagetool-test--assert-no-readiness-work)
-     (should-not (buffer-live-p buffer)))))
+    (let* ((proofread-languagetool-auto-start nil)
+           (session
+            (proofread-languagetool--server-session-snapshot))
+           (proofread-languagetool--server-session session)
+           (proofread-languagetool--server-generation 1)
+           (proofread-languagetool--server-state 'probing)
+           (token (list 'probe-token))
+           buffer)
+      (setq proofread-languagetool--probe-retry-token token)
+      (cl-letf
+          (((symbol-function 'url-retrieve)
+            (lambda (&rest _ignored)
+              (setq buffer
+                    (generate-new-buffer
+                     " *proofread-lt-probe-timer-error*"))))
+           ((symbol-function 'run-at-time)
+            (lambda (&rest _ignored)
+              (error "Timer creation failed"))))
+        (proofread-languagetool--run-probe
+         1 'external session token))
+      (should (eq proofread-languagetool--server-state 'unknown))
+      (proofread-languagetool-test--assert-no-readiness-work)
+      (should-not (buffer-live-p buffer)))))
 
 (ert-deftest
     proofread-languagetool-test-probe-timeout-cleans-attempt ()
   "A current health-probe timeout releases and fails its attempt."
   (proofread-languagetool-test--with-state
-   (let* ((proofread-languagetool-auto-start nil)
-          (session
-           (proofread-languagetool--server-session-snapshot))
-          (proofread-languagetool--server-session session)
-          (proofread-languagetool--server-generation 1)
-          (proofread-languagetool--server-state 'probing)
-          (proofread-languagetool--probe-timeout-timer
-           (run-at-time 60 nil #'ignore))
-          (buffer
-           (generate-new-buffer " *proofread-lt-probe-timeout*"))
-          result
-          (waiter
-           (proofread-languagetool--new-handle
-            (proofread-languagetool-test--request)
-            (lambda (value) (setq result value)))))
-     (setq proofread-languagetool--probe-buffer buffer)
-     (setq proofread-languagetool--server-waiters (list waiter))
-     (proofread-languagetool--probe-timeout
-      1 'external session buffer)
-     (should (= proofread-languagetool--server-generation 2))
-     (proofread-languagetool-test--assert-no-readiness-work)
-     (should-not (buffer-live-p buffer))
-     (should (eq proofread-languagetool--server-state 'unknown))
-     (should (eq (plist-get result :error)
-                 'languagetool-unavailable)))))
+    (let* ((proofread-languagetool-auto-start nil)
+           (session
+            (proofread-languagetool--server-session-snapshot))
+           (proofread-languagetool--server-session session)
+           (proofread-languagetool--server-generation 1)
+           (proofread-languagetool--server-state 'probing)
+           (proofread-languagetool--probe-timeout-timer
+            (run-at-time 60 nil #'ignore))
+           (buffer
+            (generate-new-buffer " *proofread-lt-probe-timeout*"))
+           result
+           (waiter
+            (proofread-languagetool--new-handle
+             (proofread-languagetool-test--request)
+             (lambda (value) (setq result value)))))
+      (setq proofread-languagetool--probe-buffer buffer)
+      (setq proofread-languagetool--server-waiters (list waiter))
+      (proofread-languagetool--probe-timeout
+       1 'external session buffer)
+      (should (= proofread-languagetool--server-generation 2))
+      (proofread-languagetool-test--assert-no-readiness-work)
+      (should-not (buffer-live-p buffer))
+      (should (eq proofread-languagetool--server-state 'unknown))
+      (should (eq (plist-get result :error)
+                  'languagetool-unavailable)))))
 
 (ert-deftest
     proofread-languagetool-test-rejects-buffer-local-session-option ()
   "The server manager rejects buffer-local settings when they apply."
   (proofread-languagetool-test--with-state
-   (with-temp-buffer
-     (setq-local proofread-languagetool-server-url
-                 "http://127.0.0.1:18082/v2")
-     (let (result)
-       (proofread-languagetool--check
-        (proofread-languagetool-test--request)
-        (lambda (value) (setq result value)))
-       (should-not result)
-       (should
-        (proofread-languagetool-test--wait-for
-         (lambda () result)))
-       (should (eq (plist-get result :error)
-                   'languagetool-configuration-error))
-       (should (string-match-p "must not be buffer-local"
-                               (plist-get result :message)))
-       (should-not proofread-languagetool--probe-retry-timer)
-       (should-not proofread-languagetool--server-waiters))))
+    (with-temp-buffer
+      (setq-local proofread-languagetool-server-url
+                  "http://127.0.0.1:18082/v2")
+      (let (result)
+        (proofread-languagetool--check
+         (proofread-languagetool-test--request)
+         (lambda (value) (setq result value)))
+        (should-not result)
+        (should
+         (proofread-languagetool-test--wait-for
+          (lambda () result)))
+        (should (eq (plist-get result :error)
+                    'languagetool-configuration-error))
+        (should (string-match-p "must not be buffer-local"
+                                (plist-get result :message)))
+        (should-not proofread-languagetool--probe-retry-timer)
+        (should-not proofread-languagetool--server-waiters))))
   (with-temp-buffer
     (setq-local proofread-languagetool-health-timeout 7.5)
     (should-error
@@ -1972,373 +1972,373 @@ A stale timeout leaves readiness unchanged."
     proofread-languagetool-test-snapshots-in-request-buffer ()
   "Request-local options are captured from the request's buffer."
   (proofread-languagetool-test--with-state
-   (let ((source (generate-new-buffer " *proofread-lt-source*"))
-         (caller (generate-new-buffer " *proofread-lt-caller*"))
-         request call handle dead-result)
-     (unwind-protect
-         (progn
-           (with-current-buffer source
-             (setq-local proofread-languagetool-level 'picky)
-             (setq-local proofread-languagetool-request-timeout 23)
-             (setq request
-                   (proofread-languagetool-test--request)))
-           (with-current-buffer caller
-             (setq-local proofread-languagetool-level 'default)
-             (setq-local proofread-languagetool-request-timeout 7)
-             (let ((proofread-languagetool--server-state 'ready)
-                   (proofread-languagetool--server-session
-                    (proofread-languagetool--server-session-snapshot)))
-               (cl-letf
-                   (((symbol-function 'url-retrieve)
-                     (lambda (_url _callback _arguments
-                                   &rest _ignored)
-                       (setq call
-                             (list :data url-request-data
-                                   :buffer
-                                   (generate-new-buffer
-                                    " *proofread-lt-source-request*")))
-                       (plist-get call :buffer))))
-                 (setq handle
-                       (proofread-languagetool--check
-                        request #'ignore)))))
-           (should (string-match-p "level=picky"
-                                   (plist-get call :data)))
-           (should (= (plist-get (plist-get handle :session)
-                                 :request-timeout)
-                      23))
-           (proofread-languagetool--cancel handle)
-           (kill-buffer source)
-           (with-current-buffer caller
-             (proofread-languagetool--check
-              request (lambda (value) (setq dead-result value))))
-           (should-not dead-result)
-           (should
-            (proofread-languagetool-test--wait-for
-             (lambda () dead-result)))
-           (should (eq (plist-get dead-result :error)
-                       'languagetool-configuration-error)))
-       (when (buffer-live-p source) (kill-buffer source))
-       (when (buffer-live-p caller) (kill-buffer caller))))))
+    (let ((source (generate-new-buffer " *proofread-lt-source*"))
+          (caller (generate-new-buffer " *proofread-lt-caller*"))
+          request call handle dead-result)
+      (unwind-protect
+          (progn
+            (with-current-buffer source
+              (setq-local proofread-languagetool-level 'picky)
+              (setq-local proofread-languagetool-request-timeout 23)
+              (setq request
+                    (proofread-languagetool-test--request)))
+            (with-current-buffer caller
+              (setq-local proofread-languagetool-level 'default)
+              (setq-local proofread-languagetool-request-timeout 7)
+              (let ((proofread-languagetool--server-state 'ready)
+                    (proofread-languagetool--server-session
+                     (proofread-languagetool--server-session-snapshot)))
+                (cl-letf
+                    (((symbol-function 'url-retrieve)
+                      (lambda (_url _callback _arguments
+                                    &rest _ignored)
+                        (setq call
+                              (list :data url-request-data
+                                    :buffer
+                                    (generate-new-buffer
+                                     " *proofread-lt-source-request*")))
+                        (plist-get call :buffer))))
+                  (setq handle
+                        (proofread-languagetool--check
+                         request #'ignore)))))
+            (should (string-match-p "level=picky"
+                                    (plist-get call :data)))
+            (should (= (plist-get (plist-get handle :session)
+                                  :request-timeout)
+                       23))
+            (proofread-languagetool--cancel handle)
+            (kill-buffer source)
+            (with-current-buffer caller
+              (proofread-languagetool--check
+               request (lambda (value) (setq dead-result value))))
+            (should-not dead-result)
+            (should
+             (proofread-languagetool-test--wait-for
+              (lambda () dead-result)))
+            (should (eq (plist-get dead-result :error)
+                        'languagetool-configuration-error)))
+        (when (buffer-live-p source) (kill-buffer source))
+        (when (buffer-live-p caller) (kill-buffer caller))))))
 
 (ert-deftest
     proofread-languagetool-test-manual-start-forces-active-probe ()
   "Manual start replaces an external probe with a managed snapshot."
   (proofread-languagetool-test--with-state
-   (let* ((proofread-languagetool-auto-start nil)
-          (proofread-languagetool-config-file nil)
-          (proofread-languagetool-command "languagetool-http-server")
-          (proofread-languagetool-startup-timeout 15.0)
-          (session
-           (proofread-languagetool--server-session-snapshot))
-          (proofread-languagetool--server-session session)
-          (proofread-languagetool--server-generation 1)
-          (proofread-languagetool--server-state 'probing)
-          scheduled
-          started)
-     (cl-letf
-         (((symbol-function
-            'proofread-languagetool--start-managed-server)
-           (lambda (generation candidate)
-             (setq started (list generation candidate))))
-          ((symbol-function 'proofread-languagetool--schedule-probe)
-           (lambda (generation phase candidate delay)
-             (setq scheduled
-                   (list generation phase candidate delay)))))
-       (proofread-languagetool-start-server)
-       (should proofread-languagetool--force-start-p)
-       (should (= proofread-languagetool--server-generation 2))
-       (should
-        (proofread-languagetool--same-session-p
-         session proofread-languagetool--server-session))
-       (dolist (key '( :command :config-file :startup-timeout
-                       :managed-identity))
-         (should (plist-member proofread-languagetool--server-session
-                               key)))
-       (should
-        (equal scheduled
-               (list 2 'external
-                     proofread-languagetool--server-session 0)))
-       (proofread-languagetool--probe-failed
-        1 'external session)
-       (should-not started)
-       (proofread-languagetool--probe-failed
-        2 'external proofread-languagetool--server-session)
-       (should
-        (equal started
-               (list 2 proofread-languagetool--server-session)))))))
+    (let* ((proofread-languagetool-auto-start nil)
+           (proofread-languagetool-config-file nil)
+           (proofread-languagetool-command "languagetool-http-server")
+           (proofread-languagetool-startup-timeout 15.0)
+           (session
+            (proofread-languagetool--server-session-snapshot))
+           (proofread-languagetool--server-session session)
+           (proofread-languagetool--server-generation 1)
+           (proofread-languagetool--server-state 'probing)
+           scheduled
+           started)
+      (cl-letf
+          (((symbol-function
+             'proofread-languagetool--start-managed-server)
+            (lambda (generation candidate)
+              (setq started (list generation candidate))))
+           ((symbol-function 'proofread-languagetool--schedule-probe)
+            (lambda (generation phase candidate delay)
+              (setq scheduled
+                    (list generation phase candidate delay)))))
+        (proofread-languagetool-start-server)
+        (should proofread-languagetool--force-start-p)
+        (should (= proofread-languagetool--server-generation 2))
+        (should
+         (proofread-languagetool--same-session-p
+          session proofread-languagetool--server-session))
+        (dolist (key '( :command :config-file :startup-timeout
+                        :managed-identity))
+          (should (plist-member proofread-languagetool--server-session
+                                key)))
+        (should
+         (equal scheduled
+                (list 2 'external
+                      proofread-languagetool--server-session 0)))
+        (proofread-languagetool--probe-failed
+         1 'external session)
+        (should-not started)
+        (proofread-languagetool--probe-failed
+         2 'external proofread-languagetool--server-session)
+        (should
+         (equal started
+                (list 2 proofread-languagetool--server-session)))))))
 
 (ert-deftest
     proofread-languagetool-test-manual-start-replaces-changed-owned-process ()
   "Manual start replaces an owned process.
 Replacement occurs when managed settings have changed."
   (proofread-languagetool-test--with-state
-   (let* ((proofread-languagetool-auto-start nil)
-          (proofread-languagetool-config-file nil)
-          (proofread-languagetool-command "old-command")
-          (proofread-languagetool-startup-timeout 15.0)
-          (old-session
-           (proofread-languagetool--server-session-snapshot nil t))
-          (proofread-languagetool--server-state 'ready)
-          (proofread-languagetool--server-session old-session)
-          (proofread-languagetool--server-process 'owned-process)
-          (proofread-languagetool--server-process-session old-session)
-          deleted
-          scheduled)
-     (setq proofread-languagetool-command "new-command")
-     (cl-letf
-         (((symbol-function 'process-live-p)
-           (lambda (process) (eq process 'owned-process)))
-          ((symbol-function 'set-process-query-on-exit-flag) #'ignore)
-          ((symbol-function 'delete-process)
-           (lambda (process) (setq deleted process)))
-          ((symbol-function 'proofread-languagetool--schedule-probe)
-           (lambda (generation phase session delay)
-             (setq scheduled
-                   (list generation phase session delay)))))
-       (proofread-languagetool-start-server))
-     (should (eq deleted 'owned-process))
-     (should-not proofread-languagetool--server-process)
-     (should-not proofread-languagetool--server-process-session)
-     (should proofread-languagetool--force-start-p)
-     (should (eq proofread-languagetool--server-state 'probing))
-     (should (= proofread-languagetool--server-generation 1))
-     (should
-      (proofread-languagetool--same-session-p
-       old-session proofread-languagetool--server-session))
-     (should-not
-      (proofread-languagetool--same-managed-session-p
-       old-session proofread-languagetool--server-session))
-     (should
-      (equal scheduled
-             (list 1 'external
-                   proofread-languagetool--server-session 0))))))
+    (let* ((proofread-languagetool-auto-start nil)
+           (proofread-languagetool-config-file nil)
+           (proofread-languagetool-command "old-command")
+           (proofread-languagetool-startup-timeout 15.0)
+           (old-session
+            (proofread-languagetool--server-session-snapshot nil t))
+           (proofread-languagetool--server-state 'ready)
+           (proofread-languagetool--server-session old-session)
+           (proofread-languagetool--server-process 'owned-process)
+           (proofread-languagetool--server-process-session old-session)
+           deleted
+           scheduled)
+      (setq proofread-languagetool-command "new-command")
+      (cl-letf
+          (((symbol-function 'process-live-p)
+            (lambda (process) (eq process 'owned-process)))
+           ((symbol-function 'set-process-query-on-exit-flag) #'ignore)
+           ((symbol-function 'delete-process)
+            (lambda (process) (setq deleted process)))
+           ((symbol-function 'proofread-languagetool--schedule-probe)
+            (lambda (generation phase session delay)
+              (setq scheduled
+                    (list generation phase session delay)))))
+        (proofread-languagetool-start-server))
+      (should (eq deleted 'owned-process))
+      (should-not proofread-languagetool--server-process)
+      (should-not proofread-languagetool--server-process-session)
+      (should proofread-languagetool--force-start-p)
+      (should (eq proofread-languagetool--server-state 'probing))
+      (should (= proofread-languagetool--server-generation 1))
+      (should
+       (proofread-languagetool--same-session-p
+        old-session proofread-languagetool--server-session))
+      (should-not
+       (proofread-languagetool--same-managed-session-p
+        old-session proofread-languagetool--server-session))
+      (should
+       (equal scheduled
+              (list 1 'external
+                    proofread-languagetool--server-session 0))))))
 
 (ert-deftest
     proofread-languagetool-test-repeated-manual-start-is-idempotent ()
   "Repeated manual start keeps an equivalent managed probe in flight."
   (proofread-languagetool-test--with-state
-   (let* ((proofread-languagetool-auto-start nil)
-          (proofread-languagetool-config-file nil)
-          (proofread-languagetool-command "languagetool-http-server")
-          (proofread-languagetool-startup-timeout 15.0)
-          (session
-           (proofread-languagetool--server-session-snapshot nil t))
-          (proofread-languagetool--server-session session)
-          (proofread-languagetool--server-generation 1)
-          (proofread-languagetool--server-state 'probing))
-     (cl-letf
-         (((symbol-function
-            'proofread-languagetool--begin-readiness-check)
-           (lambda (&rest _ignored)
-             (ert-fail "Equivalent managed probe was restarted"))))
-       (proofread-languagetool-start-server))
-     (should proofread-languagetool--force-start-p)
-     (should (= proofread-languagetool--server-generation 1))
-     (should (eq proofread-languagetool--server-session session)))))
+    (let* ((proofread-languagetool-auto-start nil)
+           (proofread-languagetool-config-file nil)
+           (proofread-languagetool-command "languagetool-http-server")
+           (proofread-languagetool-startup-timeout 15.0)
+           (session
+            (proofread-languagetool--server-session-snapshot nil t))
+           (proofread-languagetool--server-session session)
+           (proofread-languagetool--server-generation 1)
+           (proofread-languagetool--server-state 'probing))
+      (cl-letf
+          (((symbol-function
+             'proofread-languagetool--begin-readiness-check)
+            (lambda (&rest _ignored)
+              (ert-fail "Equivalent managed probe was restarted"))))
+        (proofread-languagetool-start-server))
+      (should proofread-languagetool--force-start-p)
+      (should (= proofread-languagetool--server-generation 1))
+      (should (eq proofread-languagetool--server-session session)))))
 
 (ert-deftest
     proofread-languagetool-test-stale-probe-keeps-current-timer ()
   "A stale probe callback cannot clear a newer probe's resources."
   (proofread-languagetool-test--with-state
-   (let* ((session
-           (proofread-languagetool--server-session-snapshot))
-          (proofread-languagetool--server-session session)
-          (proofread-languagetool--server-generation 2)
-          (proofread-languagetool--server-state 'probing)
-          (old-buffer
-           (proofread-languagetool-test--response-buffer 200 "OK"))
-          (current-buffer
-           (generate-new-buffer " *proofread-lt-current-probe*"))
-          (current-timer (run-at-time 60 nil #'ignore)))
-     (setq proofread-languagetool--probe-buffer current-buffer)
-     (setq proofread-languagetool--probe-timeout-timer current-timer)
-     (with-current-buffer old-buffer
-       (proofread-languagetool--probe-response
-        nil 1 'external session))
-     (should-not (buffer-live-p old-buffer))
-     (should (eq proofread-languagetool--probe-buffer
-                 current-buffer))
-     (should (eq proofread-languagetool--probe-timeout-timer
-                 current-timer))
-     (should (eq proofread-languagetool--server-state 'probing)))))
+    (let* ((session
+            (proofread-languagetool--server-session-snapshot))
+           (proofread-languagetool--server-session session)
+           (proofread-languagetool--server-generation 2)
+           (proofread-languagetool--server-state 'probing)
+           (old-buffer
+            (proofread-languagetool-test--response-buffer 200 "OK"))
+           (current-buffer
+            (generate-new-buffer " *proofread-lt-current-probe*"))
+           (current-timer (run-at-time 60 nil #'ignore)))
+      (setq proofread-languagetool--probe-buffer current-buffer)
+      (setq proofread-languagetool--probe-timeout-timer current-timer)
+      (with-current-buffer old-buffer
+        (proofread-languagetool--probe-response
+         nil 1 'external session))
+      (should-not (buffer-live-p old-buffer))
+      (should (eq proofread-languagetool--probe-buffer
+                  current-buffer))
+      (should (eq proofread-languagetool--probe-timeout-timer
+                  current-timer))
+      (should (eq proofread-languagetool--server-state 'probing)))))
 
 (ert-deftest
     proofread-languagetool-test-malformed-probe-is-contained ()
   "A malformed probe body fails once.
 The failure does not escape or leak state."
   (proofread-languagetool-test--with-state
-   (let* ((session
-           (proofread-languagetool--server-session-snapshot))
-          (proofread-languagetool--server-session session)
-          (proofread-languagetool--server-generation 1)
-          (proofread-languagetool--server-state 'probing)
-          (buffer
-           (proofread-languagetool-test--response-buffer 200 "OK"))
-          (timer (run-at-time 60 nil #'ignore))
-          (failures 0))
-     (with-current-buffer buffer
-       (set (make-local-variable 'url-http-end-of-headers)
-            (+ (point-max) 100)))
-     (setq proofread-languagetool--probe-buffer buffer)
-     (setq proofread-languagetool--probe-timeout-timer timer)
-     (cl-letf
-         (((symbol-function 'proofread-languagetool--probe-failed)
-           (lambda (_generation _phase _session)
-             (cl-incf failures))))
-       (with-current-buffer buffer
-         (proofread-languagetool--probe-response
-          nil 1 'external session)))
-     (should (= failures 1))
-     (should-not (buffer-live-p buffer))
-     (should-not proofread-languagetool--probe-buffer)
-     (should-not proofread-languagetool--probe-timeout-timer))))
+    (let* ((session
+            (proofread-languagetool--server-session-snapshot))
+           (proofread-languagetool--server-session session)
+           (proofread-languagetool--server-generation 1)
+           (proofread-languagetool--server-state 'probing)
+           (buffer
+            (proofread-languagetool-test--response-buffer 200 "OK"))
+           (timer (run-at-time 60 nil #'ignore))
+           (failures 0))
+      (with-current-buffer buffer
+        (set (make-local-variable 'url-http-end-of-headers)
+             (+ (point-max) 100)))
+      (setq proofread-languagetool--probe-buffer buffer)
+      (setq proofread-languagetool--probe-timeout-timer timer)
+      (cl-letf
+          (((symbol-function 'proofread-languagetool--probe-failed)
+            (lambda (_generation _phase _session)
+              (cl-incf failures))))
+        (with-current-buffer buffer
+          (proofread-languagetool--probe-response
+           nil 1 'external session)))
+      (should (= failures 1))
+      (should-not (buffer-live-p buffer))
+      (should-not proofread-languagetool--probe-buffer)
+      (should-not proofread-languagetool--probe-timeout-timer))))
 
 (ert-deftest
     proofread-languagetool-test-health-probe-requires-exact-ok ()
   "A successful health probe requires the complete trimmed body `OK'."
   (proofread-languagetool-test--with-state
-   (let* ((session
-           (proofread-languagetool--server-session-snapshot))
-          (proofread-languagetool--server-session session)
-          (proofread-languagetool--server-generation 1)
-          (proofread-languagetool--server-state 'probing)
-          (buffer
-           (proofread-languagetool-test--response-buffer
-            200 " OK-but-not-healthy\n"))
-          (timer (run-at-time 60 nil #'ignore))
-          (failures 0))
-     (setq proofread-languagetool--probe-buffer buffer)
-     (setq proofread-languagetool--probe-timeout-timer timer)
-     (cl-letf
-         (((symbol-function 'proofread-languagetool--probe-failed)
-           (lambda (_generation _phase _session)
-             (cl-incf failures)))
-          ((symbol-function 'proofread-languagetool--server-ready)
-           (lambda (&rest _ignored)
-             (ert-fail "A prefixed health response was accepted"))))
-       (with-current-buffer buffer
-         (proofread-languagetool--probe-response
-          nil 1 'external session)))
-     (should (= failures 1))
-     (should-not (buffer-live-p buffer))
-     (should-not proofread-languagetool--probe-buffer)
-     (should-not proofread-languagetool--probe-timeout-timer))))
+    (let* ((session
+            (proofread-languagetool--server-session-snapshot))
+           (proofread-languagetool--server-session session)
+           (proofread-languagetool--server-generation 1)
+           (proofread-languagetool--server-state 'probing)
+           (buffer
+            (proofread-languagetool-test--response-buffer
+             200 " OK-but-not-healthy\n"))
+           (timer (run-at-time 60 nil #'ignore))
+           (failures 0))
+      (setq proofread-languagetool--probe-buffer buffer)
+      (setq proofread-languagetool--probe-timeout-timer timer)
+      (cl-letf
+          (((symbol-function 'proofread-languagetool--probe-failed)
+            (lambda (_generation _phase _session)
+              (cl-incf failures)))
+           ((symbol-function 'proofread-languagetool--server-ready)
+            (lambda (&rest _ignored)
+              (ert-fail "A prefixed health response was accepted"))))
+        (with-current-buffer buffer
+          (proofread-languagetool--probe-response
+           nil 1 'external session)))
+      (should (= failures 1))
+      (should-not (buffer-live-p buffer))
+      (should-not proofread-languagetool--probe-buffer)
+      (should-not proofread-languagetool--probe-timeout-timer))))
 
 (ert-deftest
     proofread-languagetool-test-malformed-check-is-contained ()
   "Malformed check responses clean resources and deliver one error."
   (proofread-languagetool-test--with-state
-   (with-temp-buffer
-     (let ((proofread-languagetool--server-state 'ready)
-           (proofread-languagetool--server-session
-            (proofread-languagetool--server-session-snapshot))
-           call (callbacks 0) result)
-       (cl-letf
-           (((symbol-function 'url-retrieve)
-             (lambda (_url callback arguments &rest _ignored)
-               (let ((buffer
-                      (generate-new-buffer
-                       " *proofread-lt-malformed-check*")))
-                 (setq call (list :callback callback
-                                  :arguments arguments
-                                  :buffer buffer))
-                 buffer))))
-         (let ((handle
-                (proofread-languagetool--check
-                 (proofread-languagetool-test--request)
-                 (lambda (value)
-                   (cl-incf callbacks)
-                   (setq result value)))))
-           (with-current-buffer (plist-get call :buffer)
-             (set (make-local-variable 'url-http-response-status)
-                  200)
-             (set (make-local-variable 'url-http-end-of-headers)
-                  (+ (point-max) 100))
-             (apply (plist-get call :callback)
-                    (cons nil (plist-get call :arguments))))
-           (should (= callbacks 1))
-           (should (eq (plist-get result :error)
-                       'languagetool-invalid-response))
-           (should (plist-get handle :delivered))
-           (should-not (plist-get handle :timer))
-           (should-not
-            (buffer-live-p (plist-get call :buffer)))
-           (let ((stale
-                  (proofread-languagetool-test--response-buffer
-                   200 "{\"matches\":[]}")))
-             (with-current-buffer stale
-               (apply (plist-get call :callback)
-                      (cons nil (plist-get call :arguments)))))
-           (proofread-languagetool--request-timeout handle)
-           (should (= callbacks 1))))))))
+    (with-temp-buffer
+      (let ((proofread-languagetool--server-state 'ready)
+            (proofread-languagetool--server-session
+             (proofread-languagetool--server-session-snapshot))
+            call (callbacks 0) result)
+        (cl-letf
+            (((symbol-function 'url-retrieve)
+              (lambda (_url callback arguments &rest _ignored)
+                (let ((buffer
+                       (generate-new-buffer
+                        " *proofread-lt-malformed-check*")))
+                  (setq call (list :callback callback
+                                   :arguments arguments
+                                   :buffer buffer))
+                  buffer))))
+          (let ((handle
+                 (proofread-languagetool--check
+                  (proofread-languagetool-test--request)
+                  (lambda (value)
+                    (cl-incf callbacks)
+                    (setq result value)))))
+            (with-current-buffer (plist-get call :buffer)
+              (set (make-local-variable 'url-http-response-status)
+                   200)
+              (set (make-local-variable 'url-http-end-of-headers)
+                   (+ (point-max) 100))
+              (apply (plist-get call :callback)
+                     (cons nil (plist-get call :arguments))))
+            (should (= callbacks 1))
+            (should (eq (plist-get result :error)
+                        'languagetool-invalid-response))
+            (should (plist-get handle :delivered))
+            (should-not (plist-get handle :timer))
+            (should-not
+             (buffer-live-p (plist-get call :buffer)))
+            (let ((stale
+                   (proofread-languagetool-test--response-buffer
+                    200 "{\"matches\":[]}")))
+              (with-current-buffer stale
+                (apply (plist-get call :callback)
+                       (cons nil (plist-get call :arguments)))))
+            (proofread-languagetool--request-timeout handle)
+            (should (= callbacks 1))))))))
 
 (ert-deftest
     proofread-languagetool-test-malformed-http-200-is-invalid-response ()
   "Malformed JSON in an HTTP 200 response is invalid response data."
   (proofread-languagetool-test--with-state
-   (with-temp-buffer
-     (let ((proofread-languagetool--server-state 'ready)
-           (proofread-languagetool--server-session
-            (proofread-languagetool--server-session-snapshot))
-           (body "{\"matches\": [")
-           call events handle result response-buffer
-           (probes 0))
-       (cl-letf
-           (((symbol-function 'url-retrieve)
-             (lambda (_url callback arguments &rest _ignored)
-               (let ((buffer
-                      (generate-new-buffer
-                       " *proofread-lt-malformed-http-200*")))
-                 (setq call (list :callback callback
-                                  :arguments arguments
-                                  :buffer buffer))
-                 buffer)))
-            ((symbol-function
-              'proofread-languagetool--schedule-probe)
-             (lambda (&rest _ignored) (cl-incf probes))))
-         (let ((proofread-request-log-hook
-                (list (lambda (event) (push event events)))))
-           (setq handle
-                 (proofread-languagetool--check
-                  (proofread-languagetool-test--request)
-                  (lambda (value) (setq result value))))
-           (setq response-buffer (plist-get call :buffer))
-           (proofread-languagetool-test--complete-call
-            call 200 body)
-           (should (eq (plist-get result :status) 'error))
-           (should (eq (plist-get result :error)
-                       'languagetool-invalid-response))
-           (should (stringp (plist-get result :message)))
-           (should-not
-            (string-empty-p (plist-get result :message)))
-           (should (eq proofread-languagetool--server-state 'ready))
-           (should (= probes 0))
-           (should (plist-get handle :delivered))
-           (should-not (buffer-live-p response-buffer))
-           (let* ((response-event
-                   (cl-find-if
-                    (lambda (event)
-                      (eq (plist-get event :type)
-                          'backend-response))
-                    events))
-                  (result-event
-                   (cl-find-if
-                    (lambda (event)
-                      (eq (plist-get event :type)
-                          'backend-result))
-                    events))
-                  (logged-result
-                   (plist-get result-event :result)))
-             (should (= (plist-get response-event :http-status)
-                        200))
-             (should (equal (plist-get response-event :response)
-                            body))
-             (should (eq (plist-get logged-result :status) 'error))
-             (should (eq (plist-get logged-result :error)
-                         'languagetool-invalid-response))
-             (should
-              (equal (plist-get logged-result :message)
-                     "Backend request failed")))))))))
+    (with-temp-buffer
+      (let ((proofread-languagetool--server-state 'ready)
+            (proofread-languagetool--server-session
+             (proofread-languagetool--server-session-snapshot))
+            (body "{\"matches\": [")
+            call events handle result response-buffer
+            (probes 0))
+        (cl-letf
+            (((symbol-function 'url-retrieve)
+              (lambda (_url callback arguments &rest _ignored)
+                (let ((buffer
+                       (generate-new-buffer
+                        " *proofread-lt-malformed-http-200*")))
+                  (setq call (list :callback callback
+                                   :arguments arguments
+                                   :buffer buffer))
+                  buffer)))
+             ((symbol-function
+               'proofread-languagetool--schedule-probe)
+              (lambda (&rest _ignored) (cl-incf probes))))
+          (let ((proofread-request-log-hook
+                 (list (lambda (event) (push event events)))))
+            (setq handle
+                  (proofread-languagetool--check
+                   (proofread-languagetool-test--request)
+                   (lambda (value) (setq result value))))
+            (setq response-buffer (plist-get call :buffer))
+            (proofread-languagetool-test--complete-call
+             call 200 body)
+            (should (eq (plist-get result :status) 'error))
+            (should (eq (plist-get result :error)
+                        'languagetool-invalid-response))
+            (should (stringp (plist-get result :message)))
+            (should-not
+             (string-empty-p (plist-get result :message)))
+            (should (eq proofread-languagetool--server-state 'ready))
+            (should (= probes 0))
+            (should (plist-get handle :delivered))
+            (should-not (buffer-live-p response-buffer))
+            (let* ((response-event
+                    (cl-find-if
+                     (lambda (event)
+                       (eq (plist-get event :type)
+                           'backend-response))
+                     events))
+                   (result-event
+                    (cl-find-if
+                     (lambda (event)
+                       (eq (plist-get event :type)
+                           'backend-result))
+                     events))
+                   (logged-result
+                    (plist-get result-event :result)))
+              (should (= (plist-get response-event :http-status)
+                         200))
+              (should (equal (plist-get response-event :response)
+                             body))
+              (should (eq (plist-get logged-result :status) 'error))
+              (should (eq (plist-get logged-result :error)
+                          'languagetool-invalid-response))
+              (should
+               (equal (plist-get logged-result :message)
+                      "Backend request failed")))))))))
 
 (ert-deftest
     proofread-languagetool-test-url-rejects-secrets-and-controls ()
@@ -2368,227 +2368,227 @@ The failure does not escape or leak state."
   "A transport failure reprobes an owned process.
 The reprobe never overwrites the process."
   (proofread-languagetool-test--with-state
-   (with-temp-buffer
-     (let* ((session
-             (proofread-languagetool--server-session-snapshot))
-            (proofread-languagetool--server-state 'ready)
-            (proofread-languagetool--server-session session)
-            (proofread-languagetool--server-process 'owned-process)
-            (proofread-languagetool--server-process-session session)
-            calls events first-result second-result make-count
-            first-buffer)
-       (cl-letf
-           (((symbol-function 'process-live-p)
-             (lambda (process) (eq process 'owned-process)))
-            ((symbol-function 'make-process)
-             (lambda (&rest _ignored)
-               (cl-incf make-count)
-               'replacement-process))
-            ((symbol-function 'url-retrieve)
-             (lambda (url callback arguments &rest _ignored)
-               (let ((buffer
-                      (generate-new-buffer
-                       " *proofread-lt-owned-process*")))
-                 (setq calls
-                       (append calls
-                               (list (list :url url
-                                           :callback callback
-                                           :arguments arguments
-                                           :buffer buffer
-                                           :method
-                                           url-request-method))))
-                 buffer))))
-         (let ((proofread-request-log-hook
-                (list (lambda (event) (push event events)))))
-           (proofread-languagetool--check
-            (proofread-languagetool-test--request)
-            (lambda (value) (setq first-result value)))
-           (setq first-buffer (plist-get (car calls) :buffer))
-           (with-current-buffer first-buffer
-             (apply
-              (plist-get (car calls) :callback)
-              (cons
-               '( :error
-                  (error connection-failed
-                         "failed with code 111\n"
-                         :host "127.0.0.1"
-                         :service 8081))
-               (plist-get (car calls) :arguments)))))
-         (should (eq (plist-get first-result :error)
-                     'languagetool-transport-error))
-         (should-not (plist-member first-result :http-status))
-         (should-not (plist-member first-result :response))
-         (should (string-match-p
-                  "connection-failed"
-                  (plist-get first-result :message)))
-         (should (<= (string-width
-                      (plist-get first-result :message))
-                     500))
-         (should-not (buffer-live-p first-buffer))
-         (let* ((response-event
-                 (cl-find-if
-                  (lambda (event)
-                    (eq (plist-get event :type)
-                        'backend-response))
-                  events))
-                (result-event
-                 (cl-find-if
-                  (lambda (event)
-                    (eq (plist-get event :type)
-                        'backend-result))
-                  events))
-                (logged-result (plist-get result-event :result)))
-           (should-not (plist-get response-event :http-status))
-           (should-not (plist-get response-event :response))
-           (should (eq (plist-get response-event :error)
-                       'languagetool-transport-error))
-           (should
-            (equal (plist-get response-event :message)
-                   "Backend request failed"))
-           (should (eq (plist-get logged-result :error)
-                       'languagetool-transport-error)))
-         (should (eq proofread-languagetool--server-state 'unknown))
-         (should (eq proofread-languagetool--server-process
-                     'owned-process))
-         (proofread-languagetool--check
-          (proofread-languagetool-test--request)
-          (lambda (value) (setq second-result value)))
-         (proofread-languagetool-test--run-scheduled-probe)
-         (proofread-languagetool-test--complete-call
-          (cadr calls) 503 "Unavailable")
-         (should-not second-result)
-         (should-not make-count)
-         (should (eq proofread-languagetool--server-process
-                     'owned-process))
-         (should (eq proofread-languagetool--server-state
-                     'starting)))))))
+    (with-temp-buffer
+      (let* ((session
+              (proofread-languagetool--server-session-snapshot))
+             (proofread-languagetool--server-state 'ready)
+             (proofread-languagetool--server-session session)
+             (proofread-languagetool--server-process 'owned-process)
+             (proofread-languagetool--server-process-session session)
+             calls events first-result second-result make-count
+             first-buffer)
+        (cl-letf
+            (((symbol-function 'process-live-p)
+              (lambda (process) (eq process 'owned-process)))
+             ((symbol-function 'make-process)
+              (lambda (&rest _ignored)
+                (cl-incf make-count)
+                'replacement-process))
+             ((symbol-function 'url-retrieve)
+              (lambda (url callback arguments &rest _ignored)
+                (let ((buffer
+                       (generate-new-buffer
+                        " *proofread-lt-owned-process*")))
+                  (setq calls
+                        (append calls
+                                (list (list :url url
+                                            :callback callback
+                                            :arguments arguments
+                                            :buffer buffer
+                                            :method
+                                            url-request-method))))
+                  buffer))))
+          (let ((proofread-request-log-hook
+                 (list (lambda (event) (push event events)))))
+            (proofread-languagetool--check
+             (proofread-languagetool-test--request)
+             (lambda (value) (setq first-result value)))
+            (setq first-buffer (plist-get (car calls) :buffer))
+            (with-current-buffer first-buffer
+              (apply
+               (plist-get (car calls) :callback)
+               (cons
+                '( :error
+                   (error connection-failed
+                          "failed with code 111\n"
+                          :host "127.0.0.1"
+                          :service 8081))
+                (plist-get (car calls) :arguments)))))
+          (should (eq (plist-get first-result :error)
+                      'languagetool-transport-error))
+          (should-not (plist-member first-result :http-status))
+          (should-not (plist-member first-result :response))
+          (should (string-match-p
+                   "connection-failed"
+                   (plist-get first-result :message)))
+          (should (<= (string-width
+                       (plist-get first-result :message))
+                      500))
+          (should-not (buffer-live-p first-buffer))
+          (let* ((response-event
+                  (cl-find-if
+                   (lambda (event)
+                     (eq (plist-get event :type)
+                         'backend-response))
+                   events))
+                 (result-event
+                  (cl-find-if
+                   (lambda (event)
+                     (eq (plist-get event :type)
+                         'backend-result))
+                   events))
+                 (logged-result (plist-get result-event :result)))
+            (should-not (plist-get response-event :http-status))
+            (should-not (plist-get response-event :response))
+            (should (eq (plist-get response-event :error)
+                        'languagetool-transport-error))
+            (should
+             (equal (plist-get response-event :message)
+                    "Backend request failed"))
+            (should (eq (plist-get logged-result :error)
+                        'languagetool-transport-error)))
+          (should (eq proofread-languagetool--server-state 'unknown))
+          (should (eq proofread-languagetool--server-process
+                      'owned-process))
+          (proofread-languagetool--check
+           (proofread-languagetool-test--request)
+           (lambda (value) (setq second-result value)))
+          (proofread-languagetool-test--run-scheduled-probe)
+          (proofread-languagetool-test--complete-call
+           (cadr calls) 503 "Unavailable")
+          (should-not second-result)
+          (should-not make-count)
+          (should (eq proofread-languagetool--server-process
+                      'owned-process))
+          (should (eq proofread-languagetool--server-state
+                      'starting)))))))
 
 (ert-deftest
     proofread-languagetool-test-startup-timeout-clears-retry ()
   "Startup timeout invalidates every outstanding readiness resource."
   (proofread-languagetool-test--with-state
-   (let* ((session
-           (proofread-languagetool--server-session-snapshot))
-          (proofread-languagetool--server-session session)
-          (proofread-languagetool--server-generation 1)
-          (proofread-languagetool--server-state 'starting)
-          (proofread-languagetool--server-process 'owned-process)
-          (proofread-languagetool--server-process-session session)
-          (proofread-languagetool--force-start-p t)
-          (startup (run-at-time 60 nil #'ignore))
-          (retry (run-at-time 60 nil #'ignore))
-          (probe-timeout (run-at-time 60 nil #'ignore))
-          (probe-buffer
-           (generate-new-buffer " *proofread-lt-startup-timeout*"))
-          result
-          (waiter
-           (proofread-languagetool--new-handle
-            (proofread-languagetool-test--request)
-            (lambda (value) (setq result value))))
-          deleted)
-     (setq proofread-languagetool--startup-timer startup)
-     (setq proofread-languagetool--probe-retry-timer retry)
-     (setq proofread-languagetool--probe-retry-token '( retry))
-     (setq proofread-languagetool--probe-timeout-timer probe-timeout)
-     (setq proofread-languagetool--probe-buffer probe-buffer)
-     (setq proofread-languagetool--server-waiters (list waiter))
-     (cl-letf
-         (((symbol-function 'process-live-p)
-           (lambda (process) (eq process 'owned-process)))
-          ((symbol-function 'set-process-query-on-exit-flag)
-           #'ignore)
-          ((symbol-function 'delete-process)
-           (lambda (process) (setq deleted process))))
-       (proofread-languagetool--startup-timeout 1 session))
-     (should (eq deleted 'owned-process))
-     (proofread-languagetool-test--assert-no-readiness-work)
-     (should-not (buffer-live-p probe-buffer))
-     (should-not proofread-languagetool--server-process)
-     (should-not proofread-languagetool--server-process-session)
-     (should-not proofread-languagetool--force-start-p)
-     (should (eq proofread-languagetool--server-state 'unknown))
-     (should (eq (plist-get result :error)
-                 'languagetool-startup-timeout)))))
+    (let* ((session
+            (proofread-languagetool--server-session-snapshot))
+           (proofread-languagetool--server-session session)
+           (proofread-languagetool--server-generation 1)
+           (proofread-languagetool--server-state 'starting)
+           (proofread-languagetool--server-process 'owned-process)
+           (proofread-languagetool--server-process-session session)
+           (proofread-languagetool--force-start-p t)
+           (startup (run-at-time 60 nil #'ignore))
+           (retry (run-at-time 60 nil #'ignore))
+           (probe-timeout (run-at-time 60 nil #'ignore))
+           (probe-buffer
+            (generate-new-buffer " *proofread-lt-startup-timeout*"))
+           result
+           (waiter
+            (proofread-languagetool--new-handle
+             (proofread-languagetool-test--request)
+             (lambda (value) (setq result value))))
+           deleted)
+      (setq proofread-languagetool--startup-timer startup)
+      (setq proofread-languagetool--probe-retry-timer retry)
+      (setq proofread-languagetool--probe-retry-token '( retry))
+      (setq proofread-languagetool--probe-timeout-timer probe-timeout)
+      (setq proofread-languagetool--probe-buffer probe-buffer)
+      (setq proofread-languagetool--server-waiters (list waiter))
+      (cl-letf
+          (((symbol-function 'process-live-p)
+            (lambda (process) (eq process 'owned-process)))
+           ((symbol-function 'set-process-query-on-exit-flag)
+            #'ignore)
+           ((symbol-function 'delete-process)
+            (lambda (process) (setq deleted process))))
+        (proofread-languagetool--startup-timeout 1 session))
+      (should (eq deleted 'owned-process))
+      (proofread-languagetool-test--assert-no-readiness-work)
+      (should-not (buffer-live-p probe-buffer))
+      (should-not proofread-languagetool--server-process)
+      (should-not proofread-languagetool--server-process-session)
+      (should-not proofread-languagetool--force-start-p)
+      (should (eq proofread-languagetool--server-state 'unknown))
+      (should (eq (plist-get result :error)
+                  'languagetool-startup-timeout)))))
 
 (ert-deftest
     proofread-languagetool-test-start-error-cleans-lifecycle ()
   "A synchronous managed-start error releases its entire attempt."
   (proofread-languagetool-test--with-state
-   (let* ((session
-           (proofread-languagetool--server-session-snapshot))
-          (proofread-languagetool--server-session session)
-          (proofread-languagetool--server-generation 1)
-          (proofread-languagetool--server-state 'probing)
-          (proofread-languagetool--force-start-p t)
-          (timer-calls 0)
-          deleted
-          result
-          (waiter
-           (proofread-languagetool--new-handle
-            (proofread-languagetool-test--request)
-            (lambda (value) (setq result value)))))
-     (setq proofread-languagetool--server-waiters (list waiter))
-     (cl-letf
-         (((symbol-function 'proofread-languagetool--server-command)
-           (lambda (_session) '( "languagetool-http-server")))
-          ((symbol-function 'proofread-languagetool--server-arguments)
-           (lambda (_session) nil))
-          ((symbol-function 'get-buffer-create) (lambda (_name) nil))
-          ((symbol-function 'make-process)
-           (lambda (&rest _ignored) 'new-process))
-          ((symbol-function 'process-live-p)
-           (lambda (process) (eq process 'new-process)))
-          ((symbol-function 'set-process-query-on-exit-flag) #'ignore)
-          ((symbol-function 'delete-process)
-           (lambda (process) (setq deleted process)))
-          ((symbol-function 'run-at-time)
-           (lambda (&rest _ignored)
-             (cl-incf timer-calls)
-             (if (= timer-calls 1)
-                 'startup-timer
-               (error "Timer creation failed")))))
-       (proofread-languagetool--start-managed-server 1 session))
-     (should (= timer-calls 2))
-     (should (eq deleted 'new-process))
-     (proofread-languagetool-test--assert-no-readiness-work)
-     (should-not proofread-languagetool--server-process)
-     (should-not proofread-languagetool--server-process-session)
-     (should-not proofread-languagetool--force-start-p)
-     (should (eq proofread-languagetool--server-state 'unknown))
-     (should (eq (plist-get result :error)
-                 'languagetool-startup-error)))))
+    (let* ((session
+            (proofread-languagetool--server-session-snapshot))
+           (proofread-languagetool--server-session session)
+           (proofread-languagetool--server-generation 1)
+           (proofread-languagetool--server-state 'probing)
+           (proofread-languagetool--force-start-p t)
+           (timer-calls 0)
+           deleted
+           result
+           (waiter
+            (proofread-languagetool--new-handle
+             (proofread-languagetool-test--request)
+             (lambda (value) (setq result value)))))
+      (setq proofread-languagetool--server-waiters (list waiter))
+      (cl-letf
+          (((symbol-function 'proofread-languagetool--server-command)
+            (lambda (_session) '( "languagetool-http-server")))
+           ((symbol-function 'proofread-languagetool--server-arguments)
+            (lambda (_session) nil))
+           ((symbol-function 'get-buffer-create) (lambda (_name) nil))
+           ((symbol-function 'make-process)
+            (lambda (&rest _ignored) 'new-process))
+           ((symbol-function 'process-live-p)
+            (lambda (process) (eq process 'new-process)))
+           ((symbol-function 'set-process-query-on-exit-flag) #'ignore)
+           ((symbol-function 'delete-process)
+            (lambda (process) (setq deleted process)))
+           ((symbol-function 'run-at-time)
+            (lambda (&rest _ignored)
+              (cl-incf timer-calls)
+              (if (= timer-calls 1)
+                  'startup-timer
+                (error "Timer creation failed")))))
+        (proofread-languagetool--start-managed-server 1 session))
+      (should (= timer-calls 2))
+      (should (eq deleted 'new-process))
+      (proofread-languagetool-test--assert-no-readiness-work)
+      (should-not proofread-languagetool--server-process)
+      (should-not proofread-languagetool--server-process-session)
+      (should-not proofread-languagetool--force-start-p)
+      (should (eq proofread-languagetool--server-state 'unknown))
+      (should (eq (plist-get result :error)
+                  'languagetool-startup-error)))))
 
 (ert-deftest
     proofread-languagetool-test-dead-startup-process-is-forgotten ()
   "A failed startup probe immediately forgets its dead owned process."
   (proofread-languagetool-test--with-state
-   (let* ((session
-           (proofread-languagetool--server-session-snapshot))
-          (proofread-languagetool--server-session session)
-          (proofread-languagetool--server-generation 1)
-          (proofread-languagetool--server-state 'starting)
-          (proofread-languagetool--server-process 'dead-process)
-          (proofread-languagetool--server-process-session session)
-          (proofread-languagetool--force-start-p t)
-          (proofread-languagetool--startup-timer
-           (run-at-time 60 nil #'ignore))
-          result
-          (waiter
-           (proofread-languagetool--new-handle
-            (proofread-languagetool-test--request)
-            (lambda (value) (setq result value)))))
-     (setq proofread-languagetool--server-waiters (list waiter))
-     (cl-letf (((symbol-function 'process-live-p)
-                (lambda (_process) nil)))
-       (proofread-languagetool--probe-failed
-        1 'startup session))
-     (proofread-languagetool-test--assert-no-readiness-work)
-     (should-not proofread-languagetool--server-process)
-     (should-not proofread-languagetool--server-process-session)
-     (should-not proofread-languagetool--force-start-p)
-     (should (eq proofread-languagetool--server-state 'unknown))
-     (should (eq (plist-get result :error)
-                 'languagetool-startup-failed)))))
+    (let* ((session
+            (proofread-languagetool--server-session-snapshot))
+           (proofread-languagetool--server-session session)
+           (proofread-languagetool--server-generation 1)
+           (proofread-languagetool--server-state 'starting)
+           (proofread-languagetool--server-process 'dead-process)
+           (proofread-languagetool--server-process-session session)
+           (proofread-languagetool--force-start-p t)
+           (proofread-languagetool--startup-timer
+            (run-at-time 60 nil #'ignore))
+           result
+           (waiter
+            (proofread-languagetool--new-handle
+             (proofread-languagetool-test--request)
+             (lambda (value) (setq result value)))))
+      (setq proofread-languagetool--server-waiters (list waiter))
+      (cl-letf (((symbol-function 'process-live-p)
+                 (lambda (_process) nil)))
+        (proofread-languagetool--probe-failed
+         1 'startup session))
+      (proofread-languagetool-test--assert-no-readiness-work)
+      (should-not proofread-languagetool--server-process)
+      (should-not proofread-languagetool--server-process-session)
+      (should-not proofread-languagetool--force-start-p)
+      (should (eq proofread-languagetool--server-state 'unknown))
+      (should (eq (plist-get result :error)
+                  'languagetool-startup-failed)))))
 
 ;;;; Process and cancellation lifecycle
 
@@ -2628,136 +2628,136 @@ The reprobe never overwrites the process."
     ()
   "A starting process exit invalidates and settles its whole attempt."
   (proofread-languagetool-test--with-state
-   (let* ((session
-           (proofread-languagetool--server-session-snapshot))
-          (proofread-languagetool--server-session session)
-          (proofread-languagetool--server-generation 1)
-          (proofread-languagetool--server-state 'starting)
-          (proofread-languagetool--server-process 'owned-process)
-          (proofread-languagetool--server-process-session session)
-          (proofread-languagetool--force-start-p t)
-          (proofread-languagetool--startup-timer
-           (run-at-time 60 nil #'ignore))
-          (proofread-languagetool--probe-retry-timer
-           (run-at-time 60 nil #'ignore))
-          (proofread-languagetool--probe-retry-token '( retry))
-          (proofread-languagetool--probe-timeout-timer
-           (run-at-time 60 nil #'ignore))
-          (probe-buffer
-           (generate-new-buffer " *proofread-lt-process-exit*"))
-          result
-          (waiter
-           (proofread-languagetool--new-handle
-            (proofread-languagetool-test--request)
-            (lambda (value) (setq result value)))))
-     (setq proofread-languagetool--probe-buffer probe-buffer)
-     (setq proofread-languagetool--server-waiters (list waiter))
-     (cl-letf (((symbol-function 'process-status)
-                (lambda (_process) 'exit))
-               ((symbol-function 'process-exit-status)
-                (lambda (_process) 23)))
-       (proofread-languagetool--process-sentinel
-        'owned-process "exited"))
-     (should (= proofread-languagetool--server-generation 2))
-     (proofread-languagetool-test--assert-no-readiness-work)
-     (should-not (buffer-live-p probe-buffer))
-     (should-not proofread-languagetool--server-process)
-     (should-not proofread-languagetool--server-process-session)
-     (should-not proofread-languagetool--force-start-p)
-     (should (eq proofread-languagetool--server-state 'unknown))
-     (should (eq (plist-get result :error)
-                 'languagetool-startup-failed)))))
+    (let* ((session
+            (proofread-languagetool--server-session-snapshot))
+           (proofread-languagetool--server-session session)
+           (proofread-languagetool--server-generation 1)
+           (proofread-languagetool--server-state 'starting)
+           (proofread-languagetool--server-process 'owned-process)
+           (proofread-languagetool--server-process-session session)
+           (proofread-languagetool--force-start-p t)
+           (proofread-languagetool--startup-timer
+            (run-at-time 60 nil #'ignore))
+           (proofread-languagetool--probe-retry-timer
+            (run-at-time 60 nil #'ignore))
+           (proofread-languagetool--probe-retry-token '( retry))
+           (proofread-languagetool--probe-timeout-timer
+            (run-at-time 60 nil #'ignore))
+           (probe-buffer
+            (generate-new-buffer " *proofread-lt-process-exit*"))
+           result
+           (waiter
+            (proofread-languagetool--new-handle
+             (proofread-languagetool-test--request)
+             (lambda (value) (setq result value)))))
+      (setq proofread-languagetool--probe-buffer probe-buffer)
+      (setq proofread-languagetool--server-waiters (list waiter))
+      (cl-letf (((symbol-function 'process-status)
+                 (lambda (_process) 'exit))
+                ((symbol-function 'process-exit-status)
+                 (lambda (_process) 23)))
+        (proofread-languagetool--process-sentinel
+         'owned-process "exited"))
+      (should (= proofread-languagetool--server-generation 2))
+      (proofread-languagetool-test--assert-no-readiness-work)
+      (should-not (buffer-live-p probe-buffer))
+      (should-not proofread-languagetool--server-process)
+      (should-not proofread-languagetool--server-process-session)
+      (should-not proofread-languagetool--force-start-p)
+      (should (eq proofread-languagetool--server-state 'unknown))
+      (should (eq (plist-get result :error)
+                  'languagetool-startup-failed)))))
 
 (ert-deftest
     proofread-languagetool-test-probing-process-exit-restarts-readiness ()
   "A probing process exit invalidates its readiness attempt.
 It then restarts readiness for the current session."
   (proofread-languagetool-test--with-state
-   (let* ((proofread-languagetool-auto-start nil)
-          (session
-           (proofread-languagetool--server-session-snapshot nil t))
-          (proofread-languagetool--server-session session)
-          (proofread-languagetool--server-generation 1)
-          (proofread-languagetool--server-state 'probing)
-          (proofread-languagetool--server-process 'owned-process)
-          (proofread-languagetool--server-process-session session)
-          (proofread-languagetool--force-start-p t)
-          (proofread-languagetool--probe-timeout-timer
-           (run-at-time 60 nil #'ignore))
-          (probe-buffer
-           (generate-new-buffer " *proofread-lt-probing-exit*"))
-          result
-          scheduled
-          started
-          (waiter
-           (proofread-languagetool--new-handle
-            (proofread-languagetool-test--request)
-            (lambda (value) (setq result value)))))
-     (setq proofread-languagetool--probe-buffer probe-buffer)
-     (setq proofread-languagetool--server-waiters (list waiter))
-     (cl-letf
-         (((symbol-function 'process-status)
-           (lambda (_process) 'exit))
-          ((symbol-function 'proofread-languagetool--schedule-probe)
-           (lambda (generation phase candidate delay)
-             (setq scheduled
-                   (list generation phase candidate delay))))
-          ((symbol-function
-            'proofread-languagetool--start-managed-server)
-           (lambda (generation candidate)
-             (setq started (list generation candidate)))))
-       (proofread-languagetool--process-sentinel
-        'owned-process "exited")
-       (should (= proofread-languagetool--server-generation 2))
-       (proofread-languagetool-test--assert-no-readiness-work)
-       (should-not (buffer-live-p probe-buffer))
-       (should-not proofread-languagetool--server-process)
-       (should-not proofread-languagetool--server-process-session)
-       (should (eq proofread-languagetool--server-state 'probing))
-       (should proofread-languagetool--force-start-p)
-       (should-not result)
-       (should (memq waiter proofread-languagetool--server-waiters))
-       (should (equal scheduled (list 2 'external session 0)))
-       (proofread-languagetool--server-ready 1 session)
-       (should (eq proofread-languagetool--server-state 'probing))
-       (proofread-languagetool--probe-failed
-        1 'external session)
-       (should-not started)
-       (proofread-languagetool--probe-failed
-        2 'external session)
-       (should (equal started (list 2 session)))))))
+    (let* ((proofread-languagetool-auto-start nil)
+           (session
+            (proofread-languagetool--server-session-snapshot nil t))
+           (proofread-languagetool--server-session session)
+           (proofread-languagetool--server-generation 1)
+           (proofread-languagetool--server-state 'probing)
+           (proofread-languagetool--server-process 'owned-process)
+           (proofread-languagetool--server-process-session session)
+           (proofread-languagetool--force-start-p t)
+           (proofread-languagetool--probe-timeout-timer
+            (run-at-time 60 nil #'ignore))
+           (probe-buffer
+            (generate-new-buffer " *proofread-lt-probing-exit*"))
+           result
+           scheduled
+           started
+           (waiter
+            (proofread-languagetool--new-handle
+             (proofread-languagetool-test--request)
+             (lambda (value) (setq result value)))))
+      (setq proofread-languagetool--probe-buffer probe-buffer)
+      (setq proofread-languagetool--server-waiters (list waiter))
+      (cl-letf
+          (((symbol-function 'process-status)
+            (lambda (_process) 'exit))
+           ((symbol-function 'proofread-languagetool--schedule-probe)
+            (lambda (generation phase candidate delay)
+              (setq scheduled
+                    (list generation phase candidate delay))))
+           ((symbol-function
+             'proofread-languagetool--start-managed-server)
+            (lambda (generation candidate)
+              (setq started (list generation candidate)))))
+        (proofread-languagetool--process-sentinel
+         'owned-process "exited")
+        (should (= proofread-languagetool--server-generation 2))
+        (proofread-languagetool-test--assert-no-readiness-work)
+        (should-not (buffer-live-p probe-buffer))
+        (should-not proofread-languagetool--server-process)
+        (should-not proofread-languagetool--server-process-session)
+        (should (eq proofread-languagetool--server-state 'probing))
+        (should proofread-languagetool--force-start-p)
+        (should-not result)
+        (should (memq waiter proofread-languagetool--server-waiters))
+        (should (equal scheduled (list 2 'external session 0)))
+        (proofread-languagetool--server-ready 1 session)
+        (should (eq proofread-languagetool--server-state 'probing))
+        (proofread-languagetool--probe-failed
+         1 'external session)
+        (should-not started)
+        (proofread-languagetool--probe-failed
+         2 'external session)
+        (should (equal started (list 2 session)))))))
 
 (ert-deftest proofread-languagetool-test-cancel-suppresses-callback ()
   "Cancelling a request kills retrieval and suppresses its callback."
   (proofread-languagetool-test--with-state
-   (with-temp-buffer
-     (let ((proofread-languagetool--server-state 'ready)
-           (proofread-languagetool--server-session
-            (proofread-languagetool--server-session-snapshot))
-           call result)
-       (cl-letf
-           (((symbol-function 'url-retrieve)
-             (lambda (_url callback arguments &rest _ignored)
-               (let ((buffer (generate-new-buffer
-                              " *proofread-lt-cancel*")))
-                 (setq call (list :callback callback
-                                  :arguments arguments
-                                  :buffer buffer))
-                 buffer))))
-         (let ((handle
-                (proofread-languagetool--check
-                 (proofread-languagetool-test--request)
-                 (lambda (value) (setq result value)))))
-           (proofread-languagetool--cancel handle)
-           (should (plist-get handle :cancelled))
-           (should-not (buffer-live-p (plist-get call :buffer)))
-           (let ((response
-                  (proofread-languagetool-test--response-buffer
-                   200 "{\"matches\":[]}")))
-             (with-current-buffer response
-               (apply (plist-get call :callback)
-                      (cons nil (plist-get call :arguments)))))
-           (should-not result)))))))
+    (with-temp-buffer
+      (let ((proofread-languagetool--server-state 'ready)
+            (proofread-languagetool--server-session
+             (proofread-languagetool--server-session-snapshot))
+            call result)
+        (cl-letf
+            (((symbol-function 'url-retrieve)
+              (lambda (_url callback arguments &rest _ignored)
+                (let ((buffer (generate-new-buffer
+                               " *proofread-lt-cancel*")))
+                  (setq call (list :callback callback
+                                   :arguments arguments
+                                   :buffer buffer))
+                  buffer))))
+          (let ((handle
+                 (proofread-languagetool--check
+                  (proofread-languagetool-test--request)
+                  (lambda (value) (setq result value)))))
+            (proofread-languagetool--cancel handle)
+            (should (plist-get handle :cancelled))
+            (should-not (buffer-live-p (plist-get call :buffer)))
+            (let ((response
+                   (proofread-languagetool-test--response-buffer
+                    200 "{\"matches\":[]}")))
+              (with-current-buffer response
+                (apply (plist-get call :callback)
+                       (cons nil (plist-get call :arguments)))))
+            (should-not result)))))))
 
 ;;;; External and managed server integration
 
@@ -2766,117 +2766,117 @@ It then restarts readiness for the current session."
     ()
   "External identity and readiness never inspect managed files."
   (proofread-languagetool-test--with-state
-   (let ((proofread-languagetool-server-url
-          "https://example.test/languagetool/v2")
-         (proofread-languagetool-auto-start nil)
-         (proofread-languagetool-command
-          "/secret/first-languagetool-command")
-         (proofread-languagetool-config-file
-          "/secret/first-languagetool.properties"))
-     (cl-letf
-         (((symbol-function
-            'proofread-languagetool--file-content-digest)
-           (lambda (_file)
-             (ert-fail "External identity inspected a managed file"))))
-       (let ((identity (proofread-languagetool--identity))
-             (session
-              (proofread-languagetool--server-session-snapshot)))
-         (setq proofread-languagetool-command
-               "/secret/second-languagetool-command")
-         (setq proofread-languagetool-config-file
-               "/secret/second-languagetool.properties")
-         (should (equal identity
-                        (proofread-languagetool--identity)))
-         (should
-          (proofread-languagetool--same-session-p
-           session (proofread-languagetool--server-session-snapshot)))
-         (let ((proofread-languagetool--server-state 'ready)
-               (proofread-languagetool--server-session session)
-               call handle)
-           (cl-letf
-               (((symbol-function
-                  'proofread-languagetool--begin-readiness-check)
-                 (lambda (&rest _ignored)
-                   (ert-fail "External server readiness restarted")))
-                ((symbol-function
-                  'proofread-languagetool--stop-owned-process)
-                 (lambda ()
-                   (ert-fail "External server was stopped")))
-                ((symbol-function
-                  'proofread-languagetool--start-managed-server)
-                 (lambda (&rest _ignored)
-                   (ert-fail "External check started a managed server")))
-                ((symbol-function 'url-retrieve-synchronously)
-                 (lambda (&rest _ignored)
-                   (ert-fail "External version discovery was attempted")))
-                ((symbol-function 'url-retrieve)
-                 (lambda (url _callback _arguments &rest _ignored)
-                   (should-not call)
-                   (setq call
-                         (list :url url
-                               :method url-request-method
-                               :buffer
-                               (generate-new-buffer
-                                " *proofread-lt-external-managed*")))
-                   (plist-get call :buffer))))
-             (with-temp-buffer
-               (setq handle
-                     (proofread-languagetool--check
-                      (proofread-languagetool-test--request)
-                      #'ignore)))
-             (should (equal (plist-get call :method) "POST"))
-             (should
-              (equal (plist-get call :url)
-                     "https://example.test/languagetool/v2/check"))
-             (should (eq proofread-languagetool--server-state 'ready))
-             (should-not proofread-languagetool--server-process)
-             (proofread-languagetool--cancel handle))))))))
+    (let ((proofread-languagetool-server-url
+           "https://example.test/languagetool/v2")
+          (proofread-languagetool-auto-start nil)
+          (proofread-languagetool-command
+           "/secret/first-languagetool-command")
+          (proofread-languagetool-config-file
+           "/secret/first-languagetool.properties"))
+      (cl-letf
+          (((symbol-function
+             'proofread-languagetool--file-content-digest)
+            (lambda (_file)
+              (ert-fail "External identity inspected a managed file"))))
+        (let ((identity (proofread-languagetool--identity))
+              (session
+               (proofread-languagetool--server-session-snapshot)))
+          (setq proofread-languagetool-command
+                "/secret/second-languagetool-command")
+          (setq proofread-languagetool-config-file
+                "/secret/second-languagetool.properties")
+          (should (equal identity
+                         (proofread-languagetool--identity)))
+          (should
+           (proofread-languagetool--same-session-p
+            session (proofread-languagetool--server-session-snapshot)))
+          (let ((proofread-languagetool--server-state 'ready)
+                (proofread-languagetool--server-session session)
+                call handle)
+            (cl-letf
+                (((symbol-function
+                   'proofread-languagetool--begin-readiness-check)
+                  (lambda (&rest _ignored)
+                    (ert-fail "External server readiness restarted")))
+                 ((symbol-function
+                   'proofread-languagetool--stop-owned-process)
+                  (lambda ()
+                    (ert-fail "External server was stopped")))
+                 ((symbol-function
+                   'proofread-languagetool--start-managed-server)
+                  (lambda (&rest _ignored)
+                    (ert-fail "External check started a managed server")))
+                 ((symbol-function 'url-retrieve-synchronously)
+                  (lambda (&rest _ignored)
+                    (ert-fail "External version discovery was attempted")))
+                 ((symbol-function 'url-retrieve)
+                  (lambda (url _callback _arguments &rest _ignored)
+                    (should-not call)
+                    (setq call
+                          (list :url url
+                                :method url-request-method
+                                :buffer
+                                (generate-new-buffer
+                                 " *proofread-lt-external-managed*")))
+                    (plist-get call :buffer))))
+              (with-temp-buffer
+                (setq handle
+                      (proofread-languagetool--check
+                       (proofread-languagetool-test--request)
+                       #'ignore)))
+              (should (equal (plist-get call :method) "POST"))
+              (should
+               (equal (plist-get call :url)
+                      "https://example.test/languagetool/v2/check"))
+              (should (eq proofread-languagetool--server-state 'ready))
+              (should-not proofread-languagetool--server-process)
+              (proofread-languagetool--cancel handle))))))))
 
 (ert-deftest
     proofread-languagetool-test-external-check-ignores-managed-options
     ()
   "A healthy external server needs no valid managed startup settings."
   (proofread-languagetool-test--with-state
-   (with-temp-buffer
-     (let ((proofread-languagetool-auto-start nil)
-           (proofread-languagetool-command 42)
-           (proofread-languagetool-config-file "relative.properties")
-           (proofread-languagetool-startup-timeout 0)
-           calls
-           result)
-       (cl-letf
-           (((symbol-function 'url-retrieve)
-             (lambda (url callback arguments &rest _ignored)
-               (let ((buffer
-                      (generate-new-buffer
-                       " *proofread-lt-external-only*")))
-                 (setq calls
-                       (append calls
-                               (list (list :url url
-                                           :callback callback
-                                           :arguments arguments
-                                           :buffer buffer
-                                           :method
-                                           url-request-method))))
-                 buffer)))
-            ((symbol-function 'make-process)
-             (lambda (&rest _ignored)
-               (ert-fail
-                "External check attempted managed startup"))))
-         (proofread-languagetool--check
-          (proofread-languagetool-test--request)
-          (lambda (value) (setq result value)))
-         (should proofread-languagetool--probe-retry-token)
-         (proofread-languagetool-test--run-scheduled-probe)
-         (should (= (length calls) 1))
-         (should (equal (plist-get (car calls) :method) "GET"))
-         (proofread-languagetool-test--complete-call
-          (car calls) 200 "OK")
-         (should (= (length calls) 2))
-         (should (equal (plist-get (cadr calls) :method) "POST"))
-         (proofread-languagetool-test--complete-call
-          (cadr calls) 200 "{\"matches\":[]}")
-         (should (eq (plist-get result :status) 'ok)))))))
+    (with-temp-buffer
+      (let ((proofread-languagetool-auto-start nil)
+            (proofread-languagetool-command 42)
+            (proofread-languagetool-config-file "relative.properties")
+            (proofread-languagetool-startup-timeout 0)
+            calls
+            result)
+        (cl-letf
+            (((symbol-function 'url-retrieve)
+              (lambda (url callback arguments &rest _ignored)
+                (let ((buffer
+                       (generate-new-buffer
+                        " *proofread-lt-external-only*")))
+                  (setq calls
+                        (append calls
+                                (list (list :url url
+                                            :callback callback
+                                            :arguments arguments
+                                            :buffer buffer
+                                            :method
+                                            url-request-method))))
+                  buffer)))
+             ((symbol-function 'make-process)
+              (lambda (&rest _ignored)
+                (ert-fail
+                 "External check attempted managed startup"))))
+          (proofread-languagetool--check
+           (proofread-languagetool-test--request)
+           (lambda (value) (setq result value)))
+          (should proofread-languagetool--probe-retry-token)
+          (proofread-languagetool-test--run-scheduled-probe)
+          (should (= (length calls) 1))
+          (should (equal (plist-get (car calls) :method) "GET"))
+          (proofread-languagetool-test--complete-call
+           (car calls) 200 "OK")
+          (should (= (length calls) 2))
+          (should (equal (plist-get (cadr calls) :method) "POST"))
+          (proofread-languagetool-test--complete-call
+           (cadr calls) 200 "{\"matches\":[]}")
+          (should (eq (plist-get result :status) 'ok)))))))
 
 (ert-deftest
     proofread-languagetool-test-external-failure-skips-managed-startup
@@ -2884,156 +2884,156 @@ It then restarts readiness for the current session."
   "An unavailable external server does not start a process.
 It also does not validate managed settings."
   (proofread-languagetool-test--with-state
-   (with-temp-buffer
-     (let ((proofread-languagetool-auto-start nil)
-           (proofread-languagetool-command 42)
-           (proofread-languagetool-config-file "relative.properties")
-           (proofread-languagetool-startup-timeout 0)
-           call
-           result)
-       (cl-letf
-           (((symbol-function 'url-retrieve)
-             (lambda (url callback arguments &rest _ignored)
-               (let ((buffer
-                      (generate-new-buffer
-                       " *proofread-lt-external-failure*")))
-                 (setq call (list :url url
-                                  :callback callback
-                                  :arguments arguments
-                                  :buffer buffer
-                                  :method url-request-method))
-                 buffer)))
-            ((symbol-function 'make-process)
-             (lambda (&rest _ignored)
-               (ert-fail
-                "External failure attempted managed startup"))))
-         (proofread-languagetool--check
-          (proofread-languagetool-test--request)
-          (lambda (value) (setq result value)))
-         (proofread-languagetool-test--run-scheduled-probe)
-         (should (equal (plist-get call :method) "GET"))
-         (proofread-languagetool-test--complete-call call 200 "DOWN")
-         (should (eq (plist-get result :error)
-                     'languagetool-unavailable))
-         (should
-          (eq proofread-languagetool--server-state 'unknown)))))))
+    (with-temp-buffer
+      (let ((proofread-languagetool-auto-start nil)
+            (proofread-languagetool-command 42)
+            (proofread-languagetool-config-file "relative.properties")
+            (proofread-languagetool-startup-timeout 0)
+            call
+            result)
+        (cl-letf
+            (((symbol-function 'url-retrieve)
+              (lambda (url callback arguments &rest _ignored)
+                (let ((buffer
+                       (generate-new-buffer
+                        " *proofread-lt-external-failure*")))
+                  (setq call (list :url url
+                                   :callback callback
+                                   :arguments arguments
+                                   :buffer buffer
+                                   :method url-request-method))
+                  buffer)))
+             ((symbol-function 'make-process)
+              (lambda (&rest _ignored)
+                (ert-fail
+                 "External failure attempted managed startup"))))
+          (proofread-languagetool--check
+           (proofread-languagetool-test--request)
+           (lambda (value) (setq result value)))
+          (proofread-languagetool-test--run-scheduled-probe)
+          (should (equal (plist-get call :method) "GET"))
+          (proofread-languagetool-test--complete-call call 200 "DOWN")
+          (should (eq (plist-get result :error)
+                      'languagetool-unavailable))
+          (should
+           (eq proofread-languagetool--server-state 'unknown)))))))
 
 (ert-deftest
     proofread-languagetool-test-external-ready-ignores-managed-changes
     ()
   "An external check does not disturb a ready manually owned session."
   (proofread-languagetool-test--with-state
-   (with-temp-buffer
-     (let* ((proofread-languagetool-auto-start nil)
-            (proofread-languagetool-command "old-command")
-            (proofread-languagetool-config-file nil)
-            (proofread-languagetool-startup-timeout 15.0)
-            (session
-             (proofread-languagetool--server-session-snapshot nil t))
-            (proofread-languagetool--server-state 'ready)
-            (proofread-languagetool--server-session session)
-            (proofread-languagetool--server-process 'owned-process)
-            (proofread-languagetool--server-process-session session)
-            request-buffer)
-       (setq proofread-languagetool-command 42)
-       (setq proofread-languagetool-config-file "relative.properties")
-       (setq proofread-languagetool-startup-timeout 0)
-       (cl-letf
-           (((symbol-function
-              'proofread-languagetool--begin-readiness-check)
-             (lambda (&rest _ignored)
-               (ert-fail
-                "Managed changes restarted external readiness")))
-            ((symbol-function
-              'proofread-languagetool--stop-owned-process)
-             (lambda ()
-               (ert-fail
-                "Managed changes stopped the owned process")))
-            ((symbol-function 'url-retrieve)
-             (lambda (_url _callback _arguments &rest _ignored)
-               (should (equal url-request-method "POST"))
-               (setq request-buffer
-                     (generate-new-buffer
-                      " *proofread-lt-external-ready*")))))
-         (let ((handle
-                (proofread-languagetool--check
-                 (proofread-languagetool-test--request)
-                 #'ignore)))
-           (should (buffer-live-p request-buffer))
-           (proofread-languagetool--cancel handle)))))))
+    (with-temp-buffer
+      (let* ((proofread-languagetool-auto-start nil)
+             (proofread-languagetool-command "old-command")
+             (proofread-languagetool-config-file nil)
+             (proofread-languagetool-startup-timeout 15.0)
+             (session
+              (proofread-languagetool--server-session-snapshot nil t))
+             (proofread-languagetool--server-state 'ready)
+             (proofread-languagetool--server-session session)
+             (proofread-languagetool--server-process 'owned-process)
+             (proofread-languagetool--server-process-session session)
+             request-buffer)
+        (setq proofread-languagetool-command 42)
+        (setq proofread-languagetool-config-file "relative.properties")
+        (setq proofread-languagetool-startup-timeout 0)
+        (cl-letf
+            (((symbol-function
+               'proofread-languagetool--begin-readiness-check)
+              (lambda (&rest _ignored)
+                (ert-fail
+                 "Managed changes restarted external readiness")))
+             ((symbol-function
+               'proofread-languagetool--stop-owned-process)
+              (lambda ()
+                (ert-fail
+                 "Managed changes stopped the owned process")))
+             ((symbol-function 'url-retrieve)
+              (lambda (_url _callback _arguments &rest _ignored)
+                (should (equal url-request-method "POST"))
+                (setq request-buffer
+                      (generate-new-buffer
+                       " *proofread-lt-external-ready*")))))
+          (let ((handle
+                 (proofread-languagetool--check
+                  (proofread-languagetool-test--request)
+                  #'ignore)))
+            (should (buffer-live-p request-buffer))
+            (proofread-languagetool--cancel handle)))))))
 
 (ert-deftest proofread-languagetool-test-reuses-healthy-server ()
   "The first request reuses a healthy server without spawning Java."
   (proofread-languagetool-test--with-state
-   (with-temp-buffer
-     (let (calls result)
-       (cl-letf
-           (((symbol-function 'url-retrieve)
-             (lambda (url callback arguments &rest _ignored)
-               (let ((buffer
-                      (generate-new-buffer " *proofread-lt-probe*")))
-                 (setq calls
-                       (append calls
-                               (list (list :url url
-                                           :callback callback
-                                           :arguments arguments
-                                           :buffer buffer
-                                           :method
-                                           url-request-method))))
-                 buffer)))
-            ((symbol-function 'make-process)
-             (lambda (&rest _ignored)
-               (ert-fail "Healthy external server was not reused"))))
-         (proofread-languagetool--check
-          (proofread-languagetool-test--request)
-          (lambda (value) (setq result value)))
-         (proofread-languagetool-test--run-scheduled-probe)
-         (should (= (length calls) 1))
-         (should (equal (plist-get (car calls) :method) "GET"))
-         (proofread-languagetool-test--complete-call
-          (car calls) 200 "OK")
-         (should (eq proofread-languagetool--server-state 'ready))
-         (should (= (length calls) 2))
-         (should (equal (plist-get (cadr calls) :method) "POST"))
-         (proofread-languagetool-test--complete-call
-          (cadr calls) 200 "{\"matches\":[]}")
-         (should (eq (plist-get result :status) 'ok)))))))
+    (with-temp-buffer
+      (let (calls result)
+        (cl-letf
+            (((symbol-function 'url-retrieve)
+              (lambda (url callback arguments &rest _ignored)
+                (let ((buffer
+                       (generate-new-buffer " *proofread-lt-probe*")))
+                  (setq calls
+                        (append calls
+                                (list (list :url url
+                                            :callback callback
+                                            :arguments arguments
+                                            :buffer buffer
+                                            :method
+                                            url-request-method))))
+                  buffer)))
+             ((symbol-function 'make-process)
+              (lambda (&rest _ignored)
+                (ert-fail "Healthy external server was not reused"))))
+          (proofread-languagetool--check
+           (proofread-languagetool-test--request)
+           (lambda (value) (setq result value)))
+          (proofread-languagetool-test--run-scheduled-probe)
+          (should (= (length calls) 1))
+          (should (equal (plist-get (car calls) :method) "GET"))
+          (proofread-languagetool-test--complete-call
+           (car calls) 200 "OK")
+          (should (eq proofread-languagetool--server-state 'ready))
+          (should (= (length calls) 2))
+          (should (equal (plist-get (cadr calls) :method) "POST"))
+          (proofread-languagetool-test--complete-call
+           (cadr calls) 200 "{\"matches\":[]}")
+          (should (eq (plist-get result :status) 'ok)))))))
 
 (ert-deftest proofread-languagetool-test-managed-command-is-local ()
   "Managed startup uses the URL port without public server options."
   (proofread-languagetool-test--with-state
-   (let ((proofread-languagetool-server-url
-          "http://127.0.0.1:18081/v2")
-         (proofread-languagetool-config-file nil)
-         (proofread-languagetool--server-generation 1)
-         command)
-     (let ((proofread-languagetool--server-session
-            (proofread-languagetool--server-session-snapshot)))
-       (cl-letf
-           (((symbol-function 'proofread-languagetool--server-command)
-             (lambda (_session)
-               '( "/opt/languagetool/bin/languagetool-http-server"
-                  "--fixed" "argument")))
-            ((symbol-function 'make-process)
-             (lambda (&rest arguments)
-               (setq command (plist-get arguments :command))
-               'proofread-languagetool-test-process))
-            ((symbol-function 'process-put) #'ignore)
-            ((symbol-function
-              'set-process-query-on-exit-flag)
-             #'ignore)
-            ((symbol-function 'process-live-p)
-             (lambda (process) (and process t))))
-         (proofread-languagetool--start-managed-server
-          1 proofread-languagetool--server-session)
-         (should
-          (equal command
-                 '( "/opt/languagetool/bin/languagetool-http-server"
-                    "--fixed" "argument"
-                    "--port" "18081")))
-         (should-not (member "--public" command))
-         (should-not (member "--allow-origin" command))
-         (setq proofread-languagetool--server-process nil))))))
+    (let ((proofread-languagetool-server-url
+           "http://127.0.0.1:18081/v2")
+          (proofread-languagetool-config-file nil)
+          (proofread-languagetool--server-generation 1)
+          command)
+      (let ((proofread-languagetool--server-session
+             (proofread-languagetool--server-session-snapshot)))
+        (cl-letf
+            (((symbol-function 'proofread-languagetool--server-command)
+              (lambda (_session)
+                '( "/opt/languagetool/bin/languagetool-http-server"
+                   "--fixed" "argument")))
+             ((symbol-function 'make-process)
+              (lambda (&rest arguments)
+                (setq command (plist-get arguments :command))
+                'proofread-languagetool-test-process))
+             ((symbol-function 'process-put) #'ignore)
+             ((symbol-function
+               'set-process-query-on-exit-flag)
+              #'ignore)
+             ((symbol-function 'process-live-p)
+              (lambda (process) (and process t))))
+          (proofread-languagetool--start-managed-server
+           1 proofread-languagetool--server-session)
+          (should
+           (equal command
+                  '( "/opt/languagetool/bin/languagetool-http-server"
+                     "--fixed" "argument"
+                     "--port" "18081")))
+          (should-not (member "--public" command))
+          (should-not (member "--allow-origin" command))
+          (setq proofread-languagetool--server-process nil))))))
 
 ;;;; Live integration
 
@@ -3047,32 +3047,32 @@ It also does not validate managed settings."
               proofread-languagetool-command)))
      (error nil)))
   (proofread-languagetool-test--with-state
-   (with-temp-buffer
-     (let ((proofread-languagetool-server-url
-            (or (getenv "PROOFREAD_LANGUAGETOOL_TEST_URL")
-                "http://127.0.0.1:18091/v2"))
-           (proofread-languagetool-auto-start t)
-           (proofread-languagetool-startup-timeout 20.0)
-           (proofread-languagetool-request-timeout 20.0)
-           result)
-       (unwind-protect
-           (progn
-             (proofread-languagetool--check
-              (list :beg 1
-                    :end 14
-                    :text "This are bad."
-                    :context-before ""
-                    :context-after ""
-                    :language "en-US"
-                    :target-kind 'text
-                    :buffer (current-buffer))
-              (lambda (value) (setq result value)))
-             (should
-              (proofread-languagetool-test--wait-for
-               (lambda () result) 45.0))
-             (should (eq (plist-get result :status) 'ok))
-             (should (plist-get result :diagnostics)))
-         (proofread-languagetool-stop-server))))))
+    (with-temp-buffer
+      (let ((proofread-languagetool-server-url
+             (or (getenv "PROOFREAD_LANGUAGETOOL_TEST_URL")
+                 "http://127.0.0.1:18091/v2"))
+            (proofread-languagetool-auto-start t)
+            (proofread-languagetool-startup-timeout 20.0)
+            (proofread-languagetool-request-timeout 20.0)
+            result)
+        (unwind-protect
+            (progn
+              (proofread-languagetool--check
+               (list :beg 1
+                     :end 14
+                     :text "This are bad."
+                     :context-before ""
+                     :context-after ""
+                     :language "en-US"
+                     :target-kind 'text
+                     :buffer (current-buffer))
+               (lambda (value) (setq result value)))
+              (should
+               (proofread-languagetool-test--wait-for
+                (lambda () result) 45.0))
+              (should (eq (plist-get result :status) 'ok))
+              (should (plist-get result :diagnostics)))
+          (proofread-languagetool-stop-server))))))
 
 (provide 'proofread-languagetool-tests)
 ;;; proofread-languagetool-tests.el ends here
