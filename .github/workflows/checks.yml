@@ -32,12 +32,21 @@ concurrency:
 
 jobs:
   check:
-    name: Check
+    name: ${{ matrix.check }}
     runs-on: ubuntu-24.04
     timeout-minutes: 60
 
     permissions:
       contents: read
+
+    strategy:
+      fail-fast: false
+      matrix:
+        check:
+          - flake
+          - test
+          - byte-compilation
+          - checkdoc
 
     steps:
       - name: Check out source
@@ -54,10 +63,11 @@ jobs:
         uses: nix-community/cache-nix-action@v7.0.2
         with:
           primary-key: >-
-            emacs-proofread-nix-${{ runner.os }}-${{
+            emacs-proofread-nix-${{ runner.os }}-${{ matrix.check }}-${{
               hashFiles('**/*.nix', '**/flake.lock')
             }}
-          restore-prefixes-first-match: >-
+          restore-prefixes-first-match: |
+            emacs-proofread-nix-${{ runner.os }}-${{ matrix.check }}-
             emacs-proofread-nix-${{ runner.os }}-
           save: >-
             ${{
@@ -65,43 +75,54 @@ jobs:
               github.ref == 'refs/heads/main'
             }}
 
-      - name: Check flake, formatting, and workflows
+      - name: Run ${{ matrix.check }}
+        env:
+          CHECK: ${{ matrix.check }}
         run: |
           set -euo pipefail
-          nix flake check --all-systems
-          nix fmt -- --fail-on-change
-          nix develop .#release --command \
-            actionlint \
-            -ignore 'unexpected key "queue"' \
-            .github/workflows/*.yml
+          status=0
+          run_check() {
+            if ! "$@"; then
+              status=1
+            fi
+          }
 
-      - name: Run tests
-        run: |
-          set -euo pipefail
-          nix run .#emacs30-run-proofread-tests
-          nix run .#emacs31-run-proofread-tests
+          case "$CHECK" in
+            flake)
+              run_check nix flake check --all-systems
+              run_check nix fmt -- --fail-on-change
+              run_check \
+                nix develop .#release --command \
+                  actionlint \
+                  -ignore 'unexpected key "queue"' \
+                  .github/workflows/*.yml
+              ;;
+            test)
+              run_check nix run .#emacs30-run-proofread-tests
+              run_check nix run .#emacs31-run-proofread-tests
+              ;;
+            byte-compilation)
+              run_check nix run .#emacs30-byte-compile-proofread
+              run_check nix run .#emacs31-byte-compile-proofread
+              ;;
+            checkdoc)
+              run_check nix run .#emacs30-checkdoc-proofread
+              run_check nix run .#emacs31-checkdoc-proofread
+              run_check nix develop .#release --command make clean
+              run_check \
+                nix develop .#release --command \
+                  make \
+                    proofread-pkg \
+                    proofread-autoloads \
+                    proofread-compile \
+                    proofread-popup-pkg \
+                    proofread-popup-autoloads \
+                    proofread-popup-compile
+              ;;
+            *)
+              printf 'Unknown check: %s\n' "$CHECK" >&2
+              status=1
+              ;;
+          esac
 
-      - name: Run strict byte compilation
-        run: |
-          set -euo pipefail
-          nix run .#emacs30-byte-compile-proofread
-          nix run .#emacs31-byte-compile-proofread
-
-      - name: Run checkdoc
-        run: |
-          set -euo pipefail
-          nix run .#emacs30-checkdoc-proofread
-          nix run .#emacs31-checkdoc-proofread
-
-      - name: Build packages without archives
-        run: |
-          set -euo pipefail
-          nix develop .#release --command make clean
-          nix develop .#release --command \
-            make \
-              proofread-pkg \
-              proofread-autoloads \
-              proofread-compile \
-              proofread-popup-pkg \
-              proofread-popup-autoloads \
-              proofread-popup-compile
+          exit "$status"

@@ -35,6 +35,16 @@ let
     ]
   );
 
+  chinese-typography-space-check =
+    pkgs.callPackage
+      (
+        projectRoot
+        + /tool/chinese-typography-space-check/package.nix
+      )
+      {
+        emacs = pkgs.emacs31;
+      };
+
   languagetool-server = pkgs.callPackage (
     projectRoot
     + /tool/languagetool-server-wrapper.nix
@@ -288,6 +298,7 @@ in
   };
 
   packages = [
+    chinese-typography-space-check
     languagetool-server
   ]
   ++ (with pkgs; [

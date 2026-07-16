@@ -1,0 +1,81 @@
+name: Documentation
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - "*.md"
+  pull_request:
+    branches:
+      - main
+    paths:
+      - "*.md"
+
+permissions: {}
+
+concurrency:
+  group: emacs-proofread-documentation-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check-markdown:
+    name: check-markdown
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+
+    permissions:
+      contents: read
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v6.0.3
+        with:
+          persist-credentials: false
+
+      - name: Install Nix
+        uses: cachix/install-nix-action@v31.10.7
+        with:
+          github_access_token: ${{ github.token }}
+
+      - name: Restore Nix store cache
+        uses: nix-community/cache-nix-action@v7.0.2
+        with:
+          primary-key: >-
+            emacs-proofread-nix-${{ runner.os }}-check-markdown-${{
+              hashFiles('**/*.nix', '**/flake.lock')
+            }}
+          restore-prefixes-first-match: |
+            emacs-proofread-nix-${{ runner.os }}-check-markdown-
+            emacs-proofread-nix-${{ runner.os }}-
+          save: >-
+            ${{
+              github.event_name == 'push' &&
+              github.ref == 'refs/heads/main'
+            }}
+
+      - name: Run check-markdown
+        run: |
+          set -euo pipefail
+          status=0
+          run_check() {
+            if ! "$@"; then
+              status=1
+            fi
+          }
+
+          mapfile -d '' -t chinese_docs < <(
+            git ls-files -z -- \
+              ':(glob)**/*_zh*.md'
+          )
+          if ((${#chinese_docs[@]} > 0)); then
+            run_check \
+              nix fmt -- --fail-on-change \
+                "${chinese_docs[@]}"
+            run_check \
+              nix develop .#default --command \
+                chinese-typography-space-check \
+                "${chinese_docs[@]}"
+          fi
+
+          exit "$status"
