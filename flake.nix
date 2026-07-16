@@ -300,7 +300,7 @@
                     proofreadRelease =
                       pkgs.callPackage
                         (
-                          projectRoot + /tool/proofread-release-wrapper.nix
+                          projectRoot + /tool/proofread-release/package.nix
                         )
                         {
                           emacs = releaseEmacs;
