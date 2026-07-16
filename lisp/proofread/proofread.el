@@ -249,12 +249,12 @@ request-ready chunks."
 ;;;; Faces
 
 (defface proofread-face
-  '((t :inherit warning :underline ( :style wave)))
+  '((t :inherit font-lock-warning-face :underline ( :style wave)))
   "Face for proofreading diagnostics."
   :group 'proofread)
 
 (defface proofread-current-face
-  '((t :inherit proofread-face :weight bold))
+  '((t :inherit proofread-face))
   "Face for the current proofreading diagnostic."
   :group 'proofread)
 
