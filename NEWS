@@ -278,6 +278,11 @@ The new 'proofread-popup-delay' option defaults to 0.5 seconds; set it
 to zero to restore immediate updates.
 
 ---
+*** Popups no longer linger after their source display loses selection.
+A child frame is now hidden immediately when its source buffer or window
+loses selection, including switches and programmatic window changes.
+
+---
 *** Popup messages identify their backend source.
 Every diagnostic message is displayed on its own line with its LLM or
 LanguageTool source label.  Source labels use the new

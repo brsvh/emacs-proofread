@@ -50,9 +50,11 @@ SUGGESTIONS, MESSAGE, and SOURCE supply the optional field values."
   (declare (indent 0) (debug (body)))
   `(let ((proofread-popup-delay 0)
          (proofread-auto-check nil)
+         (proofread-popup--owners nil)
          proofread-popup-test--shows
          proofread-popup-test--hides
-         proofread-popup-test--deletes)
+         proofread-popup-test--deletes
+         proofread-popup-test--events)
      (cl-letf (((symbol-function 'posframe-workable-p)
                 (lambda ()
                   t))
@@ -63,14 +65,20 @@ SUGGESTIONS, MESSAGE, and SOURCE supply the optional field values."
                 (lambda (buffer-or-name &rest args)
                   (push (cons buffer-or-name args)
                         proofread-popup-test--shows)
+                  (push (list 'show buffer-or-name)
+                        proofread-popup-test--events)
                   'proofread-popup-test-posframe))
                ((symbol-function 'posframe-hide)
                 (lambda (buffer-or-name)
-                  (push buffer-or-name proofread-popup-test--hides)))
+                  (push buffer-or-name proofread-popup-test--hides)
+                  (push (list 'hide buffer-or-name)
+                        proofread-popup-test--events)))
                ((symbol-function 'posframe-delete)
                 (lambda (buffer-or-name)
                   (push buffer-or-name
-                        proofread-popup-test--deletes))))
+                        proofread-popup-test--deletes)
+                  (push (list 'delete buffer-or-name)
+                        proofread-popup-test--events))))
        ,@body)))
 
 (defmacro proofread-popup-test--with-idle-timer-recorder (&rest body)
@@ -109,6 +117,20 @@ SUGGESTIONS, MESSAGE, and SOURCE supply the optional field values."
   "Invoke recorded idle timer CALL."
   (apply (plist-get call :function)
          (plist-get call :arguments)))
+
+(defvar proofread-popup-test--events nil)
+
+(defvar proofread-popup-test--switch-target nil)
+
+(defun proofread-popup-test--switch-buffer-command ()
+  "Switch to `proofread-popup-test--switch-target' as a test command."
+  (interactive)
+  (push '(command) proofread-popup-test--events)
+  (switch-to-buffer proofread-popup-test--switch-target))
+
+(defun proofread-popup-test--noop-command ()
+  "Do nothing as an interactive test command."
+  (interactive))
 
 ;;;; Configuration and messages
 
@@ -251,14 +273,30 @@ SUGGESTIONS, MESSAGE, and SOURCE supply the optional field values."
     (should-not proofread-popup-mode)
     (proofread-mode 1)
     (should proofread-popup-mode)
+    (should (memq #'proofread-popup--pre-command-cleanup
+                  pre-command-hook))
     (should (memq #'proofread-popup--update post-command-hook))
     (should (memq #'proofread-popup--update
                   proofread-diagnostics-changed-hook))
     (proofread-mode -1)
     (should-not proofread-popup-mode)
+    (should-not (memq #'proofread-popup--pre-command-cleanup
+                      pre-command-hook))
     (should-not (memq #'proofread-popup--update post-command-hook))
     (should-not (memq #'proofread-popup--update
                       proofread-diagnostics-changed-hook))))
+
+(ert-deftest proofread-popup-test-ownership-hooks-are-default ()
+  "Window and frame ownership hooks are installed globally once."
+  (dolist (entry
+           '((window-buffer-change-functions
+              proofread-popup--validate-owners)
+             (window-selection-change-functions
+              proofread-popup--validate-owners)
+             (delete-frame-functions
+              proofread-popup--delete-frame-owner)))
+    (should
+     (= (cl-count (cadr entry) (default-value (car entry))) 1))))
 
 (ert-deftest
     proofread-popup-test-diagnostics-change-shows-automatically ()
@@ -355,9 +393,14 @@ SUGGESTIONS, MESSAGE, and SOURCE supply the optional field values."
           (let ((calls
                  (proofread-popup-test--popup-idle-timer-calls
                   proofread-popup-test--idle-timer-calls)))
-            (should (= (length calls) 1))
+            (should (= (length calls) 2))
             (should-not proofread-popup-test--shows)
-            (proofread-popup-test--fire-idle-timer (car calls)))
+            (should
+             (memq (plist-get (car calls) :timer)
+                   proofread-popup-test--canceled-timers))
+            (proofread-popup-test--fire-idle-timer (car calls))
+            (should-not proofread-popup-test--shows)
+            (proofread-popup-test--fire-idle-timer (cadr calls)))
           (should (= (length proofread-popup-test--shows) 1))
           (should (eq proofread-popup--window second-window))
           (should (= proofread-popup--position 8))
@@ -518,61 +561,144 @@ SUGGESTIONS, MESSAGE, and SOURCE supply the optional field values."
 (ert-deftest proofread-popup-test-pending-updates-are-buffer-local ()
   "Each Proofread buffer owns an independent delayed update."
   (proofread-popup-test--with-posframe-recorder
-   (let ((first (generate-new-buffer " *proofread-popup-first*"))
-         (second (generate-new-buffer " *proofread-popup-second*")))
-     (unwind-protect
-         (progn
-           (dolist (buffer (list first second))
-             (with-current-buffer buffer
-               (insert "helo")
-               (proofread-mode 1)))
-           (let ((proofread-popup-delay 0.5))
-             (proofread-popup-test--with-idle-timer-recorder
-              (with-current-buffer first
-                (proofread-popup--update))
-              (with-current-buffer second
-                (proofread-popup--update))
-              (let* ((calls
-                      (proofread-popup-test--popup-idle-timer-calls
-                       proofread-popup-test--idle-timer-calls))
-                     (first-call (car calls))
-                     (second-call (cadr calls))
-                     (first-timer (plist-get first-call :timer))
-                     (second-timer (plist-get second-call :timer)))
-                (should (= (length calls) 2))
-                (should-not (eq first-timer second-timer))
-                (should
-                 (eq (with-current-buffer first
-                       proofread-popup--idle-timer)
-                     first-timer))
-                (should
-                 (eq (with-current-buffer second
-                       proofread-popup--idle-timer)
-                     second-timer))
+   (save-window-excursion
+     (let ((first (generate-new-buffer " *proofread-popup-first*"))
+           (second (generate-new-buffer " *proofread-popup-second*")))
+       (unwind-protect
+           (let* ((first-window (selected-window))
+                  (second-window
+                   (split-window first-window nil 'below)))
+             (set-window-buffer first-window first)
+             (set-window-buffer second-window second)
+             (dolist (buffer (list first second))
+               (with-current-buffer buffer
+                 (insert "helo")
+                 (proofread-mode 1)))
+             (let ((proofread-popup-delay 0.5))
+               (proofread-popup-test--with-idle-timer-recorder
+                (select-window first-window)
                 (with-current-buffer first
-                  (proofread-popup--cancel-pending-update))
-                (should
-                 (eq (with-current-buffer second
-                       proofread-popup--idle-timer)
-                     second-timer))
-                (proofread-popup-test--fire-idle-timer first-call)
-                (should
-                 (eq (with-current-buffer second
-                       proofread-popup--idle-timer)
-                     second-timer))
-                (proofread-popup-test--fire-idle-timer second-call)
-                (should-not
-                 (with-current-buffer second
-                   proofread-popup--idle-timer))))))
-       (dolist (buffer (list first second))
-         (when (buffer-live-p buffer)
-           (kill-buffer buffer)))))))
+                  (proofread-popup--update))
+                (select-window second-window)
+                (with-current-buffer second
+                  (proofread-popup--update))
+                (let* ((calls
+                        (proofread-popup-test--popup-idle-timer-calls
+                         proofread-popup-test--idle-timer-calls))
+                       (first-call (car calls))
+                       (second-call (cadr calls))
+                       (first-timer (plist-get first-call :timer))
+                       (second-timer (plist-get second-call :timer)))
+                  (should (= (length calls) 2))
+                  (should-not (eq first-timer second-timer))
+                  (should
+                   (eq (with-current-buffer first
+                         proofread-popup--idle-timer)
+                       first-timer))
+                  (should
+                   (eq (with-current-buffer second
+                         proofread-popup--idle-timer)
+                       second-timer))
+                  (with-current-buffer first
+                    (proofread-popup--cancel-pending-update))
+                  (should
+                   (eq (with-current-buffer second
+                         proofread-popup--idle-timer)
+                       second-timer))
+                  (proofread-popup-test--fire-idle-timer first-call)
+                  (should
+                   (eq (with-current-buffer second
+                         proofread-popup--idle-timer)
+                       second-timer))
+                  (proofread-popup-test--fire-idle-timer second-call)
+                  (should-not
+                   (with-current-buffer second
+                     proofread-popup--idle-timer))))))
+         (dolist (buffer (list first second))
+           (when (buffer-live-p buffer)
+             (kill-buffer buffer))))))))
+
+(ert-deftest proofread-popup-test-owner-registry-tracks-active-state ()
+  "The registry contains exactly pending or visible popup owners."
+  (proofread-popup-test--with-posframe-recorder
+   (save-window-excursion
+     (with-temp-buffer
+       (switch-to-buffer (current-buffer))
+       (insert "helo")
+       (goto-char 2)
+       (proofread-mode 1)
+       (let ((source (current-buffer))
+             (window (selected-window))
+             (proofread-popup-delay 0.5))
+         (proofread-popup-test--with-idle-timer-recorder
+          (proofread-popup--update)
+          (let ((call
+                 (car
+                  (proofread-popup-test--popup-idle-timer-calls
+                   proofread-popup-test--idle-timer-calls))))
+            (should proofread-popup--idle-timer)
+            (should proofread-popup--update-generation)
+            (should-not proofread-popup--visible-p)
+            (should-not proofread-popup--render-signature)
+            (should (equal proofread-popup--owners (list source)))
+            (should (eq proofread-popup--owner-window window))
+            (should (eq proofread-popup--owner-frame
+                        (window-frame window)))
+            (proofread-popup-test--fire-idle-timer call)
+            (should-not proofread-popup--idle-timer)
+            (should-not proofread-popup--update-generation)
+            (should-not proofread-popup--owners)
+            (should-not proofread-popup--owner-window)
+            (should-not proofread-popup--owner-frame)))
+         (proofread-popup-test--install-diagnostics
+          (list (proofread-popup-test--diagnostic 1 5 "helo")))
+         (let ((proofread-popup-delay 0))
+           (proofread-popup--update))
+         (let ((popup-buffer-name proofread-popup--buffer-name))
+           (should proofread-popup--visible-p)
+           (should (equal proofread-popup--owners (list source)))
+           (setq proofread-popup--render-signature nil)
+           (proofread-popup--hide)
+           (should (equal proofread-popup-test--hides
+                          (list popup-buffer-name)))
+           (should-not proofread-popup--visible-p)
+           (should-not proofread-popup--owners)
+           (should-not proofread-popup--owner-window)
+           (should-not proofread-popup--owner-frame)))))))
+
+(ert-deftest proofread-popup-test-pending-update-survives-typing ()
+  "Pending-only updates remain coalesced across interactive commands."
+  (proofread-popup-test--with-posframe-recorder
+   (save-window-excursion
+     (with-temp-buffer
+       (switch-to-buffer (current-buffer))
+       (insert "helo")
+       (proofread-mode 1)
+       (let ((proofread-popup-delay 0.5))
+         (proofread-popup-test--with-idle-timer-recorder
+          (proofread-popup--update)
+          (let* ((call
+                  (car
+                   (proofread-popup-test--popup-idle-timer-calls
+                    proofread-popup-test--idle-timer-calls)))
+                 (timer (plist-get call :timer))
+                 (map (make-sparse-keymap)))
+            (define-key map "x" #'proofread-popup-test--noop-command)
+            (let ((overriding-local-map map))
+              (execute-kbd-macro "xx"))
+            (let ((calls
+                   (proofread-popup-test--popup-idle-timer-calls
+                    proofread-popup-test--idle-timer-calls)))
+              (should (= (length calls) 1)))
+            (should (eq proofread-popup--idle-timer timer))
+            (should-not proofread-popup-test--canceled-timers)
+            (should (memq (current-buffer) proofread-popup--owners)))))))))
 
 ;;;; Rendering
 
 (ert-deftest
     proofread-popup-test-update-captures-render-inputs-once ()
-  "Only the delayed callback captures each render input, exactly once."
+  "Scheduling captures ownership; the callback captures render inputs once."
   (proofread-popup-test--with-posframe-recorder
    (save-window-excursion
      (with-temp-buffer
@@ -642,9 +768,9 @@ SUGGESTIONS, MESSAGE, and SOURCE supply the optional field values."
            (proofread-popup-test--with-idle-timer-recorder
             (proofread-popup--update)
             (should-not proofread-popup-test--shows)
+            (should (= selection-calls 1))
             (dolist (calls
-                     (list selection-calls diagnostic-calls
-                           anchor-calls snapshot-calls
+                     (list diagnostic-calls anchor-calls snapshot-calls
                            render-data-calls available-calls))
               (should (zerop calls)))
             (let ((calls
@@ -653,7 +779,7 @@ SUGGESTIONS, MESSAGE, and SOURCE supply the optional field values."
               (should (= (length calls) 1))
               (proofread-popup-test--fire-idle-timer (car calls)))))
          (should (= (length proofread-popup-test--shows) 1))
-         (should (= selection-calls 1))
+         (should (= selection-calls 2))
          (should (= diagnostic-calls 1))
          (should (= anchor-calls 1))
          (should (= snapshot-calls 1))
@@ -1031,9 +1157,8 @@ SUGGESTIONS, MESSAGE, and SOURCE supply the optional field values."
            (proofread-popup--delete)
            (should (= (length proofread-popup-test--deletes) 1))))))))
 
-(ert-deftest
-    proofread-popup-test-hide-handler-allows-reshow-after-switch ()
-  "The popup returns after Posframe's hide handler runs."
+(ert-deftest proofread-popup-test-command-switch-hides-before-command ()
+  "A command-style buffer switch hides its source popup immediately."
   (proofread-popup-test--with-posframe-recorder
    (save-window-excursion
      (let ((source (generate-new-buffer " *proofread-popup-source*"))
@@ -1043,37 +1168,441 @@ SUGGESTIONS, MESSAGE, and SOURCE supply the optional field values."
              (switch-to-buffer source)
              (insert "helo")
              (proofread-mode 1)
-             (let ((diagnostic
-                    (proofread-popup-test--diagnostic 1 5 "helo")))
-               (proofread-popup-test--install-diagnostics
-                (list diagnostic))
-               (goto-char 2)
-               (proofread-popup--update)
-               (let* ((args (cdar proofread-popup-test--shows))
-                      (hide-handler (plist-get args :hidehandler))
-                      (popup-buffer-name
-                       proofread-popup--buffer-name))
-                 (switch-to-buffer other)
-                 (should
-                  (funcall
-                   hide-handler
-                   (list :posframe-parent-buffer
-                         (cons nil source))))
-                 (with-current-buffer source
-                   (should (equal proofread-popup--buffer-name
-                                  popup-buffer-name))
-                   (should-not proofread-popup--render-signature)
-                   (should-not proofread-popup--position)
-                   (should-not proofread-popup--window)
-                   (should-not proofread-popup--render-state))
-                 (switch-to-buffer source)
-                 (proofread-popup--update)
-                 (should
-                  (= (length proofread-popup-test--shows) 2)))))
+             (proofread-popup-test--install-diagnostics
+              (list (proofread-popup-test--diagnostic 1 5 "helo")))
+             (goto-char 2)
+             (proofread-popup--update)
+             (let ((popup-buffer-name proofread-popup--buffer-name)
+                   (proofread-popup-delay 0.5))
+               (proofread-popup-test--with-idle-timer-recorder
+                (proofread-popup--update)
+                (let* ((call
+                        (car
+                         (proofread-popup-test--popup-idle-timer-calls
+                          proofread-popup-test--idle-timer-calls)))
+                       (timer (plist-get call :timer))
+                       (map (make-sparse-keymap)))
+                  (setq proofread-popup-test--events nil)
+                  (define-key
+                   map "x"
+                   #'proofread-popup-test--switch-buffer-command)
+                  (let ((proofread-popup-test--switch-target other)
+                        (overriding-local-map map))
+                    (execute-kbd-macro "x"))
+                  (should (eq (current-buffer) other))
+                  (should
+                   (equal (nreverse proofread-popup-test--events)
+                          (list (list 'hide popup-buffer-name)
+                                '(command))))
+                  (should (equal proofread-popup-test--hides
+                                 (list popup-buffer-name)))
+                  (should-not proofread-popup-test--deletes)
+                  (should (memq timer
+                                proofread-popup-test--canceled-timers))
+                  (with-current-buffer source
+                    (should (equal proofread-popup--buffer-name
+                                   popup-buffer-name))
+                    (should-not proofread-popup--visible-p)
+                    (should-not proofread-popup--idle-timer)
+                    (should-not proofread-popup--update-generation)
+                    (should-not proofread-popup--render-signature)
+                    (should-not (memq source proofread-popup--owners)))
+                  (proofread-popup-test--fire-idle-timer call)
+                  (should (= (length proofread-popup-test--shows) 1))
+                  (switch-to-buffer source)
+                  (let ((proofread-popup-delay 0))
+                    (proofread-popup--update))
+                  (should (= (length proofread-popup-test--shows) 2))
+                  (should (equal (caar proofread-popup-test--shows)
+                                 popup-buffer-name))))))
          (when (buffer-live-p source)
            (kill-buffer source))
          (when (buffer-live-p other)
            (kill-buffer other)))))))
+
+(ert-deftest proofread-popup-test-hide-handler-remains-fallback ()
+  "Posframe's hide handler invalidates ownership as a fallback."
+  (proofread-popup-test--with-posframe-recorder
+   (save-window-excursion
+     (let ((source (generate-new-buffer " *proofread-popup-source*"))
+           (other (generate-new-buffer " *proofread-popup-other*")))
+       (unwind-protect
+           (progn
+             (switch-to-buffer source)
+             (insert "helo")
+             (proofread-mode 1)
+             (proofread-popup-test--install-diagnostics
+              (list (proofread-popup-test--diagnostic 1 5 "helo")))
+             (goto-char 2)
+             (proofread-popup--update)
+             (let* ((args (cdar proofread-popup-test--shows))
+                    (hide-handler (plist-get args :hidehandler))
+                    (popup-buffer-name proofread-popup--buffer-name)
+                    (proofread-popup-delay 0.5))
+               (proofread-popup-test--with-idle-timer-recorder
+                (proofread-popup--update)
+                (let* ((call
+                        (car
+                         (proofread-popup-test--popup-idle-timer-calls
+                          proofread-popup-test--idle-timer-calls)))
+                       (timer (plist-get call :timer))
+                       (info
+                        (list :posframe-parent-buffer
+                              (cons nil source))))
+                  (switch-to-buffer other)
+                  (should (funcall hide-handler info))
+                  (should (funcall hide-handler info))
+                  (should (memq timer
+                                proofread-popup-test--canceled-timers))
+                  (should (= (length
+                              proofread-popup-test--canceled-timers)
+                             1))
+                  (should-not proofread-popup-test--hides)
+                  (should-not proofread-popup-test--deletes)
+                  (with-current-buffer source
+                    (should (equal proofread-popup--buffer-name
+                                   popup-buffer-name))
+                    (should-not proofread-popup--visible-p)
+                    (should-not proofread-popup--render-signature)
+                    (should-not proofread-popup--idle-timer)
+                    (should-not proofread-popup--update-generation)
+                    (should-not (memq source proofread-popup--owners)))
+                  (proofread-popup-test--fire-idle-timer call)
+                  (should (= (length proofread-popup-test--shows) 1))))))
+         (when (buffer-live-p source)
+           (kill-buffer source))
+         (when (buffer-live-p other)
+           (kill-buffer other)))))))
+
+(ert-deftest proofread-popup-test-set-window-buffer-hides-owner ()
+  "Changing an owner window's buffer hides and invalidates its popup."
+  (proofread-popup-test--with-posframe-recorder
+   (save-window-excursion
+     (let ((source (generate-new-buffer " *proofread-popup-source*"))
+           (other (generate-new-buffer " *proofread-popup-other*")))
+       (unwind-protect
+           (progn
+             (switch-to-buffer source)
+             (insert "helo")
+             (proofread-mode 1)
+             (proofread-popup-test--install-diagnostics
+              (list (proofread-popup-test--diagnostic 1 5 "helo")))
+             (goto-char 2)
+             (proofread-popup--update)
+             (let ((window (selected-window))
+                   (frame (selected-frame))
+                   (popup-buffer-name proofread-popup--buffer-name)
+                   (proofread-popup-delay 0.5))
+               (proofread-popup-test--with-idle-timer-recorder
+                (proofread-popup--update)
+                (let* ((call
+                        (car
+                         (proofread-popup-test--popup-idle-timer-calls
+                          proofread-popup-test--idle-timer-calls)))
+                       (timer (plist-get call :timer)))
+                  (set-window-buffer window other)
+                  (proofread-popup--validate-owners frame)
+                  (proofread-popup--validate-owners frame)
+                  (with-current-buffer source
+                    (proofread-popup--pre-command-cleanup)
+                    (should (equal proofread-popup--buffer-name
+                                   popup-buffer-name))
+                    (should-not proofread-popup--visible-p)
+                    (should-not proofread-popup--idle-timer)
+                    (should-not proofread-popup--update-generation)
+                    (should-not (memq source proofread-popup--owners)))
+                  (should (equal proofread-popup-test--hides
+                                 (list popup-buffer-name)))
+                  (should-not proofread-popup-test--deletes)
+                  (should (equal proofread-popup-test--canceled-timers
+                                 (list timer)))
+                  (proofread-popup-test--fire-idle-timer call)
+                  (should (= (length proofread-popup-test--shows) 1))))))
+         (when (buffer-live-p source)
+           (kill-buffer source))
+         (when (buffer-live-p other)
+           (kill-buffer other)))))))
+
+(ert-deftest proofread-popup-test-selection-change-hides-owner ()
+  "Selecting another window hides the popup even for the same buffer."
+  (proofread-popup-test--with-posframe-recorder
+   (save-window-excursion
+     (with-temp-buffer
+       (switch-to-buffer (current-buffer))
+       (insert "helo")
+       (proofread-mode 1)
+       (proofread-popup-test--install-diagnostics
+        (list (proofread-popup-test--diagnostic 1 5 "helo")))
+       (goto-char 2)
+       (let* ((first-window (selected-window))
+              (second-window (split-window first-window nil 'below)))
+         (proofread-popup--update)
+         (let ((popup-buffer-name proofread-popup--buffer-name)
+               (proofread-popup-delay 0.5))
+           (proofread-popup-test--with-idle-timer-recorder
+            (proofread-popup--update)
+            (let* ((call
+                    (car
+                     (proofread-popup-test--popup-idle-timer-calls
+                      proofread-popup-test--idle-timer-calls)))
+                   (timer (plist-get call :timer)))
+              (select-window second-window)
+              (proofread-popup--validate-owners (selected-frame))
+              (proofread-popup--validate-owners (selected-frame))
+              (should (equal proofread-popup-test--hides
+                             (list popup-buffer-name)))
+              (should-not proofread-popup-test--deletes)
+              (should (equal proofread-popup-test--canceled-timers
+                             (list timer)))
+              (should-not proofread-popup--visible-p)
+              (should-not proofread-popup--idle-timer)
+              (should-not proofread-popup--owners)
+              (proofread-popup-test--fire-idle-timer call)
+              (should (= (length proofread-popup-test--shows) 1))
+              (let ((proofread-popup-delay 0))
+                (proofread-popup--update))
+              (should (= (length proofread-popup-test--shows) 2))
+              (should (eq proofread-popup--owner-window
+                          second-window))))))))))
+
+(ert-deftest proofread-popup-test-dead-owner-window-hides-popup ()
+  "Deleting the source window hides its popup without deleting Posframe."
+  (proofread-popup-test--with-posframe-recorder
+   (save-window-excursion
+     (let ((source (generate-new-buffer " *proofread-popup-source*"))
+           (other (generate-new-buffer " *proofread-popup-other*")))
+       (unwind-protect
+           (let* ((source-window (selected-window))
+                  (other-window
+                   (split-window source-window nil 'below)))
+             (set-window-buffer source-window source)
+             (set-window-buffer other-window other)
+             (select-window source-window)
+             (with-current-buffer source
+               (insert "helo")
+               (proofread-mode 1)
+               (proofread-popup-test--install-diagnostics
+                (list (proofread-popup-test--diagnostic 1 5 "helo")))
+               (goto-char 2)
+               (proofread-popup--update)
+               (let ((popup-buffer-name proofread-popup--buffer-name)
+                     (proofread-popup-delay 0.5))
+                 (proofread-popup-test--with-idle-timer-recorder
+                  (proofread-popup--update)
+                  (let* ((call
+                          (car
+                           (proofread-popup-test--popup-idle-timer-calls
+                            proofread-popup-test--idle-timer-calls)))
+                         (timer (plist-get call :timer)))
+                    (select-window other-window)
+                    (delete-window source-window)
+                    (proofread-popup--validate-owners (selected-frame))
+                    (should-not (window-live-p source-window))
+                    (should (equal proofread-popup-test--hides
+                                   (list popup-buffer-name)))
+                    (should-not proofread-popup-test--deletes)
+                    (should (equal
+                             proofread-popup-test--canceled-timers
+                             (list timer)))
+                    (should-not proofread-popup--owners)
+                    (proofread-popup-test--fire-idle-timer call)
+                    (should (= (length
+                                proofread-popup-test--shows)
+                               1)))))))
+         (when (buffer-live-p source)
+           (kill-buffer source))
+         (when (buffer-live-p other)
+           (kill-buffer other)))))))
+
+(ert-deftest proofread-popup-test-parent-frame-selection-hides-owner ()
+  "Losing the selected parent frame hides and invalidates its popup."
+  (proofread-popup-test--with-posframe-recorder
+   (save-window-excursion
+     (with-temp-buffer
+       (switch-to-buffer (current-buffer))
+       (insert "helo")
+       (proofread-mode 1)
+       (proofread-popup-test--install-diagnostics
+        (list (proofread-popup-test--diagnostic 1 5 "helo")))
+       (goto-char 2)
+       (proofread-popup--update)
+       (let ((popup-buffer-name proofread-popup--buffer-name)
+             (other-frame (make-symbol "proofread-popup-other-frame"))
+             (proofread-popup-delay 0.5))
+         (proofread-popup-test--with-idle-timer-recorder
+          (proofread-popup--update)
+          (let* ((call
+                  (car
+                   (proofread-popup-test--popup-idle-timer-calls
+                    proofread-popup-test--idle-timer-calls)))
+                 (timer (plist-get call :timer)))
+            (cl-letf (((symbol-function 'selected-frame)
+                       (lambda () other-frame)))
+              (proofread-popup--validate-owners other-frame))
+            (should (equal proofread-popup-test--hides
+                           (list popup-buffer-name)))
+            (should-not proofread-popup-test--deletes)
+            (should (equal proofread-popup-test--canceled-timers
+                           (list timer)))
+            (should-not proofread-popup--owners)
+            (proofread-popup-test--fire-idle-timer call)
+            (should (= (length proofread-popup-test--shows) 1)))))))))
+
+(ert-deftest proofread-popup-test-unrelated-window-preserves-owner ()
+  "An unrelated window or frame change preserves a valid popup owner."
+  (proofread-popup-test--with-posframe-recorder
+   (save-window-excursion
+     (let ((source (generate-new-buffer " *proofread-popup-source*"))
+           (other (generate-new-buffer " *proofread-popup-other*"))
+           (replacement
+            (generate-new-buffer " *proofread-popup-replacement*")))
+       (unwind-protect
+           (let* ((source-window (selected-window))
+                  (other-window
+                   (split-window source-window nil 'below)))
+             (set-window-buffer source-window source)
+             (set-window-buffer other-window other)
+             (select-window source-window)
+             (with-current-buffer source
+               (insert "helo")
+               (proofread-mode 1)
+               (proofread-popup-test--install-diagnostics
+                (list (proofread-popup-test--diagnostic 1 5 "helo")))
+               (goto-char 2)
+               (proofread-popup--update)
+               (let ((proofread-popup-delay 0.5))
+                 (proofread-popup-test--with-idle-timer-recorder
+                  (proofread-popup--update)
+                  (let* ((call
+                          (car
+                           (proofread-popup-test--popup-idle-timer-calls
+                            proofread-popup-test--idle-timer-calls)))
+                         (timer (plist-get call :timer)))
+                    (set-window-buffer other-window replacement)
+                    (proofread-popup--validate-owners (selected-frame))
+                    (proofread-popup--delete-frame-owner
+                     (make-symbol "proofread-popup-unrelated-frame"))
+                    (should-not proofread-popup-test--hides)
+                    (should-not proofread-popup-test--deletes)
+                    (should-not proofread-popup-test--canceled-timers)
+                    (should (eq proofread-popup--idle-timer timer))
+                    (should (equal proofread-popup--owners
+                                   (list source)))
+                    (proofread-popup-test--fire-idle-timer call)
+                    (should-not proofread-popup--idle-timer)
+                    (should proofread-popup--visible-p)
+                    (should (equal proofread-popup--owners
+                                   (list source))))))))
+         (dolist (buffer (list source other replacement))
+           (when (buffer-live-p buffer)
+             (kill-buffer buffer))))))))
+
+(ert-deftest proofread-popup-test-parent-frame-delete-is-final ()
+  "Deleting the parent frame deletes rather than hides its popup."
+  (proofread-popup-test--with-posframe-recorder
+   (save-window-excursion
+     (with-temp-buffer
+       (switch-to-buffer (current-buffer))
+       (insert "helo")
+       (proofread-mode 1)
+       (proofread-popup-test--install-diagnostics
+        (list (proofread-popup-test--diagnostic 1 5 "helo")))
+       (goto-char 2)
+       (proofread-popup--update)
+       (let ((frame proofread-popup--owner-frame)
+             (popup-buffer-name proofread-popup--buffer-name)
+             (proofread-popup-delay 0.5))
+         (proofread-popup-test--with-idle-timer-recorder
+          (proofread-popup--update)
+          (let* ((call
+                  (car
+                   (proofread-popup-test--popup-idle-timer-calls
+                    proofread-popup-test--idle-timer-calls)))
+                 (timer (plist-get call :timer)))
+            (proofread-popup--delete-frame-owner frame)
+            (proofread-popup--delete-frame-owner frame)
+            (should-not proofread-popup-test--hides)
+            (should (equal proofread-popup-test--deletes
+                           (list popup-buffer-name)))
+            (should (equal proofread-popup-test--canceled-timers
+                           (list timer)))
+            (should-not proofread-popup--buffer-name)
+            (should-not proofread-popup--visible-p)
+            (should-not proofread-popup--idle-timer)
+            (should-not proofread-popup--update-generation)
+            (should-not proofread-popup--owners)
+            (proofread-popup-test--fire-idle-timer call)
+            (should (= (length proofread-popup-test--shows) 1)))))))))
+
+(ert-deftest proofread-popup-test-delete-is-reentrant-safe ()
+  "Recursive final cleanup deletes a Posframe only once."
+  (proofread-popup-test--with-posframe-recorder
+   (save-window-excursion
+     (with-temp-buffer
+       (switch-to-buffer (current-buffer))
+       (insert "helo")
+       (proofread-mode 1)
+       (proofread-popup-test--install-diagnostics
+        (list (proofread-popup-test--diagnostic 1 5 "helo")))
+       (goto-char 2)
+       (proofread-popup--update)
+       (let ((deletes 0))
+         (cl-letf (((symbol-function 'posframe-delete)
+                    (lambda (_buffer-or-name)
+                      (setq deletes (1+ deletes))
+                      (proofread-popup--delete))))
+           (proofread-popup--delete))
+         (should (= deletes 1))
+         (should-not proofread-popup--buffer-name)
+         (should-not proofread-popup--owners))))))
+
+(ert-deftest proofread-popup-test-cleanup-errors-remain-isolated ()
+  "Timer and warning failures cannot interrupt ordinary popup hiding."
+  (proofread-popup-test--with-posframe-recorder
+   (save-window-excursion
+     (with-temp-buffer
+       (switch-to-buffer (current-buffer))
+       (insert "helo")
+       (proofread-mode 1)
+       (proofread-popup-test--install-diagnostics
+        (list (proofread-popup-test--diagnostic 1 5 "helo")))
+       (goto-char 2)
+       (proofread-popup--update)
+       (let ((popup-buffer-name proofread-popup--buffer-name)
+             (proofread-popup-delay 0.5))
+         (proofread-popup-test--with-idle-timer-recorder
+          (proofread-popup--update)
+          (cl-letf
+              (((symbol-function 'cancel-timer)
+                (lambda (_timer)
+                  (error "timer cancellation failed")))
+               ((symbol-function
+                 'proofread-report-warning-without-window)
+                (lambda (&rest _args)
+                  (error "warning reporter failed"))))
+            (should-not
+             (condition-case err
+                 (progn
+                   (proofread-popup--hide)
+                   nil)
+               (error err))))
+          (should (equal proofread-popup-test--hides
+                         (list popup-buffer-name)))
+          (should-not proofread-popup--visible-p)
+          (should-not proofread-popup--idle-timer)
+          (should-not proofread-popup--update-generation)
+          (should-not proofread-popup--owners)))))))
+
+(ert-deftest proofread-popup-test-dead-owner-buffer-is-pruned ()
+  "Ownership validation safely removes a dead source buffer."
+  (proofread-popup-test--with-posframe-recorder
+   (let ((buffer (generate-new-buffer " *proofread-popup-dead*")))
+     (setq proofread-popup--owners (list buffer))
+     (kill-buffer buffer)
+     (proofread-popup--validate-owners (selected-frame))
+     (should-not proofread-popup--owners)
+     (should-not proofread-popup-test--hides)
+     (should-not proofread-popup-test--deletes))))
 
 ;;;; Availability and lifecycle
 
@@ -1347,14 +1876,50 @@ SUGGESTIONS, MESSAGE, and SOURCE supply the optional field values."
                 (list diagnostic))
                (goto-char 2)
                (proofread-popup--update))
-             (unload-feature 'proofread-popup t)
+             (let* ((popup-buffer
+                     (get-buffer-create proofread-popup--buffer-name))
+                    (delete-function
+                     (symbol-function 'posframe-delete)))
+               (bury-buffer popup-buffer)
+               (cl-letf (((symbol-function 'posframe-delete)
+                          (lambda (buffer-or-name)
+                            (funcall delete-function buffer-or-name)
+                            (when-let* ((popup-buffer
+                                         (get-buffer buffer-or-name)))
+                              (kill-buffer popup-buffer)))))
+                 (unload-feature 'proofread-popup t))
+               (should-not (buffer-live-p popup-buffer)))
              (should proofread-popup-test--deletes)
              (should-not
               (memq #'proofread-popup--sync-with-proofread-mode
                     proofread-mode-hook))
+             (dolist (entry
+                      '((window-buffer-change-functions
+                         proofread-popup--validate-owners)
+                        (window-selection-change-functions
+                         proofread-popup--validate-owners)
+                        (delete-frame-functions
+                         proofread-popup--delete-frame-owner)))
+               (should-not
+                (memq (cadr entry) (default-value (car entry)))))
              (with-current-buffer buffer
-               (should-not (bound-and-true-p proofread-popup-mode))))
-         (require 'proofread-popup)
+               (should-not (bound-and-true-p proofread-popup-mode))
+               (should-not
+                (memq 'proofread-popup--pre-command-cleanup
+                      pre-command-hook))))
+         (progn
+           (require 'proofread-popup)
+           (dolist (entry
+                    '((window-buffer-change-functions
+                       proofread-popup--validate-owners)
+                      (window-selection-change-functions
+                       proofread-popup--validate-owners)
+                      (delete-frame-functions
+                       proofread-popup--delete-frame-owner)))
+             (should
+              (= (cl-count (cadr entry)
+                           (default-value (car entry)))
+                 1))))
          (when (buffer-live-p buffer)
            (kill-buffer buffer)))))))
 

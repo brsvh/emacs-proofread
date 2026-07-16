@@ -447,7 +447,9 @@ buffer:
 
 When point is on a diagnostic, the frontend displays each diagnostic message in
 a child frame above the start of its range and hides the frame when point moves
-away. By default, it waits until point has been idle for `0.5` seconds, then
+away. The frame is also hidden immediately when its source buffer or window
+loses selection, so switching buffers or windows cannot leave a stale popup
+behind. By default, it waits until point has been idle for `0.5` seconds, then
 creates or updates the child frame from the diagnostic at that time. Movement
 and diagnostic notifications during the wait are coalesced. Set
 `proofread-popup-delay` to `0` to restore immediate updates, for example with

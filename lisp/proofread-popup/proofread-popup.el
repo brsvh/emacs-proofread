@@ -93,6 +93,9 @@ Set this to zero to update the child frame immediately."
 
 (defvar proofread-popup-mode)
 
+(defvar proofread-popup--owners nil
+  "Source buffers with pending or visible Proofread popups.")
+
 (defvar-local proofread-popup--buffer-name nil
   "Hidden Posframe buffer name for the current Proofread buffer.")
 
@@ -114,10 +117,63 @@ Set this to zero to update the child frame immediately."
 (defvar-local proofread-popup--update-generation nil
   "Identity token for the current pending popup update.")
 
+(defvar-local proofread-popup--owner-window nil
+  "Selected source window that owns this buffer's popup state.")
+
+(defvar-local proofread-popup--owner-frame nil
+  "Parent frame that owns this buffer's popup state.")
+
+(defvar-local proofread-popup--visible-p nil
+  "Non-nil when this buffer owns a visible Proofread child frame.")
+
 (defvar-local proofread-popup--user-disabled-p nil
   "Non-nil when the user disabled popup integration in this buffer.")
 
 ;;;; Child-frame rendering
+
+(defun proofread-popup--owner-active-p ()
+  "Return non-nil when the current buffer has popup-owned work."
+  (or proofread-popup--idle-timer proofread-popup--visible-p))
+
+(defun proofread-popup--sync-owner-registry ()
+  "Synchronize the current buffer with the popup owner registry."
+  (if (proofread-popup--owner-active-p)
+      (unless (memq (current-buffer) proofread-popup--owners)
+        (push (current-buffer) proofread-popup--owners))
+    (setq proofread-popup--owners
+          (delq (current-buffer) proofread-popup--owners))
+    (setq proofread-popup--owner-window nil)
+    (setq proofread-popup--owner-frame nil)))
+
+(defun proofread-popup--set-owner-target (window)
+  "Record WINDOW and its parent frame as the current popup owner."
+  (setq proofread-popup--owner-window window)
+  (setq proofread-popup--owner-frame (window-frame window)))
+
+(defun proofread-popup--selected-owner-target ()
+  "Return the selected source window for the current buffer, or nil."
+  (let ((window (selected-window)))
+    (when (and (window-live-p window)
+               (eq (window-buffer window) (current-buffer))
+               (frame-live-p (window-frame window)))
+      window)))
+
+(defun proofread-popup--owner-valid-p (&optional selected-window)
+  "Return non-nil when the current buffer still owns its display.
+SELECTED-WINDOW, when non-nil, is the already captured selected window."
+  (let ((selected-window
+         (or selected-window (selected-window))))
+    (and (proofread-popup--owner-active-p)
+         (window-live-p proofread-popup--owner-window)
+         (frame-live-p proofread-popup--owner-frame)
+         (eq (window-frame proofread-popup--owner-window)
+             proofread-popup--owner-frame)
+         (eq (selected-frame) proofread-popup--owner-frame)
+         (eq selected-window proofread-popup--owner-window)
+         (eq (frame-selected-window proofread-popup--owner-frame)
+             proofread-popup--owner-window)
+         (eq (window-buffer proofread-popup--owner-window)
+             (current-buffer)))))
 
 (defun proofread-popup--reset-state ()
   "Forget the child frame currently associated with this buffer."
@@ -246,45 +302,125 @@ WINDOW and SNAPSHOT describe the selected display target."
             (eq window proofread-popup--window)
             (equal snapshot proofread-popup--render-state))))
 
-(defun proofread-popup--hide ()
-  "Hide the current Proofread child frame."
-  (when (and proofread-popup--buffer-name
-             proofread-popup--render-signature)
-    (posframe-hide proofread-popup--buffer-name))
-  (proofread-popup--reset-state))
+(defun proofread-popup--report-cleanup-error (message)
+  "Report popup cleanup MESSAGE without allowing another error."
+  (condition-case nil
+      (proofread-report-warning-without-window
+       message "popup cleanup failed; see *Warnings*")
+    (error nil)))
+
+(defun proofread-popup--cancel-timer (timer)
+  "Cancel TIMER, isolating cleanup errors."
+  (when timer
+    (condition-case err
+        (cancel-timer timer)
+      (error
+       (proofread-popup--report-cleanup-error
+        (format "Proofread popup timer cancellation error: %s"
+                (error-message-string err)))))))
 
 (defun proofread-popup--cancel-pending-update ()
   "Cancel and invalidate the pending popup update, if any."
   (let ((timer proofread-popup--idle-timer))
     (setq proofread-popup--idle-timer nil)
     (setq proofread-popup--update-generation nil)
-    (when timer
-      (cancel-timer timer))))
+    (proofread-popup--sync-owner-registry)
+    (proofread-popup--cancel-timer timer)))
+
+(defun proofread-popup--claim-hidden-popup ()
+  "Claim and return the timer for all current popup-owned state."
+  (let ((timer proofread-popup--idle-timer))
+    (setq proofread-popup--idle-timer nil)
+    (setq proofread-popup--update-generation nil)
+    (setq proofread-popup--visible-p nil)
+    (proofread-popup--reset-state)
+    (proofread-popup--sync-owner-registry)
+    timer))
+
+(defun proofread-popup--forget-hidden-popup ()
+  "Forget popup state after Posframe has hidden the child frame."
+  (proofread-popup--cancel-timer
+   (proofread-popup--claim-hidden-popup)))
+
+(defun proofread-popup--hide ()
+  "Hide and invalidate the current Proofread child frame."
+  (let ((buffer-name proofread-popup--buffer-name)
+        (visible-p proofread-popup--visible-p))
+    (proofread-popup--forget-hidden-popup)
+    (when (and buffer-name visible-p)
+      (condition-case err
+          (posframe-hide buffer-name)
+        (error
+         (proofread-popup--report-cleanup-error
+          (format "Proofread popup hide error: %s"
+                  (error-message-string err))))))))
 
 (defun proofread-popup--delete ()
   "Delete the current Proofread child frame and hidden buffer."
-  (proofread-popup--cancel-pending-update)
-  (when proofread-popup--buffer-name
-    (condition-case err
-        (progn
-          (posframe-delete proofread-popup--buffer-name)
-          (setq proofread-popup--buffer-name nil))
-      (error
-       (proofread-report-warning-without-window
-        (format "Proofread popup delete error: %s"
-                (error-message-string err))
-        "popup cleanup failed; see *Warnings*"))))
-  (proofread-popup--reset-state))
+  (let ((buffer-name proofread-popup--buffer-name))
+    (setq proofread-popup--buffer-name nil)
+    (proofread-popup--forget-hidden-popup)
+    (when buffer-name
+      (condition-case err
+          (posframe-delete buffer-name)
+        (error
+         (unless proofread-popup--buffer-name
+           (setq proofread-popup--buffer-name buffer-name))
+         (proofread-popup--report-cleanup-error
+          (format "Proofread popup delete error: %s"
+                  (error-message-string err))))))))
 
 (defun proofread-popup--hide-handler (info)
   "Handle automatic child-frame hiding described by Posframe INFO."
   (when (posframe-hidehandler-when-buffer-switch info)
     (when-let* ((parent-info (plist-get info :posframe-parent-buffer))
-                (parent-buffer (cdr-safe parent-info))
-                ((buffer-live-p parent-buffer)))
-      (with-current-buffer parent-buffer
-        (proofread-popup--reset-state)))
+                (parent-buffer (cdr-safe parent-info)))
+      (if (buffer-live-p parent-buffer)
+          (with-current-buffer parent-buffer
+            (proofread-popup--forget-hidden-popup))
+        (setq proofread-popup--owners
+              (delq parent-buffer proofread-popup--owners))))
     t))
+
+(defun proofread-popup--pre-command-cleanup ()
+  "Hide popup-owned state before a command can leave this buffer."
+  (when proofread-popup--visible-p
+    (condition-case err
+        (proofread-popup--hide)
+      (error
+       (proofread-popup--report-cleanup-error
+        (format "Proofread popup pre-command cleanup error: %s"
+                (error-message-string err)))))))
+
+(defun proofread-popup--validate-owners (&optional _frame)
+  "Hide registered popups whose display ownership is no longer valid."
+  (dolist (buffer (copy-sequence proofread-popup--owners))
+    (if (buffer-live-p buffer)
+        (condition-case err
+            (with-current-buffer buffer
+              (unless (proofread-popup--owner-valid-p)
+                (proofread-popup--hide)))
+          (error
+           (proofread-popup--report-cleanup-error
+            (format "Proofread popup ownership cleanup error: %s"
+                    (error-message-string err)))))
+      (setq proofread-popup--owners
+            (delq buffer proofread-popup--owners)))))
+
+(defun proofread-popup--delete-frame-owner (frame)
+  "Delete registered popups whose parent frame is FRAME."
+  (dolist (buffer (copy-sequence proofread-popup--owners))
+    (if (buffer-live-p buffer)
+        (condition-case err
+            (with-current-buffer buffer
+              (when (eq proofread-popup--owner-frame frame)
+                (proofread-popup--delete)))
+          (error
+           (proofread-popup--report-cleanup-error
+            (format "Proofread popup frame cleanup error: %s"
+                    (error-message-string err)))))
+      (setq proofread-popup--owners
+            (delq buffer proofread-popup--owners)))))
 
 (defun proofread-popup--anchor-position (diagnostic window)
   "Return DIAGNOSTIC's visible, accessible anchor in WINDOW."
@@ -327,14 +463,18 @@ WINDOW and SNAPSHOT describe the selected display target."
   (setq proofread-popup--render-signature signature)
   (setq proofread-popup--position position)
   (setq proofread-popup--window window)
-  (setq proofread-popup--render-state snapshot))
+  (setq proofread-popup--render-state snapshot)
+  (setq proofread-popup--visible-p t)
+  (proofread-popup--set-owner-target window)
+  (proofread-popup--sync-owner-registry))
 
-(defun proofread-popup--render-now ()
-  "Immediately update the child frame from the current buffer state."
+(defun proofread-popup--render-now (&optional selected-window)
+  "Immediately update the child frame from the current buffer state.
+SELECTED-WINDOW, when non-nil, is the already captured selected window."
   (if (and proofread-popup-mode
            proofread-mode
            proofread-popup-enabled)
-      (let ((window (selected-window)))
+      (let ((window (or selected-window (selected-window))))
         (if (proofread-popup--selected-buffer-p window)
             (let* ((diagnostic (proofread-diagnostic-at-point))
                    (position
@@ -365,21 +505,39 @@ WINDOW and SNAPSHOT describe the selected display target."
   (when (buffer-live-p buffer)
     (with-current-buffer buffer
       (when (eq generation proofread-popup--update-generation)
-        (setq proofread-popup--idle-timer nil)
-        (setq proofread-popup--update-generation nil)
-        (proofread-popup--render-now)))))
+        (let ((window (selected-window)))
+          (if (proofread-popup--owner-valid-p window)
+              (progn
+                (setq proofread-popup--idle-timer nil)
+                (setq proofread-popup--update-generation nil)
+                (proofread-popup--sync-owner-registry)
+                (proofread-popup--render-now window))
+            (proofread-popup--hide)))))))
 
 (defun proofread-popup--schedule-update ()
   "Schedule one idle popup update for the current buffer."
-  (unless proofread-popup--idle-timer
-    (let ((generation
-           (make-symbol "proofread-popup-pending-generation")))
-      (setq proofread-popup--update-generation generation)
-      (setq proofread-popup--idle-timer
-            (run-with-idle-timer
-             proofread-popup-delay nil
-             #'proofread-popup--idle-timer-run
-             (current-buffer) generation)))))
+  (let ((window (proofread-popup--selected-owner-target)))
+    (cond
+     ((not window)
+      (proofread-popup--hide))
+     ((and (proofread-popup--owner-active-p)
+           (not (and (eq proofread-popup--owner-window window)
+                     (eq proofread-popup--owner-frame
+                         (window-frame window)))))
+      (proofread-popup--hide)
+      (proofread-popup--schedule-update))
+     ((not proofread-popup--idle-timer)
+      (let* ((generation
+              (make-symbol "proofread-popup-pending-generation"))
+             (timer
+              (run-with-idle-timer
+               proofread-popup-delay nil
+               #'proofread-popup--idle-timer-run
+               (current-buffer) generation)))
+        (proofread-popup--set-owner-target window)
+        (setq proofread-popup--update-generation generation)
+        (setq proofread-popup--idle-timer timer)
+        (proofread-popup--sync-owner-registry))))))
 
 (defun proofread-popup--update ()
   "Schedule an update for the Proofread diagnostic at point."
@@ -391,8 +549,7 @@ WINDOW and SNAPSHOT describe the selected display target."
             (proofread-popup--cancel-pending-update)
             (proofread-popup--render-now))
         (proofread-popup--schedule-update))
-    (proofread-popup--cancel-pending-update)
-    (proofread-popup--render-now)))
+    (proofread-popup--hide)))
 
 ;;;; Mode lifecycle
 
@@ -402,6 +559,8 @@ WINDOW and SNAPSHOT describe the selected display target."
 
 (defun proofread-popup--enable ()
   "Install the buffer-local hooks used by `proofread-popup-mode'."
+  (add-hook 'pre-command-hook
+            #'proofread-popup--pre-command-cleanup nil t)
   (add-hook 'post-command-hook #'proofread-popup--update nil t)
   (add-hook 'proofread-diagnostics-changed-hook
             #'proofread-popup--update nil t)
@@ -413,6 +572,8 @@ WINDOW and SNAPSHOT describe the selected display target."
 
 (defun proofread-popup--disable ()
   "Remove local popup hooks and delete the current child frame."
+  (remove-hook 'pre-command-hook
+               #'proofread-popup--pre-command-cleanup t)
   (remove-hook 'post-command-hook #'proofread-popup--update t)
   (remove-hook 'proofread-diagnostics-changed-hook
                #'proofread-popup--update t)
@@ -455,17 +616,31 @@ mode locally."
 
 (defun proofread-popup-unload-function ()
   "Remove Proofread popup integration before unloading this library."
+  (remove-hook 'window-buffer-change-functions
+               #'proofread-popup--validate-owners)
+  (remove-hook 'window-selection-change-functions
+               #'proofread-popup--validate-owners)
+  (remove-hook 'delete-frame-functions
+               #'proofread-popup--delete-frame-owner)
   (remove-hook 'proofread-mode-hook
                #'proofread-popup--sync-with-proofread-mode)
   (dolist (buffer (buffer-list))
-    (with-current-buffer buffer
-      (when (bound-and-true-p proofread-popup-mode)
-        (proofread-popup-mode -1))))
+    (when (buffer-live-p buffer)
+      (with-current-buffer buffer
+        (when (bound-and-true-p proofread-popup-mode)
+          (proofread-popup-mode -1)))))
+  (setq proofread-popup--owners nil)
   nil)
 
 ;;;; Runtime setup
 
 (progn
+  (add-hook 'window-buffer-change-functions
+            #'proofread-popup--validate-owners)
+  (add-hook 'window-selection-change-functions
+            #'proofread-popup--validate-owners)
+  (add-hook 'delete-frame-functions
+            #'proofread-popup--delete-frame-owner)
   (add-hook 'proofread-mode-hook
             #'proofread-popup--sync-with-proofread-mode)
   (dolist (buffer (buffer-list))
