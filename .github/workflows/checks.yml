@@ -1,0 +1,78 @@
+name: Checks
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+
+permissions: {}
+
+concurrency:
+  group: emacs-proofread-checks-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    name: Check
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+
+    permissions:
+      contents: read
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v6.0.3
+        with:
+          persist-credentials: false
+
+      - name: Install Nix
+        uses: cachix/install-nix-action@v31.10.7
+        with:
+          github_access_token: ${{ github.token }}
+
+      - name: Restore Nix store cache
+        uses: nix-community/cache-nix-action@v7.0.2
+        with:
+          primary-key: >-
+            emacs-proofread-nix-${{ runner.os }}-${{
+              hashFiles('**/*.nix', '**/flake.lock')
+            }}
+          restore-prefixes-first-match: >-
+            emacs-proofread-nix-${{ runner.os }}-
+          save: >-
+            ${{
+              github.event_name == 'push' &&
+              github.ref == 'refs/heads/main'
+            }}
+
+      - name: Check flake, formatting, and workflows
+        run: |
+          set -euo pipefail
+          nix flake check --all-systems
+          nix fmt -- --fail-on-change
+          nix develop .#release --command \
+            actionlint \
+            -ignore 'unexpected key "queue"' \
+            .github/workflows/*.yml
+
+      - name: Run tests
+        run: |
+          set -euo pipefail
+          nix run .#emacs30-run-proofread-tests
+          nix run .#emacs31-run-proofread-tests
+
+      - name: Run strict byte compilation
+        run: |
+          set -euo pipefail
+          nix run .#emacs30-byte-compile-proofread
+          nix run .#emacs31-byte-compile-proofread
+
+      - name: Run Checkdoc
+        run: |
+          set -euo pipefail
+          nix run .#emacs30-checkdoc-proofread
+          nix run .#emacs31-checkdoc-proofread
