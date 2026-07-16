@@ -12,10 +12,10 @@ proofread-popup.  For detailed development history, see the Git log.
 *** Profiles and checkers are now the primary configuration interface.
 The user option 'proofread-profile' selects a named entry from
 'proofread-profiles'.  Each profile can specify ':language',
-':display-language', and an ordered ':checkers' list.  Each checker has a
-unique symbol ':name', selects a registered backend with ':backend', and
-can carry backend-specific ':options'.  Multiple checkers can therefore
-proofread the same text with different backends or settings.
+':display-language', and an ordered ':checkers' list.  Each checker has a unique
+symbol ':name', selects a registered backend with ':backend', and can carry
+backend-specific ':options'.  Multiple checkers can therefore proofread the same
+text with different backends or settings.
 
 The profile ':language' is a machine-readable language code, while
 ':display-language' is the human-readable language name used in LLM prompts.
@@ -26,120 +26,117 @@ detection), falls back to the profile ':language' when the key is absent, and
 never receives the display name.
 
 An empty ':checkers' list disables proofreading for that profile.
-'proofread-profile' can also be set buffer-locally to select different
-profiles in different buffers.
+'proofread-profile' can also be set buffer-locally to select different profiles
+in different buffers.
 
 ---
 *** The legacy single-backend configuration is now obsolete.
-The user options 'proofread-backend' and 'proofread-language' are both
-obsolete as of proofread 0.2.0.  They remain functional for compatibility
-in this release.  An actual check that uses the legacy configuration
-issues one warning per Emacs session.
+The user options 'proofread-backend' and 'proofread-language' are both obsolete
+as of proofread 0.2.0.  They remain functional for compatibility in this
+release.  An actual check that uses the legacy configuration issues one warning
+per Emacs session.
 
-To migrate, define a named entry in 'proofread-profiles', move the old
-language value to the profile's ':language' property, represent the old
-backend with a named checker whose ':backend' property selects it, and
-select the profile with 'proofread-profile'.
+To migrate, define a named entry in 'proofread-profiles', move the old language
+value to the profile's ':language' property, represent the old backend with a
+named checker whose ':backend' property selects it, and select the profile with
+'proofread-profile'.
 
 ** Backends
 
 ---
 *** Proofread mode now aligns LLM connection and request timeouts.
-When 'proofread-mode' is enabled, the current
-'proofread-llm-request-timeout' is used as the buffer-local
-'llm-request-plz-connect-timeout'.  Disabling the mode or unloading the LLM
-backend restores the previous local binding or current global value.
+When 'proofread-mode' is enabled, the current 'proofread-llm-request-timeout' is
+used as the buffer-local 'llm-request-plz-connect-timeout'.  Disabling the mode
+or unloading the LLM backend restores the previous local binding or current
+global value.
 
 ---
 *** New local LanguageTool backend.
-The new backend sends asynchronous HTTP requests to a LanguageTool v2
-server.  It supports safe UTF-16 offset conversion, configurable language
-and rule selection, request timeouts, and optional management of a
-session-local LanguageTool server.
+The new backend sends asynchronous HTTP requests to a LanguageTool v2 server.
+It supports safe UTF-16 offset conversion, configurable language and rule
+selection, request timeouts, and optional management of a session-local
+LanguageTool server.
 
-LanguageTool remains an optional runtime dependency used only by
-LanguageTool checkers.
+LanguageTool remains an optional runtime dependency used only by LanguageTool
+checkers.
 
 ---
 *** New backend registry.
-The core now dispatches through a backend registry.  The registry supports
-lazy loading, backend-specific cache identities, and backend-specific
-request cancellation.
+The core now dispatches through a backend registry.  The registry supports lazy
+loading, backend-specific cache identities, and backend-specific request
+cancellation.
 
 ---
 *** Checker dispatch failures are isolated within a profile.
 Failures while loading a backend, computing checker identity, constructing
-requests, or submitting them are reported for that checker.  Remaining
-checkers in the profile continue to run.
+requests, or submitting them are reported for that checker.  Remaining checkers
+in the profile continue to run.
 
 ---
 *** Unloading the LLM backend safely terminates active requests.
-Unloading "proofread-llm" now cancels live provider work and timers and
-settles the related core requests exactly once.  Late provider callbacks are
-ignored, preventing void-function errors and occupied scheduler slots during
-unload or reload.
+Unloading "proofread-llm" now cancels live provider work and timers and settles
+the related core requests exactly once.  Late provider callbacks are ignored,
+preventing void-function errors and occupied scheduler slots during unload or
+reload.
 
 ---
 *** Fallback LLM provider identities no longer collide after reload.
-Automatically generated identities now differ across loads of
-"proofread-llm", so a different provider with the same name cannot reuse stale
-cache entries.  Explicit ':provider-identity' values remain stable for
-intentional cache reuse.
+Automatically generated identities now differ across loads of "proofread-llm",
+so a different provider with the same name cannot reuse stale cache entries.
+Explicit ':provider-identity' values remain stable for intentional cache reuse.
 
 ---
 *** LLM requests now have a Proofread-owned timeout watchdog.
 The new option 'proofread-llm-request-timeout' defaults to 120 seconds; nil
 disables it.  A checker-local ':request-timeout' takes precedence whenever the
-key is present, including nil.  A timeout cancels provider work and releases
-the core scheduler slot.  Timeout settings affect liveness, not cache
-compatibility.
+key is present, including nil.  A timeout cancels provider work and releases the
+core scheduler slot.  Timeout settings affect liveness, not cache compatibility.
 
 ---
 *** LanguageTool distinguishes HTTP responses from transport failures.
 Non-200 responses with a valid HTTP status now report a
-'languagetool-http-error' and retain the status and bounded response body in
-the error details.  Such responses keep a reachable server ready.
+'languagetool-http-error' and retain the status and bounded response body in the
+error details.  Such responses keep a reachable server ready.
 'languagetool-transport-error' is reserved for failures without a valid HTTP
 response; malformed successful responses remain invalid-response errors.
 
 ---
 *** Managed LanguageTool identities now track configuration contents.
-For servers owned by Proofread, the normalized configuration content digest
-and resolved command identity now participate in startup and cache identity.
-Changing the configuration or replacing the executable at the same path
-restarts a ready owned server and prevents reuse of old cached results.
-Configuration contents are not exposed in logs, and external servers are not
-restarted.
+For servers owned by Proofread, the normalized configuration content digest and
+resolved command identity now participate in startup and cache identity.
+Changing the configuration or replacing the executable at the same path restarts
+a ready owned server and prevents reuse of old cached results.  Configuration
+contents are not exposed in logs, and external servers are not restarted.
 
 ** User interface
 
 ---
 *** Diagnostics now carry frontend source labels.
-Backends can provide one safe display label per checker without changing the
-raw backend source stored in diagnostics and used by ignoring.  LLM checkers
-use an explicit ':source-label', the new 'proofread-llm-source-label' default,
-or the effective provider name; LanguageTool uses "languagetool".  The new
-public diagnostic message-entry interface preserves each message-to-source
-association for frontends, including aggregate diagnostics and cache hits.
+Backends can provide one safe display label per checker without changing the raw
+backend source stored in diagnostics and used by ignoring.  LLM checkers use an
+explicit ':source-label', the new 'proofread-llm-source-label' default, or the
+effective provider name; LanguageTool uses "languagetool".  The new public
+diagnostic message-entry interface preserves each message-to-source association
+for frontends, including aggregate diagnostics and cache hits.
 
 ---
 *** Explicit checks now retire diagnostics owned by inactive checkers.
-After a profile switch or checker removal, explicitly checking a range
-removes diagnostics in that range that belong to checkers absent from the
-current profile, even if no replacement diagnostics are reported.  An
-empty profile similarly retires profile-owned diagnostics from the checked
-range without dispatching backend requests.  Diagnostics outside the
-checked range remain unchanged.  Profile-owner retirement does not affect
-otherwise-valid ad-hoc low-level diagnostics, while diagnostics from current
-checkers remain visible until their replacement results are applied.
+After a profile switch or checker removal, explicitly checking a range removes
+diagnostics in that range that belong to checkers absent from the current
+profile, even if no replacement diagnostics are reported.  An empty profile
+similarly retires profile-owned diagnostics from the checked range without
+dispatching backend requests.  Diagnostics outside the checked range remain
+unchanged.  Profile-owner retirement does not affect otherwise-valid ad-hoc
+low-level diagnostics, while diagnostics from current checkers remain visible
+until their replacement results are applied.
 
 ---
 *** Matching diagnostics from multiple checkers are aggregated.
-Diagnostics for the same text and range remain independent internally but
-are presented as one source-aware diagnostic for navigation, descriptions,
-suggestions, correction, and ignoring.  Grouped sources, messages,
-suggestions, and correction choices follow the profile's declared checker
-order, regardless of asynchronous completion order.
+Diagnostics for the same text and range remain independent internally but are
+presented as one source-aware diagnostic for navigation, descriptions,
+suggestions, correction, and ignoring.  Grouped sources, messages, suggestions,
+and correction choices follow the profile's declared checker order, regardless
+of asynchronous completion order.
 
 ---
 *** Request monitoring excludes configuration secrets and opaque objects.
@@ -147,10 +144,10 @@ All request-log events, stored records, and detail buffers now use a safe
 representation that omits raw checker options, provider objects, backend
 handles, and other opaque backend-local objects.
 
-Logged URLs retain only their origin (scheme, host, and port).  Backend
-errors and related warnings retain only the condition kind rather than raw
-payloads or messages.  Checker fingerprints are derived from safe identity
-summaries, not raw options.
+Logged URLs retain only their origin (scheme, host, and port).  Backend errors
+and related warnings retain only the condition kind rather than raw payloads or
+messages.  Checker fingerprints are derived from safe identity summaries, not
+raw options.
 
 Source text, generated prompt text, HTTP request parameters, and provider
 responses remain visible for debugging and may contain sensitive text.
@@ -165,10 +162,10 @@ the same source-aware aggregation and ordering.
 
 ---
 *** Large asynchronous checks remain responsive with caching enabled.
-Successful backend replies now wake only queued requests that can use the
-new cache entry.  This avoids repeated scans of unrelated queued work in
-buffers split into many chunks, without changing cache-hit behavior,
-checker isolation, or request ordering.
+Successful backend replies now wake only queued requests that can use the new
+cache entry.  This avoids repeated scans of unrelated queued work in buffers
+split into many chunks, without changing cache-hit behavior, checker isolation,
+or request ordering.
 
 ** Packaging and development
 
@@ -180,27 +177,27 @@ implementation is split into "proofread.el", "proofread-llm.el", and
 
 ---
 *** Backend-private implementation details use feature namespaces.
-Backend-private functions and variables now live under their feature
-namespaces.  Shared callback scheduling and position conversion are
-centralized in the core library.
+Backend-private functions and variables now live under their feature namespaces.
+Shared callback scheduling and position conversion are centralized in the core
+library.
 
 ---
 *** Tests are split by backend.
-Core, LLM, and LanguageTool tests are now independent suites.  Backend
-test symbols are aligned with their feature namespaces.
+Core, LLM, and LanguageTool tests are now independent suites.  Backend test
+symbols are aligned with their feature namespaces.
 
 ---
 *** The core library no longer loads GNU ELPA llm eagerly.
-The core library does not load GNU ELPA "llm" until the LLM backend is
-selected or required explicitly.
+The core library does not load GNU ELPA "llm" until the LLM backend is selected
+or required explicitly.
 
 ** Compatibility
 
 ---
 *** proofread 0.2.0 remains compatible with proofread-popup 0.1.0.
-The core retains the compatibility entry points used by the released
-popup.  Users may therefore upgrade proofread before upgrading the
-optional popup frontend.
+The core retains the compatibility entry points used by the released popup.
+Users may therefore upgrade proofread before upgrading the optional popup
+frontend.
 
 
 * Changes in proofread 0.1.0
@@ -211,54 +208,52 @@ Initial release.
 
 ---
 *** Asynchronous, context-aware proofreading.
-Proofread provides asynchronous, context-aware proofreading through
-provider objects from the GNU ELPA "llm" package.
+Proofread provides asynchronous, context-aware proofreading through provider
+objects from the GNU ELPA "llm" package.
 
 ---
 *** LLM JSON response handling.
-Proofread supports provider-enforced JSON schema responses and
-prompt-only JSON responses, with automatic selection based on provider
-capabilities.
+Proofread supports provider-enforced JSON schema responses and prompt-only JSON
+responses, with automatic selection based on provider capabilities.
 
 ---
 *** Automatic and explicit checks.
 Proofread can check visible text automatically after idle time.  It also
-provides explicit commands for checking the text at point, the active
-region, the accessible buffer, or all visible ranges.
+provides explicit commands for checking the text at point, the active region,
+the accessible buffer, or all visible ranges.
 
 ---
 *** Mode-aware text selection.
-Proofread can select ordinary text, comments, or docstrings with
-mode-aware defaults.  It excludes URLs, email addresses, invisible text,
-configured faces, and configured text properties.
+Proofread can select ordinary text, comments, or docstrings with mode-aware
+defaults.  It excludes URLs, email addresses, invisible text, configured faces,
+and configured text properties.
 
 ---
 *** Sentence-aware request chunking.
-Proofread splits prose into bounded, sentence-aware requests with
-configurable surrounding context.
+Proofread splits prose into bounded, sentence-aware requests with configurable
+surrounding context.
 
 ---
 *** Overlay diagnostics and navigation.
-Diagnostics are displayed with overlays.  Commands are provided for
-navigation, detailed descriptions, and a tabulated buffer-wide diagnostic
-list.
+Diagnostics are displayed with overlays.  Commands are provided for navigation,
+detailed descriptions, and a tabulated buffer-wide diagnostic list.
 
 ---
 *** Interactive and batch correction.
-Proofread can correct individual diagnostics or scoped groups of
-diagnostics.  Batch corrections are applied atomically as one undo step
-and roll back on failure.
+Proofread can correct individual diagnostics or scoped groups of diagnostics.
+Batch corrections are applied atomically as one undo step and roll back on
+failure.
 
 ---
 *** Session-local ignore records.
-Proofread can ignore semantically identical diagnostics for the current
-Emacs session.
+Proofread can ignore semantically identical diagnostics for the current Emacs
+session.
 
 ---
 *** Caching, concurrency, and stale-result handling.
-Proofread caches diagnostics per buffer, queues requests behind a
-configurable concurrency limit, rejects stale results after edits, and
-preserves usable results when only part of a check fails.
+Proofread caches diagnostics per buffer, queues requests behind a configurable
+concurrency limit, rejects stale results after edits, and preserves usable
+results when only part of a check fails.
 
 ---
 *** Request lifecycle recording.
@@ -272,23 +267,22 @@ including queued, active, completed, failed, and stale requests.
 
 ---
 *** Child-frame updates wait for point to become idle.
-Popup updates now coalesce movement and diagnostic notifications, then
-recompute the display from the final state after point has been idle.
-The new 'proofread-popup-delay' option defaults to 0.5 seconds; set it
-to zero to restore immediate updates.
+Popup updates now coalesce movement and diagnostic notifications, then recompute
+the display from the final state after point has been idle.  The new
+'proofread-popup-delay' option defaults to 0.5 seconds; set it to zero to
+restore immediate updates.
 
 ---
 *** Popups no longer linger after their source display loses selection.
-A child frame is now hidden immediately when its source buffer or window
-loses selection, including switches and programmatic window changes.
+A child frame is now hidden immediately when its source buffer or window loses
+selection, including switches and programmatic window changes.
 
 ---
 *** Popup messages identify their backend source.
 Every diagnostic message is displayed on its own line with its LLM or
 LanguageTool source label.  Source labels use the new
-'proofread-popup-source-face', which inherits 'completions-group-title'.
-Message text inherits 'completions-annotations' through
-'proofread-popup-face'.
+'proofread-popup-source-face', which inherits 'font-lock-keyword-face'.  Message
+text inherits 'font-lock-comment-face' through 'proofread-popup-face'.
 
 ---
 *** Equal aggregate diagnostics no longer cause redundant redraws.
@@ -300,16 +294,15 @@ state still refresh it.
 
 ---
 *** proofread-popup now requires proofread 0.2.0.
-This release uses the public frontend integration interfaces introduced
-in proofread 0.2.0.  Update the core package before installing this
-version of proofread-popup.
+This release uses the public frontend integration interfaces introduced in
+proofread 0.2.0.  Update the core package before installing this version of
+proofread-popup.
 
 ** Packaging
 
 ---
 *** The source file now lives in its package directory.
-Source-checkout installations should add "lisp/proofread-popup" to
-'load-path'.
+Source-checkout installations should add "lisp/proofread-popup" to 'load-path'.
 
 
 * Changes in proofread-popup 0.1.0
@@ -320,13 +313,13 @@ Initial release.
 
 ---
 *** Optional Posframe frontend.
-The proofread-popup package provides an optional Posframe frontend that
-displays the diagnostic at point in a child frame.
+The proofread-popup package provides an optional Posframe frontend that displays
+the diagnostic at point in a child frame.
 
 ---
 *** Automatic integration with proofread-mode.
-proofread-popup follows 'proofread-mode' automatically while allowing
-popup display to be disabled per buffer.
+proofread-popup follows 'proofread-mode' automatically while allowing popup
+display to be disabled per buffer.
 
 ---
 *** Customizable popup appearance.
@@ -334,6 +327,7 @@ Popup width, text appearance, and border appearance are customizable.
 
 
 Local variables:
+fill-column: 80
 mode: outline
 paragraph-separate: "[ 	]*$"
 end:

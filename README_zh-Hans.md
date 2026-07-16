@@ -384,8 +384,8 @@ https://github.com/user-attachments/assets/8ce73c38-69af-4b51-bcc8-f913753751fc
 `0.5` 秒，再根据届时光标处的诊断创建或更新子框架；等待期间发生的移动和诊断变化会合并为一次更新。将 `proofread-popup-delay` 设为
 `0` 可恢复立即更新行为，例如使用 `(setq proofread-popup-delay 0)` 或
 Customize。每条消息都会带有后端来源前缀：LLM checker 使用其有效来源标签，LanguageTool 显示
-`languagetool`。来源标签继承主题的 `completions-group-title` face，消息正文继承
-`completions-annotations`。弹窗不显示修改建议，也不提供操作。在终端及其他无法使用子框架的环境中，弹窗不可用。运行
+`languagetool`。来源标签继承主题的 `font-lock-keyword-face` face，消息正文继承
+`font-lock-comment-face`。弹窗不显示修改建议，也不提供操作。在终端及其他无法使用子框架的环境中，弹窗不可用。运行
 `M-x proofread-popup-mode` 可在当前缓冲区中禁用或重新启用该自动集成。也可以使用
 `proofread-popup-enabled`、`proofread-popup-delay` 和 `proofread-popup-max-width`
 控制其显示。

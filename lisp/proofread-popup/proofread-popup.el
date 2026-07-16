@@ -71,12 +71,12 @@ Set this to zero to update the child frame immediately."
 ;;;; Faces
 
 (defface proofread-popup-face
-  '((t :inherit completions-annotations))
+  '((t :inherit font-lock-comment-face))
   "Face for Proofread child-frame messages."
   :group 'proofread-popup)
 
 (defface proofread-popup-source-face
-  '((t :inherit completions-group-title))
+  '((t :inherit font-lock-keyword-face))
   "Face for source labels in Proofread child-frame messages."
   :group 'proofread-popup)
 

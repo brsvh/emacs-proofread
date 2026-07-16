@@ -150,9 +150,9 @@ SUGGESTIONS, MESSAGE, and SOURCE supply the optional field values."
 (ert-deftest proofread-popup-test-faces-have-package-defaults ()
   "Proofread popup faces use the package defaults."
   (should (equal (face-default-spec 'proofread-popup-face)
-                 '((t :inherit completions-annotations))))
+                 '((t :inherit font-lock-comment-face))))
   (should (equal (face-default-spec 'proofread-popup-source-face)
-                 '((t :inherit completions-group-title))))
+                 '((t :inherit font-lock-keyword-face))))
   (should (equal (face-default-spec 'proofread-popup-border-face)
                  '((((background dark)) :background "white")
                    (((background light)) :background "black")))))
