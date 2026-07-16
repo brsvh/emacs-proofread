@@ -47,7 +47,7 @@ let
 
   languagetool-server = pkgs.callPackage (
     projectRoot
-    + /tool/languagetool-server-wrapper.nix
+    + /tool/languagetool-server/package.nix
   ) { };
 
   formatters = with pkgs; [
