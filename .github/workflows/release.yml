@@ -326,40 +326,40 @@ jobs:
 
           archive="$(cat release-input/target-archive-path)"
           nix develop .#release --command \
-            proofread-release required-dependencies \
+            proofread-release verification-packages \
             "$RELEASE_PACKAGE" \
             "$RELEASE_VERSION" \
             "$RELEASE_TAG" \
             release-input/previous-manifest.json \
             "$archive" \
-            release-input/dependencies.json
+            release-input/verification-packages.json
 
-          mkdir -p release-input/dependency-archives
-          dependency_archives=()
-          mapfile -t dependency_rows < <(
-            jq -c '.[]' release-input/dependencies.json
+          mkdir -p release-input/verification-archives
+          verification_archives=()
+          mapfile -t verification_rows < <(
+            jq -c '.[]' release-input/verification-packages.json
           )
-          for row in "${dependency_rows[@]}"; do
+          for row in "${verification_rows[@]}"; do
             name="$(jq -r '.name' <<<"$row")"
-            dep_tag="$(jq -r '.release_tag' <<<"$row")"
+            package_tag="$(jq -r '.release_tag' <<<"$row")"
             asset="$(jq -r '.asset' <<<"$row")"
             sha256="$(jq -r '.sha256' <<<"$row")"
-            dep_release="release-input/${name}-release.json"
+            package_release="release-input/${name}-release.json"
 
             api \
-              "repos/${GITHUB_REPOSITORY}/releases/tags/${dep_tag}" \
-              > "$dep_release"
+              "repos/${GITHUB_REPOSITORY}/releases/tags/${package_tag}" \
+              > "$package_release"
             jq -e '.draft == false and .immutable == true' \
-              "$dep_release"
+              "$package_release"
 
-            gh release download "$dep_tag" \
+            gh release download "$package_tag" \
               --repo "$GITHUB_REPOSITORY" \
               --pattern "$asset" \
-              --dir release-input/dependency-archives
-            path="release-input/dependency-archives/${asset}"
+              --dir release-input/verification-archives
+            path="release-input/verification-archives/${asset}"
             test "$(sha256sum "$path" | cut -d ' ' -f 1)" = "$sha256"
-            verify_github_asset_digest "$dep_release" "$asset" "$path"
-            dependency_archives+=("$path")
+            verify_github_asset_digest "$package_release" "$asset" "$path"
+            verification_archives+=("$path")
           done
 
           nix develop .#release --command \
@@ -371,7 +371,7 @@ jobs:
             release-input/previous-manifest.json \
             release-handoff \
             "$archive" \
-            "${dependency_archives[@]}"
+            "${verification_archives[@]}"
 
           nix build --no-link ".#${RELEASE_PACKAGE}"
           nix_version="$(nix eval --raw ".#${RELEASE_PACKAGE}.version")"
@@ -388,7 +388,7 @@ jobs:
             proofread-release verify-install \
             release-handoff/assets/manifest.json \
             "release-handoff/assets/${target_asset}" \
-            "${dependency_archives[@]}"
+            "${verification_archives[@]}"
 
       - name: Upload verified handoff
         id: upload

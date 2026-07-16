@@ -158,6 +158,42 @@ EXTRA-FILES maps additional relative file names to their contents."
         (error "Could not create release fixture: %s" name)))
     archive))
 
+(defun proofread-release-test--archive-package
+    (archive release-tag &optional commit)
+  "Return release metadata for ARCHIVE under RELEASE-TAG.
+
+COMMIT defaults to `proofread-release-test--commit'."
+  (proofread-release--with-release-identity
+   (proofread-release--package-from-archive archive)
+   release-tag
+   (or commit proofread-release-test--commit)))
+
+(defun proofread-release-test--write-manifest
+    (directory released packages)
+  "Write a manifest for RELEASED and PACKAGES in DIRECTORY."
+  (let ((file (expand-file-name "manifest.json" directory)))
+    (proofread-release--write-json
+     (proofread-release-test--manifest
+      (proofread-release--package-release-tag released)
+      (proofread-release--package-commit released)
+      (proofread-release--package-name released)
+      packages)
+     file)
+    file))
+
+(defvar proofread-release-test--load-order nil
+  "Package load order recorded by release archive fixtures.")
+
+(defun proofread-release-test--recording-body (marker prelude)
+  "Return fixture source that records MARKER after evaluating PRELUDE."
+  (format
+   (concat
+    "(defvar proofread-release-test--load-order nil)\n"
+    "%s\n"
+    "(setq proofread-release-test--load-order\n"
+    "      (append proofread-release-test--load-order '(%S)))")
+   prelude marker))
+
 ;;;; Manifest validation
 
 (ert-deftest proofread-release-test-bootstrap-manifest-is-valid ()
@@ -518,6 +554,30 @@ EXTRA-FILES maps additional relative file names to their contents."
       '("proofread")))))
 
 (ert-deftest
+    proofread-release-test-finds-transitive-reverse-dependencies ()
+  "Verification selects forward and transitive reverse dependencies."
+  (let* ((base
+          (proofread-release-test--package "base" "1.0.0" ?a))
+         (candidate
+          (proofread-release-test--package
+           "core" "2.0.0" ?b '(("base" . "1.0.0"))))
+         (middle
+          (proofread-release-test--package
+           "middle" "1.0.0" ?c '(("core" . "1.0.0"))))
+         (top
+          (proofread-release-test--package
+           "top" "1.0.0" ?d '(("middle" . "1.0.0"))))
+         (unrelated
+          (proofread-release-test--package "unrelated" "1.0.0" ?e)))
+    (should
+     (equal
+      (mapcar
+       #'proofread-release--package-name
+       (proofread-release--verification-packages
+        candidate (list top unrelated base middle)))
+      '("base" "core" "middle" "top")))))
+
+(ert-deftest
     proofread-release-test-rejects-unsatisfied-internal-dependency ()
   "Dependency resolution rejects an insufficient ledger package."
   (let* ((core
@@ -716,6 +776,250 @@ EXTRA-FILES maps additional relative file names to their contents."
               addon-manifest
               (list core addon)))))
       (delete-directory directory t))))
+
+(ert-deftest
+    proofread-release-test-rejects-core-incompatible-with-released-popup ()
+  "Reverse verification loads the released popup against a new core."
+  (let* ((directory
+          (make-temp-file "proofread-release-reverse-broken-" t))
+         (core-name "proofread-release-fixture-broken-core")
+         (popup-name "proofread-release-fixture-broken-popup")
+         (current-api (intern (format "%s-current-api" core-name)))
+         (legacy-api (intern (format "%s-legacy-api" core-name)))
+         (core-archive
+          (proofread-release-test--create-archive
+           directory core-name "2.0.0"
+           '((emacs "30.1"))
+           (format "(defun %s () t)" current-api)))
+         (popup-archive
+          (proofread-release-test--create-archive
+           directory popup-name "1.0.0"
+           `((emacs "30.1") (,(intern core-name) "1.0.0"))
+           (format
+            "(require '%s)\n(funcall (intern %S))"
+            core-name (symbol-name legacy-api))))
+         (core
+          (proofread-release-test--archive-package
+           core-archive
+           (format "%s-v2.0.0" core-name)
+           proofread-release-test--other-commit))
+         (popup
+          (proofread-release-test--archive-package
+           popup-archive (format "%s-v1.0.0" popup-name)))
+         (manifest
+          (proofread-release-test--write-manifest
+           directory core (list core popup))))
+    (unwind-protect
+        (let ((condition
+               (should-error
+                (proofread-release-verify-install
+                 manifest (list popup-archive core-archive)))))
+          (should
+           (string-match-p
+            (regexp-quote (symbol-name legacy-api))
+            (error-message-string condition)))
+          (should
+           (string-match-p
+            (regexp-quote popup-name)
+            (error-message-string condition))))
+      (when (fboundp current-api)
+        (fmakunbound current-api))
+      (when (fboundp legacy-api)
+        (fmakunbound legacy-api))
+      (delete-directory directory t))))
+
+(ert-deftest
+    proofread-release-test-verifies-corrected-core-and-popup-releases ()
+  "Corrected core and popup releases pass reverse and forward checks."
+  (let* ((directory
+          (make-temp-file "proofread-release-reverse-fixed-" t))
+         (core-name "proofread-release-fixture-fixed-core")
+         (alpha-name "proofread-release-fixture-alpha-popup")
+         (zeta-name "proofread-release-fixture-zeta-popup")
+         (current-api (intern (format "%s-current-api" core-name)))
+         (legacy-api (intern (format "%s-legacy-api" core-name)))
+         (core-archive
+          (proofread-release-test--create-archive
+           directory core-name "2.0.0"
+           '((emacs "30.1"))
+           (proofread-release-test--recording-body
+            'core
+            (format
+             "(defun %s () t)\n(defun %s () (%s))"
+             current-api legacy-api current-api))))
+         (alpha-archive
+          (proofread-release-test--create-archive
+           directory alpha-name "1.0.0"
+           `((emacs "30.1") (,(intern core-name) "1.0.0"))
+           (proofread-release-test--recording-body
+            'alpha
+            (format "(require '%s)\n(%s)" core-name legacy-api))))
+         (zeta-archive
+          (proofread-release-test--create-archive
+           directory zeta-name "1.0.0"
+           `((emacs "30.1") (,(intern core-name) "1.0.0"))
+           (proofread-release-test--recording-body
+            'zeta
+            (format "(require '%s)\n(%s)" core-name legacy-api))))
+         (alpha-candidate-archive
+          (proofread-release-test--create-archive
+           directory alpha-name "1.1.0"
+           `((emacs "30.1") (,(intern core-name) "2.0.0"))
+           (proofread-release-test--recording-body
+            'alpha
+            (format "(require '%s)\n(%s)" core-name current-api))))
+         (old-core
+          (proofread-release-test--package
+           core-name "1.0.0" ?c '(("emacs" . "30.1"))))
+         (alpha
+          (proofread-release-test--archive-package
+           alpha-archive (format "%s-v1.0.0" alpha-name)))
+         (zeta
+          (proofread-release-test--archive-package
+           zeta-archive (format "%s-v1.0.0" zeta-name))))
+    (unwind-protect
+        (let ((previous-file
+               (expand-file-name "legacy-manifest.json" directory))
+              (verification-file
+               (expand-file-name "verification-packages.json" directory))
+              (core-output
+               (expand-file-name "core-handoff" directory))
+              (popup-output
+               (expand-file-name "popup-handoff" directory)))
+          (proofread-release--write-json
+           (proofread-release-test--legacy-manifest
+            "v1.0.0"
+            proofread-release-test--commit
+            (list zeta old-core alpha))
+           previous-file)
+          (should
+           (equal
+            (mapcar
+             #'proofread-release--package-name
+             (proofread-release-verification-packages
+              core-name
+              "2.0.0"
+              (format "%s-v2.0.0" core-name)
+              previous-file
+              core-archive
+              verification-file))
+            (list alpha-name zeta-name)))
+          (should (file-exists-p verification-file))
+          (proofread-release-prepare-package
+           core-name
+           "2.0.0"
+           (format "%s-v2.0.0" core-name)
+           proofread-release-test--other-commit
+           previous-file
+           core-output
+           core-archive
+           (list zeta-archive alpha-archive))
+          (let ((core-manifest
+                 (expand-file-name "assets/manifest.json" core-output)))
+            (setq proofread-release-test--load-order nil)
+            (should
+             (proofread-release-verify-install
+              core-manifest
+              (list zeta-archive core-archive alpha-archive)))
+            (should
+             (equal proofread-release-test--load-order
+                    '(core alpha zeta)))
+            (proofread-release-prepare-package
+             alpha-name
+             "1.1.0"
+             (format "%s-v1.1.0" alpha-name)
+             proofread-release-test--commit
+             core-manifest
+             popup-output
+             alpha-candidate-archive
+             (list core-archive)))
+          (let ((popup-manifest
+                 (expand-file-name "assets/manifest.json" popup-output)))
+            (setq proofread-release-test--load-order nil)
+            (should
+             (proofread-release-verify-install
+              popup-manifest
+              (list alpha-candidate-archive core-archive)))
+            (should
+             (equal proofread-release-test--load-order '(core alpha)))))
+      (setq proofread-release-test--load-order nil)
+      (when (fboundp current-api)
+        (fmakunbound current-api))
+      (when (fboundp legacy-api)
+        (fmakunbound legacy-api))
+      (delete-directory directory t))))
+
+(ert-deftest
+    proofread-release-test-reports-invalid-reverse-dependency-archives ()
+  "Reverse verification diagnoses missing, changed, and extra archives."
+  (let* ((directory
+          (make-temp-file "proofread-release-reverse-archives-" t))
+         (changed-directory
+          (make-temp-file "proofread-release-reverse-changed-" t))
+         (core-name "proofread-release-fixture-archive-core")
+         (popup-name "proofread-release-fixture-archive-popup")
+         (extra-name "proofread-release-fixture-extra-popup")
+         (legacy-api (intern (format "%s-legacy-api" core-name)))
+         (core-archive
+          (proofread-release-test--create-archive
+           directory core-name "2.0.0"
+           '((emacs "30.1"))
+           (format "(defun %s () t)" legacy-api)))
+         (popup-requires
+          `((emacs "30.1") (,(intern core-name) "1.0.0")))
+         (popup-archive
+          (proofread-release-test--create-archive
+           directory popup-name "1.0.0" popup-requires
+           (format "(require '%s)\n(%s)" core-name legacy-api)))
+         (changed-popup-archive
+          (proofread-release-test--create-archive
+           changed-directory popup-name "1.0.0" popup-requires
+           (format
+            "(require '%s)\n(%s)\n(message \"changed\")"
+            core-name legacy-api)))
+         (extra-archive
+          (proofread-release-test--create-archive
+           directory extra-name "1.0.0"
+           '((emacs "30.1"))
+           "(message \"extra\")"))
+         (core
+          (proofread-release-test--archive-package
+           core-archive
+           (format "%s-v2.0.0" core-name)
+           proofread-release-test--other-commit))
+         (popup
+          (proofread-release-test--archive-package
+           popup-archive (format "%s-v1.0.0" popup-name)))
+         (manifest
+          (proofread-release-test--write-manifest
+           directory core (list core popup))))
+    (unwind-protect
+        (let ((missing
+               (should-error
+                (proofread-release-verify-install
+                 manifest (list core-archive))))
+              (changed
+               (should-error
+                (proofread-release-verify-install
+                 manifest (list core-archive changed-popup-archive))))
+              (extra
+               (should-error
+                (proofread-release-verify-install
+                 manifest
+                 (list core-archive popup-archive extra-archive)))))
+          (should
+           (string-match-p
+            (regexp-quote popup-name) (error-message-string missing)))
+          (should
+           (string-match-p
+            (regexp-quote popup-name) (error-message-string changed)))
+          (should
+           (string-match-p
+            (regexp-quote extra-name) (error-message-string extra))))
+      (when (fboundp legacy-api)
+        (fmakunbound legacy-api))
+      (delete-directory directory t)
+      (delete-directory changed-directory t))))
 
 (provide 'proofread-release-tests)
 ;;; proofread-release-tests.el ends here

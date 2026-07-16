@@ -16,9 +16,9 @@ let
     ;;; Commentary:
 
     ;; This internal tool validates Makefile-built Emacs package archives,
-    ;; compares them with the cumulative release manifest, verifies package
-    ;; dependencies and installation, and prepares the immutable handoff consumed
-    ;; by the release workflow.
+    ;; compares them with the cumulative release manifest, verifies forward
+    ;; dependencies and released reverse dependents in isolation, and prepares
+    ;; the immutable handoff consumed by the release workflow.
 
     ;;; Code:
 
@@ -620,7 +620,12 @@ let
     (defun proofread-release--dependency-order (packages)
       "Return PACKAGES in internal dependency order."
       (let ((table (proofread-release--package-table packages))
-            (pending (copy-sequence packages))
+            (pending
+             (sort
+              (copy-sequence packages)
+              (lambda (left right)
+                (string< (proofread-release--package-name left)
+                         (proofread-release--package-name right)))))
             installed
             order)
         (while pending
@@ -641,6 +646,62 @@ let
             (push ready order)))
         (nreverse order)))
 
+    (defun proofread-release--verification-packages (candidate packages)
+      "Return packages needed to verify CANDIDATE against PACKAGES.
+    The result includes CANDIDATE, its internal dependencies, and every
+    active reverse dependent whose transitive internal dependency closure
+    contains CANDIDATE.  Include each reverse dependent's closure and
+    return the union in deterministic installation order."
+      (let* ((candidate-name
+              (proofread-release--package-name candidate))
+             (graph
+              (cons
+               candidate
+               (seq-remove
+                (lambda (package)
+                  (equal (proofread-release--package-name package)
+                         candidate-name))
+                packages)))
+             (selected (make-hash-table :test #'equal)))
+        (cl-labels
+            ((select
+               (package)
+               (puthash (proofread-release--package-name package)
+                        package selected)))
+          (select candidate)
+          (dolist (dependency
+                   (proofread-release--collect-dependencies
+                    candidate graph))
+            (select dependency))
+          (dolist (package graph)
+            (unless (equal (proofread-release--package-name package)
+                           candidate-name)
+              (let ((dependencies
+                     (proofread-release--collect-dependencies
+                      package graph)))
+                (when (seq-some
+                       (lambda (dependency)
+                         (equal
+                          (proofread-release--package-name dependency)
+                          candidate-name))
+                       dependencies)
+                  (select package)
+                  (dolist (dependency dependencies)
+                    (select dependency))))))
+          (proofread-release--dependency-order
+           (hash-table-values selected)))))
+
+    (defun proofread-release--verification-companions (candidate packages)
+      "Return non-candidate packages needed to verify CANDIDATE.
+    PACKAGES is the active project package graph."
+      (let ((candidate-name
+             (proofread-release--package-name candidate)))
+        (seq-remove
+         (lambda (package)
+           (equal (proofread-release--package-name package)
+                  candidate-name))
+         (proofread-release--verification-packages candidate packages))))
+
     (defun proofread-release--same-package-p (left right)
       "Return non-nil if LEFT and RIGHT describe the same package archive."
       (and (equal (proofread-release--package-name left)
@@ -654,22 +715,22 @@ let
            (equal (proofread-release--package-requires left)
                   (proofread-release--package-requires right))))
 
-    (defun proofread-release--verify-dependency-archives (dependencies archives)
-      "Verify DEPENDENCIES are provided by ARCHIVES."
+    (defun proofread-release--verify-package-archives (packages archives)
+      "Verify that PACKAGES are provided exactly by ARCHIVES."
       (let ((provided (proofread-release--package-table
                        (proofread-release--read-archives archives)))
-            (expected (proofread-release--package-table dependencies)))
-        (dolist (package dependencies)
+            (expected (proofread-release--package-table packages)))
+        (dolist (package packages)
           (let* ((name (proofread-release--package-name package))
                  (archive (gethash name provided)))
             (unless archive
-              (error "Missing dependency archive: %s" name))
+              (error "Missing verification archive: %s" name))
             (unless (proofread-release--same-package-p archive package)
-              (error "Dependency archive differs from manifest: %s" name))))
+              (error "Verification archive differs from manifest: %s" name))))
         (maphash
          (lambda (name _package)
            (unless (gethash name expected)
-             (error "Unexpected dependency archive: %s" name)))
+             (error "Unexpected verification archive: %s" name)))
          provided)))
 
     (defun proofread-release--new-manifest (tag commit previous-manifest package)
@@ -843,13 +904,43 @@ let
           (princ "\n"))
         dependencies))
 
+    (defun proofread-release-verification-packages
+        (package version tag previous-file archive &optional output-file)
+      "Write packages needed to verify PACKAGE VERSION at TAG.
+
+    PREVIOUS-FILE supplies the cumulative ledger and ARCHIVE supplies the
+    candidate package archive.  The output contains every non-candidate archive
+    required for forward and reverse-dependency installation verification.
+    When OUTPUT-FILE is nil, write JSON to stdout."
+      (let* ((previous
+              (proofread-release--validate-manifest
+               (proofread-release--read-json previous-file)))
+             (archive-package
+              (proofread-release--validate-package-inputs
+               package version tag archive))
+             (verification-packages
+              (proofread-release--verification-companions
+               archive-package
+               (proofread-release--packages-from-manifest previous)))
+             (json
+              (vconcat
+               (mapcar
+                #'proofread-release--package-to-json
+                verification-packages))))
+        (if output-file
+            (proofread-release--write-json json output-file)
+          (princ (json-serialize json))
+          (princ "\n"))
+        verification-packages))
+
     (defun proofread-release-prepare-package
-        (package version tag commit previous-file output archive dependency-archives)
+        (package version tag commit previous-file output archive
+                 verification-archives)
       "Prepare release handoff for PACKAGE VERSION at TAG and COMMIT.
 
     PREVIOUS-FILE supplies the previous ledger, OUTPUT receives the handoff,
-    ARCHIVE is the package being released, and DEPENDENCY-ARCHIVES are archives
-    needed only to verify installation."
+    ARCHIVE is the package being released, and VERIFICATION-ARCHIVES are the exact
+    non-candidate archive set needed for forward and reverse verification."
       (proofread-release--validate-commit commit)
       (let* ((previous
               (proofread-release--validate-manifest
@@ -876,9 +967,12 @@ let
               (proofread-release--manifest-package manifest package))
              (dependencies
               (proofread-release--collect-dependencies
+               released (proofread-release--packages-from-manifest manifest)))
+             (verification-companions
+              (proofread-release--verification-companions
                released (proofread-release--packages-from-manifest manifest))))
-        (proofread-release--verify-dependency-archives
-         dependencies dependency-archives)
+        (proofread-release--verify-package-archives
+         verification-companions verification-archives)
         (when (file-exists-p output)
           (error "Release output already exists: %s" output))
         (let ((assets-dir (expand-file-name "assets" output)))
@@ -928,10 +1022,10 @@ let
                  (proofread-release--package-name package))))
 
     (defun proofread-release-verify-install (manifest-file archives)
-      "Install and load the release package from MANIFEST-FILE in isolation.
+      "Install and load the release verification set from MANIFEST-FILE.
 
-    ARCHIVES must contain the released package archive and all internal dependency
-    archives required by the manifest."
+    ARCHIVES must contain exactly the candidate archive and the released archives
+    selected for its forward and reverse-dependency verification."
       (let* ((manifest
               (proofread-release--validate-schema-2-manifest
                (proofread-release--read-json manifest-file)))
@@ -942,23 +1036,10 @@ let
               (or (proofread-release--manifest-package manifest released-name)
                   (error "Released package missing from manifest: %s"
                          released-name)))
-             (dependencies
-              (proofread-release--collect-dependencies released packages))
              (install-order
-              (proofread-release--dependency-order
-               (append dependencies (list released))))
+              (proofread-release--verification-packages released packages))
              (provided (proofread-release--archives-by-name archives))
-             (expected (proofread-release--package-table install-order))
-             (package-dir (make-temp-file "proofread-release-packages-" t))
-             (init-dir (make-temp-file "proofread-release-init-" t))
-             (old-features features)
-             (old-load-path load-path)
-             (old-package-alist package-alist)
-             (old-package-activated-list package-activated-list)
-             (old-package-selected-packages package-selected-packages)
-             (old-package--initialized
-              (and (boundp 'package--initialized)
-                   package--initialized)))
+             (expected (proofread-release--package-table install-order)))
         (maphash
          (lambda (name _package)
            (unless (gethash name expected)
@@ -969,57 +1050,73 @@ let
             (unless (proofread-release--same-package-p archive package)
               (error "Archive metadata differs from manifest: %s"
                      (proofread-release--package-asset package)))))
-        (unwind-protect
-            (let ((package-user-dir package-dir)
-                  (package-archives nil)
-                  (package-archive-contents nil)
-                  (package-check-signature nil)
-                  (package-enable-at-startup nil)
-                  (package-native-compile nil)
-                  (package-quickstart nil)
-                  (user-emacs-directory
-                   (file-name-as-directory init-dir)))
-              (package-initialize)
-              (dolist (package install-order)
-                (let ((name (proofread-release--package-name package)))
-                  (when (or (featurep (intern name))
-                            (locate-library name))
-                    (error "Project package is already available: %s" name))))
-              (dolist (package install-order)
-                (let* ((name (proofread-release--package-name package))
-                       (archive
-                        (proofread-release--archive-for-package
-                         package provided))
-                       (version
-                        (proofread-release--package-version package)))
-                  (package-install-file
-                   (proofread-release--package-file archive))
-                  (unless (package-installed-p
-                           (intern name)
-                           (proofread-release--version-list version))
-                    (error "Package was not installed: %s" name))
-                  (let ((description
-                         (car (alist-get (intern name) package-alist))))
-                    (unless (and description
-                                 (equal (package-desc-version description)
-                                        (proofread-release--version-list version)))
-                      (error "Package installed at an unexpected version: %s"
-                             name)))
-                  (require (intern name))
-                  (let ((library (locate-library name)))
-                    (unless (and library
-                                 (file-in-directory-p library package-dir))
-                      (error "Package did not load from the isolated directory: %s"
-                             name))))))
-          (setq features old-features)
-          (setq load-path old-load-path)
-          (setq package-alist old-package-alist)
-          (setq package-activated-list old-package-activated-list)
-          (setq package-selected-packages old-package-selected-packages)
-          (when (boundp 'package--initialized)
-            (setq package--initialized old-package--initialized))
-          (delete-directory package-dir t)
-          (delete-directory init-dir t)))
+        (let ((package-dir (make-temp-file "proofread-release-packages-" t))
+              (init-dir (make-temp-file "proofread-release-init-" t))
+              (old-features features)
+              (old-load-path load-path)
+              (old-package-alist package-alist)
+              (old-package-activated-list package-activated-list)
+              (old-package-selected-packages package-selected-packages)
+              (old-package--initialized
+               (and (boundp 'package--initialized)
+                    package--initialized)))
+          (unwind-protect
+              (let ((package-user-dir package-dir)
+                    (package-archives nil)
+                    (package-archive-contents nil)
+                    (package-check-signature nil)
+                    (package-enable-at-startup nil)
+                    (package-native-compile nil)
+                    (package-quickstart nil)
+                    (user-emacs-directory
+                     (file-name-as-directory init-dir)))
+                (package-initialize)
+                (dolist (package install-order)
+                  (let ((name (proofread-release--package-name package)))
+                    (when (or (featurep (intern name))
+                              (locate-library name))
+                      (error "Project package is already available: %s" name))))
+                (dolist (package install-order)
+                  (let* ((name (proofread-release--package-name package))
+                         (archive
+                          (proofread-release--archive-for-package
+                           package provided))
+                         (version
+                          (proofread-release--package-version package)))
+                    (package-install-file
+                     (proofread-release--package-file archive))
+                    (unless (package-installed-p
+                             (intern name)
+                             (proofread-release--version-list version))
+                      (error "Package was not installed: %s" name))
+                    (let ((description
+                           (car (alist-get (intern name) package-alist))))
+                      (unless (and description
+                                   (equal (package-desc-version description)
+                                          (proofread-release--version-list version)))
+                        (error "Package installed at an unexpected version: %s"
+                               name)))
+                    (condition-case condition
+                        (require (intern name))
+                      (error
+                       (error
+                        "Could not load verification package %s: %s"
+                        name
+                        (error-message-string condition))))
+                    (let ((library (locate-library name)))
+                      (unless (and library
+                                   (file-in-directory-p library package-dir))
+                        (error "Package did not load from the isolated directory: %s"
+                               name))))))
+            (setq features old-features)
+            (setq load-path old-load-path)
+            (setq package-alist old-package-alist)
+            (setq package-activated-list old-package-activated-list)
+            (setq package-selected-packages old-package-selected-packages)
+            (when (boundp 'package--initialized)
+              (setq package--initialized old-package--initialized))
+            (delete-directory package-dir t)
+            (delete-directory init-dir t))))
       t)
 
     (defun proofread-release-check-package-version
@@ -1067,12 +1164,26 @@ let
                  (output (pop command-line-args-left)))
              (proofread-release-required-dependencies
               package version tag previous archive output)))
+          ("verification-packages"
+           (unless (member (length command-line-args-left) '(5 6))
+             (error
+              (concat
+               "Usage: verification-packages PACKAGE VERSION TAG PREVIOUS "
+               "ARCHIVE [OUTPUT]")))
+           (let ((package (pop command-line-args-left))
+                 (version (pop command-line-args-left))
+                 (tag (pop command-line-args-left))
+                 (previous (pop command-line-args-left))
+                 (archive (pop command-line-args-left))
+                 (output (pop command-line-args-left)))
+             (proofread-release-verification-packages
+              package version tag previous archive output)))
           ("prepare-package"
            (when (< (length command-line-args-left) 7)
              (error
               (concat
                "Usage: prepare-package PACKAGE VERSION TAG COMMIT PREVIOUS "
-               "OUTPUT ARCHIVE [DEPENDENCY-ARCHIVE...]")))
+               "OUTPUT ARCHIVE [VERIFICATION-ARCHIVE...]")))
            (let ((package (pop command-line-args-left))
                  (version (pop command-line-args-left))
                  (tag (pop command-line-args-left))
