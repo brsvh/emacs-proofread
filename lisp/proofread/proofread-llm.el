@@ -32,6 +32,7 @@
 (require 'cl-lib)
 (require 'json)
 (require 'llm)
+(require 'llm-request-plz)
 (require 'proofread)
 (require 'subr-x)
 (require 'warnings)
@@ -127,7 +128,12 @@ of 1 uses a single LLM call."
 The timeout covers all diagnostic passes for that request.  A non-nil
 value must be a positive number; set it to nil to disable the
 Proofread-owned watchdog.  A checker-local `:request-timeout' option
-overrides this value for that checker."
+overrides this value for that checker.
+
+When `proofread-mode' is enabled, the current value also becomes the
+buffer-local `llm-request-plz-connect-timeout'.  Disabling the mode
+restores that variable's previous local binding or current global
+value."
   :type '(choice
           (const :tag "Disabled" nil)
           (number :tag "Seconds"))
@@ -167,6 +173,57 @@ is non-nil, because extra instructions can change LLM diagnostics."
 
 (defvar proofread-llm--live-handles nil
   "LLM backend handles that have not settled or been cancelled.")
+
+(defvar-local proofread-llm--connect-timeout-snapshot nil
+  "Previous buffer-local state of the llm plz connect timeout.
+The value is a cons whose car records whether the variable was already
+buffer-local and whose cdr stores its previous value.  Nil means that
+Proofread does not currently own the buffer-local override.")
+
+(defun proofread-llm--enable-connect-timeout-override ()
+  "Use the Proofread LLM timeout for plz connections in this buffer."
+  (unless proofread-llm--connect-timeout-snapshot
+    (setq-local proofread-llm--connect-timeout-snapshot
+                (cons
+                 (local-variable-p
+                  'llm-request-plz-connect-timeout)
+                 llm-request-plz-connect-timeout)))
+  (setq-local llm-request-plz-connect-timeout
+              proofread-llm-request-timeout))
+
+(defun proofread-llm--restore-connect-timeout ()
+  "Restore this buffer's plz connect timeout before the override."
+  (when proofread-llm--connect-timeout-snapshot
+    (let ((snapshot proofread-llm--connect-timeout-snapshot))
+      (if (car snapshot)
+          (setq-local llm-request-plz-connect-timeout
+                      (cdr snapshot))
+        (kill-local-variable 'llm-request-plz-connect-timeout))
+      (kill-local-variable
+       'proofread-llm--connect-timeout-snapshot))))
+
+(defun proofread-llm--sync-connect-timeout ()
+  "Synchronize the current buffer's LLM plz connect timeout."
+  (if proofread-mode
+      (proofread-llm--enable-connect-timeout-override)
+    (proofread-llm--restore-connect-timeout)))
+
+(defun proofread-llm--install-connect-timeout-integration ()
+  "Install the `proofread-mode' plz connect-timeout integration."
+  (add-hook 'proofread-mode-hook
+            #'proofread-llm--sync-connect-timeout)
+  (dolist (buffer (buffer-list))
+    (with-current-buffer buffer
+      (when (bound-and-true-p proofread-mode)
+        (proofread-llm--sync-connect-timeout)))))
+
+(defun proofread-llm--remove-connect-timeout-integration ()
+  "Remove the `proofread-mode' plz connect-timeout integration."
+  (remove-hook 'proofread-mode-hook
+               #'proofread-llm--sync-connect-timeout)
+  (dolist (buffer (buffer-list))
+    (with-current-buffer buffer
+      (proofread-llm--restore-connect-timeout))))
 
 ;;;; Structured response contract
 
@@ -1384,6 +1441,7 @@ MAX-PASSES is the request-local diagnostic pass limit."
 
 (defun proofread-llm-unload-function ()
   "Unregister the LLM backend and settle its live requests."
+  (proofread-llm--remove-connect-timeout-integration)
   (proofread--unregister-backend 'llm)
   (proofread-llm--settle-live-handles)
   nil)
@@ -1397,7 +1455,8 @@ MAX-PASSES is the request-local diagnostic pass limit."
    :identity #'proofread-llm--provider-identity
    :checker-identity #'proofread-llm--checker-identity
    :source-label #'proofread-llm--checker-source-label
-   :cancel #'proofread-llm--cancel-request-handle))
+   :cancel #'proofread-llm--cancel-request-handle)
+  (proofread-llm--install-connect-timeout-integration))
 
 (provide 'proofread-llm)
 ;;; proofread-llm.el ends here

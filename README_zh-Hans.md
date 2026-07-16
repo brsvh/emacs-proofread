@@ -155,7 +155,9 @@ Schema，否则回退到仅由提示词约束的 JSON。如果提供 `:instructi
 `proofread-llm-request-timeout` 是由 Proofread 管理的请求 watchdog，默认值为 `120` 秒；将其设为
 `nil` 可在全局禁用 watchdog，所有非 `nil` 值都必须是正数。只要 checker 局部 `:options` 中存在
 `:request-timeout` 键，就会覆盖全局值，因此显式的 `nil` 会只为该 checker 禁用 watchdog。超时设置只控制请求的
-存活时间，不参与缓存兼容性；修改它不会使其他方面仍兼容的缓存结果失效。
+存活时间，不参与缓存兼容性；修改它不会使其他方面仍兼容的缓存结果失效。启用 `proofread-mode` 时，当前的
+`proofread-llm-request-timeout` 值也会成为 buffer-local 的
+`llm-request-plz-connect-timeout`。关闭模式会恢复原先的局部绑定；若原先没有局部绑定，则重新继承届时的全局值。
 
 更完整的 provider 配置请参考上游
 [`llm.el` provider 文档](https://github.com/ahyatt/llm#setting-up-providers)。
@@ -438,32 +440,32 @@ https://github.com/user-attachments/assets/2dda228e-f85c-4500-aea0-549500628c6e
 
 运行 `M-x customize-group RET proofread RET` 可编辑核心选项：
 
-| 选项                                      | 默认值 | 用途                                                           |
-| ----------------------------------------- | ------ | -------------------------------------------------------------- |
-| `proofread-auto-check`                    | `t`    | 在启用模式、编辑和窗口活动后安排检查；设置后为缓冲区局部变量   |
-| `proofread-targets`                       | `auto` | 选择全部文本、注释或文档字符串；设置后为缓冲区局部变量         |
-| `proofread-docstring-predicate-functions` | `nil`  | 添加识别文档字符串的谓词函数；设置后为缓冲区局部变量           |
-| `proofread-idle-delay`                    | `1.0`  | 自动检查前等待的空闲秒数                                       |
-| `proofread-inhibit-progress-messages`     | `t`    | 抑制后台进度消息，但不抑制错误或显式命令反馈                   |
-| `proofread-max-chunk-size`                | `2000` | 限制每个校对文本块的字符数                                     |
-| `proofread-context-size`                  | `300`  | 限制文本块每侧发送的上下文字符数                               |
-| `proofread-context-sentences-before`      | `1`    | 限制文本块之前的逻辑上下文句数                                 |
-| `proofread-context-sentences-after`       | `1`    | 限制文本块之后的逻辑上下文句数                                 |
-| `proofread-max-concurrent-requests`       | `8`    | 限制每个缓冲区的活动后端请求数                                 |
-| `proofread-profiles`                      | `nil`  | 定义命名的多后端 profile                                       |
-| `proofread-profile`                       | `nil`  | 选择命名 profile                                               |
-| `proofread-llm-provider`                  | `nil`  | LLM checker 省略 `:provider` 时使用的默认提供程序              |
-| `proofread-llm-response-strategy`         | `auto` | LLM checker 省略 `:response-strategy` 时使用的默认响应策略     |
-| `proofread-llm-request-timeout`           | `120`  | 限制 LLM 请求的存活时间；`nil` 表示禁用 watchdog               |
-| `proofread-llm-provider-identity`         | `nil`  | LLM checker 省略 `:provider-identity` 时使用的默认稳定标识     |
-| `proofread-llm-source-label`              | `nil`  | 默认诊断来源标签；`nil` 表示使用有效 provider 名称             |
-| `proofread-llm-max-diagnostic-passes`     | `3`    | LLM checker 省略 `:diagnostic-passes` 时使用的默认诊断轮数     |
-| `proofread-llm-instructions-function`     | `nil`  | LLM checker 省略 `:instructions-function` 时使用的默认附加说明 |
-| `proofread-llm-instructions-identity`     | `nil`  | LLM checker 省略说明标识时使用的默认稳定标识                   |
-| `proofread-cache-max-entries`             | `128`  | 限制每个缓冲区的 LRU 缓存条目数；`0` 表示禁用缓存              |
-| `proofread-request-log-max-records`       | `100`  | 限制每个受监视缓冲区保留的记录数                               |
-| `proofread-ignored-faces`                 | `nil`  | 排除 `face` 属性与指定 `face` 匹配的文本                       |
-| `proofread-ignored-properties`            | `nil`  | 排除指定文本属性之一为非 `nil` 的文本                          |
+| 选项                                      | 默认值 | 用途                                                             |
+| ----------------------------------------- | ------ | ---------------------------------------------------------------- |
+| `proofread-auto-check`                    | `t`    | 在启用模式、编辑和窗口活动后安排检查；设置后为缓冲区局部变量     |
+| `proofread-targets`                       | `auto` | 选择全部文本、注释或文档字符串；设置后为缓冲区局部变量           |
+| `proofread-docstring-predicate-functions` | `nil`  | 添加识别文档字符串的谓词函数；设置后为缓冲区局部变量             |
+| `proofread-idle-delay`                    | `1.0`  | 自动检查前等待的空闲秒数                                         |
+| `proofread-inhibit-progress-messages`     | `t`    | 抑制后台进度消息，但不抑制错误或显式命令反馈                     |
+| `proofread-max-chunk-size`                | `2000` | 限制每个校对文本块的字符数                                       |
+| `proofread-context-size`                  | `300`  | 限制文本块每侧发送的上下文字符数                                 |
+| `proofread-context-sentences-before`      | `1`    | 限制文本块之前的逻辑上下文句数                                   |
+| `proofread-context-sentences-after`       | `1`    | 限制文本块之后的逻辑上下文句数                                   |
+| `proofread-max-concurrent-requests`       | `8`    | 限制每个缓冲区的活动后端请求数                                   |
+| `proofread-profiles`                      | `nil`  | 定义命名的多后端 profile                                         |
+| `proofread-profile`                       | `nil`  | 选择命名 profile                                                 |
+| `proofread-llm-provider`                  | `nil`  | LLM checker 省略 `:provider` 时使用的默认提供程序                |
+| `proofread-llm-response-strategy`         | `auto` | LLM checker 省略 `:response-strategy` 时使用的默认响应策略       |
+| `proofread-llm-request-timeout`           | `120`  | 设置 LLM watchdog 与 mode-local plz 连接超时；`nil` 表示禁用两者 |
+| `proofread-llm-provider-identity`         | `nil`  | LLM checker 省略 `:provider-identity` 时使用的默认稳定标识       |
+| `proofread-llm-source-label`              | `nil`  | 默认诊断来源标签；`nil` 表示使用有效 provider 名称               |
+| `proofread-llm-max-diagnostic-passes`     | `3`    | LLM checker 省略 `:diagnostic-passes` 时使用的默认诊断轮数       |
+| `proofread-llm-instructions-function`     | `nil`  | LLM checker 省略 `:instructions-function` 时使用的默认附加说明   |
+| `proofread-llm-instructions-identity`     | `nil`  | LLM checker 省略说明标识时使用的默认稳定标识                     |
+| `proofread-cache-max-entries`             | `128`  | 限制每个缓冲区的 LRU 缓存条目数；`0` 表示禁用缓存                |
+| `proofread-request-log-max-records`       | `100`  | 限制每个受监视缓冲区保留的记录数                                 |
+| `proofread-ignored-faces`                 | `nil`  | 排除 `face` 属性与指定 `face` 匹配的文本                         |
+| `proofread-ignored-properties`            | `nil`  | 排除指定文本属性之一为非 `nil` 的文本                            |
 
 LanguageTool 库另有一个 `proofread-languagetool` Customize 组：
 

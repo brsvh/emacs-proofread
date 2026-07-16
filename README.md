@@ -180,7 +180,10 @@ it to `nil` to disable the watchdog globally. A checker-local `:request-timeout`
 overrides the global value whenever that key is present, so an explicit `nil`
 disables the watchdog for that checker. The timeout controls request liveness
 only and is not part of cache compatibility; changing it does not invalidate
-otherwise compatible cached results.
+otherwise compatible cached results. When `proofread-mode` is enabled, the
+current `proofread-llm-request-timeout` value also becomes the buffer-local
+`llm-request-plz-connect-timeout`; disabling the mode restores its previous
+local binding or inherits its current global value.
 
 For provider-specific setup details, see the upstream
 [`llm.el` provider documentation](https://github.com/ahyatt/llm#setting-up-providers).
@@ -532,7 +535,7 @@ Run `M-x customize-group RET proofread RET` to edit the core options:
 | `proofread-profile`                       | `nil`   | Select a named profile                                                            |
 | `proofread-llm-provider`                  | `nil`   | Default provider when an LLM checker omits `:provider`                            |
 | `proofread-llm-response-strategy`         | `auto`  | Default response strategy when an LLM checker omits `:response-strategy`          |
-| `proofread-llm-request-timeout`           | `120`   | Limit LLM request lifetime; `nil` disables the watchdog                           |
+| `proofread-llm-request-timeout`           | `120`   | Set the LLM watchdog and mode-local plz connect timeout; `nil` disables both      |
 | `proofread-llm-provider-identity`         | `nil`   | Default stable provider identity when an LLM checker omits `:provider-identity`   |
 | `proofread-llm-source-label`              | `nil`   | Default diagnostic source label; `nil` uses the effective provider name           |
 | `proofread-llm-max-diagnostic-passes`     | `3`     | Default pass limit when an LLM checker omits `:diagnostic-passes`                 |

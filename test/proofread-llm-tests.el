@@ -266,6 +266,125 @@ When PROFILE is nil, use the current profile."
          (proofread-llm--cancel-request-handle handle)
          (should-not proofread-llm--live-handles))))))
 
+(ert-deftest proofread-llm-test-mode-sets-plz-connect-timeout ()
+  "Use the Proofread LLM timeout locally while the mode is enabled."
+  (let ((llm-request-plz-connect-timeout 10))
+    (with-temp-buffer
+      (setq-local proofread-auto-check nil)
+      (setq-local proofread-llm-request-timeout 30)
+      (should-not
+       (local-variable-p 'llm-request-plz-connect-timeout))
+      (proofread-mode 1)
+      (should
+       (local-variable-p 'llm-request-plz-connect-timeout))
+      (should (= llm-request-plz-connect-timeout 30))
+      (setq-local proofread-llm-request-timeout nil)
+      (proofread-mode 1)
+      (should
+       (local-variable-p 'llm-request-plz-connect-timeout))
+      (should-not llm-request-plz-connect-timeout)
+      (proofread-mode -1)
+      (should-not
+       (local-variable-p 'llm-request-plz-connect-timeout))
+      (should (= llm-request-plz-connect-timeout 10)))))
+
+(ert-deftest proofread-llm-test-mode-passes-connect-timeout-to-plz ()
+  "Pass the mode-local LLM timeout to the plz transport."
+  (with-temp-buffer
+    (setq-local proofread-auto-check nil)
+    (setq-local proofread-llm-request-timeout 30)
+    (proofread-mode 1)
+    (let (connect-timeout)
+      (cl-letf (((symbol-function 'plz-media-type-request)
+                 (lambda (_method _url &rest arguments)
+                   (setq connect-timeout
+                         (plist-get arguments :connect-timeout))
+                   'proofread-llm-test-request)))
+        (should
+         (eq
+          (llm-request-plz-async
+           "https://example.invalid"
+           :data '( :message "ignored")
+           :on-error #'ignore)
+          'proofread-llm-test-request)))
+      (should (= connect-timeout 30)))
+    (proofread-mode -1)))
+
+(ert-deftest
+    proofread-llm-test-mode-restores-local-plz-connect-timeout ()
+  "Restore a preexisting local plz connect timeout after disabling."
+  (with-temp-buffer
+    (setq-local proofread-auto-check nil)
+    (setq-local llm-request-plz-connect-timeout 45)
+    (setq-local proofread-llm-request-timeout 90)
+    (proofread-mode 1)
+    (should (= llm-request-plz-connect-timeout 90))
+    (proofread-mode -1)
+    (should
+     (local-variable-p 'llm-request-plz-connect-timeout))
+    (should (= llm-request-plz-connect-timeout 45))))
+
+(ert-deftest
+    proofread-llm-test-mode-connect-timeouts-are-buffer-local ()
+  "Keep simultaneous Proofread buffer connect timeouts independent."
+  (let ((llm-request-plz-connect-timeout 10)
+        (first (generate-new-buffer " *proofread-llm-timeout-a*"))
+        (second (generate-new-buffer " *proofread-llm-timeout-b*")))
+    (unwind-protect
+        (progn
+          (with-current-buffer first
+            (setq-local proofread-auto-check nil)
+            (setq-local proofread-llm-request-timeout 20)
+            (proofread-mode 1))
+          (with-current-buffer second
+            (setq-local proofread-auto-check nil)
+            (setq-local proofread-llm-request-timeout 40)
+            (proofread-mode 1))
+          (with-current-buffer first
+            (should (= llm-request-plz-connect-timeout 20))
+            (proofread-mode -1)
+            (should (= llm-request-plz-connect-timeout 10)))
+          (with-current-buffer second
+            (should (= llm-request-plz-connect-timeout 40))
+            (proofread-mode -1)
+            (should (= llm-request-plz-connect-timeout 10))))
+      (dolist (buffer (list first second))
+        (when (buffer-live-p buffer)
+          (kill-buffer buffer))))))
+
+(ert-deftest
+    proofread-llm-test-unload-restores-plz-connect-timeout ()
+  "Restore and reapply a live buffer's timeout across backend reload."
+  (let ((llm-request-plz-connect-timeout 10))
+    (with-temp-buffer
+      (setq-local proofread-auto-check nil)
+      (setq-local llm-request-plz-connect-timeout 45)
+      (unwind-protect
+          (progn
+            (proofread-mode 1)
+            (should
+             (= llm-request-plz-connect-timeout
+                proofread-llm-request-timeout))
+            (unload-feature 'proofread-llm t)
+            (should-not (featurep 'proofread-llm))
+            (should
+             (local-variable-p
+              'llm-request-plz-connect-timeout))
+            (should (= llm-request-plz-connect-timeout 45))
+            (should-not
+             (memq 'proofread-llm--sync-connect-timeout
+                   (default-value 'proofread-mode-hook)))
+            (require 'proofread-llm)
+            (should
+             (= llm-request-plz-connect-timeout
+                proofread-llm-request-timeout))
+            (proofread-mode -1)
+            (should (= llm-request-plz-connect-timeout 45)))
+        (unless (featurep 'proofread-llm)
+          (require 'proofread-llm))
+        (when proofread-mode
+          (proofread-mode -1))))))
+
 (ert-deftest proofread-llm-test-source-label-configuration ()
   "Resolve validated global and checker-local LLM source labels."
   (let ((symbol 'proofread-llm-source-label))

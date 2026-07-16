@@ -44,6 +44,13 @@ select the profile with 'proofread-profile'.
 ** Backends
 
 ---
+*** Proofread mode now aligns LLM connection and request timeouts.
+When 'proofread-mode' is enabled, the current
+'proofread-llm-request-timeout' is used as the buffer-local
+'llm-request-plz-connect-timeout'.  Disabling the mode or unloading the LLM
+backend restores the previous local binding or current global value.
+
+---
 *** New local LanguageTool backend.
 The new backend sends asynchronous HTTP requests to a LanguageTool v2
 server.  It supports safe UTF-16 offset conversion, configurable language
