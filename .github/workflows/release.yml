@@ -45,7 +45,6 @@ jobs:
           github_access_token: ${{ github.token }}
 
       - name: Identify package release
-        id: release
         shell: bash
         env:
           RELEASE_TAG: ${{ github.ref_name }}
@@ -82,10 +81,6 @@ jobs:
             exit 1
           fi
 
-          {
-            printf 'package=%s\n' "$release_package"
-            printf 'version=%s\n' "$release_version"
-          } >> "$GITHUB_OUTPUT"
           {
             printf 'RELEASE_PACKAGE=%s\n' "$release_package"
             printf 'RELEASE_VERSION=%s\n' "$release_version"

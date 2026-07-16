@@ -300,10 +300,6 @@ let
       "Return MANIFEST schema number."
       (proofread-release--field manifest 'schema))
 
-    (defun proofread-release--manifest-tag (manifest)
-      "Return MANIFEST tag field."
-      (proofread-release--field manifest 'tag))
-
     (defun proofread-release--packages-from-manifest (manifest)
       "Return the sorted active package list represented by MANIFEST."
       (let ((schema (proofread-release--schema manifest))

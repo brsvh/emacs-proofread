@@ -143,13 +143,6 @@
              chunks
              "\n"))
 
-(defun proofread-test--chunk-ranges (chunks)
-  "Return the buffer ranges from CHUNKS."
-  (mapcar (lambda (chunk)
-            (cons (plist-get chunk :beg)
-                  (plist-get chunk :end)))
-          chunks))
-
 (defun proofread-test--span-texts (spans)
   "Return buffer text selected by SPANS."
   (mapcar (lambda (span)
@@ -3784,15 +3777,20 @@ This covers URLs, email, invisible text, faces, and properties."
         (proofread-profiles nil))
     (should-error (proofread--current-profile) :type 'user-error)))
 
-(ert-deftest proofread-test-profile-rejects-bindings-key ()
-  "Reject the unreleased `:bindings' profile key."
-  (let ((proofread-profile 'old-key)
+(ert-deftest proofread-test-profile-rejects-unknown-property ()
+  "Reject unknown properties in a profile definition."
+  (let ((proofread-profile 'invalid)
         (proofread-profiles
-         `((old-key
-            :bindings
-            (( :name old
-               :backend ,proofread-test--backend))))))
-    (should-error (proofread--current-profile) :type 'error)))
+         `((invalid
+            :checkers
+            (( :name current
+               :backend ,proofread-test--backend))
+            :unknown-property t))))
+    (let ((err (should-error (proofread--current-profile) :type 'error)))
+      (should
+       (string-match-p
+        "unknown property :unknown-property"
+        (error-message-string err))))))
 
 (ert-deftest proofread-test-profile-rejects-duplicate-checker-names
     ()
@@ -5423,9 +5421,9 @@ This covers URLs, email, invisible text, faces, and properties."
           (prin1-to-string
            (plist-get formal-a-request :cache-key))))))))
 
-(ert-deftest proofread-test-cache-contract-v3-isolates-old-namespace
+(ert-deftest proofread-test-cache-contract-v3-isolates-v0.1-namespace
     ()
-  "Keep version 2 cache entries out of the renamed version 3 namespace."
+  "Keep released v0.1 cache entries out of the current namespace."
   (with-temp-buffer
     (insert "Alpha")
     (let ((proofread-auto-check nil)
@@ -5439,22 +5437,30 @@ This covers URLs, email, invisible text, faces, and properties."
               (request
                (proofread-test--make-profile-request chunk))
               (new-key (plist-get request :cache-key))
-              (old-key
-               (cl-substitute :binding :checker
-                              (copy-tree new-key) :test #'eq)))
-         (setf (plist-get old-key :contract-version) 2)
+              (v0.1-key
+               (list
+                :text-hash (plist-get new-key :text-hash)
+                :language (plist-get new-key :language)
+                :major-mode (plist-get new-key :major-mode)
+                :target-policy (plist-get new-key :target-policy)
+                :target-kind (plist-get new-key :target-kind)
+                :backend (plist-get new-key :backend)
+                :contract-version 2
+                :context (plist-get new-key :context)
+                :response-schema '( :type "object"))))
          (should (= proofread--contract-version 3))
          (should (= (plist-get new-key :contract-version) 3))
          (should (plist-member new-key :checker))
-         (should-not (plist-member new-key :binding))
-         (should (plist-member old-key :binding))
-         (should-not (plist-member old-key :checker))
-         (should (proofread--cache-write old-key 'old-value))
-         (should (eq (proofread--cache-read old-key) 'old-value))
+         (should (plist-member new-key :display-language))
+         (should-not (plist-member v0.1-key :checker))
+         (should-not (plist-member v0.1-key :display-language))
+         (should (plist-member v0.1-key :response-schema))
+         (should (proofread--cache-write v0.1-key 'old-value))
+         (should (eq (proofread--cache-read v0.1-key) 'old-value))
          (should-not (proofread--cache-read new-key)))))))
 
-(ert-deftest proofread-test-old-provenance-request-is-stale ()
-  "Reject version 2 requests carrying only binding provenance."
+(ert-deftest proofread-test-request-requires-current-checker-provenance ()
+  "Reject requests missing any current checker provenance field."
   (with-temp-buffer
     (insert "Alpha")
     (let ((proofread-auto-check nil)
@@ -5466,27 +5472,21 @@ This covers URLs, email, invisible text, faces, and properties."
                 (proofread-test--request-ready-chunks-for-ranges
                  (list (cons (point-min) (point-max))))))
               (request
-               (proofread-test--make-profile-request chunk))
-              (old-request (copy-tree request)))
-         (dolist (fields
-                  '(( :checker-name :binding-name)
-                    ( :checker-owner :binding-owner)
-                    ( :checker-options :binding-options)
-                    ( :checker-identity :binding-identity)))
-           (let ((value (plist-get old-request (car fields))))
-             (cl-remf old-request (car fields))
-             (setq old-request
-                   (plist-put old-request (cadr fields) value))))
-         (should-not (plist-member request :contract-version))
-         (should-not (plist-member old-request :checker-name))
-         (should (plist-member old-request :binding-name))
-         (should
-          (proofread--request-current-backend-identity-p old-request))
+               (proofread-test--make-profile-request chunk)))
          (should (proofread--request-current-checker-p request))
-         (should-not
-          (proofread--request-current-checker-p old-request))
          (should (proofread--fresh-request-p request))
-         (should-not (proofread--fresh-request-p old-request)))))))
+         (dolist (field
+                  '( :checker-name :checker-owner
+                     :checker-options :checker-identity))
+           (let ((incomplete-request (copy-tree request)))
+             (cl-remf incomplete-request field)
+             (should
+              (proofread--request-current-backend-identity-p
+               incomplete-request))
+             (should-not
+              (proofread--request-current-checker-p incomplete-request))
+             (should-not
+              (proofread--fresh-request-p incomplete-request)))))))))
 
 (ert-deftest
     proofread-test-profile-checker-change-makes-request-stale

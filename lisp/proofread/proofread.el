@@ -777,10 +777,6 @@ synthetic legacy or explicit profile checkers."
   "Return the selected proofreading profile's language hint."
   (plist-get (proofread--current-profile) :language))
 
-(defun proofread--current-profile-checkers ()
-  "Return normalized checkers from the selected proofreading profile."
-  (plist-get (proofread--current-profile) :checkers))
-
 (defun proofread--checker-discriminator (checker)
   "Return internal provenance properties for CHECKER."
   (cond

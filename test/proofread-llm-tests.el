@@ -357,7 +357,6 @@ When PROFILE is nil, use the current profile."
                 #'proofread-llm--provider-identity))
     (should (eq (plist-get descriptor :checker-identity)
                 #'proofread-llm--checker-identity))
-    (should-not (plist-member descriptor :binding-identity))
     (should (eq (plist-get descriptor :cancel)
                 #'proofread-llm--cancel-request-handle))))
 
