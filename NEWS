@@ -271,6 +271,13 @@ including queued, active, completed, failed, and stale requests.
 ** Popup display
 
 ---
+*** Child-frame updates wait for point to become idle.
+Popup updates now coalesce movement and diagnostic notifications, then
+recompute the display from the final state after point has been idle.
+The new 'proofread-popup-delay' option defaults to 0.5 seconds; set it
+to zero to restore immediate updates.
+
+---
 *** Popup messages identify their backend source.
 Every diagnostic message is displayed on its own line with its LLM or
 LanguageTool source label.  Source labels use the new

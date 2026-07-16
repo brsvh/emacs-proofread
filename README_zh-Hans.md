@@ -380,10 +380,12 @@ https://github.com/user-attachments/assets/8ce73c38-69af-4b51-bcc8-f913753751fc
 (require 'proofread-popup)
 ```
 
-当光标位于诊断项上时，该前端会在诊断范围起点上方的子框架中逐条显示诊断消息，并在光标离开时隐藏子框架。每条消息都会带有后端来源前缀：LLM checker
-使用其有效来源标签，LanguageTool 显示 `languagetool`。来源标签使用加粗且跟随主题的强调
+当光标位于诊断项上时，该前端会在诊断范围起点上方的子框架中逐条显示诊断消息，并在光标离开时隐藏子框架。默认会等待光标保持空闲 `0.5`
+秒，再根据届时光标处的诊断创建或更新子框架；等待期间发生的移动和诊断变化会合并为一次更新。将 `proofread-popup-delay` 设为 `0`
+可恢复立即更新行为，例如使用 `(setq proofread-popup-delay 0)` 或 Customize。每条消息都会带有后端来源前缀：LLM
+checker 使用其有效来源标签，LanguageTool 显示 `languagetool`。来源标签使用加粗且跟随主题的强调
 face。弹窗不显示修改建议，也不提供操作。在终端及其他无法使用子框架的环境中，弹窗不可用。运行 `M-x proofread-popup-mode`
-可在当前缓冲区中禁用或重新启用该自动集成。也可以使用 `proofread-popup-enabled` 和
+可在当前缓冲区中禁用或重新启用该自动集成。也可以使用 `proofread-popup-enabled`、`proofread-popup-delay` 和
 `proofread-popup-max-width` 控制其显示。
 
 ### 批量修正
@@ -490,9 +492,10 @@ LanguageTool 库另有一个 `proofread-languagetool` Customize 组：
 启用 `proofread-languagetool-enabled-only`
 时必须至少启用一个规则或分类，且不能同时配置禁用规则或分类。语言、检查级别、语言变体、母语、规则和分类设置都会进入后端缓存标识，因此修改检查策略后不会复用旧策略生成的结果。
 
-可选前端还定义了 `proofread-popup-enabled`（默认值为 `t`）和 `proofread-popup-max-width`（默认值为
-`80`）。可使用 `proofread-face`、`proofread-current-face`、`proofread-popup-face`、
-`proofread-popup-source-face` 和 `proofread-popup-border-face` 自定义诊断外观。
+可选前端还定义了 `proofread-popup-enabled`（默认值为 `t`）、`proofread-popup-delay`（默认值为 `0.5`
+秒，`0` 表示立即更新）和 `proofread-popup-max-width`（默认值为 `80`）。可使用
+`proofread-face`、`proofread-current-face`、`proofread-popup-face`、`proofread-popup-source-face`
+和 `proofread-popup-border-face` 自定义诊断外观。
 
 ### 调整并发数
 

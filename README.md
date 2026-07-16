@@ -447,13 +447,18 @@ buffer:
 
 When point is on a diagnostic, the frontend displays each diagnostic message in
 a child frame above the start of its range and hides the frame when point moves
-away. Every message is prefixed with its backend source: LLM checkers use their
-effective source label, while LanguageTool displays `languagetool`. Source
-labels use a bold, theme-aware emphasis face. The popup does not show
-suggestions or provide actions. It is unavailable in terminals and other
-environments where child frames do not work. Run `M-x proofread-popup-mode` to
-opt the current buffer out of or back into the automatic integration. Its
-display can also be controlled with `proofread-popup-enabled` and
+away. By default, it waits until point has been idle for `0.5` seconds, then
+creates or updates the child frame from the diagnostic at that time. Movement
+and diagnostic notifications during the wait are coalesced. Set
+`proofread-popup-delay` to `0` to restore immediate updates, for example with
+`(setq proofread-popup-delay 0)` or Customize. Every message is prefixed with
+its backend source: LLM checkers use their effective source label, while
+LanguageTool displays `languagetool`. Source labels use a bold, theme-aware
+emphasis face. The popup does not show suggestions or provide actions. It is
+unavailable in terminals and other environments where child frames do not work.
+Run `M-x proofread-popup-mode` to opt the current buffer out of or back into the
+automatic integration. Its display can also be controlled with
+`proofread-popup-enabled`, `proofread-popup-delay`, and
 `proofread-popup-max-width`.
 
 ### Batch correction
@@ -573,10 +578,12 @@ level, variant, mother-tongue, rule, and category settings are included in the
 backend cache identity, so changing them does not reuse results produced by a
 different checking policy.
 
-The optional frontend also defines `proofread-popup-enabled` (default `t`) and
-`proofread-popup-max-width` (default `80`). Customize diagnostic appearance with
-`proofread-face`, `proofread-current-face`, `proofread-popup-face`,
-`proofread-popup-source-face`, and `proofread-popup-border-face`.
+The optional frontend also defines `proofread-popup-enabled` (default `t`),
+`proofread-popup-delay` (default `0.5` seconds, with `0` meaning immediate
+updates), and `proofread-popup-max-width` (default `80`). Customize diagnostic
+appearance with `proofread-face`, `proofread-current-face`,
+`proofread-popup-face`, `proofread-popup-source-face`, and
+`proofread-popup-border-face`.
 
 ### Tuning concurrency
 

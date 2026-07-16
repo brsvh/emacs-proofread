@@ -46,9 +46,11 @@ SUGGESTIONS, MESSAGE, and SOURCE supply the optional field values."
                (list :profile 'multi :checker-name checker))))
 
 (defmacro proofread-popup-test--with-posframe-recorder (&rest body)
-  "Run BODY and record invocations of the Posframe frontend."
+  "Record Posframe invocations while running BODY with immediate rendering."
   (declare (indent 0) (debug (body)))
-  `(let (proofread-popup-test--shows
+  `(let ((proofread-popup-delay 0)
+         (proofread-auto-check nil)
+         proofread-popup-test--shows
          proofread-popup-test--hides
          proofread-popup-test--deletes)
      (cl-letf (((symbol-function 'posframe-workable-p)
@@ -70,6 +72,43 @@ SUGGESTIONS, MESSAGE, and SOURCE supply the optional field values."
                   (push buffer-or-name
                         proofread-popup-test--deletes))))
        ,@body)))
+
+(defmacro proofread-popup-test--with-idle-timer-recorder (&rest body)
+  "Run BODY and record idle timer creation and cancellation."
+  (declare (indent 0) (debug (body)))
+  `(let (proofread-popup-test--idle-timer-calls
+         proofread-popup-test--canceled-timers)
+     (cl-letf (((symbol-function 'run-with-idle-timer)
+                (lambda (seconds repeat function &rest arguments)
+                  (let* ((timer (timer-create))
+                         (call
+                          (list :timer timer
+                                :seconds seconds
+                                :repeat repeat
+                                :function function
+                                :arguments arguments)))
+                    (push call
+                          proofread-popup-test--idle-timer-calls)
+                    timer)))
+               ((symbol-function 'cancel-timer)
+                (lambda (timer)
+                  (push timer
+                        proofread-popup-test--canceled-timers))))
+       ,@body)))
+
+(defun proofread-popup-test--popup-idle-timer-calls (records)
+  "Filter RECORDS to popup idle timer entries in creation order."
+  (nreverse
+   (cl-remove-if-not
+    (lambda (call)
+      (eq (plist-get call :function)
+          #'proofread-popup--idle-timer-run))
+    records)))
+
+(defun proofread-popup-test--fire-idle-timer (call)
+  "Invoke recorded idle timer CALL."
+  (apply (plist-get call :function)
+         (plist-get call :arguments)))
 
 ;;;; Configuration and messages
 
@@ -105,6 +144,22 @@ SUGGESTIONS, MESSAGE, and SOURCE supply the optional field values."
   (should-error
    (funcall (get 'proofread-popup-max-width 'custom-set)
             'proofread-popup-max-width 0)))
+
+(ert-deftest proofread-popup-test-delay-is-nonnegative ()
+  "The popup delay defaults to 0.5 and rejects negative values."
+  (should (= (default-value 'proofread-popup-delay) 0.5))
+  (should
+   (eq (get 'proofread-popup-delay 'custom-set)
+       #'proofread-popup--set-nonnegative-number-option))
+  (let ((symbol (make-symbol "proofread-popup-test-delay")))
+    (proofread-popup--set-nonnegative-number-option symbol 0)
+    (should (zerop (default-value symbol)))
+    (should-error
+     (proofread-popup--set-nonnegative-number-option symbol -0.1)
+     :type 'user-error)
+    (should-error
+     (proofread-popup--set-nonnegative-number-option symbol "0.5")
+     :type 'user-error)))
 
 (ert-deftest proofread-popup-test-blank-message-falls-back-to-text ()
   "A blank diagnostic message falls back to the diagnostic text."
@@ -152,6 +207,7 @@ SUGGESTIONS, MESSAGE, and SOURCE supply the optional field values."
   "Popup messages preserve each aggregate member's source."
   (with-temp-buffer
     (insert "helo")
+    (setq-local proofread-popup-delay 0)
     (proofread-mode 1)
     (let ((first
            (proofread-popup-test--diagnostic-with-checker
@@ -190,6 +246,7 @@ SUGGESTIONS, MESSAGE, and SOURCE supply the optional field values."
 (ert-deftest proofread-popup-test-mode-follows-proofread-mode ()
   "The popup frontend follows the core minor mode automatically."
   (with-temp-buffer
+    (setq-local proofread-popup-delay 0)
     (should-not proofread-mode)
     (should-not proofread-popup-mode)
     (proofread-mode 1)
@@ -205,7 +262,192 @@ SUGGESTIONS, MESSAGE, and SOURCE supply the optional field values."
 
 (ert-deftest
     proofread-popup-test-diagnostics-change-shows-automatically ()
-  "A notification shows the popup without another command."
+  "A notification schedules a delayed popup without another command."
+  (proofread-popup-test--with-posframe-recorder
+   (save-window-excursion
+     (with-temp-buffer
+       (switch-to-buffer (current-buffer))
+       (insert "helo")
+       (goto-char 2)
+       (let ((diagnostic
+              (proofread-popup-test--diagnostic 1 5 "helo"))
+             (proofread-popup-delay 0.5))
+         (proofread-popup-test--with-idle-timer-recorder
+          (proofread-mode 1)
+          (let ((startup-call
+                 (car
+                  (proofread-popup-test--popup-idle-timer-calls
+                   proofread-popup-test--idle-timer-calls))))
+            (proofread-popup-test--fire-idle-timer startup-call))
+          (should-not proofread-popup-test--shows)
+          (proofread--apply-backend-diagnostics (list diagnostic))
+          (let ((calls
+                 (proofread-popup-test--popup-idle-timer-calls
+                  proofread-popup-test--idle-timer-calls)))
+            (should (= (length calls) 2))
+            (should-not proofread-popup-test--shows)
+            (proofread-popup-test--fire-idle-timer (cadr calls)))
+          (should (= (length proofread-popup-test--shows) 1))
+          (should proofread-popup--render-signature)
+          (should (equal diagnostic (car proofread--diagnostics)))))))))
+
+;;;; Delayed scheduling
+
+(ert-deftest proofread-popup-test-waits-for-idle-callback ()
+  "Mode startup and diagnostics coalesce before the idle callback."
+  (proofread-popup-test--with-posframe-recorder
+   (save-window-excursion
+     (with-temp-buffer
+       (switch-to-buffer (current-buffer))
+       (insert "helo")
+       (goto-char 2)
+       (let ((proofread-auto-check nil)
+             (proofread-popup-delay 0.5))
+         (proofread-popup-test--with-idle-timer-recorder
+          (proofread-mode 1)
+          (proofread--apply-backend-diagnostics
+           (list (proofread-popup-test--diagnostic 1 5 "helo")))
+          (let ((calls
+                 (proofread-popup-test--popup-idle-timer-calls
+                  proofread-popup-test--idle-timer-calls)))
+            (should (= (length calls) 1))
+            (should (= (plist-get (car calls) :seconds) 0.5))
+            (should-not (plist-get (car calls) :repeat))
+            (should-not proofread-popup-test--shows)
+            (should proofread-popup--idle-timer)
+            (with-temp-buffer
+              (proofread-popup-test--fire-idle-timer (car calls)))
+            (should (= (length proofread-popup-test--shows) 1))
+            (should-not proofread-popup--idle-timer)
+            (should-not proofread-popup--update-generation))))))))
+
+(ert-deftest proofread-popup-test-coalesces-and-rereads-final-state ()
+  "One delayed update reads the final point, window, and diagnostic."
+  (proofread-popup-test--with-posframe-recorder
+   (save-window-excursion
+     (with-temp-buffer
+       (switch-to-buffer (current-buffer))
+       (insert "one xx two")
+       (proofread-mode 1)
+       (let* ((first
+               (proofread-popup-test--diagnostic
+                1 4 "one" nil "First message"))
+              (second
+               (proofread-popup-test--diagnostic
+                8 11 "two" nil "Second message"))
+              (first-window (selected-window))
+              (second-window
+               (split-window first-window nil 'below))
+              (proofread-popup-max-width 80)
+              (proofread-popup-delay 0.5))
+         (proofread-popup-test--install-diagnostics
+          (list first second))
+         (goto-char 2)
+         (proofread-popup-test--with-idle-timer-recorder
+          (proofread-popup--update)
+          (goto-char 3)
+          (proofread-popup--update)
+          (setf (plist-get second :message) "Final message")
+          (setq proofread-popup-max-width 43)
+          (set-window-point second-window 9)
+          (select-window second-window)
+          (proofread-popup--update)
+          (let ((calls
+                 (proofread-popup-test--popup-idle-timer-calls
+                  proofread-popup-test--idle-timer-calls)))
+            (should (= (length calls) 1))
+            (should-not proofread-popup-test--shows)
+            (proofread-popup-test--fire-idle-timer (car calls)))
+          (should (= (length proofread-popup-test--shows) 1))
+          (should (eq proofread-popup--window second-window))
+          (should (= proofread-popup--position 8))
+          (should
+           (= (plist-get (cdar proofread-popup-test--shows)
+                         :max-width)
+              43))
+          (should
+           (= (plist-get proofread-popup--render-state :max-width)
+              43))
+          (should
+           (equal
+            (substring-no-properties
+             (plist-get (cdar proofread-popup-test--shows) :string))
+            "test: Final message"))))))))
+
+(ert-deftest proofread-popup-test-delayed-update-ignores-stale-diagnostic ()
+  "A delayed update renders a replacement diagnostic, not stale data."
+  (proofread-popup-test--with-posframe-recorder
+   (save-window-excursion
+     (with-temp-buffer
+       (switch-to-buffer (current-buffer))
+       (insert "helo")
+       (proofread-mode 1)
+       (proofread-popup-test--install-diagnostics
+        (list (proofread-popup-test--diagnostic
+               1 5 "helo" nil "Old message")))
+       (goto-char 2)
+       (let ((proofread-popup-delay 0.5))
+         (proofread-popup-test--with-idle-timer-recorder
+          (proofread-popup--update)
+          (proofread-clear)
+          (proofread-popup-test--install-diagnostics
+           (list (proofread-popup-test--diagnostic
+                  1 5 "helo" nil "Replacement message")))
+          (let ((calls
+                 (proofread-popup-test--popup-idle-timer-calls
+                  proofread-popup-test--idle-timer-calls)))
+            (should (= (length calls) 1))
+            (proofread-popup-test--fire-idle-timer (car calls)))
+          (should
+           (equal
+            (substring-no-properties
+             (plist-get (cdar proofread-popup-test--shows) :string))
+            "test: Replacement message"))))))))
+
+(ert-deftest proofread-popup-test-stale-generation-preserves-new-timer ()
+  "A canceled callback neither renders nor clears a newer timer."
+  (proofread-popup-test--with-posframe-recorder
+   (save-window-excursion
+     (with-temp-buffer
+       (switch-to-buffer (current-buffer))
+       (insert "helo")
+       (proofread-mode 1)
+       (proofread-popup-test--install-diagnostics
+        (list (proofread-popup-test--diagnostic 1 5 "helo")))
+       (goto-char 2)
+       (let ((proofread-popup-delay 0.5))
+         (proofread-popup-test--with-idle-timer-recorder
+          (proofread-popup--update)
+          (let* ((old-call
+                  (car
+                   (proofread-popup-test--popup-idle-timer-calls
+                    proofread-popup-test--idle-timer-calls)))
+                 (old-timer (plist-get old-call :timer)))
+            (proofread-popup--cancel-pending-update)
+            (proofread-popup--update)
+            (let* ((calls
+                    (proofread-popup-test--popup-idle-timer-calls
+                     proofread-popup-test--idle-timer-calls))
+                   (new-call (cadr calls))
+                   (new-timer (plist-get new-call :timer)))
+              (should (= (length calls) 2))
+              (should (memq old-timer
+                            proofread-popup-test--canceled-timers))
+              (should (eq proofread-popup--idle-timer new-timer))
+              (proofread-popup-test--fire-idle-timer old-call)
+              (should-not proofread-popup-test--shows)
+              (should (eq proofread-popup--idle-timer new-timer))
+              (proofread-popup-test--fire-idle-timer new-call)
+              (should (= (length proofread-popup-test--shows) 1))
+              (should-not proofread-popup--idle-timer)
+              (should-not proofread-popup--update-generation)
+              (proofread-popup-test--fire-idle-timer new-call)
+              (should
+               (= (length proofread-popup-test--shows) 1))))))))))
+
+(ert-deftest
+    proofread-popup-test-generation-survives-major-mode-local-reset ()
+  "A stale callback cannot match a new timer after local variables reset."
   (proofread-popup-test--with-posframe-recorder
    (save-window-excursion
      (with-temp-buffer
@@ -213,18 +455,124 @@ SUGGESTIONS, MESSAGE, and SOURCE supply the optional field values."
        (insert "helo")
        (proofread-mode 1)
        (goto-char 2)
-       (let ((diagnostic
-              (proofread-popup-test--diagnostic 1 5 "helo")))
-         (proofread--apply-backend-diagnostics (list diagnostic))
-         (should (= (length proofread-popup-test--shows) 1))
-         (should proofread-popup--render-signature)
-         (should (equal diagnostic (car proofread--diagnostics))))))))
+       (let ((proofread-popup-delay 0.5))
+         (proofread-popup-test--with-idle-timer-recorder
+          (proofread-popup--update)
+          (let* ((old-call
+                  (car
+                   (proofread-popup-test--popup-idle-timer-calls
+                    proofread-popup-test--idle-timer-calls)))
+                 (old-timer (plist-get old-call :timer)))
+            (text-mode)
+            (proofread-mode 1)
+            (proofread-popup-test--install-diagnostics
+             (list (proofread-popup-test--diagnostic 1 5 "helo")))
+            (let* ((calls
+                    (proofread-popup-test--popup-idle-timer-calls
+                     proofread-popup-test--idle-timer-calls))
+                   (new-call (cadr calls))
+                   (new-timer (plist-get new-call :timer)))
+              (should (= (length calls) 2))
+              (should (memq old-timer
+                            proofread-popup-test--canceled-timers))
+              (should (eq proofread-popup--idle-timer new-timer))
+              (proofread-popup-test--fire-idle-timer old-call)
+              (should-not proofread-popup-test--shows)
+              (should (eq proofread-popup--idle-timer new-timer))
+              (proofread-popup-test--fire-idle-timer new-call)
+              (should (= (length proofread-popup-test--shows) 1))))))))))
+
+(ert-deftest proofread-popup-test-zero-delay-cancels-pending-update ()
+  "Switching to zero delay cancels pending work and renders immediately."
+  (proofread-popup-test--with-posframe-recorder
+   (save-window-excursion
+     (with-temp-buffer
+       (switch-to-buffer (current-buffer))
+       (insert "helo")
+       (proofread-mode 1)
+       (proofread-popup-test--install-diagnostics
+        (list (proofread-popup-test--diagnostic 1 5 "helo")))
+       (goto-char 2)
+       (let ((proofread-popup-delay 0.5))
+         (proofread-popup-test--with-idle-timer-recorder
+          (proofread-popup--update)
+          (let* ((call
+                  (car
+                   (proofread-popup-test--popup-idle-timer-calls
+                    proofread-popup-test--idle-timer-calls)))
+                 (timer (plist-get call :timer)))
+            (let ((proofread-popup-delay 0))
+              (proofread-popup--update))
+            (should (memq timer
+                          proofread-popup-test--canceled-timers))
+            (should (= (length proofread-popup-test--shows) 1))
+            (should-not proofread-popup--idle-timer)
+            (should-not proofread-popup--update-generation)
+            (let ((signature proofread-popup--render-signature))
+              (proofread-popup-test--fire-idle-timer call)
+              (should (= (length proofread-popup-test--shows) 1))
+              (should
+               (equal-including-properties
+                proofread-popup--render-signature signature))))))))))
+
+(ert-deftest proofread-popup-test-pending-updates-are-buffer-local ()
+  "Each Proofread buffer owns an independent delayed update."
+  (proofread-popup-test--with-posframe-recorder
+   (let ((first (generate-new-buffer " *proofread-popup-first*"))
+         (second (generate-new-buffer " *proofread-popup-second*")))
+     (unwind-protect
+         (progn
+           (dolist (buffer (list first second))
+             (with-current-buffer buffer
+               (insert "helo")
+               (proofread-mode 1)))
+           (let ((proofread-popup-delay 0.5))
+             (proofread-popup-test--with-idle-timer-recorder
+              (with-current-buffer first
+                (proofread-popup--update))
+              (with-current-buffer second
+                (proofread-popup--update))
+              (let* ((calls
+                      (proofread-popup-test--popup-idle-timer-calls
+                       proofread-popup-test--idle-timer-calls))
+                     (first-call (car calls))
+                     (second-call (cadr calls))
+                     (first-timer (plist-get first-call :timer))
+                     (second-timer (plist-get second-call :timer)))
+                (should (= (length calls) 2))
+                (should-not (eq first-timer second-timer))
+                (should
+                 (eq (with-current-buffer first
+                       proofread-popup--idle-timer)
+                     first-timer))
+                (should
+                 (eq (with-current-buffer second
+                       proofread-popup--idle-timer)
+                     second-timer))
+                (with-current-buffer first
+                  (proofread-popup--cancel-pending-update))
+                (should
+                 (eq (with-current-buffer second
+                       proofread-popup--idle-timer)
+                     second-timer))
+                (proofread-popup-test--fire-idle-timer first-call)
+                (should
+                 (eq (with-current-buffer second
+                       proofread-popup--idle-timer)
+                     second-timer))
+                (proofread-popup-test--fire-idle-timer second-call)
+                (should-not
+                 (with-current-buffer second
+                   proofread-popup--idle-timer))))))
+       (dolist (buffer (list first second))
+         (when (buffer-live-p buffer)
+           (kill-buffer buffer)))))))
 
 ;;;; Rendering
 
 (ert-deftest
     proofread-popup-test-update-captures-render-inputs-once ()
-  "One popup update captures each render input exactly once."
+  "Only the delayed callback captures each render input, exactly once."
   (proofread-popup-test--with-posframe-recorder
    (save-window-excursion
      (with-temp-buffer
@@ -241,12 +589,17 @@ SUGGESTIONS, MESSAGE, and SOURCE supply the optional field values."
                (symbol-function 'proofread-popup--anchor-position))
               (snapshot-function
                (symbol-function 'proofread-popup--render-snapshot))
+              (render-data-function
+               (symbol-function
+                'proofread-popup--diagnostic-render-data))
               (available-function
                (symbol-function 'proofread-popup--available-p))
+              (proofread-popup-delay 0.5)
               (selection-calls 0)
               (diagnostic-calls 0)
               (anchor-calls 0)
               (snapshot-calls 0)
+              (render-data-calls 0)
               (available-calls 0)
               selected-window-value
               anchor-window
@@ -276,16 +629,35 @@ SUGGESTIONS, MESSAGE, and SOURCE supply the optional field values."
                       (setq snapshot-window window)
                       (setq snapshot
                             (funcall snapshot-function window))))
+                   ((symbol-function
+                     'proofread-popup--diagnostic-render-data)
+                    (lambda (value)
+                      (setq render-data-calls
+                            (1+ render-data-calls))
+                      (funcall render-data-function value)))
                    ((symbol-function 'proofread-popup--available-p)
                     (lambda ()
                       (setq available-calls (1+ available-calls))
                       (funcall available-function))))
-           (proofread-popup--update))
+           (proofread-popup-test--with-idle-timer-recorder
+            (proofread-popup--update)
+            (should-not proofread-popup-test--shows)
+            (dolist (calls
+                     (list selection-calls diagnostic-calls
+                           anchor-calls snapshot-calls
+                           render-data-calls available-calls))
+              (should (zerop calls)))
+            (let ((calls
+                   (proofread-popup-test--popup-idle-timer-calls
+                    proofread-popup-test--idle-timer-calls)))
+              (should (= (length calls) 1))
+              (proofread-popup-test--fire-idle-timer (car calls)))))
          (should (= (length proofread-popup-test--shows) 1))
          (should (= selection-calls 1))
          (should (= diagnostic-calls 1))
          (should (= anchor-calls 1))
          (should (= snapshot-calls 1))
+         (should (= render-data-calls 1))
          (should (= available-calls 1))
          (should (eq anchor-window selected-window-value))
          (should (eq snapshot-window selected-window-value))
@@ -596,7 +968,7 @@ SUGGESTIONS, MESSAGE, and SOURCE supply the optional field values."
              (point))))))))
 
 (ert-deftest proofread-popup-test-hides-away-from-diagnostic ()
-  "The child frame hides when point leaves diagnostics."
+  "With zero delay, the child frame hides when point leaves diagnostics."
   (proofread-popup-test--with-posframe-recorder
    (save-window-excursion
      (with-temp-buffer
@@ -705,6 +1077,108 @@ SUGGESTIONS, MESSAGE, and SOURCE supply the optional field values."
 
 ;;;; Availability and lifecycle
 
+(ert-deftest proofread-popup-test-mode-disable-cancels-idle-timer ()
+  "Disabling popup mode cancels its pending idle timer."
+  (proofread-popup-test--with-posframe-recorder
+   (save-window-excursion
+     (with-temp-buffer
+       (switch-to-buffer (current-buffer))
+       (insert "helo")
+       (proofread-mode 1)
+       (let ((proofread-popup-delay 0.5))
+         (proofread-popup-test--with-idle-timer-recorder
+          (proofread-popup--update)
+          (let* ((call
+                  (car
+                   (proofread-popup-test--popup-idle-timer-calls
+                    proofread-popup-test--idle-timer-calls)))
+                 (timer (plist-get call :timer)))
+            (proofread-popup-mode -1)
+            (should (memq timer
+                          proofread-popup-test--canceled-timers))
+            (should-not proofread-popup--idle-timer))))))))
+
+(ert-deftest proofread-popup-test-major-mode-change-cancels-idle-timer ()
+  "Changing major mode cancels the pending popup idle timer."
+  (proofread-popup-test--with-posframe-recorder
+   (save-window-excursion
+     (with-temp-buffer
+       (switch-to-buffer (current-buffer))
+       (insert "helo")
+       (proofread-mode 1)
+       (let ((proofread-popup-delay 0.5))
+         (proofread-popup-test--with-idle-timer-recorder
+          (proofread-popup--update)
+          (let* ((call
+                  (car
+                   (proofread-popup-test--popup-idle-timer-calls
+                    proofread-popup-test--idle-timer-calls)))
+                 (timer (plist-get call :timer)))
+            (text-mode)
+            (should (memq timer
+                          proofread-popup-test--canceled-timers))
+            (should-not (bound-and-true-p
+                         proofread-popup--idle-timer)))))))))
+
+(ert-deftest proofread-popup-test-kill-buffer-cancels-idle-timer ()
+  "Killing the source buffer cancels the pending popup idle timer."
+  (proofread-popup-test--with-posframe-recorder
+   (save-window-excursion
+     (let ((buffer
+            (generate-new-buffer " *proofread-popup-timer-kill*")))
+       (unwind-protect
+           (progn
+             (switch-to-buffer buffer)
+             (insert "helo")
+             (proofread-mode 1)
+             (let ((proofread-popup-delay 0.5))
+               (proofread-popup-test--with-idle-timer-recorder
+                (proofread-popup--update)
+                (let* ((call
+                        (car
+                         (proofread-popup-test--popup-idle-timer-calls
+                          proofread-popup-test--idle-timer-calls)))
+                       (timer (plist-get call :timer)))
+                  (kill-buffer buffer)
+                  (should (memq
+                           timer
+                           proofread-popup-test--canceled-timers))
+                  (should-not
+                   (proofread-popup-test--fire-idle-timer call))
+                  (should-not proofread-popup-test--shows)))))
+         (when (buffer-live-p buffer)
+           (kill-buffer buffer)))))))
+
+(ert-deftest proofread-popup-test-unload-cancels-idle-timer ()
+  "Unloading the package cancels pending popup idle timers."
+  (proofread-popup-test--with-posframe-recorder
+   (save-window-excursion
+     (let ((buffer
+            (generate-new-buffer " *proofread-popup-timer-unload*")))
+       (unwind-protect
+           (progn
+             (switch-to-buffer buffer)
+             (insert "helo")
+             (proofread-mode 1)
+             (let ((proofread-popup-delay 0.5))
+               (proofread-popup-test--with-idle-timer-recorder
+                (proofread-popup--update)
+                (let* ((call
+                        (car
+                         (proofread-popup-test--popup-idle-timer-calls
+                          proofread-popup-test--idle-timer-calls)))
+                       (timer (plist-get call :timer)))
+                  (unload-feature 'proofread-popup t)
+                  (should (memq
+                           timer
+                           proofread-popup-test--canceled-timers))
+                  (should-not
+                   (with-current-buffer buffer
+                     (bound-and-true-p proofread-popup-mode)))))))
+         (require 'proofread-popup)
+         (when (buffer-live-p buffer)
+           (kill-buffer buffer)))))))
+
 (ert-deftest proofread-popup-test-disabled-does-not-show ()
   "Disabling popup display prevents child frame creation."
   (proofread-popup-test--with-posframe-recorder
@@ -750,6 +1224,7 @@ SUGGESTIONS, MESSAGE, and SOURCE supply the optional field values."
 (ert-deftest proofread-popup-test-manual-opt-out-persists ()
   "A manual popup opt-out survives core mode disable and re-enable."
   (with-temp-buffer
+    (setq-local proofread-popup-delay 0)
     (proofread-mode 1)
     (should proofread-popup-mode)
     (cl-letf (((symbol-function 'called-interactively-p)
@@ -837,7 +1312,7 @@ SUGGESTIONS, MESSAGE, and SOURCE supply the optional field values."
            (kill-buffer buffer)))))))
 
 (ert-deftest proofread-popup-test-correct-at-point-hides-frame ()
-  "Correction at point immediately hides its diagnostic frame."
+  "With zero delay, correction immediately hides its diagnostic frame."
   (proofread-popup-test--with-posframe-recorder
    (save-window-excursion
      (with-temp-buffer

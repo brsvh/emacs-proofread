@@ -49,6 +49,19 @@
   :type 'boolean
   :group 'proofread-popup)
 
+(defun proofread-popup--set-nonnegative-number-option (symbol value)
+  "Set SYMBOL to VALUE after requiring a nonnegative number."
+  (unless (and (numberp value) (>= value 0))
+    (user-error "%s must be a nonnegative number" symbol))
+  (set-default symbol value))
+
+(defcustom proofread-popup-delay 0.5
+  "Seconds point must remain idle before updating the child frame.
+Set this to zero to update the child frame immediately."
+  :type '(number :tag "Seconds")
+  :set #'proofread-popup--set-nonnegative-number-option
+  :group 'proofread-popup)
+
 (defcustom proofread-popup-max-width 80
   "Maximum width of the Proofread child-frame message."
   :type 'natnum
@@ -94,6 +107,12 @@
 
 (defvar-local proofread-popup--render-state nil
   "Render snapshot used for the current Proofread child frame.")
+
+(defvar-local proofread-popup--idle-timer nil
+  "One-shot idle timer for the next popup update.")
+
+(defvar-local proofread-popup--update-generation nil
+  "Identity token for the current pending popup update.")
 
 (defvar-local proofread-popup--user-disabled-p nil
   "Non-nil when the user disabled popup integration in this buffer.")
@@ -234,8 +253,17 @@ WINDOW and SNAPSHOT describe the selected display target."
     (posframe-hide proofread-popup--buffer-name))
   (proofread-popup--reset-state))
 
+(defun proofread-popup--cancel-pending-update ()
+  "Cancel and invalidate the pending popup update, if any."
+  (let ((timer proofread-popup--idle-timer))
+    (setq proofread-popup--idle-timer nil)
+    (setq proofread-popup--update-generation nil)
+    (when timer
+      (cancel-timer timer))))
+
 (defun proofread-popup--delete ()
   "Delete the current Proofread child frame and hidden buffer."
+  (proofread-popup--cancel-pending-update)
   (when proofread-popup--buffer-name
     (condition-case err
         (progn
@@ -301,8 +329,8 @@ WINDOW and SNAPSHOT describe the selected display target."
   (setq proofread-popup--window window)
   (setq proofread-popup--render-state snapshot))
 
-(defun proofread-popup--update ()
-  "Update the child frame for the Proofread diagnostic at point."
+(defun proofread-popup--render-now ()
+  "Immediately update the child frame from the current buffer state."
   (if (and proofread-popup-mode
            proofread-mode
            proofread-popup-enabled)
@@ -331,6 +359,40 @@ WINDOW and SNAPSHOT describe the selected display target."
                 (proofread-popup--hide)))
           (proofread-popup--hide)))
     (proofread-popup--hide)))
+
+(defun proofread-popup--idle-timer-run (buffer generation)
+  "Render BUFFER when GENERATION still identifies its pending update."
+  (when (buffer-live-p buffer)
+    (with-current-buffer buffer
+      (when (eq generation proofread-popup--update-generation)
+        (setq proofread-popup--idle-timer nil)
+        (setq proofread-popup--update-generation nil)
+        (proofread-popup--render-now)))))
+
+(defun proofread-popup--schedule-update ()
+  "Schedule one idle popup update for the current buffer."
+  (unless proofread-popup--idle-timer
+    (let ((generation
+           (make-symbol "proofread-popup-pending-generation")))
+      (setq proofread-popup--update-generation generation)
+      (setq proofread-popup--idle-timer
+            (run-with-idle-timer
+             proofread-popup-delay nil
+             #'proofread-popup--idle-timer-run
+             (current-buffer) generation)))))
+
+(defun proofread-popup--update ()
+  "Schedule an update for the Proofread diagnostic at point."
+  (if (and proofread-popup-mode
+           proofread-mode
+           proofread-popup-enabled)
+      (if (zerop proofread-popup-delay)
+          (progn
+            (proofread-popup--cancel-pending-update)
+            (proofread-popup--render-now))
+        (proofread-popup--schedule-update))
+    (proofread-popup--cancel-pending-update)
+    (proofread-popup--render-now)))
 
 ;;;; Mode lifecycle
 
