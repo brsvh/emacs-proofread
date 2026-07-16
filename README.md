@@ -412,6 +412,16 @@ list below the source window with `proofread-show-buffer-diagnostics`. In that
 list, `RET` visits a diagnostic, `SPC` or `C-o` previews it in another window,
 and `n` or `p` moves through the list.
 
+When point is on a diagnostic, `proofread-mode` also shows its message in the
+echo area through ElDoc. The format is `Source: message`; messages from multiple
+checkers retain profile order and are separated by semicolons on one line.
+`proofread-echo-area-messages` controls this behavior and defaults to `t`. It
+becomes buffer-local when set. Source prefixes inherit `font-lock-keyword-face`
+through `proofread-echo-area-source-face`, while message text inherits
+`font-lock-comment-face` through `proofread-echo-area-message-face`. If ElDoc
+was disabled, Proofread enables it for this integration and restores that state
+when `proofread-mode` is disabled.
+
 ### Correcting errors
 
 Place point on a diagnostic and run `M-x proofread-correct-at-point`. A single
@@ -463,6 +473,10 @@ frames do not work. Run `M-x proofread-popup-mode` to opt the current buffer out
 of or back into the automatic integration. Its display can also be controlled
 with `proofread-popup-enabled`, `proofread-popup-delay`, and
 `proofread-popup-max-width`.
+
+Third-party frontends can use `proofread-format-diagnostic-message` for the same
+source-aware fallback and aggregation rules while selecting their own separator
+and faces.
 
 ### Batch correction
 
@@ -534,6 +548,7 @@ Run `M-x customize-group RET proofread RET` to edit the core options:
 | `proofread-docstring-predicate-functions` | `nil`   | Add predicate functions for recognizing docstrings; buffer-local when set         |
 | `proofread-idle-delay`                    | `1.0`   | Wait this many idle seconds before an automatic check                             |
 | `proofread-inhibit-progress-messages`     | `t`     | Suppress background progress, but not errors or explicit command feedback         |
+| `proofread-echo-area-messages`            | `t`     | Show the diagnostic at point through ElDoc; buffer-local when set                 |
 | `proofread-max-chunk-size`                | `2000`  | Limit the number of characters in each proofreading chunk                         |
 | `proofread-context-size`                  | `300`   | Limit context characters sent on each side of a chunk                             |
 | `proofread-context-sentences-before`      | `1`     | Limit logical context sentences before a chunk                                    |
@@ -585,6 +600,7 @@ The optional frontend also defines `proofread-popup-enabled` (default `t`),
 `proofread-popup-delay` (default `0.5` seconds, with `0` meaning immediate
 updates), and `proofread-popup-max-width` (default `80`). Customize diagnostic
 appearance with `proofread-face`, `proofread-current-face`,
+`proofread-echo-area-source-face`, `proofread-echo-area-message-face`,
 `proofread-popup-face`, `proofread-popup-source-face`, and
 `proofread-popup-border-face`.
 

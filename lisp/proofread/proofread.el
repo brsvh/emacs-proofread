@@ -36,6 +36,7 @@
 
 (require 'button)
 (require 'cl-lib)
+(require 'eldoc)
 (require 'lisp-mode)
 (require 'pp)
 (require 'pulse)
@@ -128,6 +129,14 @@ used as a fallback.  This option becomes buffer-local when set."
 This affects background check and request-dispatch progress messages.
 It does not suppress errors or explicit command feedback."
   :type 'boolean
+  :group 'proofread)
+
+(defcustom proofread-echo-area-messages t
+  "Show the Proofread diagnostic at point in the echo area.
+When non-nil, `proofread-mode' uses ElDoc to show diagnostic messages
+at point.  This option becomes buffer-local when set."
+  :type 'boolean
+  :local t
   :group 'proofread)
 
 (defcustom proofread-max-chunk-size 2000
@@ -256,6 +265,16 @@ request-ready chunks."
 (defface proofread-current-face
   '((t :inherit proofread-face))
   "Face for the current proofreading diagnostic."
+  :group 'proofread)
+
+(defface proofread-echo-area-source-face
+  '((t :inherit font-lock-keyword-face))
+  "Face for Proofread diagnostic sources in the echo area."
+  :group 'proofread)
+
+(defface proofread-echo-area-message-face
+  '((t :inherit font-lock-comment-face))
+  "Face for Proofread diagnostic messages in the echo area."
   :group 'proofread)
 
 ;;;; Internal constants
@@ -404,6 +423,12 @@ request-ready chunks."
 
 (defvar-local proofread--current-diagnostic nil
   "Currently selected proofread diagnostic in the current buffer.")
+
+(defvar-local proofread--eldoc-mode-owned-p nil
+  "Non-nil when Proofread enabled ElDoc in the current buffer.")
+
+(defvar-local proofread--echo-area-refresh-pending-p nil
+  "Non-nil when a guarded Proofread echo-area refresh is pending.")
 
 (defvar-local proofread--diagnostics-current-line 0
   "Current line in a proofread diagnostics listing buffer.")
@@ -5041,6 +5066,7 @@ BEG and END delimit the changed text."
 
 (defun proofread--kill-buffer ()
   "Clean up Proofread state before killing this buffer."
+  (proofread--disable-echo-area)
   (proofread--close-source-list-buffers (current-buffer))
   (proofread--clear-request-work)
   (proofread--unregister-mode-buffer))
@@ -5280,6 +5306,87 @@ using their printed representation."
    ((stringp value) value)
    ((symbolp value) (symbol-name value))
    (t (format "%S" value))))
+
+(defun proofread--format-diagnostic-message-field (value single-line)
+  "Return VALUE as a clean diagnostic display field, or nil.
+When SINGLE-LINE is non-nil, collapse whitespace to single spaces."
+  (when value
+    (let ((field
+           (string-trim
+            (substring-no-properties
+             (if (stringp value)
+                 value
+               (proofread-format-diagnostic-field value))))))
+      (unless (string-empty-p field)
+        (if single-line
+            (replace-regexp-in-string "[[:space:]]+" " " field)
+          field)))))
+
+(defun proofread--format-diagnostic-message-fallback
+    (diagnostic single-line)
+  "Return DIAGNOSTIC's fallback message.
+When SINGLE-LINE is non-nil, collapse whitespace to single spaces."
+  (if-let* ((text
+             (proofread--format-diagnostic-message-field
+              (proofread-diagnostic-text diagnostic) single-line)))
+      (concat "Proofread: " text)
+    "Proofread diagnostic"))
+
+(defun proofread--format-diagnostic-message-entry
+    (entry fallback-function source-face message-face single-line)
+  "Format diagnostic message ENTRY using FALLBACK-FUNCTION.
+Apply SOURCE-FACE to the source and MESSAGE-FACE to the message.  When
+SINGLE-LINE is non-nil, collapse field whitespace to single spaces."
+  (let* ((source
+          (proofread--format-diagnostic-message-field
+           (plist-get entry :source) single-line))
+         (message
+          (or (proofread--format-diagnostic-message-field
+               (plist-get entry :message) single-line)
+              (funcall fallback-function)))
+         (source-prefix
+          (and source
+               (if source-face
+                   (propertize (concat source ":")
+                               'face source-face)
+                 (concat source ":")))))
+    (concat source-prefix
+            (and source-prefix " ")
+            (if message-face
+                (propertize message 'face message-face)
+              message))))
+
+(cl-defun proofread-format-diagnostic-message
+    (diagnostic &key (separator "\n") source-face message-face single-line)
+  "Return a source-aware display message for DIAGNOSTIC.
+Format each represented diagnostic as `SOURCE: MESSAGE' in
+presentation order, joining entries with SEPARATOR.  SOURCE-FACE is
+applied to the source and colon; MESSAGE-FACE is applied only to the
+message.  The intervening space and SEPARATOR remain unpropertized.
+
+Blank or missing messages fall back to DIAGNOSTIC's text, or to a
+generic diagnostic label when no text is available.  Input text
+properties are not retained.  When SINGLE-LINE is non-nil, collapse
+whitespace inside each field to single spaces."
+  (let ((separator (substring-no-properties separator))
+        (entries (proofread-diagnostic-message-entries diagnostic))
+        fallback)
+    (cl-labels
+        ((fallback
+           ()
+           (or fallback
+               (setq fallback
+                     (proofread--format-diagnostic-message-fallback
+                      diagnostic single-line)))))
+      (if entries
+          (mapconcat
+           (lambda (entry)
+             (proofread--format-diagnostic-message-entry
+              entry #'fallback source-face message-face single-line))
+           entries separator)
+        (if message-face
+            (propertize (fallback) 'face message-face)
+          (fallback))))))
 
 (defun proofread--navigation-entry< (a b)
   "Return non-nil when navigation entry A should sort before B."
@@ -5651,6 +5758,184 @@ and `proofread-diagnostic-text' instead."
                       point-position)))
           (proofread--aggregate-local-navigation-entry
            (car entries) entries))))))
+
+(defun proofread--echo-area-message (diagnostic)
+  "Return the echo-area message for DIAGNOSTIC."
+  (let ((message
+         (proofread-format-diagnostic-message
+          diagnostic
+          :separator "; "
+          :source-face 'proofread-echo-area-source-face
+          :message-face 'proofread-echo-area-message-face
+          :single-line t)))
+    (add-text-properties
+     0 (length message)
+     (list 'proofread--echo-area-message (current-buffer))
+     message)
+    message))
+
+(defun proofread--eldoc-function (callback &rest _ignored)
+  "Report the Proofread diagnostic at point through CALLBACK."
+  (when (and proofread-mode proofread-echo-area-messages)
+    (when-let* ((diagnostic (proofread-diagnostic-at-point))
+                (message (proofread--echo-area-message diagnostic)))
+      (funcall callback message :echo message))))
+
+(defun proofread--echo-area-owned-message-p (message)
+  "Return non-nil when this buffer owns Proofread MESSAGE."
+  (and (stringp message)
+       (> (length message) 0)
+       (text-property-any
+        0 (length message)
+        'proofread--echo-area-message (current-buffer) message)))
+
+(defun proofread--echo-area-refresh-permitted-p (&optional after-command)
+  "Return non-nil when Proofread may refresh the echo area now.
+When AFTER-COMMAND is non-nil, do not treat `this-command' as an
+in-progress command."
+  (and eldoc-mode
+       (or after-command (null this-command))
+       (eq (window-buffer (selected-window)) (current-buffer))
+       (not (active-minibuffer-window))
+       (eldoc-display-message-no-interference-p)
+       (let ((current (current-message)))
+         (or (null current)
+             (proofread--echo-area-owned-message-p current)))))
+
+(defun proofread--echo-area-clear-current-message ()
+  "Forget ElDoc state owned by Proofread in the current buffer."
+  (when (proofread--echo-area-owned-message-p (current-message))
+    (eldoc-display-in-echo-area nil t))
+  (when (proofread--echo-area-owned-message-p eldoc-last-message)
+    (setq eldoc-last-message nil)))
+
+(defun proofread--configure-echo-area (enabled)
+  "Configure Proofread's echo-area integration for ENABLED."
+  (if enabled
+      (unless eldoc-mode
+        (eldoc-mode 1)
+        (setq proofread--eldoc-mode-owned-p (and eldoc-mode t)))
+    (proofread--cancel-echo-area-refresh)
+    (proofread--echo-area-clear-current-message)
+    (when proofread--eldoc-mode-owned-p
+      (setq proofread--eldoc-mode-owned-p nil)
+      (when eldoc-mode
+        (eldoc-mode -1)))))
+
+(defun proofread--display-echo-area-message (message)
+  "Display Proofread MESSAGE through ElDoc's echo-area frontend."
+  (eldoc-display-in-echo-area
+   (list
+    (list message
+          :origin #'proofread--eldoc-function
+          :echo message))
+   t))
+
+(defun proofread--refresh-echo-area-now (&optional after-command)
+  "Refresh Proofread's echo-area message when permitted.
+When AFTER-COMMAND is non-nil, the command has finished and may no
+longer be treated as in progress.  Return non-nil when the refresh
+gate permitted an update."
+  (when (proofread--echo-area-refresh-permitted-p after-command)
+    (if-let* ((diagnostic
+               (and proofread-mode
+                    proofread-echo-area-messages
+                    (proofread-diagnostic-at-point)))
+              (message (proofread--echo-area-message diagnostic)))
+        (proofread--display-echo-area-message message)
+      (proofread--echo-area-clear-current-message))
+    t))
+
+(defun proofread--cancel-echo-area-refresh ()
+  "Cancel a pending Proofread echo-area refresh."
+  (setq proofread--echo-area-refresh-pending-p nil)
+  (remove-hook 'post-command-hook
+               #'proofread--retry-echo-area-refresh t))
+
+(defun proofread--retry-echo-area-refresh ()
+  "Retry a guarded Proofread echo-area refresh after a command."
+  (cond
+   ((not (and proofread-mode
+              proofread-echo-area-messages
+              eldoc-mode))
+    (proofread--cancel-echo-area-refresh))
+   ((proofread--refresh-echo-area-now t)
+    (proofread--cancel-echo-area-refresh))))
+
+(defun proofread--queue-echo-area-refresh ()
+  "Retry Proofread's echo-area refresh after the next safe command."
+  (setq proofread--echo-area-refresh-pending-p t)
+  (add-hook 'post-command-hook
+            #'proofread--retry-echo-area-refresh nil t))
+
+(defun proofread--refresh-echo-area ()
+  "Refresh Proofread's ElDoc message after diagnostics change."
+  (cond
+   ((not (and proofread-mode
+              proofread-echo-area-messages
+              eldoc-mode))
+    (proofread--cancel-echo-area-refresh))
+   ((proofread--refresh-echo-area-now)
+    (proofread--cancel-echo-area-refresh))
+   (t
+    (proofread--queue-echo-area-refresh))))
+
+(defun proofread--enable-echo-area ()
+  "Enable Proofread's echo-area integration in the current buffer."
+  (add-hook 'eldoc-documentation-functions
+            #'proofread--eldoc-function nil t)
+  (add-hook 'proofread-diagnostics-changed-hook
+            #'proofread--refresh-echo-area nil t)
+  (proofread--configure-echo-area proofread-echo-area-messages))
+
+(defun proofread--disable-echo-area ()
+  "Disable Proofread's echo-area integration in the current buffer."
+  (proofread--cancel-echo-area-refresh)
+  (remove-hook 'proofread-diagnostics-changed-hook
+               #'proofread--refresh-echo-area t)
+  (remove-hook 'eldoc-documentation-functions
+               #'proofread--eldoc-function t)
+  (proofread--echo-area-clear-current-message)
+  (when proofread--eldoc-mode-owned-p
+    (setq proofread--eldoc-mode-owned-p nil)
+    (when eldoc-mode
+      (eldoc-mode -1))))
+
+(defun proofread--configure-echo-area-in-buffer (buffer enabled)
+  "Configure Proofread echo display in BUFFER for ENABLED."
+  (when (buffer-live-p buffer)
+    (with-current-buffer buffer
+      (when proofread-mode
+        (proofread--configure-echo-area enabled)))))
+
+(defun proofread--configure-default-echo-area (symbol enabled)
+  "Configure non-local SYMBOL users for default value ENABLED."
+  (dolist (buffer (copy-sequence proofread--mode-buffers))
+    (when (and (buffer-live-p buffer)
+               (not (local-variable-p symbol buffer)))
+      (proofread--configure-echo-area-in-buffer buffer enabled))))
+
+(defun proofread--echo-area-option-watcher
+    (symbol value operation where)
+  "Synchronize echo display when SYMBOL receives VALUE.
+OPERATION describes the variable change, and WHERE is its buffer or
+nil for a change to the default."
+  (pcase operation
+    ((or 'set 'let 'unlet)
+     (if (and (buffer-live-p where)
+              (or (eq operation 'set)
+                  (local-variable-p symbol where)))
+         (proofread--configure-echo-area-in-buffer where value)
+       ;; A dynamic binding of the default may report the buffer that
+       ;; initiated it even though that buffer has no local value.
+       (unless (equal value (default-value symbol))
+         (proofread--configure-default-echo-area symbol value))))
+    ('makunbound
+     (when (buffer-live-p where)
+       ;; `kill-local-variable' reports nil as VALUE before exposing
+       ;; the default value, so synchronize to that default directly.
+       (proofread--configure-echo-area-in-buffer
+        where (default-value symbol))))))
 
 (defun proofread--mark-current-diagnostic (diagnostic)
   "Mark DIAGNOSTIC current and update its overlay face."
@@ -7200,6 +7485,8 @@ DIAGNOSTICS must be in navigation order.  Return `applied'."
   (setq-local proofread--diagnostic-request-ranges
               (make-hash-table :test #'eq))
   (setq-local proofread--current-diagnostic nil)
+  (setq-local proofread--eldoc-mode-owned-p nil)
+  (setq-local proofread--echo-area-refresh-pending-p nil)
   (setq-local proofread--active-requests nil)
   (setq-local proofread--request-queue nil)
   (setq-local proofread--request-queue-tail nil)
@@ -7248,6 +7535,8 @@ DIAGNOSTICS must be in navigation order.  Return `applied'."
   (setq proofread--diagnostic-overlays nil)
   (setq proofread--next-diagnostic-insertion-ordinal nil)
   (setq proofread--diagnostic-request-ranges nil)
+  (setq proofread--eldoc-mode-owned-p nil)
+  (setq proofread--echo-area-refresh-pending-p nil)
   (setq proofread--pending-invalidated-overlays nil)
   (setq proofread--pending-invalidated-diagnostics nil))
 
@@ -7264,6 +7553,7 @@ DIAGNOSTICS must be in navigation order.  Return `applied'."
   (add-hook 'kill-buffer-hook #'proofread--kill-buffer nil t)
   (add-hook 'change-major-mode-hook
             #'proofread--change-major-mode nil t)
+  (proofread--enable-echo-area)
   (proofread--register-mode-buffer)
   (proofread--mark-pending-work))
 
@@ -7274,6 +7564,7 @@ DIAGNOSTICS must be in navigation order.  Return `applied'."
   (remove-hook 'kill-buffer-hook #'proofread--kill-buffer t)
   (remove-hook 'change-major-mode-hook
                #'proofread--change-major-mode t)
+  (proofread--disable-echo-area)
   (proofread--clear-buffer-state)
   (proofread--unregister-mode-buffer))
 
@@ -7548,6 +7839,9 @@ schedules an initial visible-buffer check when enabled, and further
 checks after editing or window activity.  It then dispatches
 request-ready visible chunks through the configured backend.  The
 option `proofread-targets' controls which kinds of text are selected.
+When point is on a diagnostic and `proofread-echo-area-messages' is
+non-nil, its source and message are also shown through ElDoc in the
+echo area.
 When automatic checking is disabled, use
 `proofread-check-at-point', `proofread-check-region',
 `proofread-check-buffer', or `proofread-check-visible-range' manually.
@@ -7826,6 +8120,7 @@ buffer."
          ((bound-and-true-p proofread-mode)
           (proofread-mode -1))
          ((memq buffer proofread--mode-buffers)
+          (proofread--disable-echo-area)
           (proofread--clear-buffer-state)
           (proofread--unregister-mode-buffer)))
         (when (memq major-mode
@@ -7845,7 +8140,14 @@ buffer."
   (setq proofread--request-log-sources nil)
   (setq proofread--mode-buffers nil)
   (setq proofread--window-hooks-installed nil)
+  (remove-variable-watcher
+   'proofread-echo-area-messages
+   #'proofread--echo-area-option-watcher)
   nil)
+
+(add-variable-watcher
+ 'proofread-echo-area-messages
+ #'proofread--echo-area-option-watcher)
 
 (provide 'proofread)
 ;;; proofread.el ends here

@@ -120,6 +120,20 @@ diagnostic message-entry interface preserves each message-to-source association
 for frontends, including aggregate diagnostics and cache hits.
 
 ---
+*** Diagnostics at point now appear in the echo area.
+When 'proofread-echo-area-messages' is non-nil, 'proofread-mode' registers an
+ElDoc provider that displays the diagnostic at point as "Source: message".
+Messages from multiple checkers retain profile order and share one line.  The
+new option defaults to non-nil and becomes buffer-local when set.
+
+The new 'proofread-echo-area-source-face' inherits
+'font-lock-keyword-face', while 'proofread-echo-area-message-face' inherits
+'font-lock-comment-face'.  The public 'proofread-format-diagnostic-message'
+function lets optional frontends reuse the same source-aware fallback and
+aggregation rules with independent faces and separators.  proofread-popup now
+uses this shared formatter.
+
+---
 *** Explicit checks now retire diagnostics owned by inactive checkers.
 After a profile switch or checker removal, explicitly checking a range removes
 diagnostics in that range that belong to checkers absent from the current

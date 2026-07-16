@@ -1059,7 +1059,10 @@ When PROFILE is nil, use the current profile."
 
 (ert-deftest proofread-test-face-defaults-avoid-fixed-colors ()
   "Proofread faces are defined without fixed color attributes."
-  (dolist (face '( proofread-face proofread-current-face))
+  (dolist (face '( proofread-face
+                   proofread-current-face
+                   proofread-echo-area-source-face
+                   proofread-echo-area-message-face))
     (should (facep face))
     (let ((spec (face-default-spec face)))
       (should-not (proofread-test--tree-member-p :foreground spec))
@@ -1073,10 +1076,20 @@ When PROFILE is nil, use the current profile."
       (should-not (proofread-test--tree-member-p 'flycheck-error
                                                  spec)))))
 
-(ert-deftest proofread-test-face-uses-warning-severity ()
-  "Diagnostic text uses a theme-aware warning color."
+(ert-deftest proofread-test-echo-area-faces-have-package-defaults ()
+  "Proofread echo-area faces inherit theme-aware font-lock faces."
+  (should
+   (equal (face-default-spec 'proofread-echo-area-source-face)
+          '((t :inherit font-lock-keyword-face))))
+  (should
+   (equal (face-default-spec 'proofread-echo-area-message-face)
+          '((t :inherit font-lock-comment-face)))))
+
+(ert-deftest proofread-test-face-uses-font-lock-warning-face ()
+  "Diagnostic text uses the theme's font-lock warning face."
   (let ((spec (face-default-spec 'proofread-face)))
-    (should (proofread-test--tree-member-p 'warning spec))
+    (should
+     (proofread-test--tree-member-p 'font-lock-warning-face spec))
     (should (proofread-test--tree-member-p :underline spec))))
 
 (ert-deftest proofread-test-overlay-stores-diagnostic ()
@@ -1683,6 +1696,19 @@ range; no available backend"))))))
     (should-not proofread-auto-check)
     (with-temp-buffer
       (should proofread-auto-check))))
+
+(ert-deftest
+    proofread-test-echo-area-messages-default-enabled-and-local ()
+  "The echo-area option defaults to enabled and localizes when set."
+  (should (custom-variable-p 'proofread-echo-area-messages))
+  (should (default-value 'proofread-echo-area-messages))
+  (should (local-variable-if-set-p 'proofread-echo-area-messages))
+  (with-temp-buffer
+    (setq proofread-echo-area-messages nil)
+    (should (local-variable-p 'proofread-echo-area-messages))
+    (should-not proofread-echo-area-messages)
+    (with-temp-buffer
+      (should proofread-echo-area-messages))))
 
 (ert-deftest
     proofread-test-mode-enable-schedules-initial-idle-work ()
@@ -8118,6 +8144,112 @@ This covers URLs, email, invisible text, faces, and properties."
   (should (equal (proofread-format-diagnostic-field '( bad "text"))
                  "(bad \"text\")")))
 
+(ert-deftest proofread-test-public-diagnostic-message-formatting-faces ()
+  "The shared message formatter owns exact face boundaries."
+  (let* ((source
+          (propertize "test" 'face 'bold 'help-echo "source"))
+         (raw-message
+          (propertize
+           "Possible misspelling"
+           'face 'error
+           'font-lock-face 'warning
+           'proofread-test-property t))
+         (diagnostic
+          (list :source source
+                :message raw-message
+                :text "helo"))
+         (message
+          (proofread-format-diagnostic-message
+           diagnostic
+           :source-face 'proofread-echo-area-source-face
+           :message-face 'proofread-echo-area-message-face)))
+    (should (equal message "test: Possible misspelling"))
+    (should
+     (eq (get-text-property 0 'face message)
+         'proofread-echo-area-source-face))
+    (should
+     (eq (get-text-property 4 'face message)
+         'proofread-echo-area-source-face))
+    (should-not (get-text-property 5 'face message))
+    (should
+     (eq (get-text-property 6 'face message)
+         'proofread-echo-area-message-face))
+    (dolist (property '( font-lock-face
+                         help-echo
+                         proofread-test-property))
+      (should-not (get-text-property 6 property message)))
+    (should (eq (get-text-property 0 'face source) 'bold))
+    (should (eq (get-text-property 0 'face raw-message) 'error))
+    (should
+     (eq (get-text-property 0 'font-lock-face raw-message)
+         'warning))))
+
+(ert-deftest
+    proofread-test-public-diagnostic-message-formatting-aggregates ()
+  "Format aggregate entries in order with caller-selected separation."
+  (let* ((first
+          (list :source-label " model\n a "
+                :source 'raw
+                :message " First\n message "))
+         (second
+          (list :source 'languagetool
+                :message 'structured))
+         (diagnostic
+          (list :proofread-aggregate t
+                :diagnostics (list first second)
+                :text "helo"))
+         (message
+          (proofread-format-diagnostic-message
+           diagnostic
+           :separator "; "
+           :source-face 'proofread-echo-area-source-face
+           :message-face 'proofread-echo-area-message-face
+           :single-line t))
+         (separator (string-match-p "; " message))
+         (second-source (string-match-p "languagetool" message)))
+    (should
+     (equal message
+            "model a: First message; languagetool: structured"))
+    (should separator)
+    (should-not (get-text-property separator 'face message))
+    (should-not (get-text-property (1+ separator) 'face message))
+    (should second-source)
+    (should
+     (eq (get-text-property second-source 'face message)
+         'proofread-echo-area-source-face))
+    (should
+     (eq (get-text-property (+ second-source 14) 'face message)
+         'proofread-echo-area-message-face))))
+
+(ert-deftest proofread-test-public-diagnostic-message-fallbacks ()
+  "The shared message formatter handles blank and non-string fields."
+  (dolist (raw-message '(nil "" " \t\n"))
+    (let ((message
+           (proofread-format-diagnostic-message
+            (list :source " "
+                  :message raw-message
+                  :text (propertize "helo" 'face 'error))
+            :message-face 'proofread-echo-area-message-face)))
+      (should (equal message "Proofread: helo"))
+      (should
+       (eq (get-text-property 0 'face message)
+           'proofread-echo-area-message-face))))
+  (should
+   (equal
+    (proofread-format-diagnostic-message
+     (list :source 'test :message nil :text nil))
+    "test: Proofread diagnostic"))
+  (should
+   (equal
+    (proofread-format-diagnostic-message
+     (list :source nil :message '( bad "text") :text "helo"))
+    "(bad \"text\")"))
+  (should
+   (equal
+    (proofread-format-diagnostic-message
+     (list :proofread-aggregate t :diagnostics nil :text "helo"))
+    "Proofread: helo")))
+
 (ert-deftest
     proofread-test-public-diagnostic-at-point-requires-overlay ()
   "Return only live displayed diagnostics from the public lookup."
@@ -8147,6 +8279,345 @@ This covers URLs, email, invisible text, faces, and properties."
       (setq proofread--diagnostics (list stale live))
       (proofread--create-overlay live)
       (should (eq (proofread-diagnostic-at-point 4) live)))))
+
+(ert-deftest proofread-test-eldoc-provider-formats-diagnostic-at-point
+    ()
+  "The ElDoc provider reports the local diagnostic with echo faces."
+  (with-temp-buffer
+    (insert "helo")
+    (let ((proofread-auto-check nil))
+      (proofread-mode 1)
+      (let (called)
+        (should-not
+         (proofread--eldoc-function
+          (lambda (&rest _arguments)
+            (setq called t))))
+        (should-not called))
+      (proofread-test--install-diagnostics
+       (list (proofread-test--diagnostic-for-range 1 5 "helo")))
+      (goto-char 2)
+      (let (callback-arguments)
+        (should
+         (proofread--eldoc-function
+          (lambda (&rest arguments)
+            (setq callback-arguments arguments))))
+        (let ((message (car callback-arguments)))
+          (should (equal message "test: Possible misspelling"))
+          (should (equal (plist-get (cdr callback-arguments) :echo)
+                         message))
+          (should
+           (eq (get-text-property 0 'face message)
+               'proofread-echo-area-source-face))
+          (should-not (get-text-property 5 'face message))
+          (should
+           (eq (get-text-property 6 'face message)
+               'proofread-echo-area-message-face))
+          (should
+           (eq (get-text-property
+                0 'proofread--echo-area-message message)
+               (current-buffer)))))
+      (setq-local proofread-echo-area-messages nil)
+      (let (called)
+        (should-not
+         (proofread--eldoc-function
+          (lambda (&rest _arguments)
+            (setq called t))))
+        (should-not called)))))
+
+(ert-deftest proofread-test-eldoc-provider-aggregates-on-one-line ()
+  "Echo diagnostics retain checker order without multiline output."
+  (with-temp-buffer
+    (insert "helo")
+    (let ((proofread-auto-check nil)
+          (first
+           (proofread-test--diagnostic-with-checker
+            (proofread--make-diagnostic
+             :beg 1 :end 5 :text "helo" :kind 'grammar
+             :message "First\nmessage" :suggestions nil
+             :source 'first)
+            'first))
+          (second
+           (proofread-test--diagnostic-with-checker
+            (proofread--make-diagnostic
+             :beg 1 :end 5 :text "helo" :kind 'style
+             :message "Second message" :suggestions nil
+             :source 'second)
+            'second)))
+      (proofread-mode 1)
+      (proofread-test--install-diagnostics (list first second))
+      (goto-char 2)
+      (let (message)
+        (proofread--eldoc-function
+         (lambda (document &rest _properties)
+           (setq message document)))
+        (should
+         (equal message
+                "first: First message; second: Second message"))
+        (should-not (string-match-p "[\n\r]" message))))))
+
+(ert-deftest proofread-test-eldoc-mode-lifecycle-restores-state ()
+  "Proofread restores only ElDoc mode state that it enabled."
+  (with-temp-buffer
+    (text-mode)
+    (setq-local eldoc-documentation-functions nil)
+    (eldoc-mode -1)
+    (let ((proofread-auto-check nil))
+      (proofread-mode 1)
+      (should eldoc-mode)
+      (should proofread--eldoc-mode-owned-p)
+      (should (eq (car eldoc-documentation-functions)
+                  #'proofread--eldoc-function))
+      (should-not (memq #'proofread--retry-echo-area-refresh
+                        post-command-hook))
+      (proofread-mode -1)
+      (should-not eldoc-mode)
+      (should-not proofread--eldoc-mode-owned-p)
+      (should-not (memq #'proofread--eldoc-function
+                        eldoc-documentation-functions))))
+  (with-temp-buffer
+    (text-mode)
+    (add-hook 'eldoc-documentation-functions #'ignore nil t)
+    (eldoc-mode 1)
+    (should eldoc-mode)
+    (let ((proofread-auto-check nil))
+      (proofread-mode 1)
+      (should-not proofread--eldoc-mode-owned-p)
+      (should (eq (car eldoc-documentation-functions)
+                  #'proofread--eldoc-function))
+      (setq-local proofread-echo-area-messages nil)
+      (should eldoc-mode)
+      (should-not proofread--eldoc-mode-owned-p)
+      (setq-local proofread-echo-area-messages t)
+      (should eldoc-mode)
+      (proofread-mode -1)
+      (should eldoc-mode)
+      (should (memq #'ignore eldoc-documentation-functions))
+      (should-not (memq #'proofread--eldoc-function
+                        eldoc-documentation-functions)))
+    (eldoc-mode -1)))
+
+(ert-deftest proofread-test-echo-option-controls-owned-eldoc ()
+  "The echo option dynamically owns and restores a disabled ElDoc mode."
+  (with-temp-buffer
+    (text-mode)
+    (setq-local eldoc-documentation-functions nil)
+    (eldoc-mode -1)
+    (setq-local proofread-echo-area-messages nil)
+    (let ((proofread-auto-check nil)
+          (eldoc-last-message nil))
+      (proofread-mode 1)
+      (should-not eldoc-mode)
+      (should-not proofread--eldoc-mode-owned-p)
+      (should (eq (car eldoc-documentation-functions)
+                  #'proofread--eldoc-function))
+      (setq-local proofread-echo-area-messages t)
+      (should eldoc-mode)
+      (should proofread--eldoc-mode-owned-p)
+      (let ((message
+             (proofread--echo-area-message
+              (proofread-test--diagnostic)))
+            displays)
+        (setq eldoc-last-message message)
+        (cl-letf
+            (((symbol-function 'current-message)
+              (lambda () message))
+             ((symbol-function 'eldoc-display-in-echo-area)
+              (lambda (documents interactive)
+                (push (list documents interactive) displays))))
+          (setq-local proofread-echo-area-messages nil))
+        (should (equal displays '((nil t))))
+        (should-not eldoc-last-message))
+      (should-not eldoc-mode)
+      (should-not proofread--eldoc-mode-owned-p))))
+
+(ert-deftest proofread-test-echo-option-local-let-restores-eldoc ()
+  "A temporary local echo option restores Proofread-owned ElDoc."
+  (with-temp-buffer
+    (text-mode)
+    (setq-local eldoc-documentation-functions nil)
+    (eldoc-mode -1)
+    (setq-local proofread-echo-area-messages nil)
+    (let ((proofread-auto-check nil))
+      (proofread-mode 1)
+      (should-not eldoc-mode)
+      (let ((proofread-echo-area-messages t))
+        (should eldoc-mode)
+        (should proofread--eldoc-mode-owned-p))
+      (should-not proofread-echo-area-messages)
+      (should-not eldoc-mode)
+      (should-not proofread--eldoc-mode-owned-p))))
+
+(ert-deftest proofread-test-echo-option-default-let-restores-eldoc ()
+  "A temporary default echo option restores non-local users."
+  (with-temp-buffer
+    (text-mode)
+    (setq-local eldoc-documentation-functions nil)
+    (eldoc-mode -1)
+    (let ((proofread-auto-check nil))
+      (proofread-mode 1)
+      (should-not
+       (local-variable-p 'proofread-echo-area-messages))
+      (should eldoc-mode)
+      (should proofread--eldoc-mode-owned-p)
+      (let ((proofread-echo-area-messages nil))
+        (should-not proofread-echo-area-messages)
+        (should-not eldoc-mode)
+        (should-not proofread--eldoc-mode-owned-p))
+      (should proofread-echo-area-messages)
+      (should eldoc-mode)
+      (should proofread--eldoc-mode-owned-p))))
+
+(ert-deftest proofread-test-echo-option-kill-local-uses-default ()
+  "Killing a local echo option synchronizes to its default value."
+  (with-temp-buffer
+    (text-mode)
+    (setq-local eldoc-documentation-functions nil)
+    (eldoc-mode -1)
+    (setq-local proofread-echo-area-messages nil)
+    (let ((proofread-auto-check nil))
+      (proofread-mode 1)
+      (should-not eldoc-mode)
+      (kill-local-variable 'proofread-echo-area-messages)
+      (should proofread-echo-area-messages)
+      (should-not
+       (local-variable-p 'proofread-echo-area-messages))
+      (should eldoc-mode)
+      (should proofread--eldoc-mode-owned-p))))
+
+(ert-deftest proofread-test-echo-option-default-set-is-local-aware ()
+  "A new echo default updates only buffers without a local value."
+  (let ((default-buffer
+         (generate-new-buffer " *proofread-echo-default*"))
+        (local-buffer
+         (generate-new-buffer " *proofread-echo-local*"))
+        (original-default
+         (default-value 'proofread-echo-area-messages)))
+    (unwind-protect
+        (progn
+          (set-default 'proofread-echo-area-messages t)
+          (dolist (buffer (list default-buffer local-buffer))
+            (with-current-buffer buffer
+              (text-mode)
+              (setq-local eldoc-documentation-functions nil)
+              (eldoc-mode -1)))
+          (with-current-buffer local-buffer
+            (setq-local proofread-echo-area-messages t))
+          (dolist (buffer (list default-buffer local-buffer))
+            (with-current-buffer buffer
+              (let ((proofread-auto-check nil))
+                (proofread-mode 1))
+              (should eldoc-mode)
+              (should proofread--eldoc-mode-owned-p)))
+          (set-default 'proofread-echo-area-messages nil)
+          (with-current-buffer default-buffer
+            (should-not proofread-echo-area-messages)
+            (should-not eldoc-mode)
+            (should-not proofread--eldoc-mode-owned-p))
+          (with-current-buffer local-buffer
+            (should proofread-echo-area-messages)
+            (should eldoc-mode)
+            (should proofread--eldoc-mode-owned-p))
+          (set-default 'proofread-echo-area-messages t)
+          (with-current-buffer default-buffer
+            (should proofread-echo-area-messages)
+            (should eldoc-mode)
+            (should proofread--eldoc-mode-owned-p)))
+      (dolist (buffer (list default-buffer local-buffer))
+        (when (buffer-live-p buffer)
+          (kill-buffer buffer)))
+      (set-default 'proofread-echo-area-messages original-default))))
+
+(ert-deftest proofread-test-echo-area-refresh-is-guarded-and-retried
+    ()
+  "Do not overwrite foreign messages; retry only after a safe command."
+  (save-window-excursion
+    (let ((buffer (generate-new-buffer " *proofread-echo-refresh*")))
+      (unwind-protect
+          (progn
+            (switch-to-buffer buffer)
+            (insert "helo")
+            (let ((proofread-auto-check nil)
+                  (this-command nil)
+                  current-message-value
+                  displays)
+              (proofread-mode 1)
+              (proofread-test--install-diagnostics
+               (list
+                (proofread-test--diagnostic-for-range 1 5 "helo")))
+              (goto-char 2)
+              (cl-letf
+                  (((symbol-function 'active-minibuffer-window)
+                    (lambda () nil))
+                   ((symbol-function
+                     'eldoc-display-message-no-interference-p)
+                    (lambda () t))
+                   ((symbol-function 'current-message)
+                    (lambda () current-message-value))
+                   ((symbol-function 'eldoc-display-in-echo-area)
+                    (lambda (documents interactive)
+                      (push (list documents interactive) displays)
+                      (setq current-message-value
+                            (and documents (caar documents))))))
+                (proofread--refresh-echo-area)
+                (should (= (length displays) 1))
+                (let ((message (caaaar displays)))
+                  (should
+                   (equal message "test: Possible misspelling")))
+                (should-not proofread--echo-area-refresh-pending-p)
+                (should-not
+                 (memq #'proofread--retry-echo-area-refresh
+                       post-command-hook))
+                (setq displays nil)
+                (setq current-message-value "foreign command output")
+                (proofread--refresh-echo-area)
+                (should-not displays)
+                (should proofread--echo-area-refresh-pending-p)
+                (should
+                 (memq #'proofread--retry-echo-area-refresh
+                       post-command-hook))
+                (setq current-message-value nil)
+                (let ((this-command 'next-line))
+                  (proofread--retry-echo-area-refresh))
+                (should (= (length displays) 1))
+                (should-not proofread--echo-area-refresh-pending-p)
+                (should-not
+                 (memq #'proofread--retry-echo-area-refresh
+                       post-command-hook)))))
+        (when (buffer-live-p buffer)
+          (kill-buffer buffer))))))
+
+(ert-deftest proofread-test-echo-area-ownership-is-buffer-specific ()
+  "One Proofread buffer cannot clear another buffer's echo message."
+  (let ((first (generate-new-buffer " *proofread-echo-first*"))
+        (second (generate-new-buffer " *proofread-echo-second*"))
+        (eldoc-last-message nil)
+        displays
+        message)
+    (unwind-protect
+        (progn
+          (with-current-buffer first
+            (setq message
+                  (proofread--echo-area-message
+                   (proofread-test--diagnostic))))
+          (setq eldoc-last-message message)
+          (cl-letf
+              (((symbol-function 'current-message)
+                (lambda () message))
+               ((symbol-function 'eldoc-display-in-echo-area)
+                (lambda (documents interactive)
+                  (push (list documents interactive) displays))))
+            (with-current-buffer second
+              (proofread--echo-area-clear-current-message))
+            (should-not displays)
+            (should (eq eldoc-last-message message))
+            (with-current-buffer first
+              (proofread--echo-area-clear-current-message))
+            (should (equal displays '((nil t))))
+            (should-not eldoc-last-message)))
+      (when (buffer-live-p first)
+        (kill-buffer first))
+      (when (buffer-live-p second)
+        (kill-buffer second)))))
 
 (ert-deftest proofread-test-diagnostics-changed-hook-runs-after-clear
     ()

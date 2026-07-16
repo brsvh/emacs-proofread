@@ -199,7 +199,8 @@ SUGGESTIONS, MESSAGE, and SOURCE supply the optional field values."
       (setf (plist-get diagnostic :source) source)
       (let ((message (proofread-popup--message diagnostic)))
         (should (equal message "Possible misspelling"))
-        (should-not (get-text-property 0 'face message))))))
+        (should (eq (get-text-property 0 'face message)
+                    'proofread-popup-face))))))
 
 (ert-deftest
     proofread-popup-test-uses-shared-diagnostic-field-formatter ()
@@ -255,6 +256,8 @@ SUGGESTIONS, MESSAGE, and SOURCE supply the optional field values."
         (should (eq (get-text-property 7 'face message)
                     'proofread-popup-source-face))
         (should-not (get-text-property 8 'face message))
+        (should (eq (get-text-property 9 'face message)
+                    'proofread-popup-face))
         (let ((second-source
                (string-match-p "languagetool" message)))
           (should second-source)
@@ -265,7 +268,10 @@ SUGGESTIONS, MESSAGE, and SOURCE supply the optional field values."
            (eq (get-text-property (+ second-source 12) 'face message)
                'proofread-popup-source-face))
           (should-not
-           (get-text-property (+ second-source 13) 'face message)))))))
+           (get-text-property (+ second-source 13) 'face message))
+          (should
+           (eq (get-text-property (+ second-source 14) 'face message)
+               'proofread-popup-face)))))))
 
 ;;;; Core integration
 
@@ -825,15 +831,12 @@ SUGGESTIONS, MESSAGE, and SOURCE supply the optional field values."
            (should (equal (substring-no-properties string)
                           "test: Possible misspelling"))
            (should
-            (equal (get-text-property 0 'face string)
-                   '(proofread-popup-source-face
-                     proofread-popup-face)))
+            (eq (get-text-property 0 'face string)
+                'proofread-popup-source-face))
            (should
-            (equal (get-text-property 4 'face string)
-                   '(proofread-popup-source-face
-                     proofread-popup-face)))
-           (should (eq (get-text-property 5 'face string)
-                       'proofread-popup-face))
+            (eq (get-text-property 4 'face string)
+                'proofread-popup-source-face))
+           (should-not (get-text-property 5 'face string))
            (should (eq (get-text-property 6 'face string)
                        'proofread-popup-face))
            (should-not (get-text-property 6 'font-lock-face string))
@@ -850,10 +853,9 @@ SUGGESTIONS, MESSAGE, and SOURCE supply the optional field values."
                 'proofread-popup-source-face))
            (should-not
             (get-text-property 5 'face signature-message))
-           (should-not
-            (memq 'proofread-popup-face
-                  (ensure-list
-                   (get-text-property 0 'face signature-message))))
+           (should
+            (eq (get-text-property 6 'face signature-message)
+                'proofread-popup-face))
            (should (= (plist-get args :position) 4))
            (should
             (eq
