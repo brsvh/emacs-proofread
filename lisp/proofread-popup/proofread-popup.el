@@ -71,12 +71,12 @@ Set this to zero to update the child frame immediately."
 ;;;; Faces
 
 (defface proofread-popup-face
-  '((t :inherit default))
+  '((t :inherit completions-annotations))
   "Face for Proofread child-frame messages."
   :group 'proofread-popup)
 
 (defface proofread-popup-source-face
-  '((t :inherit font-lock-keyword-face :weight bold))
+  '((t :inherit completions-group-title))
   "Face for source labels in Proofread child-frame messages."
   :group 'proofread-popup)
 
@@ -232,8 +232,9 @@ SELECTED-WINDOW, when non-nil, is the already captured selected window."
            (plist-get entry :message) text)))
     (if (and source (not (string-empty-p source)))
         (concat
-         (propertize source 'face 'proofread-popup-source-face)
-         ": " message)
+         (propertize (concat source ":")
+                     'face 'proofread-popup-source-face)
+         " " message)
       message)))
 
 (defun proofread-popup--message-for-entries (entries text)

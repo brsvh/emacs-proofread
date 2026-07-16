@@ -150,10 +150,9 @@ SUGGESTIONS, MESSAGE, and SOURCE supply the optional field values."
 (ert-deftest proofread-popup-test-faces-have-package-defaults ()
   "Proofread popup faces use the package defaults."
   (should (equal (face-default-spec 'proofread-popup-face)
-                 '((t :inherit default))))
+                 '((t :inherit completions-annotations))))
   (should (equal (face-default-spec 'proofread-popup-source-face)
-                 '((t :inherit font-lock-keyword-face
-                      :weight bold))))
+                 '((t :inherit completions-group-title))))
   (should (equal (face-default-spec 'proofread-popup-border-face)
                  '((((background dark)) :background "white")
                    (((background light)) :background "black")))))
@@ -253,15 +252,20 @@ SUGGESTIONS, MESSAGE, and SOURCE supply the optional field values."
                         "languagetool: Second message")))
         (should (eq (get-text-property 0 'face message)
                     'proofread-popup-source-face))
-        (should-not (get-text-property 7 'face message))
+        (should (eq (get-text-property 7 'face message)
+                    'proofread-popup-source-face))
+        (should-not (get-text-property 8 'face message))
         (let ((second-source
                (string-match-p "languagetool" message)))
           (should second-source)
           (should
            (eq (get-text-property second-source 'face message)
                'proofread-popup-source-face))
+          (should
+           (eq (get-text-property (+ second-source 12) 'face message)
+               'proofread-popup-source-face))
           (should-not
-           (get-text-property (+ second-source 12) 'face message)))))))
+           (get-text-property (+ second-source 13) 'face message)))))))
 
 ;;;; Core integration
 
@@ -824,7 +828,11 @@ SUGGESTIONS, MESSAGE, and SOURCE supply the optional field values."
             (equal (get-text-property 0 'face string)
                    '(proofread-popup-source-face
                      proofread-popup-face)))
-           (should (eq (get-text-property 4 'face string)
+           (should
+            (equal (get-text-property 4 'face string)
+                   '(proofread-popup-source-face
+                     proofread-popup-face)))
+           (should (eq (get-text-property 5 'face string)
                        'proofread-popup-face))
            (should (eq (get-text-property 6 'face string)
                        'proofread-popup-face))
@@ -837,6 +845,11 @@ SUGGESTIONS, MESSAGE, and SOURCE supply the optional field values."
            (should
             (eq (get-text-property 0 'face signature-message)
                 'proofread-popup-source-face))
+           (should
+            (eq (get-text-property 4 'face signature-message)
+                'proofread-popup-source-face))
+           (should-not
+            (get-text-property 5 'face signature-message))
            (should-not
             (memq 'proofread-popup-face
                   (ensure-list

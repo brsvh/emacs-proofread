@@ -455,12 +455,13 @@ and diagnostic notifications during the wait are coalesced. Set
 `proofread-popup-delay` to `0` to restore immediate updates, for example with
 `(setq proofread-popup-delay 0)` or Customize. Every message is prefixed with
 its backend source: LLM checkers use their effective source label, while
-LanguageTool displays `languagetool`. Source labels use a bold, theme-aware
-emphasis face. The popup does not show suggestions or provide actions. It is
-unavailable in terminals and other environments where child frames do not work.
-Run `M-x proofread-popup-mode` to opt the current buffer out of or back into the
-automatic integration. Its display can also be controlled with
-`proofread-popup-enabled`, `proofread-popup-delay`, and
+LanguageTool displays `languagetool`. Source labels inherit the theme's
+`completions-group-title` face, while message text inherits
+`completions-annotations`. The popup does not show suggestions or provide
+actions. It is unavailable in terminals and other environments where child
+frames do not work. Run `M-x proofread-popup-mode` to opt the current buffer out
+of or back into the automatic integration. Its display can also be controlled
+with `proofread-popup-enabled`, `proofread-popup-delay`, and
 `proofread-popup-max-width`.
 
 ### Batch correction

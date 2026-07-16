@@ -286,8 +286,9 @@ loses selection, including switches and programmatic window changes.
 *** Popup messages identify their backend source.
 Every diagnostic message is displayed on its own line with its LLM or
 LanguageTool source label.  Source labels use the new
-'proofread-popup-source-face', which inherits a theme-provided emphasis color
-and adds bold weight.
+'proofread-popup-source-face', which inherits 'completions-group-title'.
+Message text inherits 'completions-annotations' through
+'proofread-popup-face'.
 
 ---
 *** Equal aggregate diagnostics no longer cause redundant redraws.
