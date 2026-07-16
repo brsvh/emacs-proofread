@@ -850,18 +850,17 @@ SOURCE may be a backend request or a normalized profile checker."
   "Return the actual LLM response strategy for PROVIDER, or nil.
 CONFIGURED-STRATEGY is the user-selected response strategy before
 capability fallback."
-  (let ((provider (or provider proofread-llm-provider)))
-    (when provider
-      (pcase configured-strategy
-        ('auto
-         (if (proofread-llm--provider-json-response-p provider)
-             'provider-json
-           'prompt-json))
-        ('provider-json
-         (and (proofread-llm--provider-json-response-p provider)
-              'provider-json))
-        ('prompt-json 'prompt-json)
-        (_ nil)))))
+  (when provider
+    (pcase configured-strategy
+      ('auto
+       (if (proofread-llm--provider-json-response-p provider)
+           'provider-json
+         'prompt-json))
+      ('provider-json
+       (and (proofread-llm--provider-json-response-p provider)
+            'provider-json))
+      ('prompt-json 'prompt-json)
+      (_ nil))))
 
 (defun proofread-llm--diagnostic-passes (passes)
   "Return PASSES after validating it as a positive integer."

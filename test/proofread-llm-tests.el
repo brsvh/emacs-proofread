@@ -400,6 +400,56 @@ When PROFILE is nil, use the current profile."
                   'llm-provider-unavailable)))))
 
 (ert-deftest
+    proofread-llm-test-checker-nil-provider-is-unconfigured ()
+  "Checker-local nil provider overrides the configured global provider."
+  (with-temp-buffer
+    (insert "helo")
+    (let* ((proofread-llm-provider proofread-llm-test--provider)
+           (proofread-llm-provider-identity
+            proofread-llm-test--provider-identity)
+           (proofread-llm-response-strategy 'auto)
+           (checker
+            '( :profile multi
+               :name local
+               :backend llm
+               :options ( :provider nil)))
+           (profile '( :name multi :language "en"))
+           (chunk (proofread-llm-test--whole-buffer-chunk))
+           (capability-calls 0)
+           (provider-calls 0)
+           (callback-calls 0)
+           result)
+      (should-not (proofread-llm--effective-provider checker))
+      (cl-letf (((symbol-function 'llm-capabilities)
+                 (lambda (_provider)
+                   (cl-incf capability-calls)
+                   '( json-response)))
+                ((symbol-function 'llm-chat-async)
+                 (lambda (&rest _)
+                   (cl-incf provider-calls))))
+        (let* ((request
+                (proofread--make-backend-request
+                 chunk 'llm checker profile))
+               (identity (plist-get request :backend-identity))
+               (handle
+                (proofread-llm--backend-check
+                 request
+                 (lambda (backend-result)
+                   (cl-incf callback-calls)
+                   (setq result backend-result)))))
+          (should (eq (plist-get identity :provider) 'unconfigured))
+          (should-not (plist-get identity :response-strategy))
+          (proofread-llm-test--assert-handle-shape handle))
+        (should (= capability-calls 0))
+        (should (= provider-calls 0))
+        (should-not result)
+        (should (proofread-llm-test--wait-for (lambda () result)))
+        (should (= callback-calls 1))
+        (should (eq (plist-get result :status) 'error))
+        (should (eq (plist-get result :error)
+                    'llm-provider-unavailable))))))
+
+(ert-deftest
     proofread-llm-test-structured-output-unavailable-is-asynchronous-error
     ()
   "Report missing schema output for forced provider JSON."
