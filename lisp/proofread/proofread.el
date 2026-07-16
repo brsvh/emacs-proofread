@@ -396,6 +396,9 @@ request-ready chunks."
 (defvar-local proofread--diagnostic-overlays nil
   "Map diagnostics to their proofread-owned overlays.")
 
+(defvar-local proofread--next-diagnostic-insertion-ordinal 0
+  "Next insertion ordinal for a proofread diagnostic overlay.")
+
 (defvar-local proofread--diagnostic-request-ranges nil
   "Map diagnostics to their originating request marker ranges.")
 
@@ -5567,6 +5570,68 @@ restriction."
         (mapcar #'proofread--overlay-for-diagnostic
                 (proofread--diagnostic-members diagnostic))))
 
+(defun proofread--local-navigation-entry (overlay position)
+  "Return OVERLAY's navigation entry when it covers POSITION.
+Return nil unless OVERLAY is the canonical live overlay for its raw
+diagnostic in the current buffer."
+  (when (proofread--current-buffer-overlay-p overlay)
+    (let ((diagnostic
+           (overlay-get overlay 'proofread-diagnostic))
+          (beg (overlay-start overlay))
+          (end (overlay-end overlay))
+          (insertion-ordinal
+           (overlay-get
+            overlay 'proofread-diagnostic-insertion-ordinal)))
+      (when (and (hash-table-p proofread--diagnostic-overlays)
+                 (eq (gethash diagnostic
+                              proofread--diagnostic-overlays)
+                     overlay)
+                 beg end
+                 (natnump insertion-ordinal)
+                 (proofread--range-covers-position-p
+                  (cons beg end) position))
+        (list diagnostic beg end insertion-ordinal)))))
+
+(defun proofread--local-navigation-entries-at (position)
+  "Return sorted live navigation entries covering POSITION."
+  (let ((seen (make-hash-table :test #'eq))
+        entries)
+    ;; `overlays-at' includes ordinary overlays at their front
+    ;; boundary; an empty `overlays-in' query additionally finds
+    ;; zero-width ones.  Ordinary overlays may occur in both results.
+    (dolist (overlay
+             (append (overlays-at position)
+                     (overlays-in position position)))
+      (unless (gethash overlay seen)
+        (puthash overlay t seen)
+        (when-let* ((entry
+                     (proofread--local-navigation-entry
+                      overlay position)))
+          (push entry entries))))
+    (sort entries #'proofread--navigation-entry<)))
+
+(defun proofread--aggregate-local-navigation-entry (entry entries)
+  "Return the UI diagnostic for winning local ENTRY among ENTRIES."
+  (let* ((diagnostic (car entry))
+         (beg (nth 1 entry))
+         (end (nth 2 entry))
+         (key (proofread--diagnostic-aggregate-key
+               diagnostic beg end))
+         diagnostics)
+    (dolist (candidate-entry entries)
+      (let ((candidate (car candidate-entry)))
+        (when (equal
+               key
+               (proofread--diagnostic-aggregate-key
+                candidate
+                (nth 1 candidate-entry)
+                (nth 2 candidate-entry)))
+          (push candidate diagnostics))))
+    (setq diagnostics (nreverse diagnostics))
+    (if (cdr diagnostics)
+        (proofread--make-aggregate-diagnostic diagnostics beg end)
+      diagnostic)))
+
 (defun proofread-diagnostic-at-point (&optional position)
   "Return the live proofreading diagnostic at POSITION or point.
 A diagnostic is live only while its proofread-owned overlay exists in
@@ -5581,53 +5646,11 @@ and `proofread-diagnostic-text' instead."
       (widen)
       (when (and (<= (point-min) point-position)
                  (<= point-position (point-max)))
-        (let (best best-beg best-end)
-          ;; `overlays-at' includes ordinary overlays at their front
-          ;; boundary; an empty `overlays-in' query additionally finds
-          ;; zero-width ones.
-          (dolist (overlay
-                   (delete-dups
-                    (append (overlays-at point-position)
-                            (overlays-in
-                             point-position point-position))))
-            (when (proofread--current-buffer-overlay-p overlay)
-              (let* ((diagnostic
-                      (overlay-get overlay 'proofread-diagnostic))
-                     (beg (overlay-start overlay))
-                     (end (overlay-end overlay)))
-                (when (and (memq diagnostic proofread--diagnostics)
-                           beg end
-                           (proofread--range-covers-position-p
-                            (cons beg end) point-position)
-                           (or (not best)
-                               (< beg best-beg)
-                               (and (= beg best-beg)
-                                    (< end best-end))))
-                  (setq best diagnostic
-                        best-beg beg
-                        best-end end)))))
-          (and best
-               (proofread--ui-diagnostic-for-raw-diagnostic
-                best)))))))
-
-(defun proofread--ui-diagnostic-for-raw-diagnostic
-    (diagnostic)
-  "Return the UI diagnostic representing raw DIAGNOSTIC."
-  (when-let* ((range (proofread--diagnostic-live-range diagnostic)))
-    (let* ((key (proofread--diagnostic-aggregate-key
-                 diagnostic (car range) (cdr range)))
-           diagnostics)
-      (dolist (entry (proofread--raw-navigation-entries))
-        (let ((candidate (car entry)))
-          (when (equal key
-                       (proofread--diagnostic-aggregate-key
-                        candidate (nth 1 entry) (nth 2 entry)))
-            (setq diagnostics (append diagnostics
-                                      (list candidate))))))
-      (if (cdr diagnostics)
-          (proofread--make-aggregate-diagnostic
-           diagnostics (car range) (cdr range))
-        diagnostic))))
+        (when-let* ((entries
+                     (proofread--local-navigation-entries-at
+                      point-position)))
+          (proofread--aggregate-local-navigation-entry
+           (car entries) entries))))))
 
 (defun proofread--mark-current-diagnostic (diagnostic)
   "Mark DIAGNOSTIC current and update its overlay face."
@@ -7137,6 +7160,11 @@ DIAGNOSTICS must be in navigation order.  Return `applied'."
       (overlay-put overlay 'category proofread--overlay-category)
       (overlay-put overlay 'face 'proofread-face)
       (overlay-put overlay 'proofread-diagnostic diagnostic)
+      (overlay-put
+       overlay 'proofread-diagnostic-insertion-ordinal
+       proofread--next-diagnostic-insertion-ordinal)
+      (setq proofread--next-diagnostic-insertion-ordinal
+            (1+ proofread--next-diagnostic-insertion-ordinal))
       (unless (hash-table-p proofread--diagnostic-overlays)
         (setq proofread--diagnostic-overlays
               (make-hash-table :test #'eq)))
@@ -7168,6 +7196,7 @@ DIAGNOSTICS must be in navigation order.  Return `applied'."
   (setq-local proofread--overlays nil)
   (setq-local proofread--diagnostic-overlays
               (make-hash-table :test #'eq))
+  (setq-local proofread--next-diagnostic-insertion-ordinal 0)
   (setq-local proofread--diagnostic-request-ranges
               (make-hash-table :test #'eq))
   (setq-local proofread--current-diagnostic nil)
@@ -7217,6 +7246,7 @@ DIAGNOSTICS must be in navigation order.  Return `applied'."
   (setq proofread--cache nil)
   (setq proofread--cache-order nil)
   (setq proofread--diagnostic-overlays nil)
+  (setq proofread--next-diagnostic-insertion-ordinal nil)
   (setq proofread--diagnostic-request-ranges nil)
   (setq proofread--pending-invalidated-overlays nil)
   (setq proofread--pending-invalidated-diagnostics nil))

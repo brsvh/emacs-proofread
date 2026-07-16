@@ -1092,8 +1092,45 @@ When PROFILE is nil, use the current profile."
         (should (eq (overlay-get overlay 'face) 'proofread-face))
         (should (equal (overlay-get overlay 'proofread-diagnostic)
                        diagnostic))
+        (should
+         (= (overlay-get
+             overlay 'proofread-diagnostic-insertion-ordinal)
+            0))
         (should (memq overlay proofread--overlays))
         (should (equal proofread--diagnostics (list diagnostic)))))))
+
+(ert-deftest proofread-test-diagnostic-overlay-ordinals-are-monotonic
+    ()
+  "Do not reuse diagnostic overlay ordinals after deletion or clear."
+  (with-temp-buffer
+    (insert "abcdef")
+    (let ((proofread-auto-check nil)
+          (first (proofread-test--diagnostic-for-range 1 2 "a"))
+          (second (proofread-test--diagnostic-for-range 3 4 "c"))
+          (third (proofread-test--diagnostic-for-range 5 6 "e")))
+      (proofread-mode 1)
+      (let ((overlays
+             (proofread-test--install-diagnostics
+              (list first second))))
+        (should
+         (equal
+          (mapcar
+           (lambda (overlay)
+             (overlay-get
+              overlay 'proofread-diagnostic-insertion-ordinal))
+           overlays)
+          '( 0 1)))
+        (proofread--invalidate-affected-diagnostics
+         (list (car overlays)) (list first))
+        (proofread-clear)
+        (setq proofread--diagnostics (list third))
+        (let ((overlay (proofread--create-overlay third)))
+          (should
+           (= (overlay-get
+               overlay 'proofread-diagnostic-insertion-ordinal)
+              2))
+          (should (= proofread--next-diagnostic-insertion-ordinal
+                     3)))))))
 
 (ert-deftest proofread-test-clear-preserves-unrelated-overlays ()
   "Clearing diagnostics preserves unrelated overlays."
@@ -5283,6 +5320,12 @@ This covers URLs, email, invisible text, faces, and properties."
             (goto-char 5)
             (let ((first-lookup (proofread-diagnostic-at-point))
                   (second-lookup (proofread-diagnostic-at-point)))
+              (should-not (eq first-lookup second-lookup))
+              (should
+               (equal
+                (proofread-test--aggregate-order-signature
+                 first-lookup)
+                expected))
               (should
                (equal
                 (proofread-test--public-diagnostic-signature
@@ -7254,6 +7297,12 @@ This covers URLs, email, invisible text, faces, and properties."
        (equal
         (proofread--diagnostic-members
          (car (proofread--navigation-diagnostics)))
+        (list first second)))
+      (goto-char 2)
+      (should
+       (equal
+        (proofread--diagnostic-members
+         (proofread-diagnostic-at-point))
         (list first second))))))
 
 (ert-deftest proofread-test-navigation-sorts-and-filters-diagnostics
@@ -7765,6 +7814,7 @@ This covers URLs, email, invisible text, faces, and properties."
       (let ((diagnostic (proofread-diagnostic-at-point))
             (repeated (proofread-diagnostic-at-point)))
         (should (proofread--aggregate-diagnostic-p diagnostic))
+        (should-not (eq diagnostic repeated))
         (should
          (equal
           (proofread-test--public-diagnostic-signature diagnostic)
@@ -7774,6 +7824,263 @@ This covers URLs, email, invisible text, faces, and properties."
         (should (equal (proofread--diagnostic-suggestions
                         diagnostic)
                        '( "hello" "hullo")))))))
+
+(ert-deftest
+    proofread-test-diagnostic-at-point-avoids-navigation-scan ()
+  "Do not call buffer-wide navigation while aggregating at point."
+  (with-temp-buffer
+    (insert (make-string 500 ?x))
+    (let ((proofread-auto-check nil)
+          remote-diagnostics)
+      (proofread-mode 1)
+      (dotimes (index 200)
+        (let ((beg (+ 10 (* index 2))))
+          (push
+           (proofread-test--diagnostic-for-range
+            beg (1+ beg) "x")
+           remote-diagnostics)))
+      (let* ((first
+              (proofread-test--diagnostic-with-checker
+               (proofread-test--diagnostic-for-range 1 2 "x")
+               'first))
+             (different-text
+              (proofread-test--diagnostic-with-checker
+               (proofread-test--diagnostic-for-range
+                1 2 "different")
+               'middle))
+             (second
+              (proofread-test--diagnostic-with-checker
+               (proofread-test--diagnostic-for-range 1 2 "x")
+               'second))
+             orphan-overlay)
+        (setq first (plist-put first :checker-ordinal 0))
+        (setq different-text
+              (plist-put different-text :checker-ordinal 1))
+        (setq second (plist-put second :checker-ordinal 2))
+        ;; Create the local overlays in the inverse of their checker
+        ;; order, with a different-text entry between aggregate members.
+        (proofread-test--install-diagnostics
+         (append (nreverse remote-diagnostics)
+                 (list second different-text first)))
+        (setq orphan-overlay (make-overlay 1 2))
+        (overlay-put orphan-overlay 'category
+                     proofread--overlay-category)
+        (overlay-put orphan-overlay 'proofread-diagnostic first)
+        (overlay-put
+         orphan-overlay 'proofread-diagnostic-insertion-ordinal 999)
+        (cl-letf
+            (((symbol-function 'proofread--raw-navigation-entries)
+              (lambda (&rest _args)
+                (ert-fail
+                 "Point lookup scanned all buffer diagnostics"))))
+          (let ((diagnostic (proofread-diagnostic-at-point 1)))
+            (should (proofread--aggregate-diagnostic-p diagnostic))
+            (should
+             (equal (proofread--diagnostic-members diagnostic)
+                    (list first second)))))))))
+
+(ert-deftest
+    proofread-test-diagnostic-at-point-live-range-work-is-local ()
+  "Bound live-range work by local rather than total diagnostics."
+  (let (call-counts)
+    (dolist (remote-count '( 20 200))
+      (with-temp-buffer
+        (insert (make-string 500 ?x))
+        (let ((proofread-auto-check nil)
+              remote-diagnostics)
+          (proofread-mode 1)
+          (dotimes (index remote-count)
+            (let ((beg (+ 10 (* index 2))))
+              (push
+               (proofread-test--diagnostic-for-range
+                beg (1+ beg) "x")
+               remote-diagnostics)))
+          (let* ((first
+                  (proofread-test--diagnostic-with-checker
+                   (proofread-test--diagnostic-for-range 1 2 "x")
+                   'first))
+                 (second
+                  (proofread-test--diagnostic-with-checker
+                   (proofread-test--diagnostic-for-range 1 2 "x")
+                   'second))
+                 (local-diagnostics (list first second))
+                 (live-range-calls nil)
+                 (original-live-range
+                  (symbol-function
+                   'proofread--diagnostic-live-range)))
+            (proofread-test--install-diagnostics
+             (append (nreverse remote-diagnostics)
+                     local-diagnostics))
+            (cl-letf
+                (((symbol-function 'proofread--diagnostic-live-range)
+                  (lambda (diagnostic)
+                    (push diagnostic live-range-calls)
+                    (funcall original-live-range diagnostic))))
+              (should
+               (proofread--aggregate-diagnostic-p
+                (proofread-diagnostic-at-point 1))))
+            (dolist (diagnostic live-range-calls)
+              (should (memq diagnostic local-diagnostics)))
+            (should (<= (length live-range-calls)
+                        (* 2 (length local-diagnostics))))
+            (push (length live-range-calls) call-counts)))))
+    (should (= (length call-counts) 2))
+    (should (apply #'= call-counts))))
+
+(ert-deftest
+    proofread-test-diagnostic-at-point-orders-zero-width-overlaps ()
+  "Order zero-width and nonempty local diagnostics like navigation."
+  (with-temp-buffer
+    (insert "abcd")
+    (let ((proofread-auto-check nil)
+          (zero
+           (proofread-test--diagnostic-for-range 3 3 ""))
+          (same-start
+           (proofread-test--diagnostic-for-range 3 5 "cd")))
+      (proofread-mode 1)
+      (proofread-test--install-diagnostics (list same-start zero))
+      (should (eq (proofread-diagnostic-at-point 3) zero))))
+  (with-temp-buffer
+    (insert "abcd")
+    (let ((proofread-auto-check nil)
+          (zero
+           (proofread-test--diagnostic-for-range 3 3 ""))
+          (earlier
+           (proofread-test--diagnostic-for-range 2 4 "bc")))
+      (proofread-mode 1)
+      (proofread-test--install-diagnostics (list zero earlier))
+      (should (eq (proofread-diagnostic-at-point 3) earlier)))))
+
+(ert-deftest proofread-test-diagnostic-at-point-uses-moved-range ()
+  "Aggregate diagnostics using their moved overlay ranges."
+  (with-temp-buffer
+    (insert "helo")
+    (let ((proofread-auto-check nil)
+          (first
+           (proofread-test--diagnostic-with-checker
+            (proofread-test--diagnostic-for-range 1 5 "helo")
+            'first))
+          (second
+           (proofread-test--diagnostic-with-checker
+            (proofread-test--diagnostic-for-range 1 5 "helo")
+            'second)))
+      (proofread-mode 1)
+      (proofread-test--install-diagnostics (list first second))
+      (goto-char (point-min))
+      (insert "x")
+      (should-not (proofread-diagnostic-at-point 1))
+      (let ((diagnostic (proofread-diagnostic-at-point 2)))
+        (should (equal (proofread-diagnostic-range diagnostic)
+                       '( 2 . 6)))
+        (should (equal (proofread--diagnostic-members diagnostic)
+                       (list first second)))))))
+
+(ert-deftest
+    proofread-test-diagnostic-at-point-skips-removed-overlay ()
+  "Ignore a live orphan overlay removed from diagnostic state."
+  (with-temp-buffer
+    (insert "abcdefghij")
+    (let ((proofread-auto-check nil)
+          (stale
+           (proofread-test--diagnostic-for-range 2 8 "bcdefg"))
+          (live
+           (proofread-test--diagnostic-for-range 3 6 "cde")))
+      (proofread-mode 1)
+      (proofread-test--install-diagnostics (list stale live))
+      (let ((stale-overlay
+             (proofread--overlay-for-diagnostic stale)))
+        (proofread--remove-diagnostics (list stale))
+        (should (overlay-buffer stale-overlay))
+        (should-not (gethash stale proofread--diagnostic-overlays))
+        (should (eq (proofread-diagnostic-at-point 4) live))))))
+
+(ert-deftest proofread-test-diagnostic-at-point-follows-replacement
+    ()
+  "Return only the current member after backend replacement."
+  (with-temp-buffer
+    (insert "helo")
+    (let ((proofread-auto-check nil)
+          (request '( :beg 1 :end 5))
+          (old
+           (proofread-test--diagnostic-with-kind
+            1 5 "helo" 'spelling))
+          (new
+           (proofread-test--diagnostic-with-kind
+            1 5 "helo" 'grammar)))
+      (proofread-mode 1)
+      (proofread--apply-backend-diagnostics (list old) '( 1 . 5))
+      (let* ((old-live (car proofread--diagnostics))
+             (old-overlay
+              (proofread--overlay-for-diagnostic old-live)))
+        (should (eq (proofread-diagnostic-at-point 2) old-live))
+        (proofread--replace-backend-diagnostics request (list new))
+        (let ((new-live (car proofread--diagnostics)))
+          (should-not (overlay-buffer old-overlay))
+          (should (eq (proofread-diagnostic-at-point 2) new-live)))
+        (proofread--replace-backend-diagnostics request nil)
+        (should-not (proofread-diagnostic-at-point 2))))))
+
+(ert-deftest proofread-test-diagnostic-at-point-follows-partial-merge
+    ()
+  "Aggregate local members added by a partial backend result."
+  (with-temp-buffer
+    (insert "helo xxxx")
+    (let ((proofread-auto-check nil)
+          (request '( :beg 1 :end 10))
+          (first
+           (proofread-test--diagnostic-with-kind
+            1 5 "helo" 'spelling))
+          (second
+           (proofread-test--diagnostic-with-kind
+            1 5 "helo" 'grammar))
+          (remote
+           (proofread-test--diagnostic-with-kind
+            6 10 "xxxx" 'style)))
+      (proofread-mode 1)
+      (proofread--apply-backend-diagnostics (list first) '( 1 . 10))
+      (let ((first-live (car proofread--diagnostics)))
+        (proofread--merge-backend-diagnostics
+         request (list second remote))
+        (let ((second-live (nth 1 proofread--diagnostics))
+              (remote-live (nth 2 proofread--diagnostics)))
+          (should
+           (equal
+            (proofread--diagnostic-members
+             (proofread-diagnostic-at-point 2))
+            (list first-live second-live)))
+          (should (eq (proofread-diagnostic-at-point 7)
+                      remote-live)))))))
+
+(ert-deftest proofread-test-diagnostic-at-point-follows-removal ()
+  "Shrink an aggregate as its raw diagnostics are removed."
+  (with-temp-buffer
+    (insert "helo")
+    (let ((proofread-auto-check nil)
+          (first
+           (proofread-test--diagnostic-for-range 1 5 "helo"))
+          (second
+           (proofread-test--diagnostic-for-range 1 5 "helo"))
+          (third
+           (proofread-test--diagnostic-for-range 1 5 "helo")))
+      (proofread-mode 1)
+      (proofread-test--install-diagnostics
+       (list first second third))
+      (proofread--invalidate-affected-diagnostics
+       (list (proofread--overlay-for-diagnostic second))
+       (list second))
+      (should
+       (equal
+        (proofread--diagnostic-members
+         (proofread-diagnostic-at-point 2))
+        (list first third)))
+      (proofread--invalidate-affected-diagnostics
+       (list (proofread--overlay-for-diagnostic first))
+       (list first))
+      (should (eq (proofread-diagnostic-at-point 2) third))
+      (proofread--invalidate-affected-diagnostics
+       (list (proofread--overlay-for-diagnostic third))
+       (list third))
+      (should-not (proofread-diagnostic-at-point 2)))))
 
 (ert-deftest
     proofread-test-diagnostic-at-point-ignores-foreign-overlays ()
@@ -9305,7 +9612,52 @@ This covers URLs, email, invisible text, faces, and properties."
         (should (overlay-buffer foreign-overlay))
         (should-not proofread--current-diagnostic)
         (should (equal proofread--diagnostics (list unrelated)))
+        (should-not (proofread-diagnostic-at-point 2))
+        (should (eq (proofread-diagnostic-at-point 7) unrelated))
         (should (equal (buffer-string) text))))))
+
+(ert-deftest proofread-test-ignore-command-removes-aggregate-members
+    ()
+  "Record and remove every raw member of an aggregate at point."
+  (let ((proofread--ignored-diagnostics
+         (make-hash-table :test #'equal)))
+    (with-temp-buffer
+      (insert "helo")
+      (let ((proofread-auto-check nil)
+            (first
+             (proofread-test--diagnostic-with-checker
+              (proofread-test--diagnostic-with-kind
+               1 5 "helo" 'spelling)
+              'first))
+            (second
+             (proofread-test--diagnostic-with-checker
+              (proofread-test--diagnostic-with-kind
+               1 5 "helo" 'grammar)
+              'second))
+            (control
+             (proofread-test--diagnostic-with-checker
+              (proofread-test--diagnostic-with-kind
+               1 5 "other" 'style)
+              'control)))
+        (setq first (plist-put first :checker-ordinal 0))
+        (setq second (plist-put second :checker-ordinal 1))
+        (setq control (plist-put control :checker-ordinal 2))
+        (proofread-mode 1)
+        (proofread-test--install-diagnostics
+         (list first second control))
+        (goto-char 2)
+        (should
+         (equal
+          (proofread--diagnostic-members
+           (proofread-diagnostic-at-point))
+          (list first second)))
+        (should (eq (proofread-ignore) 'ignored))
+        (should (proofread--diagnostic-ignored-p first))
+        (should (proofread--diagnostic-ignored-p second))
+        (should-not (proofread--diagnostic-ignored-p control))
+        (should (equal proofread--diagnostics (list control)))
+        (should (= (length proofread--overlays) 1))
+        (should (eq (proofread-diagnostic-at-point) control))))))
 
 (ert-deftest proofread-test-ignore-command-away-from-diagnostic ()
   "`proofread-ignore' away from diagnostics reports no target."

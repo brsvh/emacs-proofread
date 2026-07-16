@@ -158,6 +158,12 @@ responses remain visible for debugging and may contain sensitive text.
 ** Performance
 
 ---
+*** Diagnostic lookup at point now examines only local diagnostics.
+Looking up a diagnostic for commands or optional frontends no longer traverses
+and sorts every diagnostic in the buffer.  Matching diagnostics at point retain
+the same source-aware aggregation and ordering.
+
+---
 *** Large asynchronous checks remain responsive with caching enabled.
 Successful backend replies now wake only queued requests that can use the
 new cache entry.  This avoids repeated scans of unrelated queued work in
