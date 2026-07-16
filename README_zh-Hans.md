@@ -138,9 +138,15 @@ key 的稳定 provider 标识：
                                                   :host "api.openai.com")
                                             :chat-model "gpt-5.4")
                 :provider-identity "openai:gpt-5.4"
+                :source-label "gpt-5.4"
                 :response-strategy auto
                 :diagnostic-passes 1)))
 ```
+
+当 checker 局部 `:source-label` 非 `nil` 时，Proofread 会在弹窗消息中使用它；否则依次使用
+`proofread-llm-source-label`、provider 的 `llm-name`，最后回退为 `llm`。部分 provider 的
+`llm-name` 返回 provider 系列而非精确的 chat model，因此需要准确模型名时应显式设置
+`:source-label`。Checker 局部显式的 `nil` 会绕过全局标签，并为该 checker 恢复自动 provider 命名。
 
 `proofread-llm-response-strategy` 的默认值是 `auto`：当 provider 声明支持 JSON 响应时使用 JSON
 Schema，否则回退到仅由提示词约束的 JSON。如果提供 `:instructions-function`，也应提供稳定的
@@ -225,6 +231,7 @@ LanguageTool，为简体中文使用本地 Ollama 加 LanguageTool：
                                                   :host "api.openai.com")
                                             :chat-model "gpt-5.4")
                 :provider-identity "openai:gpt-5.4"
+                :source-label "gpt-5.4"
                 :response-strategy auto
                 :diagnostic-passes 1)))
 
@@ -269,7 +276,7 @@ LanguageTool，为简体中文使用本地 Ollama 加 LanguageTool：
 ```
 
 来自不同 checker 的诊断项在内部仍然彼此独立。用户界面会把指向同一实时范围和同一文本的诊断项分组，保留每个 checker
-的消息，并去重相同的修改建议文本。每个分组中的来源标签、消息、修改建议和修正选项都按 profile 所声明的 `:checkers`
+的消息，并去重相同的修改建议文本。每个分组中的 checker 标签、消息、修改建议和修正选项都按 profile 所声明的 `:checkers`
 顺序排列，不受异步请求完成顺序影响。
 
 #### 为单个缓冲区选择 profile
@@ -371,9 +378,11 @@ https://github.com/user-attachments/assets/8ce73c38-69af-4b51-bcc8-f913753751fc
 (require 'proofread-popup)
 ```
 
-当光标位于诊断项上时，该前端会在诊断范围起点上方的子框架中显示诊断消息，并在光标离开时隐藏子框架。弹窗不显示修改建议，也不提供操作。在终端及其他无法使用子框架的环境中，弹窗不可用。运行
-`M-x proofread-popup-mode` 可在当前缓冲区中禁用或重新启用该自动集成。也可以使用 `proofread-popup-enabled`
-和 `proofread-popup-max-width` 控制其显示。
+当光标位于诊断项上时，该前端会在诊断范围起点上方的子框架中逐条显示诊断消息，并在光标离开时隐藏子框架。每条消息都会带有后端来源前缀：LLM checker
+使用其有效来源标签，LanguageTool 显示 `languagetool`。来源标签使用加粗且跟随主题的强调
+face。弹窗不显示修改建议，也不提供操作。在终端及其他无法使用子框架的环境中，弹窗不可用。运行 `M-x proofread-popup-mode`
+可在当前缓冲区中禁用或重新启用该自动集成。也可以使用 `proofread-popup-enabled` 和
+`proofread-popup-max-width` 控制其显示。
 
 ### 批量修正
 
@@ -447,6 +456,7 @@ https://github.com/user-attachments/assets/2dda228e-f85c-4500-aea0-549500628c6e
 | `proofread-llm-response-strategy`         | `auto` | LLM checker 省略 `:response-strategy` 时使用的默认响应策略     |
 | `proofread-llm-request-timeout`           | `120`  | 限制 LLM 请求的存活时间；`nil` 表示禁用 watchdog               |
 | `proofread-llm-provider-identity`         | `nil`  | LLM checker 省略 `:provider-identity` 时使用的默认稳定标识     |
+| `proofread-llm-source-label`              | `nil`  | 默认诊断来源标签；`nil` 表示使用有效 provider 名称             |
 | `proofread-llm-max-diagnostic-passes`     | `3`    | LLM checker 省略 `:diagnostic-passes` 时使用的默认诊断轮数     |
 | `proofread-llm-instructions-function`     | `nil`  | LLM checker 省略 `:instructions-function` 时使用的默认附加说明 |
 | `proofread-llm-instructions-identity`     | `nil`  | LLM checker 省略说明标识时使用的默认稳定标识                   |
@@ -479,8 +489,8 @@ LanguageTool 库另有一个 `proofread-languagetool` Customize 组：
 时必须至少启用一个规则或分类，且不能同时配置禁用规则或分类。语言、检查级别、语言变体、母语、规则和分类设置都会进入后端缓存标识，因此修改检查策略后不会复用旧策略生成的结果。
 
 可选前端还定义了 `proofread-popup-enabled`（默认值为 `t`）和 `proofread-popup-max-width`（默认值为
-`80`）。可使用 `proofread-face`、`proofread-current-face`、`proofread-popup-face` 和
-`proofread-popup-border-face` 自定义诊断外观。
+`80`）。可使用 `proofread-face`、`proofread-current-face`、`proofread-popup-face`、
+`proofread-popup-source-face` 和 `proofread-popup-border-face` 自定义诊断外观。
 
 ### 调整并发数
 

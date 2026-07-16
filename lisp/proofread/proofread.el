@@ -292,7 +292,7 @@ request-ready chunks."
      :context-before :context-after
      :language :display-language
      :profile :checker-name :checker-ordinal :checker-owner
-     :checker-options :checker-identity
+     :checker-options :checker-identity :source-label
      :major-mode
      :target-policy :target-kind
      :domain-beg :domain-end :accessible-beg :accessible-end
@@ -305,6 +305,7 @@ request-ready chunks."
      :context-before :context-after
      :language :display-language
      :profile :checker-name :checker-ordinal :checker-owner
+     :source-label
      :major-mode :target-kind
      :domain-beg :domain-end :accessible-beg :accessible-end
      :backend)
@@ -317,7 +318,8 @@ request-ready chunks."
 (defconst proofread--request-log-diagnostic-keys
   '( :beg :end :text :kind :message :target-kind
      :language :display-language
-     :profile :checker-name :checker-ordinal :checker-owner)
+     :profile :checker-name :checker-ordinal :checker-owner
+     :source-label)
   "Diagnostic properties safe to retain in request logs.")
 
 (defconst proofread--overlay-category 'proofread-overlay
@@ -568,9 +570,10 @@ interrupting proofreading.")
   "Register BACKEND using functions in DESCRIPTOR.
 DESCRIPTOR must contain callable `:check' and `:identity' entries.  An
 optional callable `:checker-identity' entry returns the effective
-identity for one normalized profile checker, and an optional callable
-`:cancel' entry receives unchanged the opaque handle returned by
-`:check'."
+identity for one normalized profile checker.  An optional callable
+`:source-label' entry returns nil or a nonempty display string for one
+normalized profile checker, and an optional callable `:cancel' entry
+receives unchanged the opaque handle returned by `:check'."
   (unless (symbolp backend)
     (error "Proofread backend name must be a symbol: %S" backend))
   (dolist (key '( :check :identity))
@@ -584,6 +587,10 @@ identity for one normalized profile checker, and an optional callable
   (when (and (plist-member descriptor :checker-identity)
              (not (functionp (plist-get descriptor :checker-identity))))
     (error "Proofread backend %S has invalid :checker-identity function"
+           backend))
+  (when (and (plist-member descriptor :source-label)
+             (not (functionp (plist-get descriptor :source-label))))
+    (error "Proofread backend %S has invalid :source-label function"
            backend))
   (puthash backend (copy-sequence descriptor)
            proofread--backend-registry)
@@ -795,6 +802,58 @@ Internal checker kinds include their provenance discriminator."
   "Return BACKEND's checker-local identity function, or nil."
   (when-let* ((descriptor (proofread--backend-descriptor backend)))
     (plist-get descriptor :checker-identity)))
+
+(defun proofread--report-checker-source-label-warning
+    (checker reason)
+  "Report a bounded source-label warning for CHECKER and REASON.
+Do not let reporting errors interrupt checker dispatch."
+  (condition-case nil
+      (proofread-report-warning-without-window
+       (format
+        (concat "Proofread profile %S checker %S using backend %S "
+                "could not provide a source label (%S); continuing "
+                "without one")
+        (plist-get checker :profile)
+        (plist-get checker :name)
+        (plist-get checker :backend)
+        reason)
+       "checker source label unavailable; see *Warnings*")
+    (error nil)))
+
+(defun proofread--backend-checker-source-label (checker)
+  "Return a safe display source label for normalized CHECKER.
+Dispatch callers snapshot the backend's optional `:source-label'
+operation once per checker.  Return nil after warning when the
+operation signals an error or returns an invalid non-nil value."
+  (let* ((backend (plist-get checker :backend))
+         (descriptor (proofread--backend-descriptor backend))
+         (function (plist-get descriptor :source-label)))
+    (when function
+      (condition-case err
+          (let ((source-checker (copy-sequence checker)))
+            ;; Checker order controls presentation but not its source.
+            (cl-remf source-checker :checker-ordinal)
+            (let ((label (funcall function source-checker)))
+              (cond
+               ((null label) nil)
+               ((stringp label)
+                (let ((normalized
+                       (replace-regexp-in-string
+                        "[[:space:]]+" " " (string-trim label))))
+                  (if (string-empty-p normalized)
+                      (progn
+                        (proofread--report-checker-source-label-warning
+                         checker 'invalid-value)
+                        nil)
+                    (substring-no-properties normalized))))
+               (t
+                (proofread--report-checker-source-label-warning
+                 checker 'invalid-value)
+                nil))))
+        (error
+         (proofread--report-checker-source-label-warning
+          checker (proofread--condition-kind err))
+         nil)))))
 
 (defun proofread--backend-checker-identity (checker)
   "Return the backend identity effective for normalized CHECKER."
@@ -1060,7 +1119,7 @@ effective backend identity."
     (cons t (proofread--position-integer value)))
    ((and (memq property
                '( :text :context-before :context-after :language
-                  :display-language :message :method))
+                  :display-language :message :method :source-label))
          (stringp value))
     (cons t (substring-no-properties value)))
    ((and (memq property
@@ -1538,7 +1597,8 @@ The returned plist contains the keys in `proofread--diagnostic-keys'."
   (let ((diagnostic (copy-sequence diagnostic)))
     (dolist (key '( :language :display-language
                     :profile :checker-name
-                    :checker-ordinal :checker-owner))
+                    :checker-ordinal :checker-owner
+                    :source-label))
       (setq diagnostic
             (plist-put
              diagnostic key
@@ -2697,12 +2757,14 @@ LANGUAGE is the language hint snapshotted for the check."
   (setq proofread--next-request-id (1+ proofread--next-request-id)))
 
 (defun proofread--checker-request-identities (checker)
-  "Return request identity snapshots for normalized CHECKER."
+  "Return request metadata snapshots for normalized CHECKER."
   (let ((backend-identity
          (proofread--backend-checker-identity checker)))
     (list :backend-identity backend-identity
           :checker-identity
-          (proofread--checker-identity checker backend-identity))))
+          (proofread--checker-identity checker backend-identity)
+          :source-label
+          (proofread--backend-checker-source-label checker))))
 
 (defun proofread--make-backend-request
     (chunk &optional backend checker profile identities)
@@ -2711,8 +2773,7 @@ When BACKEND is non-nil, store its canonical identity in the request.
 CHECKER and PROFILE, when non-nil, identify the profile checker that
 owns the request.  Without CHECKER, create an ad-hoc low-level owner
 that is independent of profile selection.  IDENTITIES, when non-nil,
-contains precomputed `:backend-identity' and `:checker-identity'
-snapshots for CHECKER."
+contains precomputed identity and source-label snapshots for CHECKER."
   (let* ((checker (or checker
                       (proofread--ad-hoc-checker
                        (or backend proofread-backend))))
@@ -2732,6 +2793,11 @@ snapshots for CHECKER."
             (and checker
                  (proofread--checker-identity
                   checker backend-identity))))
+         (source-label
+          (if identities
+              (plist-get identities :source-label)
+            (and checker
+                 (proofread--backend-checker-source-label checker))))
          (profile-language
           (if profile
               (plist-get profile :language)
@@ -2765,6 +2831,8 @@ snapshots for CHECKER."
                        (proofread--snapshot-value
                         (plist-get checker :options)))
                      ( :checker-identity checker-identity)
+                     ( :source-label
+                       (proofread--snapshot-value source-label))
                      ( :language
                        (proofread--snapshot-value
                         profile-language))
@@ -3407,7 +3475,8 @@ Return one of the symbols `sent', `cached', `full', `stale', or
         (proofread--position-integer (plist-get request :end))
         (plist-get request :accessible-beg)
         (plist-get request :accessible-end)
-        (plist-get request :cache-key)))
+        (plist-get request :cache-key)
+        (plist-get request :source-label)))
 
 (defun proofread--forget-request-work (request)
   "Remove REQUEST's work key from pending state."
@@ -4721,6 +4790,27 @@ buffer; otherwise return the diagnostic's stored range."
       (plist-get diagnostic :diagnostics)
     (list diagnostic)))
 
+(defun proofread-diagnostic-message-entries (diagnostic)
+  "Return detached message and backend-source entries for DIAGNOSTIC.
+The result contains one property list for every raw diagnostic
+represented by DIAGNOSTIC, in presentation order.  Each property list
+has `:source' and `:message' keys.  The source is a display string or
+nil; prefer the checker-local source label and otherwise use the raw
+backend source.  The message retains its original value and may be
+nil.  Callers may safely modify the returned records and values."
+  (mapcar
+   (lambda (member)
+     (let ((source (or (plist-get member :source-label)
+                       (plist-get member :source))))
+       (list :source
+             (and source
+                  (substring-no-properties
+                   (proofread-format-diagnostic-field source)))
+             :message
+             (proofread--snapshot-value
+              (plist-get member :message)))))
+   (proofread--diagnostic-members diagnostic)))
+
 (defun proofread--diagnostic-source-label (diagnostic)
   "Return a display label for DIAGNOSTIC's checker or source."
   (let ((checker-name (plist-get diagnostic :checker-name))
@@ -5143,8 +5233,8 @@ A diagnostic is live only while its proofread-owned overlay exists in
 the current buffer.  An aggregate may be freshly allocated on every
 call, so callers must not rely on `eq' identity across calls.  Compare
 values from `proofread-diagnostic-range',
-`proofread-diagnostic-message', and `proofread-diagnostic-text'
-instead."
+`proofread-diagnostic-message', `proofread-diagnostic-message-entries',
+and `proofread-diagnostic-text' instead."
   (when-let* ((point-position
                (proofread--position-integer (or position (point)))))
     (save-restriction

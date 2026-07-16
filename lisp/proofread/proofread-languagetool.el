@@ -757,6 +757,10 @@ startup even when automatic startup is disabled."
   "Return stable cache identity for normalized profile CHECKER."
   (proofread-languagetool--identity-for-source checker))
 
+(defun proofread-languagetool--checker-source-label (_checker)
+  "Return the display source label for a LanguageTool checker."
+  "languagetool")
+
 ;;;; Request encoding and response parsing
 
 (defun proofread-languagetool--request-language (request)
@@ -1967,6 +1971,7 @@ An external server reused by this backend is never stopped."
    :check #'proofread-languagetool--check
    :identity #'proofread-languagetool--identity
    :checker-identity #'proofread-languagetool--checker-identity
+   :source-label #'proofread-languagetool--checker-source-label
    :cancel #'proofread-languagetool--cancel))
 
 (provide 'proofread-languagetool)

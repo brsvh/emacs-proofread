@@ -171,6 +171,15 @@ POINT-OFFSET is a zero-based offset or the symbol `end'."
                 #'proofread-languagetool--identity))
     (should (eq (plist-get descriptor :checker-identity)
                 #'proofread-languagetool--checker-identity))
+    (should (eq (plist-get descriptor :source-label)
+                #'proofread-languagetool--checker-source-label))
+    (should
+     (equal
+      (funcall (plist-get descriptor :source-label)
+               '( :profile test :name local
+                  :backend languagetool
+                  :options ( :source-label "ignored")))
+      "languagetool"))
     (should (eq (plist-get descriptor :cancel)
                 #'proofread-languagetool--cancel))))
 

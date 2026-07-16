@@ -50,6 +50,25 @@
   (proofread-llm--validate-request-timeout value)
   (set-default symbol value))
 
+(defun proofread-llm--validate-source-label (value)
+  "Return normalized LLM source label VALUE, or nil.
+Signal an error unless a non-nil value is a nonempty string."
+  (when value
+    (unless (stringp value)
+      (error "Proofread LLM source label must be nil or a string"))
+    (let ((label
+           (replace-regexp-in-string
+            "[[:space:]]+" " "
+            (string-trim (substring-no-properties value)))))
+      (when (string-empty-p label)
+        (error "Proofread LLM source label must not be empty"))
+      label)))
+
+(defun proofread-llm--set-source-label-option (symbol value)
+  "Set SYMBOL to source label VALUE as a Customize option."
+  (set-default symbol
+               (proofread-llm--validate-source-label value)))
+
 (defcustom proofread-llm-provider nil
   "Default provider object used by the LLM backend.
 Users should configure this with a provider constructor from the GNU
@@ -78,6 +97,21 @@ Set this to a stable, non-secret value to reuse compatible cache
 entries across equivalent provider objects and feature reloads in the
 same buffer."
   :type 'sexp
+  :group 'proofread)
+
+(defcustom proofread-llm-source-label nil
+  "Default display source label for LLM diagnostics.
+When nil, use `llm-name' for the effective provider and fall back to
+\"llm\" when that does not yield a usable label.  A checker-local
+`:source-label' option overrides this value; an explicit nil uses the
+automatic provider-name behavior for that checker.
+
+This label is presentation metadata and does not participate in LLM
+backend or checker cache identities."
+  :type '(choice
+          (const :tag "Automatic" nil)
+          (string :tag "Source label"))
+  :set #'proofread-llm--set-source-label-option
   :group 'proofread)
 
 (defcustom proofread-llm-max-diagnostic-passes 3
@@ -816,6 +850,11 @@ SOURCE may be a backend request or a normalized profile checker."
   (proofread-llm--option
    source :provider-identity proofread-llm-provider-identity))
 
+(defun proofread-llm--effective-source-label (source)
+  "Return the configured display source label effective for SOURCE."
+  (proofread-llm--option
+   source :source-label proofread-llm-source-label))
+
 (defun proofread-llm--effective-response-strategy (source)
   "Return the configured response strategy effective for SOURCE."
   (proofread-llm--option
@@ -882,6 +921,21 @@ capability fallback."
     (condition-case nil
         (llm-name provider)
       (error nil))))
+
+(defun proofread-llm--safe-provider-source-label (provider)
+  "Return PROVIDER's safe display source label, or nil."
+  (condition-case nil
+      (proofread-llm--validate-source-label
+       (proofread-llm--provider-name provider))
+    (error nil)))
+
+(defun proofread-llm--checker-source-label (checker)
+  "Return the display source label for normalized profile CHECKER."
+  (or (proofread-llm--validate-source-label
+       (proofread-llm--effective-source-label checker))
+      (proofread-llm--safe-provider-source-label
+       (proofread-llm--effective-provider checker))
+      "llm"))
 
 (defun proofread-llm--validate-instructions-identity
     (instructions-function instructions-identity)
@@ -1342,6 +1396,7 @@ MAX-PASSES is the request-local diagnostic pass limit."
    :check #'proofread-llm--backend-check
    :identity #'proofread-llm--provider-identity
    :checker-identity #'proofread-llm--checker-identity
+   :source-label #'proofread-llm--checker-source-label
    :cancel #'proofread-llm--cancel-request-handle))
 
 (provide 'proofread-llm)

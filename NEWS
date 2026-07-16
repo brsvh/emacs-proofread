@@ -107,6 +107,15 @@ restarted.
 ** User interface
 
 ---
+*** Diagnostics now carry frontend source labels.
+Backends can provide one safe display label per checker without changing the
+raw backend source stored in diagnostics and used by ignoring.  LLM checkers
+use an explicit ':source-label', the new 'proofread-llm-source-label' default,
+or the effective provider name; LanguageTool uses "languagetool".  The new
+public diagnostic message-entry interface preserves each message-to-source
+association for frontends, including aggregate diagnostics and cache hits.
+
+---
 *** Explicit checks now retire diagnostics owned by inactive checkers.
 After a profile switch or checker removal, explicitly checking a range
 removes diagnostics in that range that belong to checkers absent from the
@@ -238,6 +247,13 @@ including queued, active, completed, failed, and stale requests.
 * Changes in proofread-popup 0.1.1
 
 ** Popup display
+
+---
+*** Popup messages identify their backend source.
+Every diagnostic message is displayed on its own line with its LLM or
+LanguageTool source label.  Source labels use the new
+'proofread-popup-source-face', which inherits a theme-provided emphasis color
+and adds bold weight.
 
 ---
 *** Equal aggregate diagnostics no longer cause redundant redraws.

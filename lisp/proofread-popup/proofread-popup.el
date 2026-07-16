@@ -62,6 +62,11 @@
   "Face for Proofread child-frame messages."
   :group 'proofread-popup)
 
+(defface proofread-popup-source-face
+  '((t :inherit font-lock-keyword-face :weight bold))
+  "Face for source labels in Proofread child-frame messages."
+  :group 'proofread-popup)
+
 (defface proofread-popup-border-face
   '((((background dark)) :background "white")
     (((background light)) :background "black"))
@@ -119,23 +124,56 @@
   (eq (window-buffer window)
       (current-buffer)))
 
+(defun proofread-popup--message-without-faces (message)
+  "Return a copy of MESSAGE without inherited face properties."
+  (let ((copy (copy-sequence message)))
+    (remove-text-properties
+     0 (length copy) '(face nil font-lock-face nil) copy)
+    copy))
+
 (defun proofread-popup--message-for-fields (raw-message text)
   "Return the child-frame message for RAW-MESSAGE and TEXT."
   (let ((message (and (stringp raw-message)
                       (string-trim raw-message))))
-    (cond
-     ((and message (not (string-empty-p message))) message)
-     ((and raw-message (not (stringp raw-message)))
-      (proofread-format-diagnostic-field raw-message))
-     (text
-      (format "Proofread: %s"
-              (proofread-format-diagnostic-field text)))
-     (t "Proofread diagnostic"))))
+    (proofread-popup--message-without-faces
+     (cond
+      ((and message (not (string-empty-p message))) message)
+      ((and raw-message (not (stringp raw-message)))
+       (proofread-format-diagnostic-field raw-message))
+      (text
+       (format "Proofread: %s"
+               (proofread-format-diagnostic-field text)))
+      (t "Proofread diagnostic")))))
+
+(defun proofread-popup--message-for-entry (entry text)
+  "Return the child-frame message for source-aware ENTRY and TEXT."
+  (let* ((raw-source (plist-get entry :source))
+         (source
+          (and raw-source
+               (string-trim
+                (proofread-format-diagnostic-field raw-source))))
+         (message
+          (proofread-popup--message-for-fields
+           (plist-get entry :message) text)))
+    (if (and source (not (string-empty-p source)))
+        (concat
+         (propertize source 'face 'proofread-popup-source-face)
+         ": " message)
+      message)))
+
+(defun proofread-popup--message-for-entries (entries text)
+  "Return the child-frame message for source-aware ENTRIES and TEXT."
+  (if entries
+      (mapconcat
+       (lambda (entry)
+         (proofread-popup--message-for-entry entry text))
+       entries "\n")
+    (proofread-popup--message-for-fields nil text)))
 
 (defun proofread-popup--message (diagnostic)
   "Return the child-frame message for DIAGNOSTIC."
-  (proofread-popup--message-for-fields
-   (proofread-diagnostic-message diagnostic)
+  (proofread-popup--message-for-entries
+   (proofread-diagnostic-message-entries diagnostic)
    (proofread-diagnostic-text diagnostic)))
 
 (defun proofread-popup--diagnostic-render-data (diagnostic)
@@ -143,11 +181,12 @@
 The result contains the final display message and an immutable
 signature built only from public diagnostic values."
   (let* ((range (proofread-diagnostic-range diagnostic))
-         (raw-message (proofread-diagnostic-message diagnostic))
+         (entries
+          (proofread-diagnostic-message-entries diagnostic))
          (text (proofread-diagnostic-text diagnostic))
          (message
           (copy-sequence
-           (proofread-popup--message-for-fields raw-message text))))
+           (proofread-popup--message-for-entries entries text))))
     (list :message message
           :signature
           (list :range (and range (cons (car range) (cdr range)))
@@ -231,28 +270,32 @@ WINDOW and SNAPSHOT describe the selected display target."
 (defun proofread-popup--show
     (message signature position window snapshot)
   "Show MESSAGE with SIGNATURE at POSITION in WINDOW using SNAPSHOT."
-  (posframe-show
-   (proofread-popup--ensure-buffer-name)
-   :string (propertize message 'face 'proofread-popup-face)
-   :position position
-   :poshandler
-   #'posframe-poshandler-point-bottom-left-corner-upward
-   :foreground-color (plist-get snapshot :foreground-color)
-   :background-color (plist-get snapshot :background-color)
-   :max-width (plist-get snapshot :max-width)
-   :min-width 1
-   :internal-border-width 1
-   :internal-border-color (plist-get snapshot :border-color)
-   :left-fringe 3
-   :right-fringe 3
-   :accept-focus nil
-   :override-parameters
-   '((no-accept-focus . t)
-     (no-focus-on-map . t)
-     (cursor-type . nil)
-     (no-special-glyphs . t)
-     (desktop-dont-save . t))
-   :hidehandler #'proofread-popup--hide-handler)
+  (let ((display-message (copy-sequence message)))
+    (add-face-text-property
+     0 (length display-message) 'proofread-popup-face t
+     display-message)
+    (posframe-show
+     (proofread-popup--ensure-buffer-name)
+     :string display-message
+     :position position
+     :poshandler
+     #'posframe-poshandler-point-bottom-left-corner-upward
+     :foreground-color (plist-get snapshot :foreground-color)
+     :background-color (plist-get snapshot :background-color)
+     :max-width (plist-get snapshot :max-width)
+     :min-width 1
+     :internal-border-width 1
+     :internal-border-color (plist-get snapshot :border-color)
+     :left-fringe 3
+     :right-fringe 3
+     :accept-focus nil
+     :override-parameters
+     '((no-accept-focus . t)
+       (no-focus-on-map . t)
+       (cursor-type . nil)
+       (no-special-glyphs . t)
+       (desktop-dont-save . t))
+     :hidehandler #'proofread-popup--hide-handler))
   (setq proofread-popup--render-signature signature)
   (setq proofread-popup--position position)
   (setq proofread-popup--window window)

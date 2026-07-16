@@ -104,7 +104,7 @@
 
 (defconst proofread-test--diagnostic-provenance-keys
   '( :language :display-language :profile :checker-name
-     :checker-ordinal :checker-owner)
+     :checker-ordinal :checker-owner :source-label)
   "Diagnostic provenance keys added by the Proofread core.")
 
 (defun proofread-test--diagnostic-without-provenance
@@ -3908,6 +3908,219 @@ This covers URLs, email, invisible text, faces, and properties."
     (should-not reports)))
 
 (ert-deftest
+    proofread-test-profile-source-label-is-snapshotted-once-per-checker
+    ()
+  "Snapshot one safe source label for every dispatched checker."
+  (with-temp-buffer
+    (text-mode)
+    (insert "First. Second.")
+    (let* ((proofread-auto-check nil)
+           (proofread-cache-max-entries 0)
+           (proofread-context-size 0)
+           (proofread-max-concurrent-requests 20)
+           (proofread-profile 'multi)
+           (proofread-profiles (proofread-test--ordered-profiles))
+           (proofread--backend-registry (make-hash-table :test #'eq))
+           (recorder (proofread-test--make-backend-recorder))
+           calls)
+      (proofread--register-backend
+       proofread-test--backend
+       :check (plist-get recorder :function)
+       :identity #'proofread-test--backend-identity
+       :source-label
+       (lambda (checker)
+         (push (copy-sequence checker) calls)
+         (propertize
+          (format " \n%s\nmodel\tname " (plist-get checker :name))
+          'proofread-test-secret t)))
+      (proofread-mode 1)
+      (proofread-check-buffer)
+      (let ((requests (funcall (plist-get recorder :requests))))
+        (should (= (length requests) 4))
+        (should (= (length calls) 2))
+        (should (equal (sort (mapcar (lambda (checker)
+                                       (plist-get checker :name))
+                                     calls)
+                             (lambda (left right)
+                               (string< (symbol-name left)
+                                        (symbol-name right))))
+                       '( first second)))
+        (dolist (checker calls)
+          (should-not (plist-member checker :checker-ordinal)))
+        (dolist (request requests)
+          (let ((label (plist-get request :source-label)))
+            (should
+             (equal label
+                    (format "%s model name"
+                            (plist-get request :checker-name))))
+            (should-not (text-properties-at 0 label))
+            (should
+             (equal
+              (plist-get
+               (proofread--request-log-safe-request request)
+               :source-label)
+              label))))
+        (should
+         (equal (proofread-test--complete-recorded-requests recorder)
+                '( applied applied applied applied)))
+        (should (= (length proofread--diagnostics) 4))
+        (dolist (diagnostic proofread--diagnostics)
+          (should
+           (equal
+            (plist-get diagnostic :source-label)
+            (format "%s model name"
+                    (plist-get diagnostic :checker-name)))))))))
+
+(ert-deftest
+    proofread-test-source-label-failure-warns-and-dispatches-checker
+    ()
+  "Degrade invalid source labels without interrupting checker work."
+  (dolist (failure '( error invalid blank))
+    (with-temp-buffer
+      (insert "Alpha")
+      (let* ((proofread-auto-check nil)
+             (proofread-cache-max-entries 0)
+             (proofread-context-size 0)
+             (proofread-profile 'multi)
+             (proofread-profiles
+              (proofread-test--ordered-profiles '( only)))
+             (proofread--backend-registry
+              (make-hash-table :test #'eq))
+             (recorder (proofread-test--make-backend-recorder))
+             (calls 0)
+             reports)
+        (proofread--register-backend
+         proofread-test--backend
+         :check (plist-get recorder :function)
+         :identity #'proofread-test--backend-identity
+         :source-label
+         (lambda (_checker)
+           (setq calls (1+ calls))
+           (pcase failure
+             ('error (error "secret source-label failure"))
+             ('invalid '( secret invalid value))
+             ('blank " \n\t "))))
+        (proofread-mode 1)
+        (cl-letf
+            (((symbol-function
+               'proofread-report-warning-without-window)
+              (lambda (detail summary)
+                (push (list detail summary) reports))))
+          (proofread-check-buffer))
+        (let ((requests (funcall (plist-get recorder :requests))))
+          (should (= calls 1))
+          (should (= (length requests) 1))
+          (should-not (plist-get (car requests) :source-label))
+          (should (= (length reports) 1))
+          (should (string-match-p "source label" (caar reports)))
+          (proofread-test--assert-secret-not-printed
+           "secret" reports)
+          (should
+           (equal (proofread-test--complete-recorded-requests recorder)
+                  '( applied)))
+          (should-not
+           (plist-get (car proofread--diagnostics) :source-label)))))))
+
+(ert-deftest
+    proofread-test-source-label-change-supersedes-pending-work
+    ()
+  "Let a new source label supersede otherwise identical pending work."
+  (with-temp-buffer
+    (insert "helo")
+    (let* ((proofread-auto-check nil)
+           (proofread-cache-max-entries 0)
+           (proofread-context-size 0)
+           (proofread-profile 'multi)
+           (proofread-profiles
+            `((multi
+               :checkers
+               (( :name only
+                  :backend ,proofread-test--backend)))))
+           (proofread--backend-registry
+            (make-hash-table :test #'eq))
+           (recorder (proofread-test--make-backend-recorder))
+           (label "old-model")
+           cancelled-handles)
+      (proofread--register-backend
+       proofread-test--backend
+       :check (plist-get recorder :function)
+       :identity #'proofread-test--backend-identity
+       :source-label (lambda (_checker) label)
+       :cancel (lambda (handle)
+                 (push handle cancelled-handles)))
+      (proofread-mode 1)
+      (proofread-check-buffer)
+      (let ((old (car (funcall (plist-get recorder :requests)))))
+        (should old)
+        (should (equal (plist-get old :source-label) "old-model"))
+        (setq label "new-model")
+        (proofread-check-buffer)
+        (let* ((requests (funcall (plist-get recorder :requests)))
+               (callbacks (funcall (plist-get recorder :callbacks)))
+               (new (cadr requests)))
+          (should (= (length requests) 2))
+          (should (equal (plist-get new :source-label) "new-model"))
+          (should (equal (plist-get old :cache-key)
+                         (plist-get new :cache-key)))
+          (should-not (equal (proofread--request-work-key old)
+                             (proofread--request-work-key new)))
+          (should
+           (proofread--request-state-flag-p old :superseded))
+          (should (equal cancelled-handles
+                         '(proofread-test-handle)))
+          (should-not (proofread--active-request-p old))
+          (should (proofread--active-request-p new))
+          (should
+           (eq
+            (funcall
+             (car callbacks)
+             (proofread--backend-success-result
+              old
+              (list
+               (proofread-test--diagnostic-for-range 1 5 "helo"))))
+            'stale))
+          (should
+           (eq
+            (funcall
+             (cadr callbacks)
+             (proofread--backend-success-result
+              new
+              (list
+               (proofread-test--diagnostic-for-range 1 5 "helo"))))
+            'applied))
+          (should
+           (equal (plist-get (car proofread--diagnostics)
+                             :source-label)
+                  "new-model")))))))
+
+(ert-deftest proofread-test-nil-source-label-is-silent ()
+  "Treat a nil backend source label as a valid absence."
+  (let ((proofread--backend-registry (make-hash-table :test #'eq))
+        (calls 0)
+        reports)
+    (proofread--register-backend
+     proofread-test--backend
+     :check #'ignore
+     :identity #'proofread-test--backend-identity
+     :source-label
+     (lambda (_checker)
+       (setq calls (1+ calls))
+       nil))
+    (cl-letf
+        (((symbol-function 'proofread-report-warning-without-window)
+          (lambda (&rest args)
+            (push args reports))))
+      (should-not
+       (proofread--backend-checker-source-label
+        (list :profile 'multi
+              :name 'only
+              :checker-ordinal 0
+              :backend proofread-test--backend
+              :options nil))))
+    (should (= calls 1))
+    (should-not reports)))
+
+(ert-deftest
     proofread-test-profile-feature-load-error-isolates-checker ()
   "Continue later profile checkers after one feature fails to load."
   (dolist (position '( first middle))
@@ -5256,6 +5469,73 @@ This covers URLs, email, invisible text, faces, and properties."
                            (plist-get request :checker-owner)))))))))
 
 (ert-deftest
+    proofread-test-cache-hit-refreshes-source-label-provenance
+    ()
+  "Overlay cached diagnostics with the current checker source label."
+  (with-temp-buffer
+    (insert "helo")
+    (let* ((proofread-profile 'multi)
+           (proofread-profiles
+            `((multi
+               :language "en-US"
+               :checkers
+               (( :name strict
+                  :backend ,proofread-test--backend)))))
+           (proofread--backend-registry (make-hash-table :test #'eq))
+           (label "old-model"))
+      (proofread--register-backend
+       proofread-test--backend
+       :check #'proofread-test--backend-check
+       :identity #'proofread-test--backend-identity
+       :source-label (lambda (_checker) label))
+      (proofread-mode 1)
+      (let* ((profile (proofread--current-profile))
+             (checker (car (plist-get profile :checkers)))
+             (chunk
+              (car
+               (proofread-test--request-ready-chunks-for-ranges
+                (list (cons (point-min) (point-max))))))
+             (old-request
+              (proofread--make-backend-request
+               chunk proofread-test--backend checker profile))
+             (diagnostic
+              (proofread-test--diagnostic-for-range 1 5 "helo")))
+        (proofread--cache-write-request old-request (list diagnostic))
+        (let* ((entry (proofread--cache-read-request old-request))
+               (cached (car (plist-get entry :diagnostics))))
+          (should (equal (plist-get cached :source-label) "old-model"))
+          (setq label "new-model")
+          (let ((new-request
+                 (proofread--make-backend-request
+                  chunk proofread-test--backend checker profile)))
+            (should
+             (equal (plist-get old-request :cache-key)
+                    (plist-get new-request :cache-key)))
+            (should (equal (plist-get new-request :source-label)
+                           "new-model"))
+            (should (eq (proofread--apply-cache-entry new-request entry)
+                        'applied))
+            (let ((live (car proofread--diagnostics)))
+              (should (equal (plist-get live :source-label)
+                             "new-model"))
+              (should (eq (plist-get live :source) 'test))
+              (should
+               (equal
+                (proofread-diagnostic-message-entries live)
+                '(( :source "new-model"
+                    :message "Possible misspelling"))))
+              (should
+               (eq (plist-get
+                    (proofread--diagnostic-ignore-key live) :source)
+                   'test))
+              (should
+               (equal
+                (plist-get
+                 (proofread--request-log-safe-diagnostic live)
+                 :source-label)
+                "new-model")))))))))
+
+(ert-deftest
     proofread-test-profile-partial-results-keep-checker-duplicates
     ()
   "Do not merge identical internal diagnostics from different checkers."
@@ -5953,6 +6233,19 @@ This covers URLs, email, invisible text, faces, and properties."
     (proofread--unregister-backend proofread-test--backend)
     (should-not
      (proofread--supported-backend-p proofread-test--backend))))
+
+(ert-deftest proofread-test-backend-registry-validates-source-label
+    ()
+  "Reject a non-callable backend source-label operation."
+  (let ((proofread--backend-registry (make-hash-table :test #'eq)))
+    (should-error
+     (proofread--register-backend
+      proofread-test--backend
+      :check #'ignore
+      :identity #'proofread-test--backend-identity
+      :source-label 'not-callable))
+    (should-not
+     (gethash proofread-test--backend proofread--backend-registry))))
 
 (ert-deftest proofread-test-backend-registry-lazily-loads-feature ()
   "Load a known backend feature once before resolving its descriptor."
@@ -6822,6 +7115,55 @@ This covers URLs, email, invisible text, faces, and properties."
                       echoes)))))))))
 
 ;;;; Navigation and presentation tests
+
+(ert-deftest
+    proofread-test-public-diagnostic-message-entries-are-detached
+    ()
+  "Expose ordered backend sources without leaking diagnostic storage."
+  (let* ((first-message (propertize "First message" 'face 'bold))
+         (second-message '( structured "Second message"))
+         (first
+          (plist-put
+           (proofread--make-diagnostic
+            :beg 1 :end 5 :text "helo" :kind 'grammar
+            :message first-message :suggestions nil :source 'raw-first)
+           :source-label
+           (propertize "model-a" 'face 'italic)))
+         (second
+          (proofread--make-diagnostic
+           :beg 1 :end 5 :text "helo" :kind 'style
+           :message second-message :suggestions nil
+           :source 'languagetool))
+         (third
+          (proofread--make-diagnostic
+           :beg 1 :end 5 :text "helo" :kind 'spelling
+           :message nil :suggestions nil
+           :source (propertize "fallback" 'face 'underline)))
+         (aggregate
+          (list :proofread-aggregate t
+                :diagnostics (list first second third)))
+         (entries
+          (proofread-diagnostic-message-entries aggregate))
+         (singleton
+          (proofread-diagnostic-message-entries first)))
+    (should
+     (equal
+      entries
+      '(( :source "model-a" :message "First message")
+        ( :source "languagetool"
+          :message ( structured "Second message"))
+        ( :source "fallback" :message nil))))
+    (should (equal singleton (list (car entries))))
+    (dolist (entry entries)
+      (should-not
+       (text-properties-at 0 (plist-get entry :source))))
+    (aset (plist-get (car entries) :source) 0 ?X)
+    (aset (plist-get (car entries) :message) 0 ?X)
+    (setcar (plist-get (cadr entries) :message) 'changed)
+    (should (equal (plist-get first :source-label) "model-a"))
+    (should (equal (plist-get first :message) "First message"))
+    (should (equal (plist-get second :message)
+                   '( structured "Second message")))))
 
 (ert-deftest
     proofread-test-navigation-preserves-equal-checker-ordinal-order

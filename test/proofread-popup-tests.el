@@ -19,9 +19,9 @@
 ;;;; Test support
 
 (defun proofread-popup-test--diagnostic
-    (beg end text &optional suggestions message)
+    (beg end text &optional suggestions message source)
   "Return a sample diagnostic for BEG, END, and TEXT.
-SUGGESTIONS and MESSAGE supply the optional field values."
+SUGGESTIONS, MESSAGE, and SOURCE supply the optional field values."
   (proofread--make-diagnostic
    :beg beg
    :end end
@@ -29,7 +29,7 @@ SUGGESTIONS and MESSAGE supply the optional field values."
    :kind 'spelling
    :message (or message "Possible misspelling")
    :suggestions suggestions
-   :source 'test))
+   :source (or source 'test)))
 
 (defun proofread-popup-test--install-diagnostics (diagnostics)
   "Install DIAGNOSTICS and return their proofread overlays."
@@ -90,6 +90,9 @@ SUGGESTIONS and MESSAGE supply the optional field values."
   "Proofread popup faces use the package defaults."
   (should (equal (face-default-spec 'proofread-popup-face)
                  '((t :inherit default))))
+  (should (equal (face-default-spec 'proofread-popup-source-face)
+                 '((t :inherit font-lock-keyword-face
+                      :weight bold))))
   (should (equal (face-default-spec 'proofread-popup-border-face)
                  '((((background dark)) :background "white")
                    (((background light)) :background "black")))))
@@ -105,11 +108,22 @@ SUGGESTIONS and MESSAGE supply the optional field values."
 
 (ert-deftest proofread-popup-test-blank-message-falls-back-to-text ()
   "A blank diagnostic message falls back to the diagnostic text."
-  (dolist (message '( "" " \t\n"))
+  (dolist (message '(nil "" " \t\n"))
     (let ((diagnostic
-           (proofread-popup-test--diagnostic 1 5 "helo" nil message)))
+           (proofread-popup-test--diagnostic 1 5 "helo")))
+      (setf (plist-get diagnostic :message) message)
       (should (equal (proofread-popup--message diagnostic)
-                     "Proofread: helo")))))
+                     "test: Proofread: helo")))))
+
+(ert-deftest proofread-popup-test-blank-source-shows-bare-message ()
+  "A missing or blank diagnostic source leaves the message unprefixed."
+  (dolist (source '(nil "" " \t\n"))
+    (let ((diagnostic
+           (proofread-popup-test--diagnostic 1 5 "helo")))
+      (setf (plist-get diagnostic :source) source)
+      (let ((message (proofread-popup--message diagnostic)))
+        (should (equal message "Possible misspelling"))
+        (should-not (get-text-property 0 'face message))))))
 
 (ert-deftest
     proofread-popup-test-uses-shared-diagnostic-field-formatter ()
@@ -121,6 +135,8 @@ SUGGESTIONS and MESSAGE supply the optional field values."
          (proofread-popup-test--diagnostic
           1 5 '( bad "text") nil ""))
         fields)
+    (setf (plist-get message-diagnostic :source) nil)
+    (setf (plist-get text-diagnostic :source) nil)
     (cl-letf (((symbol-function 'proofread-format-diagnostic-field)
                (lambda (value)
                  (push value fields)
@@ -133,28 +149,41 @@ SUGGESTIONS and MESSAGE supply the optional field values."
                    '( misspelling ( bad "text"))))))
 
 (ert-deftest proofread-popup-test-message-aggregates-checkers ()
-  "Popup messages use aggregate checker summaries."
+  "Popup messages preserve each aggregate member's source."
   (with-temp-buffer
     (insert "helo")
     (proofread-mode 1)
     (let ((first
            (proofread-popup-test--diagnostic-with-checker
             (proofread-popup-test--diagnostic
-             1 5 "helo" '( "hello") "First message")
+             1 5 "helo" '( "hello") "First message" "gpt-5.4")
             'first))
           (second
            (proofread-popup-test--diagnostic-with-checker
             (proofread-popup-test--diagnostic
-             1 5 "helo" '( "hello") "Second message")
+             1 5 "helo" '( "hello") "Second message" 'languagetool)
             'second)))
       (proofread-popup-test--install-diagnostics
        (list first second))
       (goto-char 2)
-      (should
-       (equal
-        (proofread-popup--message
-         (proofread-diagnostic-at-point))
-        "first: First message; second: Second message")))))
+      (let ((message
+             (proofread-popup--message
+              (proofread-diagnostic-at-point))))
+        (should
+         (equal message
+                (concat "gpt-5.4: First message\n"
+                        "languagetool: Second message")))
+        (should (eq (get-text-property 0 'face message)
+                    'proofread-popup-source-face))
+        (should-not (get-text-property 7 'face message))
+        (let ((second-source
+               (string-match-p "languagetool" message)))
+          (should second-source)
+          (should
+           (eq (get-text-property second-source 'face message)
+               'proofread-popup-source-face))
+          (should-not
+           (get-text-property (+ second-source 12) 'face message)))))))
 
 ;;;; Core integration
 
@@ -272,22 +301,48 @@ SUGGESTIONS and MESSAGE supply the optional field values."
        (switch-to-buffer (current-buffer))
        (insert "aa helo zz")
        (proofread-mode 1)
-       (let ((diagnostic
-              (proofread-popup-test--diagnostic
-               4 8 "helo" '( "hello"))))
+       (let* ((raw-message
+               (propertize "Possible misspelling"
+                           'face 'error
+                           'font-lock-face 'warning))
+              (diagnostic
+               (proofread-popup-test--diagnostic
+                4 8 "helo" '( "hello") raw-message)))
          (proofread-popup-test--install-diagnostics (list diagnostic))
          (goto-char 5)
          (proofread-popup--update)
          (should (= (length proofread-popup-test--shows) 1))
          (let* ((call (car proofread-popup-test--shows))
                 (args (cdr call))
-                (string (plist-get args :string)))
+                (string (plist-get args :string))
+                (signature-message
+                 (plist-get proofread-popup--render-signature
+                            :message)))
            (should (string-prefix-p proofread-popup--buffer-prefix
                                     (car call)))
            (should (equal (substring-no-properties string)
-                          "Possible misspelling"))
-           (should (eq (get-text-property 0 'face string)
+                          "test: Possible misspelling"))
+           (should
+            (equal (get-text-property 0 'face string)
+                   '(proofread-popup-source-face
+                     proofread-popup-face)))
+           (should (eq (get-text-property 4 'face string)
                        'proofread-popup-face))
+           (should (eq (get-text-property 6 'face string)
+                       'proofread-popup-face))
+           (should-not (get-text-property 6 'font-lock-face string))
+           (should (eq (get-text-property 0 'face raw-message)
+                       'error))
+           (should
+            (eq (get-text-property 0 'font-lock-face raw-message)
+                'warning))
+           (should
+            (eq (get-text-property 0 'face signature-message)
+                'proofread-popup-source-face))
+           (should-not
+            (memq 'proofread-popup-face
+                  (ensure-list
+                   (get-text-property 0 'face signature-message))))
            (should (= (plist-get args :position) 4))
            (should
             (eq
@@ -372,12 +427,13 @@ SUGGESTIONS and MESSAGE supply the optional field values."
        (let ((first
               (proofread-popup-test--diagnostic-with-checker
                (proofread-popup-test--diagnostic
-                1 5 "helo" '( "hello") "First message")
+                1 5 "helo" '( "hello") "First message" "gpt-5.4")
                'first))
              (second
               (proofread-popup-test--diagnostic-with-checker
                (proofread-popup-test--diagnostic
-                1 5 "helo" '( "hello") "Second message")
+                1 5 "helo" '( "hello") "Second message"
+                'languagetool)
                'second)))
          (proofread-popup-test--install-diagnostics
           (list first second))
@@ -420,7 +476,31 @@ SUGGESTIONS and MESSAGE supply the optional field values."
           (equal
            (substring-no-properties
             (plist-get (cdar proofread-popup-test--shows) :string))
-           "Changed message")))))))
+           "test: Changed message")))))))
+
+(ert-deftest proofread-popup-test-source-change-refreshes ()
+  "Changing only a diagnostic source redraws the child frame."
+  (proofread-popup-test--with-posframe-recorder
+   (save-window-excursion
+     (with-temp-buffer
+       (switch-to-buffer (current-buffer))
+       (insert "helo")
+       (proofread-mode 1)
+       (let ((diagnostic
+              (proofread-popup-test--diagnostic
+               1 5 "helo" nil "First message" 'llm)))
+         (setf (plist-get diagnostic :source-label) "gpt-5.4")
+         (proofread-popup-test--install-diagnostics (list diagnostic))
+         (goto-char 2)
+         (proofread-popup--update)
+         (setf (plist-get diagnostic :source-label) "languagetool")
+         (proofread-popup--update)
+         (should (= (length proofread-popup-test--shows) 2))
+         (should
+          (equal
+           (substring-no-properties
+            (plist-get (cdar proofread-popup-test--shows) :string))
+           "languagetool: First message")))))))
 
 (ert-deftest proofread-popup-test-anchor-change-refreshes ()
   "Changing the public diagnostic range redraws at its new anchor."

@@ -266,6 +266,114 @@ When PROFILE is nil, use the current profile."
          (proofread-llm--cancel-request-handle handle)
          (should-not proofread-llm--live-handles))))))
 
+(ert-deftest proofread-llm-test-source-label-configuration ()
+  "Resolve validated global and checker-local LLM source labels."
+  (let ((symbol 'proofread-llm-source-label))
+    (should (eq (get symbol 'custom-set)
+                #'proofread-llm--set-source-label-option))
+    (dolist (invalid '(42 "" " \t\n"))
+      (should-error
+       (funcall (get symbol 'custom-set) symbol invalid))))
+  (let ((proofread-llm-provider 'global-provider)
+        (proofread-llm-source-label
+         (propertize "  Global\nlabel  " 'face 'bold))
+        (provider-name-calls 0))
+    (cl-letf (((symbol-function 'llm-name)
+               (lambda (_provider)
+                 (setq provider-name-calls
+                       (1+ provider-name-calls))
+                 "Unexpected")))
+      (should
+       (equal
+        (proofread-llm--checker-source-label
+         '( :profile multi :name global :backend llm :options nil))
+        "Global label"))
+      (should
+       (equal
+        (proofread-llm--checker-source-label
+         '( :profile multi :name local :backend llm
+            :options ( :source-label "  Local label  ")))
+        "Local label"))
+      (should (= provider-name-calls 0))))
+  (let ((proofread-llm-provider 'global-provider)
+        (proofread-llm-source-label "Global label")
+        seen-provider)
+    (cl-letf (((symbol-function 'llm-name)
+               (lambda (provider)
+                 (setq seen-provider provider)
+                 (propertize "  Local\nmodel  " 'face 'italic))))
+      (should
+       (equal
+        (proofread-llm--checker-source-label
+         '( :profile multi :name local :backend llm
+            :options ( :provider local-provider
+                       :source-label nil)))
+        "Local model"))
+      (should (eq seen-provider 'local-provider))))
+  (dolist (invalid '(42 "" " \t\n"))
+    (should-error
+     (proofread-llm--checker-source-label
+      `( :profile multi :name local :backend llm
+         :options ( :source-label ,invalid))))))
+
+(ert-deftest proofread-llm-test-source-label-provider-fallback ()
+  "Use the effective provider name safely before falling back to llm."
+  (let ((proofread-llm-provider 'global-provider)
+        (proofread-llm-source-label nil)
+        seen-provider)
+    (cl-letf (((symbol-function 'llm-name)
+               (lambda (provider)
+                 (setq seen-provider provider)
+                 "Global model")))
+      (should
+       (equal
+        (proofread-llm--checker-source-label
+         '( :profile multi :name global :backend llm :options nil))
+        "Global model"))
+      (should (eq seen-provider 'global-provider)))
+    (dolist (provider-name '(nil "" " \t\n" invalid))
+      (cl-letf (((symbol-function 'llm-name)
+                 (lambda (_provider) provider-name)))
+        (should
+         (equal
+          (proofread-llm--checker-source-label
+           '( :profile multi :name global :backend llm :options nil))
+          "llm"))))
+    (cl-letf (((symbol-function 'llm-name)
+               (lambda (_provider)
+                 (error "Provider name failed"))))
+      (should
+       (equal
+        (proofread-llm--checker-source-label
+         '( :profile multi :name global :backend llm :options nil))
+        "llm"))))
+  (let ((proofread-llm-provider nil)
+        (proofread-llm-source-label nil))
+    (should
+     (equal
+      (proofread-llm--checker-source-label
+       '( :profile multi :name unconfigured :backend llm :options nil))
+      "llm"))))
+
+(ert-deftest proofread-llm-test-source-label-does-not-change-identity ()
+  "Keep display source labels out of LLM cache identities."
+  (let ((proofread-llm-provider proofread-llm-test--provider)
+        (proofread-llm-provider-identity
+         proofread-llm-test--provider-identity))
+    (should
+     (equal
+      (proofread-llm--checker-identity
+       '( :profile multi :name local :backend llm
+          :options ( :source-label "First")))
+      (proofread-llm--checker-identity
+       '( :profile multi :name local :backend llm
+          :options ( :source-label "Second")))))
+    (let ((proofread-llm-source-label "First"))
+      (let ((first (proofread-llm--provider-identity)))
+        (let ((proofread-llm-source-label "Second"))
+          (should (equal first
+                         (proofread-llm--provider-identity))))))))
+
 (ert-deftest proofread-llm-test-timeout-does-not-change-identity ()
   "Keep backend and cache identity independent of watchdog timeout."
   (with-temp-buffer
@@ -349,7 +457,7 @@ When PROFILE is nil, use the current profile."
        (should (proofread--cache-read-request request))))))
 
 (ert-deftest proofread-llm-test-backend-registers-adapter ()
-  "Register LLM check, identity, and cancellation functions."
+  "Register all LLM backend adapter functions."
   (let ((descriptor (gethash 'llm proofread--backend-registry)))
     (should (eq (plist-get descriptor :check)
                 #'proofread-llm--backend-check))
@@ -357,6 +465,8 @@ When PROFILE is nil, use the current profile."
                 #'proofread-llm--provider-identity))
     (should (eq (plist-get descriptor :checker-identity)
                 #'proofread-llm--checker-identity))
+    (should (eq (plist-get descriptor :source-label)
+                #'proofread-llm--checker-source-label))
     (should (eq (plist-get descriptor :cancel)
                 #'proofread-llm--cancel-request-handle))))
 

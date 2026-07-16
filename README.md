@@ -156,9 +156,17 @@ identity that does not contain the key:
                                                   :host "api.openai.com")
                                             :chat-model "gpt-5.4")
                 :provider-identity "openai:gpt-5.4"
+                :source-label "gpt-5.4"
                 :response-strategy auto
                 :diagnostic-passes 1)))
 ```
+
+Proofread uses a checker-local `:source-label` in popup messages when it is
+non-`nil`. Otherwise it uses `proofread-llm-source-label`, then the provider's
+`llm-name`, and finally `llm`. Some providers return a provider family rather
+than the exact chat model from `llm-name`, so set `:source-label` explicitly
+when the precise model name matters. An explicit checker-local `nil` bypasses
+the global label and restores automatic provider naming for that checker.
 
 `proofread-llm-response-strategy` defaults to `auto`: it uses a JSON schema when
 the provider advertises that capability, and otherwise falls back to prompt-only
@@ -260,6 +268,7 @@ Simplified Chinese:
                                                   :host "api.openai.com")
                                             :chat-model "gpt-5.4")
                 :provider-identity "openai:gpt-5.4"
+                :source-label "gpt-5.4"
                 :response-strategy auto
                 :diagnostic-passes 1)))
 
@@ -306,7 +315,7 @@ Switch profiles by setting `proofread-profile`:
 Diagnostics from different checkers remain separate internally. The user
 interface groups diagnostics that refer to the same live range and text,
 preserves each checker's message, and deduplicates identical suggestion text.
-Within each group, source labels, messages, suggestions, and correction choices
+Within each group, checker labels, messages, suggestions, and correction choices
 follow the profile's declared `:checkers` order, regardless of asynchronous
 completion order.
 
@@ -433,13 +442,16 @@ buffer:
 (require 'proofread-popup)
 ```
 
-When point is on a diagnostic, the frontend displays the diagnostic message in a
-child frame above the start of its range and hides the frame when point moves
-away. The popup does not show suggestions or provide actions. It is unavailable
-in terminals and other environments where child frames do not work. Run
-`M-x proofread-popup-mode` to opt the current buffer out of or back into the
-automatic integration. Its display can also be controlled with
-`proofread-popup-enabled` and `proofread-popup-max-width`.
+When point is on a diagnostic, the frontend displays each diagnostic message in
+a child frame above the start of its range and hides the frame when point moves
+away. Every message is prefixed with its backend source: LLM checkers use their
+effective source label, while LanguageTool displays `languagetool`. Source
+labels use a bold, theme-aware emphasis face. The popup does not show
+suggestions or provide actions. It is unavailable in terminals and other
+environments where child frames do not work. Run `M-x proofread-popup-mode` to
+opt the current buffer out of or back into the automatic integration. Its
+display can also be controlled with `proofread-popup-enabled` and
+`proofread-popup-max-width`.
 
 ### Batch correction
 
@@ -522,6 +534,7 @@ Run `M-x customize-group RET proofread RET` to edit the core options:
 | `proofread-llm-response-strategy`         | `auto`  | Default response strategy when an LLM checker omits `:response-strategy`          |
 | `proofread-llm-request-timeout`           | `120`   | Limit LLM request lifetime; `nil` disables the watchdog                           |
 | `proofread-llm-provider-identity`         | `nil`   | Default stable provider identity when an LLM checker omits `:provider-identity`   |
+| `proofread-llm-source-label`              | `nil`   | Default diagnostic source label; `nil` uses the effective provider name           |
 | `proofread-llm-max-diagnostic-passes`     | `3`     | Default pass limit when an LLM checker omits `:diagnostic-passes`                 |
 | `proofread-llm-instructions-function`     | `nil`   | Default extra instructions when an LLM checker omits `:instructions-function`     |
 | `proofread-llm-instructions-identity`     | `nil`   | Default stable instructions identity when an LLM checker omits it                 |
@@ -559,8 +572,8 @@ different checking policy.
 
 The optional frontend also defines `proofread-popup-enabled` (default `t`) and
 `proofread-popup-max-width` (default `80`). Customize diagnostic appearance with
-`proofread-face`, `proofread-current-face`, `proofread-popup-face`, and
-`proofread-popup-border-face`.
+`proofread-face`, `proofread-current-face`, `proofread-popup-face`,
+`proofread-popup-source-face`, and `proofread-popup-border-face`.
 
 ### Tuning concurrency
 
