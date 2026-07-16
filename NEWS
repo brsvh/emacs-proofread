@@ -95,6 +95,15 @@ the error details.  Such responses keep a reachable server ready.
 'languagetool-transport-error' is reserved for failures without a valid HTTP
 response; malformed successful responses remain invalid-response errors.
 
+---
+*** Managed LanguageTool identities now track configuration contents.
+For servers owned by Proofread, the normalized configuration content digest
+and resolved command identity now participate in startup and cache identity.
+Changing the configuration or replacing the executable at the same path
+restarts a ready owned server and prevents reuse of old cached results.
+Configuration contents are not exposed in logs, and external servers are not
+restarted.
+
 ** User interface
 
 ---

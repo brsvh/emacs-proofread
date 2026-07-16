@@ -527,25 +527,51 @@ SOURCE may be a backend request or a normalized profile checker."
       (setcar prefix resolved))
     (if string-command-p (car prefix) prefix)))
 
+(defun proofread-languagetool--file-content-digest (file)
+  "Return a SHA-256 digest of local regular FILE contents, or nil."
+  (when (and (stringp file)
+             (file-name-absolute-p file)
+             (not (file-remote-p file))
+             (file-regular-p file)
+             (file-readable-p file))
+    (condition-case nil
+        (with-temp-buffer
+          (set-buffer-multibyte nil)
+          (insert-file-contents-literally file)
+          (secure-hash 'sha256 (current-buffer)))
+      (file-error nil))))
+
+(defun proofread-languagetool--command-identity-for-snapshot (snapshot)
+  "Return a non-secret identity for command SNAPSHOT.
+Include the executable digest when SNAPSHOT contains a resolved path."
+  (let ((executable
+         (condition-case nil
+             (car (proofread-languagetool--command-prefix snapshot))
+           (error nil))))
+    (list
+     :fingerprint
+     (secure-hash
+      'sha256
+      (prin1-to-string
+       (list :command snapshot
+             :executable-content-digest
+             (proofread-languagetool--file-content-digest
+              executable)))))))
+
 (defun proofread-languagetool--safe-command-snapshot ()
   "Return a non-secret cache identity for the configured command."
   (let ((snapshot
          (condition-case nil
              (proofread-languagetool--command-snapshot)
            (error proofread-languagetool-command))))
-    (list :fingerprint
-          (secure-hash 'sha256 (prin1-to-string snapshot)))))
+    (proofread-languagetool--command-identity-for-snapshot snapshot)))
 
 (defun proofread-languagetool--config-identity-for-file (file)
   "Return non-secret identity information for config FILE."
   (when file
-    (let ((attributes (file-attributes file 'string)))
-      (list :path-hash (secure-hash 'sha256 file)
-            :size (and attributes (file-attribute-size attributes))
-            :modified
-            (and attributes
-                 (float-time
-                  (file-attribute-modification-time attributes)))))))
+    (list :path-hash (secure-hash 'sha256 file)
+          :content-digest
+          (proofread-languagetool--file-content-digest file))))
 
 (defun proofread-languagetool--config-identity ()
   "Return non-secret identity information for the server config file."
@@ -556,22 +582,27 @@ SOURCE may be a backend request or a normalized profile checker."
 
 (defun proofread-languagetool--managed-session-snapshot ()
   "Return validated settings used only for managed server startup."
-  (let ((config-file
-         (proofread-languagetool--normalized-config-file))
-        (command (proofread-languagetool--command-snapshot))
-        (startup-timeout
-         (proofread-languagetool--positive-timeout
-          proofread-languagetool-startup-timeout
-          'proofread-languagetool-startup-timeout)))
+  (let* ((config-file
+          (proofread-languagetool--normalized-config-file))
+         (command (proofread-languagetool--command-snapshot))
+         (startup-timeout
+          (proofread-languagetool--positive-timeout
+           proofread-languagetool-startup-timeout
+           'proofread-languagetool-startup-timeout))
+         (config-identity
+          (proofread-languagetool--config-identity-for-file
+           config-file))
+         (command-identity
+          (proofread-languagetool--command-identity-for-snapshot
+           command)))
     (list :config-file config-file
           :command command
           :startup-timeout startup-timeout
           :managed-identity
           (list :server-config
-	        (proofread-languagetool--config-identity-for-file
-	         config-file)
-	        :command command
-	        :startup-timeout startup-timeout))))
+                config-identity
+                :command command-identity
+                :startup-timeout startup-timeout))))
 
 (defun proofread-languagetool--reject-local-session-options
     (&optional buffer managed)

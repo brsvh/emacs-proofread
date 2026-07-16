@@ -172,12 +172,8 @@ CALLBACK-STATUS is the status plist passed to the URL callback."
     (cl-letf (((symbol-function 'executable-find)
                (lambda (_command) nil)))
       (let ((command-identity
-             (list
-              :fingerprint
-              (secure-hash
-               'sha256
-               (prin1-to-string
-                proofread-languagetool-command)))))
+             (proofread-languagetool--command-identity-for-snapshot
+              proofread-languagetool-command)))
         (should
          (equal
           (proofread-languagetool--identity)
@@ -282,6 +278,239 @@ CALLBACK-STATUS is the status plist passed to the URL callback."
                 first-session second-session)))))
       (delete-directory directory t))))
 
+(ert-deftest
+    proofread-languagetool-test-config-content-invalidates-cache-identity
+    ()
+  "Config content changes invalidate backend and cache identity."
+  (let* ((directory (make-temp-file "proofread-lt-content-" t))
+         (config (expand-file-name "languagetool.properties" directory))
+         (first-content
+          "apiKey=proofread-task12-secret-alpha\n")
+         (second-content
+          "apiKey=proofread-task12-secret-omega\n"))
+    (unwind-protect
+        (progn
+          (should (= (length first-content) (length second-content)))
+          (write-region first-content nil config nil 'silent)
+          (let ((proofread-languagetool-auto-start t)
+                (proofread-languagetool-command
+                 "proofread-languagetool-missing-test-command")
+                (proofread-languagetool-config-file config))
+            (cl-letf (((symbol-function 'executable-find)
+                       (lambda (_command) nil)))
+              (with-temp-buffer
+                (insert "Alpha")
+                (setq-local proofread-auto-check nil)
+                (proofread-mode 1)
+                (let* ((attributes (file-attributes config))
+                       (size (file-attribute-size attributes))
+                       (mtime
+                        (file-attribute-modification-time attributes))
+                       (chunk
+                        (proofread--make-request-ready-chunk
+                         (point-min) (point-max) "en-US"))
+                       (first-identity
+                        (proofread-languagetool--identity))
+                       (first-session
+                        (proofread-languagetool--server-session-snapshot))
+                       (first-request
+                        (proofread--make-backend-request
+                         chunk 'languagetool))
+                       (diagnostic
+                        '( :beg 1 :end 6 :text "Alpha"
+                           :kind grammar :message "Cached"
+                           :suggestions ("Beta")
+                           :source languagetool)))
+                  (proofread--cache-write-request
+                   first-request (list diagnostic))
+                  (should
+                   (proofread--cache-read-request
+                    (proofread--make-backend-request
+                     chunk 'languagetool)))
+                  (write-region second-content nil config nil 'silent)
+                  (set-file-times config mtime)
+                  (let* ((new-attributes (file-attributes config))
+                         (second-identity
+                          (proofread-languagetool--identity))
+                         (second-session
+                          (proofread-languagetool--server-session-snapshot))
+                         (second-request
+                          (proofread--make-backend-request
+                           chunk 'languagetool)))
+                    (should
+                     (= size
+                        (file-attribute-size new-attributes)))
+                    (should
+                     (time-equal-p
+                      mtime
+                      (file-attribute-modification-time
+                       new-attributes)))
+                    (should-not (equal first-identity second-identity))
+                    (should-not
+                     (proofread-languagetool--same-session-p
+                      first-session second-session))
+                    (should-not
+                     (equal (plist-get first-request :cache-key)
+                            (plist-get second-request :cache-key)))
+                    (should-not
+                     (proofread--cache-read-request second-request))))))))
+      (delete-directory directory t))))
+
+(ert-deftest
+    proofread-languagetool-test-unchanged-config-is-stable-and-safe ()
+  "Unchanged config content neither leaks nor restarts a ready server."
+  (proofread-languagetool-test--with-state
+   (let* ((directory (make-temp-file "proofread-lt-stable-" t))
+          (config (expand-file-name "languagetool.properties" directory))
+          (secret "proofread-task12-stable-secret")
+          (content (format "apiKey=%s\n" secret)))
+     (unwind-protect
+         (progn
+           (write-region content nil config nil 'silent)
+           (let ((proofread-languagetool-auto-start t)
+                 (proofread-languagetool-command
+                  "proofread-languagetool-missing-test-command")
+                 (proofread-languagetool-config-file config))
+             (cl-letf (((symbol-function 'executable-find)
+                        (lambda (_command) nil)))
+               (let* ((identity (proofread-languagetool--identity))
+                      (config-identity
+                       (plist-get identity :server-config))
+                      (digest
+                       (plist-get config-identity :content-digest))
+                      (session
+                       (proofread-languagetool--server-session-snapshot))
+                      (proofread-languagetool--server-state 'ready)
+                      (proofread-languagetool--server-session session)
+                      (proofread-languagetool--server-process
+                       'owned-process)
+                      (proofread-languagetool--server-process-session
+                       session)
+                      call events handle)
+                 (should
+                  (string-match-p
+                   "\\`[[:xdigit:]]\\{64\\}\\'" digest))
+                 (set-file-times
+                  config
+                  (time-add
+                   (file-attribute-modification-time
+                    (file-attributes config))
+                   10))
+                 (should (equal identity
+                                (proofread-languagetool--identity)))
+                 (should
+                  (proofread-languagetool--same-session-p
+                   session
+                   (proofread-languagetool--server-session-snapshot)))
+                 (should-not
+                  (string-match-p
+                   (regexp-quote secret)
+                   (prin1-to-string identity)))
+                 (cl-letf
+                     (((symbol-function
+                        'proofread-languagetool--begin-readiness-check)
+                       (lambda (&rest _ignored)
+                         (ert-fail "Stable config restarted readiness")))
+                      ((symbol-function
+                        'proofread-languagetool--stop-owned-process)
+                       (lambda ()
+                         (ert-fail "Stable config stopped its process")))
+                      ((symbol-function 'url-retrieve)
+                       (lambda (url _callback _arguments &rest _ignored)
+                         (setq call
+                               (list :url url
+                                     :method url-request-method
+                                     :buffer
+                                     (generate-new-buffer
+                                      " *proofread-lt-stable-config*")))
+                         (plist-get call :buffer))))
+                   (with-temp-buffer
+                     (let ((proofread-request-log-hook
+                            (list
+                             (lambda (event) (push event events)))))
+                       (setq handle
+                             (proofread-languagetool--check
+                              (proofread-languagetool-test--request)
+                              #'ignore))))
+                   (should (equal (plist-get call :method) "POST"))
+                   (should (string-suffix-p
+                            "/check" (plist-get call :url)))
+                   (should
+                    (eq proofread-languagetool--server-state 'ready))
+                   (let ((printed-events (prin1-to-string events)))
+                     (should-not
+                      (string-match-p
+                       (regexp-quote secret) printed-events))
+                     (should-not
+                      (string-match-p
+                       (regexp-quote content) printed-events)))
+                   (proofread-languagetool--cancel handle))))))
+       (delete-directory directory t)))))
+
+(ert-deftest
+    proofread-languagetool-test-config-rewrite-restarts-owned-server ()
+  "Explicit startup replaces an owned server after a config rewrite."
+  (proofread-languagetool-test--with-state
+   (let* ((directory (make-temp-file "proofread-lt-restart-" t))
+          (config (expand-file-name "languagetool.properties" directory))
+          (first-content "languageModel=alpha\n")
+          (second-content "languageModel=omega\n"))
+     (unwind-protect
+         (progn
+           (should (= (length first-content) (length second-content)))
+           (write-region first-content nil config nil 'silent)
+           (let ((proofread-languagetool-auto-start nil)
+                 (proofread-languagetool-command
+                  "proofread-languagetool-missing-test-command")
+                 (proofread-languagetool-config-file config))
+             (cl-letf (((symbol-function 'executable-find)
+                        (lambda (_command) nil)))
+               (let* ((old-session
+                       (proofread-languagetool--server-session-snapshot
+                        nil t))
+                      (attributes (file-attributes config))
+                      (mtime
+                       (file-attribute-modification-time attributes))
+                      (proofread-languagetool--server-state 'ready)
+                      (proofread-languagetool--server-session old-session)
+                      (proofread-languagetool--server-process
+                       'owned-process)
+                      (proofread-languagetool--server-process-session
+                       old-session)
+                      deleted scheduled)
+                 (write-region second-content nil config nil 'silent)
+                 (set-file-times config mtime)
+                 (cl-letf
+                     (((symbol-function 'process-live-p)
+                       (lambda (process) (eq process 'owned-process)))
+                      ((symbol-function 'set-process-query-on-exit-flag)
+                       #'ignore)
+                      ((symbol-function 'delete-process)
+                       (lambda (process) (setq deleted process)))
+                      ((symbol-function
+                        'proofread-languagetool--schedule-probe)
+                       (lambda (generation phase session delay)
+                         (setq scheduled
+                               (list generation phase session delay)))))
+                   (proofread-languagetool-start-server))
+                 (should (eq deleted 'owned-process))
+                 (should-not proofread-languagetool--server-process)
+                 (should-not
+                  proofread-languagetool--server-process-session)
+                 (should (eq proofread-languagetool--server-state
+                             'probing))
+                 (should proofread-languagetool--force-start-p)
+                 (should-not
+                  (proofread-languagetool--same-managed-session-p
+                   old-session proofread-languagetool--server-session))
+                 (should
+                  (equal scheduled
+                         (list
+                          proofread-languagetool--server-generation
+                          'external
+                          proofread-languagetool--server-session 0)))))))
+       (delete-directory directory t)))))
+
 (ert-deftest proofread-languagetool-test-snapshots-resolved-command ()
   "A resolvable managed command is fixed in the server session."
   (let ((executable (make-temp-file "proofread-lt-command-"))
@@ -327,6 +556,50 @@ The identity does not expose arguments."
             '( "different-missing-languagetool" "--fixed"))
       (should-not
        (equal first (proofread-languagetool--identity))))))
+
+(ert-deftest
+    proofread-languagetool-test-command-replacement-changes-identity ()
+  "Replacing a resolved executable at the same path changes identity."
+  (let* ((directory (make-temp-file "proofread-lt-command-content-" t))
+         (executable (expand-file-name "languagetool-server" directory))
+         (replacement (expand-file-name "replacement" directory))
+         (first-content "#!/bin/sh\nexit 0\n")
+         (second-content "#!/bin/sh\nexit 1\n")
+         (secret "proofread-task12-command-secret"))
+    (unwind-protect
+        (progn
+          (should (= (length first-content) (length second-content)))
+          (write-region first-content nil executable nil 'silent)
+          (write-region second-content nil replacement nil 'silent)
+          (set-file-modes executable #o700)
+          (set-file-modes replacement #o700)
+          (set-file-times
+           replacement
+           (file-attribute-modification-time
+            (file-attributes executable)))
+          (let* ((proofread-languagetool-auto-start t)
+                 (proofread-languagetool-command
+                  (list executable (concat "--token=" secret)))
+                 (first-identity (proofread-languagetool--identity))
+                 (first-session
+                  (proofread-languagetool--server-session-snapshot)))
+            (rename-file replacement executable t)
+            (let ((second-identity
+                   (proofread-languagetool--identity))
+                  (second-session
+                   (proofread-languagetool--server-session-snapshot)))
+              (should-not (equal first-identity second-identity))
+              (should-not
+               (proofread-languagetool--same-managed-session-p
+                first-session second-session))
+              (should
+               (equal (plist-get first-session :command)
+                      (plist-get second-session :command)))
+              (should-not
+               (string-match-p
+                (regexp-quote secret)
+                (prin1-to-string second-identity))))))
+      (delete-directory directory t))))
 
 (ert-deftest
     proofread-languagetool-test-external-identity-ignores-managed-options ()
@@ -2426,6 +2699,77 @@ It then restarts readiness for the current session."
            (should-not result)))))))
 
 ;;;; External and managed server integration
+
+(ert-deftest
+    proofread-languagetool-test-external-server-ignores-managed-files
+    ()
+  "External identity and readiness never inspect managed files."
+  (proofread-languagetool-test--with-state
+   (let ((proofread-languagetool-server-url
+          "https://example.test/languagetool/v2")
+         (proofread-languagetool-auto-start nil)
+         (proofread-languagetool-command
+          "/secret/first-languagetool-command")
+         (proofread-languagetool-config-file
+          "/secret/first-languagetool.properties"))
+     (cl-letf
+         (((symbol-function
+            'proofread-languagetool--file-content-digest)
+           (lambda (_file)
+             (ert-fail "External identity inspected a managed file"))))
+       (let ((identity (proofread-languagetool--identity))
+             (session
+              (proofread-languagetool--server-session-snapshot)))
+         (setq proofread-languagetool-command
+               "/secret/second-languagetool-command")
+         (setq proofread-languagetool-config-file
+               "/secret/second-languagetool.properties")
+         (should (equal identity
+                        (proofread-languagetool--identity)))
+         (should
+          (proofread-languagetool--same-session-p
+           session (proofread-languagetool--server-session-snapshot)))
+         (let ((proofread-languagetool--server-state 'ready)
+               (proofread-languagetool--server-session session)
+               call handle)
+           (cl-letf
+               (((symbol-function
+                  'proofread-languagetool--begin-readiness-check)
+                 (lambda (&rest _ignored)
+                   (ert-fail "External server readiness restarted")))
+                ((symbol-function
+                  'proofread-languagetool--stop-owned-process)
+                 (lambda ()
+                   (ert-fail "External server was stopped")))
+                ((symbol-function
+                  'proofread-languagetool--start-managed-server)
+                 (lambda (&rest _ignored)
+                   (ert-fail "External check started a managed server")))
+                ((symbol-function 'url-retrieve-synchronously)
+                 (lambda (&rest _ignored)
+                   (ert-fail "External version discovery was attempted")))
+                ((symbol-function 'url-retrieve)
+                 (lambda (url _callback _arguments &rest _ignored)
+                   (should-not call)
+                   (setq call
+                         (list :url url
+                               :method url-request-method
+                               :buffer
+                               (generate-new-buffer
+                                " *proofread-lt-external-managed*")))
+                   (plist-get call :buffer))))
+             (with-temp-buffer
+               (setq handle
+                     (proofread-languagetool--check
+                      (proofread-languagetool-test--request)
+                      #'ignore)))
+             (should (equal (plist-get call :method) "POST"))
+             (should
+              (equal (plist-get call :url)
+                     "https://example.test/languagetool/v2/check"))
+             (should (eq proofread-languagetool--server-state 'ready))
+             (should-not proofread-languagetool--server-process)
+             (proofread-languagetool--cancel handle))))))))
 
 (ert-deftest
     proofread-languagetool-test-external-check-ignores-managed-options
