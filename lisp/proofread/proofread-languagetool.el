@@ -1536,12 +1536,13 @@ Signal an error when STATUS is not a URL callback status plist."
     (with-current-buffer buffer
       (let ((inhibit-read-only t)
             (at-end-p (= (point) (point-max))))
-        (goto-char (point-max))
-        (insert output)
-        (when (> (buffer-size) proofread-languagetool--log-limit)
-          (delete-region
-           (point-min)
-           (- (point-max) proofread-languagetool--log-limit)))
+        (save-excursion
+          (goto-char (point-max))
+          (insert output)
+          (when (> (buffer-size) proofread-languagetool--log-limit)
+            (delete-region
+             (point-min)
+             (- (point-max) proofread-languagetool--log-limit))))
         (when at-end-p
           (goto-char (point-max)))))))
 

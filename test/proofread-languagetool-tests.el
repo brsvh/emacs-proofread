@@ -86,6 +86,28 @@ CALLBACK-STATUS is the status plist passed to the URL callback."
       (accept-process-output nil 0.01))
     result))
 
+(defun proofread-languagetool-test--server-log-snapshot
+    (point-offset)
+  "Return a filtered server-log snapshot from POINT-OFFSET.
+POINT-OFFSET is a zero-based offset or the symbol `end'."
+  (with-temp-buffer
+    (insert "abcdefgh")
+    (goto-char
+     (if (eq point-offset 'end)
+         (point-max)
+       (+ (point-min) point-offset)))
+    (let ((buffer (current-buffer)))
+      (cl-letf (((symbol-function 'process-buffer)
+                 (lambda (_process) buffer)))
+        (proofread-languagetool--process-filter
+         'proofread-languagetool-test-process "ijkl")))
+    (list :text (buffer-string)
+          :point (point)
+          :point-min (point-min)
+          :point-max (point-max)
+          :following
+          (buffer-substring-no-properties (point) (point-max)))))
+
 (defun proofread-languagetool-test--run-scheduled-probe ()
   "Run the currently scheduled LanguageTool probe immediately."
   (let ((token proofread-languagetool--probe-retry-token))
@@ -2561,6 +2583,37 @@ The reprobe never overwrites the process."
                  'languagetool-startup-failed)))))
 
 ;;;; Process and cancellation lifecycle
+
+(ert-deftest proofread-languagetool-test-server-log-follows-at-end ()
+  "Server output follows appended text when point was at the end."
+  (let* ((proofread-languagetool--log-limit 8)
+         (snapshot
+          (proofread-languagetool-test--server-log-snapshot 'end)))
+    (should (equal (plist-get snapshot :text) "efghijkl"))
+    (should (= (plist-get snapshot :point)
+               (plist-get snapshot :point-max)))))
+
+(ert-deftest
+    proofread-languagetool-test-server-log-preserves-retained-point ()
+  "Server output preserves point within text retained after truncation."
+  (let* ((proofread-languagetool--log-limit 8)
+         (snapshot
+          (proofread-languagetool-test--server-log-snapshot 6)))
+    (should (equal (plist-get snapshot :text) "efghijkl"))
+    (should (< (plist-get snapshot :point)
+               (plist-get snapshot :point-max)))
+    (should (equal (plist-get snapshot :following) "ghijkl"))))
+
+(ert-deftest
+    proofread-languagetool-test-server-log-clamps-truncated-point ()
+  "Server output clamps point whose previous text was truncated."
+  (let* ((proofread-languagetool--log-limit 8)
+         (snapshot
+          (proofread-languagetool-test--server-log-snapshot 1)))
+    (should (equal (plist-get snapshot :text) "efghijkl"))
+    (should (= (plist-get snapshot :point)
+               (plist-get snapshot :point-min)))
+    (should (equal (plist-get snapshot :following) "efghijkl"))))
 
 (ert-deftest
     proofread-languagetool-test-starting-process-exit-cleans-lifecycle
