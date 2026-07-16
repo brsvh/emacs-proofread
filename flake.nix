@@ -356,7 +356,7 @@
 
                             "${emacs-with-proofread}/bin/emacs" --batch \
                               --init-directory "$coreInitdir" \
-                              -l "${projectRoot + /test/proofread-tests.el}" \
+                              -l "${projectRoot + /test}/proofread-tests.el" \
                               -f ert-run-tests-batch-and-exit
 
                             "${emacs-with-proofread}/bin/emacs" --batch \

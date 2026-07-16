@@ -420,6 +420,21 @@ request-ready chunks."
 (defvar-local proofread--request-queue-tail nil
   "Last cons cell of `proofread--request-queue'.")
 
+(defvar-local proofread--request-queue-index nil
+  "Map cache keys to eq sets of queued request entries.")
+
+(defvar-local proofread--request-queue-links nil
+  "Map queued request entries to their queue cells and predecessors.")
+
+(defvar-local proofread--request-queue-sequences nil
+  "Map legacy queue entry identities to stable FIFO sequence numbers.")
+
+(defvar-local proofread--cache-woken-queue-entries nil
+  "Eq set of queued entries woken by an available cache entry.")
+
+(defvar-local proofread--next-request-queue-sequence 0
+  "Next FIFO sequence number for a queued request entry.")
+
 (defvar-local proofread--claimed-requests nil
   "Requests moving atomically from queued to active or complete.")
 
@@ -429,14 +444,17 @@ request-ready chunks."
 (defvar-local proofread--queue-dispatch-requested-p nil
   "Non-nil when queue dispatch was requested during dispatch.")
 
-(defvar-local proofread--queue-cache-scan-requested-p nil
-  "Non-nil when an active dispatch should scan past full requests.")
-
 (defvar-local proofread--queue-dispatch-timer nil
   "Timer scheduled to resume queued work after an edit.")
 
 (defvar proofread--inhibit-queue-dispatch nil
   "Buffer whose request lifecycle state is being changed atomically.")
+
+(defvar proofread--queue-dispatch-transaction nil
+  "Token for the dynamically active request queue dispatch transaction.")
+
+(defvar proofread--queue-dispatch-pruned-active-p nil
+  "Non-nil after the current dispatch pruned stale active requests.")
 
 (defvar proofread--clearing-scheduled-work nil
   "Buffer whose queued and scheduled work is being cleared.")
@@ -3347,6 +3365,8 @@ When BACKEND is nil, use `proofread-backend'."
                 (equal proofread--generation
                        (plist-get request :generation))
                 (proofread--latest-request-p request)
+                (not (proofread--request-state-flag-p
+                      request :cancelled))
                 (not (proofread--request-invalidated-p request)))))))
 
 (defun proofread--request-ready-to-submit-p (request)
@@ -3402,6 +3422,15 @@ Record REASON as the cancellation reason, defaulting to `stale'."
            (plist-get request :handle)))))
     (nreverse stale)))
 
+(defun proofread--request-cache-status (request)
+  "Apply REQUEST's current cache entry and return its queue status.
+Return `cached' or `stale' when an entry settles REQUEST, and nil when
+there is no applicable entry."
+  (when-let* ((entry (proofread--cache-read-request request)))
+    (pcase (proofread--apply-cache-entry request entry)
+      ('applied 'cached)
+      ('stale 'stale))))
+
 (defun proofread--submit-request (request backend)
   "Submit REQUEST through BACKEND when cache and concurrency permit.
 Return one of the symbols `sent', `cached', `full', `stale', or
@@ -3409,17 +3438,25 @@ Return one of the symbols `sent', `cached', `full', `stale', or
   (catch 'status
     (unless (proofread--request-ready-to-submit-p request)
       (throw 'status 'stale))
-    (when-let* ((entry (proofread--cache-read-request request)))
-      (pcase (proofread--apply-cache-entry request entry)
-        ('applied
-         (throw 'status 'cached))
-        ('stale
-         (throw 'status 'stale))))
+    (when-let* ((status (proofread--request-cache-status request)))
+      (throw 'status status))
     ;; Cache lifecycle hooks can enqueue a newer conflicting request.
     (unless (proofread--request-lifecycle-current-p request)
       (throw 'status 'stale))
     (unless (proofread--request-slot-available-p)
-      (proofread--prune-stale-active-requests)
+      (if proofread--queue-dispatch-transaction
+          (unless proofread--queue-dispatch-pruned-active-p
+            (setq proofread--queue-dispatch-pruned-active-p t)
+            (proofread--prune-stale-active-requests))
+        (proofread--prune-stale-active-requests))
+      (unless (proofread--request-lifecycle-current-p request)
+        (throw 'status 'stale))
+      ;; Pruning can run freshness, cancellation, and logging hooks while
+      ;; this request is claimed and therefore absent from the queue index.
+      ;; Consume a same-key cache write from those hooks before either
+      ;; submitting the backend request or restoring the queue entry.
+      (when-let* ((status (proofread--request-cache-status request)))
+        (throw 'status status))
       (unless (proofread--request-lifecycle-current-p request)
         (throw 'status 'stale))
       (unless (proofread--request-slot-available-p)
@@ -3432,24 +3469,122 @@ Return one of the symbols `sent', `cached', `full', `stale', or
        (result 'sent)
        (t 'error)))))
 
+(defun proofread--ensure-request-queue-bookkeeping ()
+  "Ensure request queue indexes exist in the current buffer."
+  (unless (hash-table-p proofread--request-queue-index)
+    (setq proofread--request-queue-index
+          (make-hash-table :test #'equal)))
+  (unless (hash-table-p proofread--request-queue-links)
+    (setq proofread--request-queue-links
+          (make-hash-table :test #'eq)))
+  (unless (hash-table-p proofread--request-queue-sequences)
+    (setq proofread--request-queue-sequences
+          (make-hash-table :test #'eq)))
+  (unless (hash-table-p proofread--cache-woken-queue-entries)
+    (setq proofread--cache-woken-queue-entries
+          (make-hash-table :test #'eq))))
+
+(defun proofread--request-queue-entry-sequence (entry)
+  "Return the stable FIFO sequence number for queue ENTRY."
+  (proofread--ensure-request-queue-bookkeeping)
+  (or (and (consp entry)
+           (plist-get entry :queue-sequence))
+      (gethash entry proofread--request-queue-sequences)
+      (let ((sequence (cl-incf proofread--next-request-queue-sequence)))
+        ;; Keep hand-constructed entries unchanged.  Production entries
+        ;; carry their sequence in the plist before entering eq indexes.
+        (puthash entry sequence proofread--request-queue-sequences)
+        sequence)))
+
+(defun proofread--request-queue-entry-cache-key (entry)
+  "Return the frozen cache key for queued request ENTRY."
+  (plist-get (plist-get entry :request) :cache-key))
+
+(defun proofread--index-request-queue-entry (entry)
+  "Add queued ENTRY to cache-key and cache-wakeup indexes."
+  (proofread--ensure-request-queue-bookkeeping)
+  (proofread--request-queue-entry-sequence entry)
+  (let* ((key (proofread--request-queue-entry-cache-key entry))
+         (bucket (gethash key proofread--request-queue-index)))
+    (unless bucket
+      (setq bucket (make-hash-table :test #'eq))
+      (puthash key bucket proofread--request-queue-index))
+    (puthash entry t bucket)
+    (when (proofread--cache-key-present-p key)
+      (puthash entry t proofread--cache-woken-queue-entries))))
+
+(defun proofread--unindex-request-queue-entry (entry)
+  "Remove queued ENTRY from cache-key and cache-wakeup indexes."
+  (when (hash-table-p proofread--request-queue-index)
+    (let* ((key (proofread--request-queue-entry-cache-key entry))
+           (bucket (gethash key proofread--request-queue-index)))
+      (when bucket
+        (remhash entry bucket)
+        (when (= (hash-table-count bucket) 0)
+          (remhash key proofread--request-queue-index)))))
+  (when (hash-table-p proofread--cache-woken-queue-entries)
+    (remhash entry proofread--cache-woken-queue-entries)))
+
+(defun proofread--link-request-queue-entry (entry cell previous)
+  "Index queued ENTRY at CELL following PREVIOUS queue cell."
+  (proofread--ensure-request-queue-bookkeeping)
+  (puthash entry (cons cell previous) proofread--request-queue-links)
+  (proofread--index-request-queue-entry entry))
+
+(defun proofread--rebuild-request-queue-bookkeeping ()
+  "Rebuild all indexes for the current request queue."
+  (proofread--ensure-request-queue-bookkeeping)
+  (clrhash proofread--request-queue-index)
+  (clrhash proofread--request-queue-links)
+  (clrhash proofread--cache-woken-queue-entries)
+  (let ((cell proofread--request-queue)
+        previous)
+    (while cell
+      (let ((entry (car cell)))
+        (proofread--link-request-queue-entry entry cell previous))
+      (setq previous cell)
+      (setq cell (cdr cell)))
+    (setq proofread--request-queue-tail previous)))
+
+(defun proofread--clear-request-queue-bookkeeping ()
+  "Clear request queue indexes in the current buffer."
+  (dolist (table (list proofread--request-queue-index
+                       proofread--request-queue-links
+                       proofread--request-queue-sequences
+                       proofread--cache-woken-queue-entries))
+    (when (hash-table-p table)
+      (clrhash table))))
+
+(defun proofread--append-request-queue-entry (entry)
+  "Append queue ENTRY while preserving constant-time tail insertion."
+  (proofread--ensure-request-queue-bookkeeping)
+  (let ((cell (list entry))
+        (previous proofread--request-queue-tail))
+    (if previous
+        (setcdr previous cell)
+      (setq proofread--request-queue cell))
+    (setq proofread--request-queue-tail cell)
+    (proofread--link-request-queue-entry entry cell previous)))
+
 (defun proofread--enqueue-requests (requests backend)
   "Append REQUESTS for BACKEND without running lifecycle hooks."
   (when (and requests (not (proofread--clearing-scheduled-work-p)))
-    (let* ((new-queue
-            (mapcar (lambda (request)
-                      (list :request request :backend backend))
-                    requests))
-           (new-tail (last new-queue)))
-      (if proofread--request-queue-tail
-          (setcdr proofread--request-queue-tail new-queue)
-        (setq proofread--request-queue new-queue))
-      (setq proofread--request-queue-tail new-tail)
-      (dolist (request requests)
-        (puthash (proofread--request-work-key request)
-                 (plist-get request :log-id)
-                 proofread--pending-request-keys))
-      (when proofread--queue-dispatch-active-p
-        (setq proofread--queue-dispatch-requested-p t)))
+    (when (and proofread--request-queue
+               (or (not (hash-table-p proofread--request-queue-links))
+                   (= (hash-table-count proofread--request-queue-links)
+                      0)))
+      (proofread--rebuild-request-queue-bookkeeping))
+    (dolist (request requests)
+      (proofread--append-request-queue-entry
+       (list :request request
+             :backend backend
+             :queue-sequence
+             (cl-incf proofread--next-request-queue-sequence)))
+      (puthash (proofread--request-work-key request)
+               (plist-get request :log-id)
+               proofread--pending-request-keys))
+    (when proofread--queue-dispatch-active-p
+      (setq proofread--queue-dispatch-requested-p t))
     requests))
 
 (defun proofread--reject-request-during-clear (request)
@@ -3580,6 +3715,7 @@ cancel handles, or schedule work."
     (setq proofread--request-queue (nreverse retained-queue))
     (setq proofread--request-queue-tail
           (last proofread--request-queue))
+    (proofread--rebuild-request-queue-bookkeeping)
     (list :active selected-active
           :claimed selected-claimed
           :queued selected-queued)))
@@ -3661,18 +3797,43 @@ hooks or call backend cancellation functions."
     (when (and invalid-active proofread--request-queue)
       (proofread--schedule-queue-dispatch))))
 
-(defun proofread--pop-request-queue ()
-  "Remove and return the first queued request entry."
-  (let ((entry (pop proofread--request-queue)))
-    (unless proofread--request-queue
-      (setq proofread--request-queue-tail nil))
+(defun proofread--unlink-request-queue-entry (entry)
+  "Remove queued ENTRY in constant time and return it.
+Return nil when ENTRY is no longer queued."
+  (when (and proofread--request-queue
+             (or (not (hash-table-p proofread--request-queue-links))
+                 (= (hash-table-count proofread--request-queue-links)
+                    0)))
+    (proofread--rebuild-request-queue-bookkeeping))
+  (when-let* ((link (and (hash-table-p proofread--request-queue-links)
+                         (gethash entry proofread--request-queue-links))))
+    (let* ((cell (car link))
+           (previous (cdr link))
+           (next (cdr cell)))
+      (if previous
+          (setcdr previous next)
+        (setq proofread--request-queue next))
+      (if next
+          (when-let* ((next-link
+                       (gethash (car next)
+                                proofread--request-queue-links)))
+            (setcdr next-link previous))
+        (setq proofread--request-queue-tail previous))
+      (proofread--unindex-request-queue-entry entry)
+      (remhash entry proofread--request-queue-links)
+      entry)))
+
+(defun proofread--claim-request-queue-entry (entry)
+  "Move queued ENTRY into claimed state and return it."
+  (when (proofread--unlink-request-queue-entry entry)
+    (push (plist-get entry :request) proofread--claimed-requests)
     entry))
 
 (defun proofread--claim-request-queue-head ()
   "Move and return the first queue entry into claimed state."
-  (when-let* ((entry (proofread--pop-request-queue)))
-    (push (plist-get entry :request) proofread--claimed-requests)
-    entry))
+  (when proofread--request-queue
+    (proofread--claim-request-queue-entry
+     (car proofread--request-queue))))
 
 (defun proofread--release-claimed-request
     (request &optional forget-work)
@@ -3683,22 +3844,165 @@ When FORGET-WORK is non-nil, also release its pending-work identity."
   (when forget-work
     (proofread--forget-request-work request)))
 
-(defun proofread--append-request-queue-entry (entry)
-  "Append queue ENTRY while preserving constant-time tail insertion."
-  (let ((cell (list entry)))
-    (if proofread--request-queue-tail
-        (setcdr proofread--request-queue-tail cell)
-      (setq proofread--request-queue cell))
-    (setq proofread--request-queue-tail cell)))
+(defun proofread--prepend-request-queue-entry
+    (entry &optional suppress-cache-wakeup)
+  "Put ENTRY at the head of the request queue.
+When SUPPRESS-CACHE-WAKEUP is non-nil, do not retry the cache entry
+that was already considered while ENTRY was claimed."
+  (proofread--ensure-request-queue-bookkeeping)
+  (let ((cell (list entry))
+        (next proofread--request-queue))
+    (setcdr cell next)
+    (setq proofread--request-queue cell)
+    (if next
+        (when-let* ((next-link
+                     (gethash (car next)
+                              proofread--request-queue-links)))
+          (setcdr next-link cell))
+      (setq proofread--request-queue-tail cell))
+    (proofread--link-request-queue-entry entry cell nil)
+    (when suppress-cache-wakeup
+      (remhash entry proofread--cache-woken-queue-entries))))
 
-(defun proofread--drain-request-queue (&optional scan-cache)
-  "Drain ready queued requests and return those sent to the backend.
-When SCAN-CACHE is non-nil, rotate full requests once so later cache
-hits can be applied without a backend slot."
-  (let ((remaining (length proofread--request-queue))
-        requests)
-    (while (and (> remaining 0) proofread--request-queue)
-      (setq remaining (1- remaining))
+(defun proofread--insert-request-queue-entry
+    (entry &optional suppress-cache-wakeup)
+  "Restore ENTRY to its FIFO position in the request queue.
+When SUPPRESS-CACHE-WAKEUP is non-nil, do not retry a cache entry that
+was already considered while ENTRY was claimed."
+  (let ((sequence (proofread--request-queue-entry-sequence entry))
+        (cell proofread--request-queue))
+    (while (and cell
+                (< (proofread--request-queue-entry-sequence (car cell))
+                   sequence))
+      (setq cell (cdr cell)))
+    (if (null cell)
+        (proofread--append-request-queue-entry entry)
+      (let* ((next-entry (car cell))
+             (next-link (gethash next-entry
+                                 proofread--request-queue-links))
+             (previous (cdr next-link))
+             (new-cell (list entry)))
+        (setcdr new-cell cell)
+        (if previous
+            (setcdr previous new-cell)
+          (setq proofread--request-queue new-cell))
+        (setcdr next-link new-cell)
+        (proofread--link-request-queue-entry
+         entry new-cell previous)))
+    (when suppress-cache-wakeup
+      (remhash entry proofread--cache-woken-queue-entries))))
+
+(defun proofread--cache-wakeup-pending-p ()
+  "Return non-nil when exact queued cache hits await dispatch."
+  (and (hash-table-p proofread--cache-woken-queue-entries)
+       (> (hash-table-count proofread--cache-woken-queue-entries) 0)))
+
+(defun proofread--queue-dispatch-transaction-current-p ()
+  "Return non-nil when the dynamic dispatch still owns buffer state."
+  (or (null proofread--queue-dispatch-transaction)
+      (eq proofread--queue-dispatch-active-p
+          proofread--queue-dispatch-transaction)))
+
+(defun proofread--claimed-request-restorable-p (request)
+  "Return non-nil when claimed REQUEST may safely return to the queue."
+  (and (proofread--queue-dispatch-transaction-current-p)
+       (memq request proofread--claimed-requests)
+       (proofread--request-lifecycle-current-p request)))
+
+(defun proofread--retire-unrestorable-claimed-request (request)
+  "Retire claimed REQUEST after a reentrant lifecycle change."
+  (proofread--release-claimed-request request t)
+  (proofread--record-request-cancellation
+   request
+   (if (proofread--request-state-flag-p request :superseded)
+       'superseded
+     'stale)))
+
+(defun proofread--cache-woken-entry< (left right)
+  "Return non-nil when queue entry LEFT precedes RIGHT."
+  (< (proofread--request-queue-entry-sequence left)
+     (proofread--request-queue-entry-sequence right)))
+
+(defun proofread--cache-woken-request-status (request)
+  "Apply REQUEST's exact cache entry and return its queue status.
+Return one of `cached', `miss', or `stale'.  This function never sends
+REQUEST to a backend."
+  (catch 'status
+    (unless (proofread--request-ready-to-submit-p request)
+      (throw 'status 'stale))
+    (unless (proofread--request-lifecycle-current-p request)
+      (throw 'status 'stale))
+    (when-let* ((status (proofread--request-cache-status request)))
+      (throw 'status status))
+    'miss))
+
+(defun proofread--claim-current-cache-woken-entry (entry)
+  "Claim woken ENTRY only while its exact cache entry remains available."
+  (when (and (proofread--queue-dispatch-transaction-current-p)
+             (hash-table-p proofread--cache-woken-queue-entries)
+             (gethash entry proofread--cache-woken-queue-entries))
+    (if (proofread--cache-key-present-p
+         (proofread--request-queue-entry-cache-key entry))
+        (let ((claimed
+               (proofread--claim-request-queue-entry entry)))
+          (unless claimed
+            (remhash entry proofread--cache-woken-queue-entries))
+          claimed)
+      (remhash entry proofread--cache-woken-queue-entries)
+      nil)))
+
+(defun proofread--drain-cache-woken-requests ()
+  "Apply exact queued cache hits and return the number claimed.
+Do not scan unrelated requests."
+  (let (entries
+        (claimed-count 0))
+    (when (and (proofread--queue-dispatch-transaction-current-p)
+               (hash-table-p proofread--cache-woken-queue-entries))
+      (maphash (lambda (entry _value)
+                 (push entry entries))
+               proofread--cache-woken-queue-entries))
+    (setq entries (sort entries #'proofread--cache-woken-entry<))
+    (dolist (entry entries)
+      ;; Lifecycle hooks from an earlier hit may already have removed
+      ;; this exact entry or invalidated its cache wakeup.
+      (when-let* ((claimed
+                   (proofread--claim-current-cache-woken-entry entry))
+                  (request (plist-get claimed :request)))
+        (setq claimed-count (1+ claimed-count))
+        (unwind-protect
+            (pcase (proofread--cache-woken-request-status request)
+              ('cached
+               (proofread--release-claimed-request request t))
+              ('stale
+               (proofread--release-claimed-request request t)
+               (proofread--record-request-cancellation
+                request
+                (if (proofread--request-state-flag-p
+                     request :superseded)
+                    'superseded
+                  'stale)))
+              ('miss
+               ;; Cache eviction or a defensive text mismatch must not
+               ;; promote this request ahead of unrelated FIFO work.
+               (if (proofread--claimed-request-restorable-p request)
+                   (progn
+                     (proofread--insert-request-queue-entry entry t)
+                     (proofread--release-claimed-request request))
+                 (proofread--retire-unrestorable-claimed-request
+                  request))))
+          (when (memq request proofread--claimed-requests)
+            (proofread--release-claimed-request request t)
+            (proofread--record-request-cancellation
+             request 'error)))))
+    claimed-count))
+
+(defun proofread--drain-request-queue ()
+  "Drain FIFO-ready queued requests and return those sent to backends."
+  (let (requests
+        full)
+    (while (and (not full)
+                (proofread--queue-dispatch-transaction-current-p)
+                proofread--request-queue)
       (let* ((entry (proofread--claim-request-queue-head))
              (request (plist-get entry :request))
              (backend (plist-get entry :backend)))
@@ -3708,13 +4012,15 @@ hits can be applied without a backend slot."
                (proofread--release-claimed-request request)
                (push request requests))
               ('full
-               ;; Requeue before releasing the claim so edit hooks
-               ;; always see the request in one pending lifecycle
-               ;; state.
-               (proofread--append-request-queue-entry entry)
-               (proofread--release-claimed-request request)
-               (unless scan-cache
-                 (setq remaining 0)))
+               ;; The current cache state was already considered by
+               ;; submission.  Keep unrelated work in strict FIFO order.
+               (if (proofread--claimed-request-restorable-p request)
+                   (progn
+                     (proofread--prepend-request-queue-entry entry t)
+                     (proofread--release-claimed-request request))
+                 (proofread--retire-unrestorable-claimed-request
+                  request))
+               (setq full t))
               ((or 'cached 'error)
                (proofread--release-claimed-request request t))
               ('stale
@@ -3733,45 +4039,43 @@ hits can be applied without a backend slot."
              request 'error)))))
     (nreverse requests)))
 
-(defun proofread--dispatch-queued-requests (&optional scan-cache)
-  "Dispatch queued work, optionally scanning past full requests.
-Return requests sent to the backend.  SCAN-CACHE has the meaning
-documented by `proofread--drain-request-queue'."
+(defun proofread--dispatch-queued-requests ()
+  "Dispatch queued work and return requests sent to backends."
   (cond
    ((proofread--queue-dispatch-inhibited-p)
-    (when scan-cache
-      (setq proofread--queue-cache-scan-requested-p t))
     ;; The dynamic inhibition may belong to another source buffer.
     ;; Ensure this buffer resumes after that lifecycle transaction
     ;; unwinds.
     (proofread--schedule-queue-dispatch))
    (proofread--queue-dispatch-active-p
-    (when scan-cache
-      (setq proofread--queue-dispatch-requested-p t)
-      (setq proofread--queue-cache-scan-requested-p t)))
+    (setq proofread--queue-dispatch-requested-p t))
    (t
-    (setq proofread--queue-dispatch-active-p t)
-    (unwind-protect
-        (let ((continue t)
-              (scan-cache
-               (or scan-cache
-                   proofread--queue-cache-scan-requested-p))
-              dispatched)
-          (setq proofread--queue-cache-scan-requested-p nil)
-          (while continue
-            (setq proofread--queue-dispatch-requested-p nil)
-            (setq dispatched
-                  (nconc dispatched
-                         (proofread--drain-request-queue scan-cache)))
-            (setq scan-cache proofread--queue-cache-scan-requested-p)
-            (setq proofread--queue-cache-scan-requested-p nil)
-            (setq continue
-                  (or proofread--queue-dispatch-requested-p
-                      scan-cache)))
-          dispatched)
-      (setq proofread--queue-dispatch-active-p nil)
-      (setq proofread--queue-dispatch-requested-p nil)
-      (setq proofread--queue-cache-scan-requested-p nil)))))
+    (let ((transaction (make-symbol "proofread-queue-dispatch")))
+      (setq proofread--queue-dispatch-active-p transaction)
+      (unwind-protect
+          (let ((proofread--queue-dispatch-transaction transaction)
+                (proofread--queue-dispatch-pruned-active-p nil)
+                (continue t)
+                dispatched)
+            (while (and continue
+                        (eq proofread--queue-dispatch-active-p
+                            transaction))
+              (setq proofread--queue-dispatch-requested-p nil)
+              (setq dispatched
+                    (nconc dispatched
+                           (proofread--drain-request-queue)))
+              (let ((cache-claims
+                     (proofread--drain-cache-woken-requests)))
+                (setq continue
+                      (or proofread--queue-dispatch-requested-p
+                          (proofread--cache-wakeup-pending-p)
+                          (> cache-claims 0)))))
+            dispatched)
+        ;; Mode teardown and reinitialization replace transaction state.
+        ;; An old unwind must not clear a newer generation's dispatcher.
+        (when (eq proofread--queue-dispatch-active-p transaction)
+          (setq proofread--queue-dispatch-active-p nil)
+          (setq proofread--queue-dispatch-requested-p nil)))))))
 
 (defun proofread--request-range-valid-p (request)
   "Return non-nil if REQUEST range is valid in the current buffer."
@@ -4006,6 +4310,41 @@ When BACKEND is nil, use the selected `proofread-backend'."
       (setq proofread--cache (make-hash-table :test #'equal)))
     proofread--cache))
 
+(defun proofread--cache-key-present-p (key)
+  "Return non-nil when the enabled cache has KEY."
+  (and (> proofread-cache-max-entries 0)
+       (hash-table-p proofread--cache)
+       (let ((missing (make-symbol "missing")))
+         (not (eq (gethash key proofread--cache missing)
+                  missing)))))
+
+(defun proofread--wake-queued-cache-key (key)
+  "Wake only queued entries that can consume cache KEY."
+  (when (and (hash-table-p proofread--request-queue-index)
+             (hash-table-p proofread--cache-woken-queue-entries))
+    (when-let* ((bucket (gethash key proofread--request-queue-index)))
+      (maphash
+       (lambda (entry _value)
+         (puthash entry t proofread--cache-woken-queue-entries))
+       bucket)
+      (when proofread--queue-dispatch-active-p
+        (setq proofread--queue-dispatch-requested-p t)))))
+
+(defun proofread--forget-queued-cache-key (key)
+  "Forget pending cache wakeups for queued entries using KEY."
+  (when (and (hash-table-p proofread--request-queue-index)
+             (hash-table-p proofread--cache-woken-queue-entries))
+    (when-let* ((bucket (gethash key proofread--request-queue-index)))
+      (maphash
+       (lambda (entry _value)
+         (remhash entry proofread--cache-woken-queue-entries))
+       bucket))))
+
+(defun proofread--clear-queued-cache-wakeups ()
+  "Clear every pending exact cache-to-queue wakeup."
+  (when (hash-table-p proofread--cache-woken-queue-entries)
+    (clrhash proofread--cache-woken-queue-entries)))
+
 (defun proofread--cache-read (key)
   "Return diagnostic cache entry for KEY in the current buffer."
   (let ((cache (proofread--ensure-cache)))
@@ -4028,9 +4367,9 @@ When BACKEND is nil, use the selected `proofread-backend'."
         (let ((oldest (car (last proofread--cache-order))))
           (setq proofread--cache-order
                 (butlast proofread--cache-order))
-          (remhash oldest cache)))
-      (when proofread--request-queue
-        (setq proofread--queue-cache-scan-requested-p t))
+          (remhash oldest cache)
+          (proofread--forget-queued-cache-key oldest)))
+      (proofread--wake-queued-cache-key key)
       value)))
 
 (defun proofread--diagnostic-to-relative (diagnostic request)
@@ -4324,7 +4663,7 @@ CHUNKS, BACKEND, PROFILE, and IDENTITIES describe the work.  Return
           (dolist (request requests)
             (proofread--reject-request-during-clear request))))
       (when enqueued
-        (proofread--dispatch-queued-requests t)))))
+        (proofread--dispatch-queued-requests)))))
 
 (defun proofread--dispatch-request-ready-chunks
     (chunks &optional backend checker profile)
@@ -4513,6 +4852,7 @@ of later requests can continue."
     (setq proofread--claimed-requests nil)
     (setq proofread--request-queue nil)
     (setq proofread--request-queue-tail nil)
+    (proofread--clear-request-queue-bookkeeping)
     (dolist (request requests)
       (proofread--forget-request-work request)
       (proofread--record-request-cancellation request)))
@@ -6834,10 +7174,18 @@ DIAGNOSTICS must be in navigation order.  Return `applied'."
   (setq-local proofread--active-requests nil)
   (setq-local proofread--request-queue nil)
   (setq-local proofread--request-queue-tail nil)
+  (setq-local proofread--request-queue-index
+              (make-hash-table :test #'equal))
+  (setq-local proofread--request-queue-links
+              (make-hash-table :test #'eq))
+  (setq-local proofread--request-queue-sequences
+              (make-hash-table :test #'eq))
+  (setq-local proofread--cache-woken-queue-entries
+              (make-hash-table :test #'eq))
+  (setq-local proofread--next-request-queue-sequence 0)
   (setq-local proofread--claimed-requests nil)
   (setq-local proofread--queue-dispatch-active-p nil)
   (setq-local proofread--queue-dispatch-requested-p nil)
-  (setq-local proofread--queue-cache-scan-requested-p nil)
   (setq-local proofread--queue-dispatch-timer nil)
   (setq-local proofread--pending-request-keys
               (make-hash-table :test #'equal))
@@ -6855,10 +7203,14 @@ DIAGNOSTICS must be in navigation order.  Return `applied'."
   (proofread--clear-diagnostics)
   (setq proofread--request-queue nil)
   (setq proofread--request-queue-tail nil)
+  (setq proofread--request-queue-index nil)
+  (setq proofread--request-queue-links nil)
+  (setq proofread--request-queue-sequences nil)
+  (setq proofread--cache-woken-queue-entries nil)
+  (setq proofread--next-request-queue-sequence 0)
   (setq proofread--claimed-requests nil)
   (setq proofread--queue-dispatch-active-p nil)
   (setq proofread--queue-dispatch-requested-p nil)
-  (setq proofread--queue-cache-scan-requested-p nil)
   (setq proofread--queue-dispatch-timer nil)
   (setq proofread--pending-request-keys nil)
   (setq proofread--next-request-id 0)
@@ -7430,6 +7782,7 @@ buffer."
   (when (hash-table-p proofread--cache)
     (clrhash proofread--cache))
   (setq proofread--cache-order nil)
+  (proofread--clear-queued-cache-wakeups)
   (message "proofread: cleared diagnostic cache"))
 
 ;;;; Unloading

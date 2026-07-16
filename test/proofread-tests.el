@@ -25,6 +25,10 @@
 (defconst proofread-test--checker 'proofread-test-checker
   "Checker symbol used by core Proofread tests.")
 
+(defconst proofread-test--directory
+  (file-name-directory (or load-file-name buffer-file-name))
+  "Directory containing the core Proofread test fixtures.")
+
 (defvar proofread-test--backend-identity-token
   'proofread-test-identity
   "Stable identity token used by the test backend.")
@@ -301,6 +305,64 @@ CHECKER-ORDER defaults to first followed by second."
               (plist-get entry :request))
             proofread--request-queue))))
 
+(defun proofread-test--assert-queue-cache-index-consistent ()
+  "Assert that request queue links and cache-key indexes agree."
+  (let ((queued (make-hash-table :test #'eq))
+        (cell proofread--request-queue)
+        previous
+        (queue-count 0)
+        (indexed-count 0))
+    (when cell
+      (should (hash-table-p proofread--request-queue-index))
+      (should (hash-table-p proofread--request-queue-links))
+      (should (hash-table-p proofread--cache-woken-queue-entries)))
+    (while cell
+      (let* ((entry (car cell))
+             (link (gethash entry proofread--request-queue-links))
+             (key (proofread--request-queue-entry-cache-key entry))
+             (bucket (gethash key proofread--request-queue-index)))
+        (should-not (gethash entry queued))
+        (puthash entry t queued)
+        (should link)
+        (should (eq (car link) cell))
+        (should (eq (cdr link) previous))
+        (should (natnump
+                 (proofread--request-queue-entry-sequence entry)))
+        (should (hash-table-p bucket))
+        (should (gethash entry bucket)))
+      (setq queue-count (1+ queue-count))
+      (setq previous cell)
+      (setq cell (cdr cell)))
+    (should (eq proofread--request-queue-tail previous))
+    (when (hash-table-p proofread--request-queue-links)
+      (should (= (hash-table-count proofread--request-queue-links)
+                 queue-count))
+      (maphash
+       (lambda (entry _link)
+         (should (gethash entry queued)))
+       proofread--request-queue-links))
+    (when (hash-table-p proofread--request-queue-index)
+      (maphash
+       (lambda (key bucket)
+         (should (hash-table-p bucket))
+         (should (> (hash-table-count bucket) 0))
+         (maphash
+          (lambda (entry _value)
+            (setq indexed-count (1+ indexed-count))
+            (should (gethash entry queued))
+            (should (equal
+                     key
+                     (proofread--request-queue-entry-cache-key
+                      entry))))
+          bucket))
+       proofread--request-queue-index)
+      (should (= indexed-count queue-count)))
+    (when (hash-table-p proofread--cache-woken-queue-entries)
+      (maphash
+       (lambda (entry _value)
+         (should (gethash entry queued)))
+       proofread--cache-woken-queue-entries))))
+
 (defun proofread-test--assert-requests-settled (requests)
   "Assert that REQUESTS and current scheduler state are settled."
   (dolist (request requests)
@@ -319,7 +381,7 @@ CHECKER-ORDER defaults to first followed by second."
   (should-not proofread--request-queue-tail)
   (should-not proofread--queue-dispatch-active-p)
   (should-not proofread--queue-dispatch-requested-p)
-  (should-not proofread--queue-cache-scan-requested-p)
+  (proofread-test--assert-queue-cache-index-consistent)
   (should (zerop (hash-table-count proofread--pending-request-keys))))
 
 (defun proofread-test--assert-one-checker-report (reports)
@@ -576,6 +638,7 @@ When PROFILE is nil, use the current profile."
   (should-not proofread--claimed-requests)
   (should-not proofread--request-queue)
   (should-not proofread--request-queue-tail)
+  (proofread-test--assert-queue-cache-index-consistent)
   (should
    (zerop (hash-table-count proofread--pending-request-keys))))
 
@@ -11514,6 +11577,520 @@ This covers URLs, email, invisible text, faces, and properties."
                proofread--diagnostics)
               (list new-diagnostic))))))
 
+(ert-deftest
+    proofread-test-cache-write-wakes-only-matching-queued-entries ()
+  "Wake every matching cache waiter without reordering other work."
+  (with-temp-buffer
+    (insert "bb aa cc aa")
+    (let ((proofread-auto-check nil)
+          (proofread-context-size 0)
+          (proofread-max-concurrent-requests 0)
+          cache-hit-log-ids
+          (prune-calls 0)
+          (reentrant-dispatches 0))
+      (proofread-mode 1)
+      (proofread-test--with-profile
+       (let* ((chunks
+               (proofread-test--request-ready-chunks-for-ranges
+                '((1 . 3) (4 . 6) (7 . 9) (10 . 12))))
+              (unrelated-a
+               (proofread-test--make-profile-request
+                (nth 0 chunks)))
+              (matching-a
+               (proofread-test--make-profile-request
+                (nth 1 chunks)))
+              (unrelated-b
+               (proofread-test--make-profile-request
+                (nth 2 chunks)))
+              (matching-b
+               (proofread-test--make-profile-request
+                (nth 3 chunks)))
+              (requests
+               (list unrelated-a matching-a unrelated-b matching-b))
+              entries
+              (proofread-request-log-hook
+               (list
+                (lambda (event)
+                  (when (eq (plist-get event :type) 'cache-hit)
+                    (push (plist-get event :log-id)
+                          cache-hit-log-ids))))))
+         (should (equal (plist-get matching-a :cache-key)
+                        (plist-get matching-b :cache-key)))
+         (should-not (equal (plist-get matching-a :cache-key)
+                            (plist-get unrelated-a :cache-key)))
+         (proofread--enqueue-requests
+          requests proofread-test--backend)
+         (setq entries (copy-sequence proofread--request-queue))
+         (proofread-test--assert-queue-cache-index-consistent)
+         (proofread--cache-write-request matching-a nil)
+         (should (= (hash-table-count
+                     proofread--cache-woken-queue-entries)
+                    2))
+         (add-hook
+          'proofread-diagnostics-changed-hook
+          (lambda ()
+            (setq reentrant-dispatches (1+ reentrant-dispatches))
+            (proofread--dispatch-queued-requests))
+          nil t)
+         (let ((original-prune
+                (symbol-function
+                 'proofread--prune-stale-active-requests)))
+           (cl-letf
+               (((symbol-function
+                  'proofread--prune-stale-active-requests)
+                 (lambda ()
+                   (setq prune-calls (1+ prune-calls))
+                   (funcall original-prune))))
+             (should-not (proofread--dispatch-queued-requests))))
+         (should (= prune-calls 1))
+         (should (= reentrant-dispatches 2))
+         (should
+          (equal (nreverse cache-hit-log-ids)
+                 (list (plist-get matching-a :log-id)
+                       (plist-get matching-b :log-id))))
+         (should (= (length proofread--request-queue) 2))
+         (should (eq (nth 0 proofread--request-queue)
+                     (nth 0 entries)))
+         (should (eq (nth 1 proofread--request-queue)
+                     (nth 2 entries)))
+         (should (proofread--request-work-pending-p unrelated-a))
+         (should (proofread--request-work-pending-p unrelated-b))
+         (should-not (proofread--request-work-pending-p matching-a))
+         (should-not (proofread--request-work-pending-p matching-b))
+         (proofread-test--assert-queue-cache-index-consistent))))))
+
+(ert-deftest
+    proofread-test-cache-queue-index-follows-lifecycle-removal ()
+  "Keep exact cache wakeups synchronized through lifecycle removal."
+  (with-temp-buffer
+    (insert "aa bb")
+    (let ((proofread-auto-check nil)
+          (proofread-context-size 0)
+          (proofread-max-concurrent-requests 0))
+      (proofread-mode 1)
+      (proofread-test--with-profile
+       (let* ((chunks
+               (proofread-test--request-ready-chunks-for-ranges
+                '((1 . 3) (4 . 6))))
+              (request-a
+               (proofread-test--make-profile-request
+                (nth 0 chunks)))
+              (request-b
+               (proofread-test--make-profile-request
+                (nth 1 chunks)))
+              (newer-a
+               (proofread-test--make-profile-request
+                (nth 0 chunks)))
+              (entry-b nil)
+              superseded)
+         (proofread--enqueue-requests
+          (list request-a request-b) proofread-test--backend)
+         (setq entry-b (nth 1 proofread--request-queue))
+         (proofread--cache-write-request request-a nil)
+         (should (= (hash-table-count
+                     proofread--cache-woken-queue-entries)
+                    1))
+         (setq superseded
+               (proofread--supersede-conflicting-requests
+                (list newer-a)))
+         (should (equal (plist-get superseded :queued)
+                        (list request-a)))
+         (should-not
+          (gethash (plist-get request-a :cache-key)
+                   proofread--request-queue-index))
+         (should (eq (car proofread--request-queue) entry-b))
+         (should-not (proofread--cache-wakeup-pending-p))
+         (proofread-test--assert-queue-cache-index-consistent)
+         (proofread--finish-superseded-requests superseded)
+         (should (proofread--request-state-flag-p
+                  request-a :cancelled))
+
+         (proofread--cache-write-request request-b nil)
+         (should (proofread--cache-wakeup-pending-p))
+         (proofread-clear-cache)
+         (should-not (proofread--cache-wakeup-pending-p))
+         (should (eq (car proofread--request-queue) entry-b))
+         (should
+          (gethash (plist-get request-b :cache-key)
+                   proofread--request-queue-index))
+         (proofread-test--assert-queue-cache-index-consistent)
+
+         (proofread--cache-write-request request-b nil)
+         (should (proofread--cache-wakeup-pending-p))
+         (proofread--clear-scheduled-work)
+         (should (proofread--request-state-flag-p
+                  request-b :cancelled))
+         (proofread-test--assert-no-pending-request-work))))))
+
+(ert-deftest
+    proofread-test-cache-wakeup-rechecks-after-reentrant-clear ()
+  "Skip invalidated wakeup snapshots after a cache-hit hook clears cache."
+  (with-temp-buffer
+    (insert "xx aa aa")
+    (let ((proofread-auto-check nil)
+          (proofread-context-size 0)
+          (proofread-max-concurrent-requests 0)
+          cleared
+          cache-hit-log-ids
+          (insert-calls 0))
+      (proofread-mode 1)
+      (proofread-test--with-profile
+       (let* ((chunks
+               (proofread-test--request-ready-chunks-for-ranges
+                '((1 . 3) (4 . 6) (7 . 9))))
+              (unrelated
+               (proofread-test--make-profile-request
+                (nth 0 chunks)))
+              (matching-a
+               (proofread-test--make-profile-request
+                (nth 1 chunks)))
+              (matching-b
+               (proofread-test--make-profile-request
+                (nth 2 chunks)))
+              (requests (list unrelated matching-a matching-b))
+              entries
+              (proofread-request-log-hook
+               (list
+                (lambda (event)
+                  (when (eq (plist-get event :type) 'cache-hit)
+                    (push (plist-get event :log-id)
+                          cache-hit-log-ids))))))
+         (proofread--enqueue-requests
+          requests proofread-test--backend)
+         (setq entries (copy-sequence proofread--request-queue))
+         (proofread--cache-write-request matching-a nil)
+         (add-hook
+          'proofread-diagnostics-changed-hook
+          (lambda ()
+            (unless cleared
+              (setq cleared t)
+              (proofread-clear-cache)))
+          nil t)
+         (let ((original-insert
+                (symbol-function
+                 'proofread--insert-request-queue-entry)))
+           (cl-letf
+               (((symbol-function
+                  'proofread--insert-request-queue-entry)
+                 (lambda (&rest arguments)
+                   (setq insert-calls (1+ insert-calls))
+                   (apply original-insert arguments))))
+             (should-not (proofread--dispatch-queued-requests))))
+         (should cleared)
+         (should (= insert-calls 0))
+         (should (equal cache-hit-log-ids
+                        (list (plist-get matching-a :log-id))))
+         (should (= (length proofread--request-queue) 2))
+         (should (eq (nth 0 proofread--request-queue)
+                     (nth 0 entries)))
+         (should (eq (nth 1 proofread--request-queue)
+                     (nth 2 entries)))
+         (should (proofread--request-work-pending-p unrelated))
+         (should (proofread--request-work-pending-p matching-b))
+         (should-not (proofread--request-work-pending-p matching-a))
+         (should-not (proofread--cache-wakeup-pending-p))
+         (proofread-test--assert-queue-cache-index-consistent)
+         (proofread--clear-scheduled-work)
+         (proofread-test--assert-no-pending-request-work))))))
+
+(ert-deftest proofread-test-disabling-cache-clears-queued-wakeups ()
+  "Discard queued wakeups if caching is disabled before dispatch."
+  (with-temp-buffer
+    (insert "xx aa")
+    (let ((proofread-auto-check nil)
+          (proofread-cache-max-entries 128)
+          (proofread-context-size 0)
+          (proofread-max-concurrent-requests 0)
+          (wakeup-checks 0))
+      (proofread-mode 1)
+      (proofread-test--with-profile
+       (let* ((chunks
+               (proofread-test--request-ready-chunks-for-ranges
+                '((1 . 3) (4 . 6))))
+              (unrelated
+               (proofread-test--make-profile-request
+                (nth 0 chunks)))
+              (matching
+               (proofread-test--make-profile-request
+                (nth 1 chunks)))
+              entries)
+         (proofread--enqueue-requests
+          (list unrelated matching) proofread-test--backend)
+         (setq entries (copy-sequence proofread--request-queue))
+         (proofread--cache-write-request matching nil)
+         (should (proofread--cache-wakeup-pending-p))
+         (setq proofread-cache-max-entries 0)
+         (let ((original-wakeup-pending
+                (symbol-function
+                 'proofread--cache-wakeup-pending-p)))
+           (cl-letf
+               (((symbol-function
+                  'proofread--cache-wakeup-pending-p)
+                 (lambda ()
+                   (setq wakeup-checks (1+ wakeup-checks))
+                   (when (> wakeup-checks 3)
+                     (error "Cache wakeup dispatch did not converge"))
+                   (funcall original-wakeup-pending))))
+             (should-not (proofread--dispatch-queued-requests))))
+         (should (<= wakeup-checks 2))
+         (should-not (proofread--cache-wakeup-pending-p))
+         (should (= (length proofread--request-queue) 2))
+         (should (eq (nth 0 proofread--request-queue)
+                     (nth 0 entries)))
+         (should (eq (nth 1 proofread--request-queue)
+                     (nth 1 entries)))
+         (should (proofread--request-work-pending-p unrelated))
+         (should (proofread--request-work-pending-p matching))
+         (proofread-test--assert-queue-cache-index-consistent)
+         (proofread--clear-scheduled-work)
+         (proofread-test--assert-no-pending-request-work))))))
+
+(ert-deftest proofread-test-cache-write-during-prune-settles-claim ()
+  "Consume a same-key cache write made while its request is claimed."
+  (with-temp-buffer
+    (insert "aa bb")
+    (let ((proofread-auto-check nil)
+          (proofread-context-size 0)
+          (proofread-max-concurrent-requests 1)
+          cache-written
+          cache-hit-log-ids)
+      (proofread-mode 1)
+      (proofread-test--with-profile
+       (let* ((chunks
+               (proofread-test--request-ready-chunks-for-ranges
+                '((1 . 3) (4 . 6))))
+              (waiting
+               (proofread-test--make-profile-request
+                (nth 0 chunks)))
+              (active
+               (proofread-test--make-profile-request
+                (nth 1 chunks)))
+              (proofread-request-log-hook
+               (list
+                (lambda (event)
+                  (when (eq (plist-get event :type) 'cache-hit)
+                    (push (plist-get event :log-id)
+                          cache-hit-log-ids))))))
+         (proofread--register-active-request active)
+         (proofread--enqueue-requests
+          (list waiting) proofread-test--backend)
+         (cl-letf
+             (((symbol-function 'proofread--fresh-request-p)
+               (lambda (request)
+                 (when (and (eq request active)
+                            (not cache-written))
+                   (setq cache-written t)
+                   (proofread--cache-write-request waiting nil))
+                 t)))
+           (should-not (proofread--dispatch-queued-requests)))
+         (should cache-written)
+         (should (equal cache-hit-log-ids
+                        (list (plist-get waiting :log-id))))
+         (should-not (proofread--request-work-pending-p waiting))
+         (should-not proofread--request-queue)
+         (should-not proofread--claimed-requests)
+         (should (equal proofread--active-requests (list active)))
+         (should-not (proofread--cache-wakeup-pending-p))
+         (proofread-test--assert-queue-cache-index-consistent)
+         (proofread--clear-request-work)
+         (proofread-test--assert-no-pending-request-work))))))
+
+(ert-deftest proofread-test-cache-queue-wakeup-is-checker-isolated ()
+  "Do not wake a different checker that happens to check the same text."
+  (with-temp-buffer
+    (insert "same")
+    (let ((proofread-auto-check nil)
+          (proofread-context-size 0)
+          (proofread-max-concurrent-requests 0)
+          (proofread-profile 'multi)
+          (proofread-profiles (proofread-test--ordered-profiles))
+          cache-hit-checkers)
+      (proofread-mode 1)
+      (let* ((profile (proofread--current-profile))
+             (first (nth 0 (plist-get profile :checkers)))
+             (second (nth 1 (plist-get profile :checkers)))
+             (chunk
+              (car (proofread-test--request-ready-chunks-for-ranges
+                    '((1 . 5)))))
+             (first-request
+              (proofread--make-backend-request
+               chunk proofread-test--backend first profile))
+             (second-request
+              (proofread--make-backend-request
+               chunk proofread-test--backend second profile))
+             second-entry
+             (proofread-request-log-hook
+              (list
+               (lambda (event)
+                 (when (eq (plist-get event :type) 'cache-hit)
+                   (push (plist-get (plist-get event :request)
+                                    :checker-name)
+                         cache-hit-checkers))))))
+        (should-not (equal (plist-get first-request :cache-key)
+                           (plist-get second-request :cache-key)))
+        ;; Put the unrelated checker first so ordinary FIFO dispatch
+        ;; reaches the concurrency limit before the exact cache waiter.
+        (proofread--enqueue-requests
+         (list second-request first-request)
+         proofread-test--backend)
+        (setq second-entry (car proofread--request-queue))
+        (proofread--cache-write-request first-request nil)
+        (should-not (proofread--dispatch-queued-requests))
+        (should (equal cache-hit-checkers '( first)))
+        (should (= (length proofread--request-queue) 1))
+        (should (eq (car proofread--request-queue) second-entry))
+        (should (proofread--request-work-pending-p second-request))
+        (should-not (proofread--request-work-pending-p first-request))
+        (proofread-test--assert-queue-cache-index-consistent)))))
+
+(ert-deftest proofread-test-cache-queue-wakeup-honors-eviction ()
+  "Do not apply a queued cache wakeup after its entry is evicted."
+  (with-temp-buffer
+    (insert "aa bb")
+    (let ((proofread-auto-check nil)
+          (proofread-cache-max-entries 1)
+          (proofread-context-size 0)
+          (proofread-max-concurrent-requests 0)
+          cache-hit-texts)
+      (proofread-mode 1)
+      (proofread-test--with-profile
+       (let* ((chunks
+               (proofread-test--request-ready-chunks-for-ranges
+                '((1 . 3) (4 . 6))))
+              (request-a
+               (proofread-test--make-profile-request
+                (nth 0 chunks)))
+              (request-b
+               (proofread-test--make-profile-request
+                (nth 1 chunks)))
+              entry-a
+              (proofread-request-log-hook
+               (list
+                (lambda (event)
+                  (when (eq (plist-get event :type) 'cache-hit)
+                    (push (plist-get (plist-get event :request) :text)
+                          cache-hit-texts))))))
+         (proofread--enqueue-requests
+          (list request-a request-b) proofread-test--backend)
+         (setq entry-a (car proofread--request-queue))
+         (proofread--cache-write-request request-a nil)
+         (proofread--cache-write-request request-b nil)
+         (should-not (proofread--cache-read-request request-a))
+         (should (proofread--cache-read-request request-b))
+         (should-not (proofread--dispatch-queued-requests))
+         (should (equal cache-hit-texts '( "bb")))
+         (should (= (length proofread--request-queue) 1))
+         (should (eq (car proofread--request-queue) entry-a))
+         (should (proofread--request-work-pending-p request-a))
+         (proofread-test--assert-queue-cache-index-consistent)
+         (proofread--cache-write-request request-a nil)
+         (should-not (proofread--dispatch-queued-requests))
+         (should (equal cache-hit-texts '( "aa" "bb")))
+         (proofread-test--assert-no-pending-request-work))))))
+
+(ert-deftest proofread-test-cache-reply-dispatch-scales-linearly ()
+  "Bound reply dispatch work for a large asynchronous core check."
+  (with-temp-buffer
+    (insert-file-contents
+     (expand-file-name "example_zh-Hans.org"
+                       proofread-test--directory))
+    (org-mode)
+    (let ((proofread-auto-check nil)
+          (proofread-cache-max-entries 128)
+          (proofread-context-size 0)
+          (proofread-max-concurrent-requests 8)
+          (proofread-test--profile-language "zh-CN")
+          pending
+          pending-tail
+          submitted
+          (submit-attempts 0)
+          (freshness-checks 0))
+      (proofread-mode 1)
+      (proofread-test--with-profile
+       (let* ((chunks
+               (proofread-test--request-ready-chunks-for-ranges
+                (list (cons (point-min) (point-max))) "zh-CN"))
+              (request-count (length chunks))
+              (concurrency proofread-max-concurrent-requests)
+              (original-submit
+               (symbol-function 'proofread--submit-request))
+              (original-checker-freshness
+               (symbol-function
+                'proofread--request-current-checker-p)))
+         (should (= request-count 107))
+         (cl-labels
+             ((enqueue-result (pair)
+                (let ((cell (list pair)))
+                  (if pending-tail
+                      (setcdr pending-tail cell)
+                    (setq pending cell))
+                  (setq pending-tail cell)))
+              (dequeue-result ()
+                (prog1 (pop pending)
+                  (unless pending
+                    (setq pending-tail nil)))))
+           (let ((proofread-test--backend-check-function
+                  (lambda (request callback)
+                    (push request submitted)
+                    (enqueue-result (cons request callback))
+                    (vector 'proofread-test-handle
+                            (plist-get request :log-id)))))
+             (cl-letf
+                 (((symbol-function 'proofread--submit-request)
+                   (lambda (request backend)
+                     (setq submit-attempts (1+ submit-attempts))
+                     (funcall original-submit request backend)))
+                  ((symbol-function
+                    'proofread--request-current-checker-p)
+                   (lambda (request)
+                     (setq freshness-checks
+                           (1+ freshness-checks))
+                     (funcall original-checker-freshness request))))
+               (should
+                (= (length
+                    (proofread-test--dispatch-profile-chunks chunks))
+                   concurrency))
+               (should (= (length proofread--active-requests)
+                          concurrency))
+               (should (= (length proofread--request-queue)
+                          (- request-count concurrency)))
+               (setq submit-attempts 0)
+               (setq freshness-checks 0)
+               (while pending
+                 (pcase-let ((`(,request . ,callback)
+                              (dequeue-result)))
+                   (funcall callback
+                            (proofread--backend-success-result
+                             request nil))))
+               (should (= (length submitted) request-count))
+               (should
+                (= (- (length submitted) concurrency)
+                   (- request-count concurrency)))
+               (let* ((ordered (nreverse submitted))
+                      (ids
+                       (mapcar (lambda (request)
+                                 (plist-get request :log-id))
+                               ordered)))
+                 (should (= (length (delete-dups
+                                     (copy-sequence ids)))
+                            request-count))
+                 (should (equal ids
+                                (sort (copy-sequence ids) #'<))))
+               (should (<= submit-attempts
+                           (* 2 request-count)))
+               (should (<= freshness-checks
+                           (* 16 request-count)))
+               (should-not proofread--active-requests)
+               (should-not proofread--claimed-requests)
+               (should-not proofread--request-queue)
+               (should-not proofread--request-queue-tail)
+               (should (= (hash-table-count proofread--cache)
+                          request-count))
+               (should (= (hash-table-count
+                           proofread--pending-request-keys)
+                          0))
+               (proofread-test--assert-queue-cache-index-consistent)))))))))
+
 (ert-deftest proofread-test-cache-evicts-least-recently-used-entry ()
   "The buffer-local cache honors its least-recently-used size limit."
   (with-temp-buffer
@@ -11616,6 +12193,82 @@ This covers URLs, email, invisible text, faces, and properties."
           (should (= (hash-table-count
                       proofread--pending-request-keys)
                      0)))))))
+
+(ert-deftest
+    proofread-test-old-dispatch-does-not-drain-reinitialized-queue ()
+  "Stop an old dispatch transaction after mode state is reinitialized."
+  (with-temp-buffer
+    (insert "Alpha")
+    (let ((proofread-auto-check nil)
+          (proofread-max-concurrent-requests 1)
+          reinitialized
+          new-request
+          submitted)
+      (proofread-mode 1)
+      (let* ((chunk (proofread--make-request-ready-chunk 1 6))
+             (old-request
+              (proofread--make-backend-request
+               chunk proofread-test--backend)))
+        (proofread--enqueue-requests
+         (list old-request) proofread-test--backend)
+        (cl-letf
+            (((symbol-function 'proofread--submit-request)
+              (lambda (request _backend)
+                (push request submitted)
+                (unless reinitialized
+                  (setq reinitialized t)
+                  (proofread-mode -1)
+                  (proofread-mode 1)
+                  (setq new-request
+                        (proofread--make-backend-request
+                         (proofread--make-request-ready-chunk 1 6)
+                         proofread-test--backend))
+                  (proofread--enqueue-requests
+                   (list new-request) proofread-test--backend))
+                'stale)))
+          (should-not (proofread--dispatch-queued-requests)))
+        (should reinitialized)
+        (should (equal submitted (list old-request)))
+        (should (proofread--request-state-flag-p
+                 old-request :cancelled))
+        (should (= (length proofread--request-queue) 1))
+        (should (eq (plist-get (car proofread--request-queue)
+                               :request)
+                    new-request))
+        (should (proofread--request-work-pending-p new-request))
+        (should-not proofread--queue-dispatch-active-p)
+        (proofread-test--assert-queue-cache-index-consistent)
+        (proofread--clear-scheduled-work)
+        (proofread-test--assert-no-pending-request-work)))))
+
+(ert-deftest
+    proofread-test-clear-during-claimed-freshness-does-not-requeue ()
+  "Do not revive a claimed request cleared by a freshness hook."
+  (with-temp-buffer
+    (insert "Alpha")
+    (let ((proofread-auto-check nil)
+          (proofread-max-concurrent-requests 0)
+          cleared)
+      (proofread-mode 1)
+      (let* ((chunk (proofread--make-request-ready-chunk 1 6))
+             (request
+              (proofread--make-backend-request
+               chunk proofread-test--backend)))
+        (proofread--enqueue-requests
+         (list request) proofread-test--backend)
+        (cl-letf
+            (((symbol-function 'proofread--fresh-request-p)
+              (lambda (_request)
+                (unless cleared
+                  (setq cleared t)
+                  (proofread--clear-scheduled-work))
+                t)))
+          (should-not (proofread--dispatch-queued-requests)))
+        (should cleared)
+        (should (proofread--request-state-flag-p request :cancelled))
+        (should-not (proofread--request-work-pending-p request))
+        (should-not proofread--queue-dispatch-active-p)
+        (proofread-test--assert-no-pending-request-work)))))
 
 (ert-deftest
     proofread-test-reentrant-freshness-preserves-conflicting-new-work
@@ -12065,6 +12718,31 @@ This covers URLs, email, invisible text, faces, and properties."
         (should (= (hash-table-count proofread--pending-request-keys)
                    0))))))
 
+(ert-deftest proofread-test-requeue-error-does-not-strand-claimed-work
+    ()
+  "Leave no claimed or pending work when restoring a full request fails."
+  (with-temp-buffer
+    (insert "Alpha")
+    (let ((proofread-auto-check nil)
+          (proofread-max-concurrent-requests 0))
+      (proofread-mode 1)
+      (let* ((chunk (proofread--make-request-ready-chunk 1 6))
+             (request
+              (proofread--make-backend-request
+               chunk proofread-test--backend)))
+        (proofread--enqueue-requests
+         (list request) proofread-test--backend)
+        (cl-letf
+            (((symbol-function 'proofread--submit-request)
+              (lambda (&rest _) 'full))
+             ((symbol-function 'proofread--prepend-request-queue-entry)
+              (lambda (&rest _)
+                (error "Simulated requeue failure"))))
+          (should-error (proofread--dispatch-queued-requests)))
+        (should (proofread--request-state-flag-p request :cancelled))
+        (should-not proofread--queue-dispatch-active-p)
+        (proofread-test--assert-no-pending-request-work)))))
+
 (ert-deftest
     proofread-test-clear-rejects-work-enqueued-by-cancel-hook ()
   "Reject work enqueued by cancellation hooks during clearing."
@@ -12295,7 +12973,7 @@ This covers URLs, email, invisible text, faces, and properties."
                        (insert "x")
                        (delete-char -1)))
                    nil t)
-         (should-not (proofread--dispatch-queued-requests t))
+         (should-not (proofread--dispatch-queued-requests))
          (should (= calls 1))
          (should-not proofread--request-queue)
          (should (proofread--request-invalidated-p waiting))

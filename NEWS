@@ -148,6 +148,15 @@ summaries, not raw options.
 Source text, generated prompt text, HTTP request parameters, and provider
 responses remain visible for debugging and may contain sensitive text.
 
+** Performance
+
+---
+*** Large asynchronous checks remain responsive with caching enabled.
+Successful backend replies now wake only queued requests that can use the
+new cache entry.  This avoids repeated scans of unrelated queued work in
+buffers split into many chunks, without changing cache-hit behavior,
+checker isolation, or request ordering.
+
 ** Packaging and development
 
 ---
