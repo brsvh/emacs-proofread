@@ -217,6 +217,11 @@ server URL and lifecycle settings are session-global. Request options such as
 server URL remains global; do not put `:url` in a checker expecting a separate
 server per profile.
 
+Run `M-x proofread-languagetool-start-server` to explicitly reuse or start the
+configured server, including when automatic startup is disabled. Run
+`M-x proofread-languagetool-stop-server` to stop a server owned by this Emacs
+session; it never stops an external server.
+
 When a LanguageTool checker's `:language` is `nil`, the backend sends
 `language=auto`. Set `:preferred-variants` in that checker so variant-dependent
 spelling dictionaries can run, for example:
@@ -528,23 +533,23 @@ Run `M-x customize-group RET proofread RET` to edit the core options:
 The LanguageTool library defines a separate `proofread-languagetool` Customize
 group:
 
-| Option                                       | Default                    | Purpose                                                       |
-| -------------------------------------------- | -------------------------- | ------------------------------------------------------------- |
-| `proofread-languagetool-server-url`          | `http://127.0.0.1:8081/v2` | Select the local or externally managed v2 API endpoint        |
-| `proofread-languagetool-auto-start`          | `t`                        | Start a session-local server when the endpoint is unavailable |
-| `proofread-languagetool-command`             | `languagetool-http-server` | Select an executable or argv prefix for managed startup       |
-| `proofread-languagetool-config-file`         | `nil`                      | Pass an optional local Java properties file to the server     |
-| `proofread-languagetool-startup-timeout`     | `15.0`                     | Limit the overall managed-server startup wait                 |
-| `proofread-languagetool-health-timeout`      | `3.0`                      | Limit one server health probe                                 |
-| `proofread-languagetool-request-timeout`     | `10.0`                     | Limit one `/check` request                                    |
-| `proofread-languagetool-level`               | `default`                  | Default level when a checker omits `:level`                   |
-| `proofread-languagetool-preferred-variants`  | `nil`                      | Default variants when a checker omits `:preferred-variants`   |
-| `proofread-languagetool-mother-tongue`       | `nil`                      | Default mother tongue when a checker omits `:mother-tongue`   |
-| `proofread-languagetool-enabled-rules`       | `nil`                      | Default enabled rules when a checker omits `:enabled-rules`   |
-| `proofread-languagetool-disabled-rules`      | `nil`                      | Default disabled rules when a checker omits `:disabled-rules` |
-| `proofread-languagetool-enabled-categories`  | `nil`                      | Default enabled categories when omitted by a checker          |
-| `proofread-languagetool-disabled-categories` | `nil`                      | Default disabled categories when omitted by a checker         |
-| `proofread-languagetool-enabled-only`        | `nil`                      | Default enabled-only policy when a checker omits it           |
+| Option                                       | Default                                  | Purpose                                                       |
+| -------------------------------------------- | ---------------------------------------- | ------------------------------------------------------------- |
+| `proofread-languagetool-server-url`          | `http://127.0.0.1:8081/v2`               | Select the local or externally managed v2 API endpoint        |
+| `proofread-languagetool-auto-start`          | `t`                                      | Start a session-local server when the endpoint is unavailable |
+| `proofread-languagetool-command`             | `languagetool-http-server`               | Select an executable or argv prefix for managed startup       |
+| `proofread-languagetool-config-file`         | `PROOFREAD_LANGUAGETOOL_CONFIG` or `nil` | Pass an optional local Java properties file to the server     |
+| `proofread-languagetool-startup-timeout`     | `15.0`                                   | Limit the overall managed-server startup wait                 |
+| `proofread-languagetool-health-timeout`      | `3.0`                                    | Limit one server health probe                                 |
+| `proofread-languagetool-request-timeout`     | `10.0`                                   | Limit one `/check` request                                    |
+| `proofread-languagetool-level`               | `default`                                | Default level when a checker omits `:level`                   |
+| `proofread-languagetool-preferred-variants`  | `nil`                                    | Default variants when a checker omits `:preferred-variants`   |
+| `proofread-languagetool-mother-tongue`       | `nil`                                    | Default mother tongue when a checker omits `:mother-tongue`   |
+| `proofread-languagetool-enabled-rules`       | `nil`                                    | Default enabled rules when a checker omits `:enabled-rules`   |
+| `proofread-languagetool-disabled-rules`      | `nil`                                    | Default disabled rules when a checker omits `:disabled-rules` |
+| `proofread-languagetool-enabled-categories`  | `nil`                                    | Default enabled categories when omitted by a checker          |
+| `proofread-languagetool-disabled-categories` | `nil`                                    | Default disabled categories when omitted by a checker         |
+| `proofread-languagetool-enabled-only`        | `nil`                                    | Default enabled-only policy when a checker omits it           |
 
 `proofread-languagetool-enabled-only` requires at least one enabled rule or
 category and cannot be combined with disabled rules or categories. Language,

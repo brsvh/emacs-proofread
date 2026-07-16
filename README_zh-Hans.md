@@ -190,6 +190,9 @@ checker 局部 `:options` 中的 `:language`；只要该键存在，即使显式
 和 `:enabled-only` 等请求选项应放在 checker 中。LanguageTool 服务 URL 仍是全局设置；不要在 checker 中放入
 `:url` 并期待每个 profile 使用不同服务。
 
+运行 `M-x proofread-languagetool-start-server` 可以显式复用或启动配置的服务，即使自动启动已禁用也可以这样做。运行
+`M-x proofread-languagetool-stop-server` 只会停止当前 Emacs 会话所拥有的服务，绝不会停止外部服务。
+
 当 LanguageTool checker 的 `:language` 为 `nil` 时，后端会发送 `language=auto`。此时应在该
 checker 中设置 `:preferred-variants`，以便启用依赖语言变体的拼写词典，例如：
 
@@ -266,7 +269,7 @@ LanguageTool，为简体中文使用本地 Ollama 加 LanguageTool：
 ```
 
 来自不同 checker 的诊断项在内部仍然彼此独立。用户界面会把指向同一实时范围和同一文本的诊断项分组，保留每个 checker
-的消息，并去重相同的修改建议文本。 每个分组中的来源标签、消息、修改建议和修正选项都按 profile 所声明的 `:checkers`
+的消息，并去重相同的修改建议文本。每个分组中的来源标签、消息、修改建议和修正选项都按 profile 所声明的 `:checkers`
 顺序排列，不受异步请求完成顺序影响。
 
 #### 为单个缓冲区选择 profile
@@ -454,23 +457,23 @@ https://github.com/user-attachments/assets/2dda228e-f85c-4500-aea0-549500628c6e
 
 LanguageTool 库另有一个 `proofread-languagetool` Customize 组：
 
-| 选项                                         | 默认值                     | 用途                                           |
-| -------------------------------------------- | -------------------------- | ---------------------------------------------- |
-| `proofread-languagetool-server-url`          | `http://127.0.0.1:8081/v2` | 选择本地或由外部管理的 v2 API 端点             |
-| `proofread-languagetool-auto-start`          | `t`                        | 端点不可用时启动当前会话共享的本地服务         |
-| `proofread-languagetool-command`             | `languagetool-http-server` | 选择托管启动所用的可执行文件或 argv 前缀       |
-| `proofread-languagetool-config-file`         | `nil`                      | 向服务传递可选的本机 Java properties 文件      |
-| `proofread-languagetool-startup-timeout`     | `15.0`                     | 限制托管服务的整体启动等待时间                 |
-| `proofread-languagetool-health-timeout`      | `3.0`                      | 限制单次服务健康探测的等待时间                 |
-| `proofread-languagetool-request-timeout`     | `10.0`                     | 限制单次 `/check` 请求的等待时间               |
-| `proofread-languagetool-level`               | `default`                  | checker 省略 `:level` 时使用的默认检查级别     |
-| `proofread-languagetool-preferred-variants`  | `nil`                      | checker 省略 `:preferred-variants` 时的默认值  |
-| `proofread-languagetool-mother-tongue`       | `nil`                      | checker 省略 `:mother-tongue` 时的默认值       |
-| `proofread-languagetool-enabled-rules`       | `nil`                      | checker 省略 `:enabled-rules` 时的默认值       |
-| `proofread-languagetool-disabled-rules`      | `nil`                      | checker 省略 `:disabled-rules` 时的默认值      |
-| `proofread-languagetool-enabled-categories`  | `nil`                      | checker 省略 `:enabled-categories` 时的默认值  |
-| `proofread-languagetool-disabled-categories` | `nil`                      | checker 省略 `:disabled-categories` 时的默认值 |
-| `proofread-languagetool-enabled-only`        | `nil`                      | checker 省略 `:enabled-only` 时的默认策略      |
+| 选项                                         | 默认值                                   | 用途                                           |
+| -------------------------------------------- | ---------------------------------------- | ---------------------------------------------- |
+| `proofread-languagetool-server-url`          | `http://127.0.0.1:8081/v2`               | 选择本地或由外部管理的 v2 API 端点             |
+| `proofread-languagetool-auto-start`          | `t`                                      | 端点不可用时启动当前会话共享的本地服务         |
+| `proofread-languagetool-command`             | `languagetool-http-server`               | 选择托管启动所用的可执行文件或 argv 前缀       |
+| `proofread-languagetool-config-file`         | `PROOFREAD_LANGUAGETOOL_CONFIG` 或 `nil` | 向服务传递可选的本机 Java properties 文件      |
+| `proofread-languagetool-startup-timeout`     | `15.0`                                   | 限制托管服务的整体启动等待时间                 |
+| `proofread-languagetool-health-timeout`      | `3.0`                                    | 限制单次服务健康探测的等待时间                 |
+| `proofread-languagetool-request-timeout`     | `10.0`                                   | 限制单次 `/check` 请求的等待时间               |
+| `proofread-languagetool-level`               | `default`                                | checker 省略 `:level` 时使用的默认检查级别     |
+| `proofread-languagetool-preferred-variants`  | `nil`                                    | checker 省略 `:preferred-variants` 时的默认值  |
+| `proofread-languagetool-mother-tongue`       | `nil`                                    | checker 省略 `:mother-tongue` 时的默认值       |
+| `proofread-languagetool-enabled-rules`       | `nil`                                    | checker 省略 `:enabled-rules` 时的默认值       |
+| `proofread-languagetool-disabled-rules`      | `nil`                                    | checker 省略 `:disabled-rules` 时的默认值      |
+| `proofread-languagetool-enabled-categories`  | `nil`                                    | checker 省略 `:enabled-categories` 时的默认值  |
+| `proofread-languagetool-disabled-categories` | `nil`                                    | checker 省略 `:disabled-categories` 时的默认值 |
+| `proofread-languagetool-enabled-only`        | `nil`                                    | checker 省略 `:enabled-only` 时的默认策略      |
 
 启用 `proofread-languagetool-enabled-only`
 时必须至少启用一个规则或分类，且不能同时配置禁用规则或分类。语言、检查级别、语言变体、母语、规则和分类设置都会进入后端缓存标识，因此修改检查策略后不会复用旧策略生成的结果。
@@ -560,16 +563,16 @@ Proofread。
 
 ## 项目许可证
 
-emacs-proofread 是自由软件：你可以根据自由软件基金会发布的 GNU
-通用公共许可证第三版或任何后续版本，重新分发和/或修改它根据自由软件基金会发布的 GNU 通用公共许可证条款版本 3，或（根据您的选择）任何后续版本版本。
+emacs-proofread 是自由软件：您可以根据自由软件基金会发布的 GNU 通用公共许可证第 3
+版，或（由您选择）任何后续版本的条款，重新分发和/或修改它。
 
-您应该已经随本 emacs-proofread 收到了 GNU
-通用公共许可证的副本。如果没有，请访问<https://www.gnu.org/licenses/>。
+您应该已经随 emacs-proofread 一同收到 GNU 通用公共许可证的副本。如果没有，请参阅
+<https://www.gnu.org/licenses/>。
 
 ## GNU Free Documentation License
 
 <details>
-<summary>展开这里以查看“GNU Free Documentation License”.</summary>
+<summary>展开这里以查看“GNU Free Documentation License”。</summary>
 
 ```text
 
