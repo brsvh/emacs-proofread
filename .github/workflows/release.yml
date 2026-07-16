@@ -232,6 +232,12 @@ jobs:
           nix run .#emacs30-byte-compile-proofread
           nix run .#emacs31-byte-compile-proofread
 
+      - name: Run checkdoc
+        run: |
+          set -euo pipefail
+          nix run .#emacs30-checkdoc-proofread
+          nix run .#emacs31-checkdoc-proofread
+
       - name: Build reproducible package archive
         shell: bash
         run: |
