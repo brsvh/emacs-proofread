@@ -237,6 +237,14 @@ including queued, active, completed, failed, and stale requests.
 
 * Changes in proofread-popup 0.1.1
 
+** Popup display
+
+---
+*** Equal aggregate diagnostics no longer cause redundant redraws.
+Repeated updates for an unchanged aggregate diagnostic now reuse the existing
+popup.  Changes to the displayed message, anchor, selected window, or render
+state still refresh it.
+
 ** Compatibility
 
 ---

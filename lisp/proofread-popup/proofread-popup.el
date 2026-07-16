@@ -78,8 +78,8 @@
 (defvar-local proofread-popup--buffer-name nil
   "Hidden Posframe buffer name for the current Proofread buffer.")
 
-(defvar-local proofread-popup--diagnostic nil
-  "Diagnostic currently displayed in the Proofread child frame.")
+(defvar-local proofread-popup--render-signature nil
+  "Popup-owned signature of the diagnostic currently displayed.")
 
 (defvar-local proofread-popup--position nil
   "Buffer position currently used for the Proofread child frame.")
@@ -97,7 +97,7 @@
 
 (defun proofread-popup--reset-state ()
   "Forget the child frame currently associated with this buffer."
-  (setq proofread-popup--diagnostic nil)
+  (setq proofread-popup--render-signature nil)
   (setq proofread-popup--position nil)
   (setq proofread-popup--window nil)
   (setq proofread-popup--render-state nil))
@@ -119,20 +119,39 @@
   (eq (window-buffer window)
       (current-buffer)))
 
-(defun proofread-popup--message (diagnostic)
-  "Return the child-frame message for DIAGNOSTIC."
-  (let* ((raw-message (proofread-diagnostic-message diagnostic))
-         (message (and (stringp raw-message)
-                       (string-trim raw-message))))
+(defun proofread-popup--message-for-fields (raw-message text)
+  "Return the child-frame message for RAW-MESSAGE and TEXT."
+  (let ((message (and (stringp raw-message)
+                      (string-trim raw-message))))
     (cond
      ((and message (not (string-empty-p message))) message)
      ((and raw-message (not (stringp raw-message)))
       (proofread-format-diagnostic-field raw-message))
-     ((proofread-diagnostic-text diagnostic)
+     (text
       (format "Proofread: %s"
-              (proofread-format-diagnostic-field
-               (proofread-diagnostic-text diagnostic))))
+              (proofread-format-diagnostic-field text)))
      (t "Proofread diagnostic"))))
+
+(defun proofread-popup--message (diagnostic)
+  "Return the child-frame message for DIAGNOSTIC."
+  (proofread-popup--message-for-fields
+   (proofread-diagnostic-message diagnostic)
+   (proofread-diagnostic-text diagnostic)))
+
+(defun proofread-popup--diagnostic-render-data (diagnostic)
+  "Return popup-owned render data for DIAGNOSTIC.
+The result contains the final display message and an immutable
+signature built only from public diagnostic values."
+  (let* ((range (proofread-diagnostic-range diagnostic))
+         (raw-message (proofread-diagnostic-message diagnostic))
+         (text (proofread-diagnostic-text diagnostic))
+         (message
+          (copy-sequence
+           (proofread-popup--message-for-fields raw-message text))))
+    (list :message message
+          :signature
+          (list :range (and range (cons (car range) (cdr range)))
+                :message (copy-sequence message)))))
 
 (defun proofread-popup--face-color (face attribute)
   "Return FACE color ATTRIBUTE, or nil if unspecified."
@@ -160,10 +179,11 @@
          'proofread-popup-border-face :background)))
 
 (defun proofread-popup--needs-refresh-p
-    (diagnostic position window snapshot)
-  "Return non-nil when DIAGNOSTIC needs rendering at POSITION.
+    (signature position window snapshot)
+  "Return non-nil when SIGNATURE needs rendering at POSITION.
 WINDOW and SNAPSHOT describe the selected display target."
-  (not (and (eq diagnostic proofread-popup--diagnostic)
+  (not (and (equal-including-properties
+             signature proofread-popup--render-signature)
             (equal position proofread-popup--position)
             (eq window proofread-popup--window)
             (equal snapshot proofread-popup--render-state))))
@@ -171,7 +191,7 @@ WINDOW and SNAPSHOT describe the selected display target."
 (defun proofread-popup--hide ()
   "Hide the current Proofread child frame."
   (when (and proofread-popup--buffer-name
-             proofread-popup--diagnostic)
+             proofread-popup--render-signature)
     (posframe-hide proofread-popup--buffer-name))
   (proofread-popup--reset-state))
 
@@ -208,35 +228,35 @@ WINDOW and SNAPSHOT describe the selected display target."
         (car range)
       (point))))
 
-(defun proofread-popup--show (diagnostic position window snapshot)
-  "Show DIAGNOSTIC at POSITION in WINDOW using SNAPSHOT."
-  (let ((message (proofread-popup--message diagnostic)))
-    (posframe-show
-     (proofread-popup--ensure-buffer-name)
-     :string (propertize message 'face 'proofread-popup-face)
-     :position position
-     :poshandler
-     #'posframe-poshandler-point-bottom-left-corner-upward
-     :foreground-color (plist-get snapshot :foreground-color)
-     :background-color (plist-get snapshot :background-color)
-     :max-width (plist-get snapshot :max-width)
-     :min-width 1
-     :internal-border-width 1
-     :internal-border-color (plist-get snapshot :border-color)
-     :left-fringe 3
-     :right-fringe 3
-     :accept-focus nil
-     :override-parameters
-     '((no-accept-focus . t)
-       (no-focus-on-map . t)
-       (cursor-type . nil)
-       (no-special-glyphs . t)
-       (desktop-dont-save . t))
-     :hidehandler #'proofread-popup--hide-handler)
-    (setq proofread-popup--diagnostic diagnostic)
-    (setq proofread-popup--position position)
-    (setq proofread-popup--window window)
-    (setq proofread-popup--render-state snapshot)))
+(defun proofread-popup--show
+    (message signature position window snapshot)
+  "Show MESSAGE with SIGNATURE at POSITION in WINDOW using SNAPSHOT."
+  (posframe-show
+   (proofread-popup--ensure-buffer-name)
+   :string (propertize message 'face 'proofread-popup-face)
+   :position position
+   :poshandler
+   #'posframe-poshandler-point-bottom-left-corner-upward
+   :foreground-color (plist-get snapshot :foreground-color)
+   :background-color (plist-get snapshot :background-color)
+   :max-width (plist-get snapshot :max-width)
+   :min-width 1
+   :internal-border-width 1
+   :internal-border-color (plist-get snapshot :border-color)
+   :left-fringe 3
+   :right-fringe 3
+   :accept-focus nil
+   :override-parameters
+   '((no-accept-focus . t)
+     (no-focus-on-map . t)
+     (cursor-type . nil)
+     (no-special-glyphs . t)
+     (desktop-dont-save . t))
+   :hidehandler #'proofread-popup--hide-handler)
+  (setq proofread-popup--render-signature signature)
+  (setq proofread-popup--position position)
+  (setq proofread-popup--window window)
+  (setq proofread-popup--render-state snapshot))
 
 (defun proofread-popup--update ()
   "Update the child frame for the Proofread diagnostic at point."
@@ -251,13 +271,19 @@ WINDOW and SNAPSHOT describe the selected display target."
                          (proofread-popup--anchor-position
                           diagnostic window))))
               (if (and diagnostic position)
-                  (let ((snapshot
-                         (proofread-popup--render-snapshot window)))
+                  (let* ((snapshot
+                          (proofread-popup--render-snapshot window))
+                         (render-data
+                          (proofread-popup--diagnostic-render-data
+                           diagnostic))
+                         (message (plist-get render-data :message))
+                         (signature
+                          (plist-get render-data :signature)))
                     (when (proofread-popup--needs-refresh-p
-                           diagnostic position window snapshot)
+                           signature position window snapshot)
                       (if (proofread-popup--available-p)
                           (proofread-popup--show
-                           diagnostic position window snapshot)
+                           message signature position window snapshot)
                         (proofread-popup--hide))))
                 (proofread-popup--hide)))
           (proofread-popup--hide)))

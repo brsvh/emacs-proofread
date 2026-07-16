@@ -188,9 +188,8 @@ SUGGESTIONS and MESSAGE supply the optional field values."
               (proofread-popup-test--diagnostic 1 5 "helo")))
          (proofread--apply-backend-diagnostics (list diagnostic))
          (should (= (length proofread-popup-test--shows) 1))
-         (should (equal proofread-popup--diagnostic diagnostic))
-         (should (eq proofread-popup--diagnostic
-                     (car proofread--diagnostics))))))))
+         (should proofread-popup--render-signature)
+         (should (equal diagnostic (car proofread--diagnostics))))))))
 
 ;;;; Rendering
 
@@ -362,6 +361,116 @@ SUGGESTIONS and MESSAGE supply the optional field values."
          (should (= (length proofread-popup-test--shows) 1)))))))
 
 (ert-deftest
+    proofread-popup-test-equal-aggregate-does-not-refresh ()
+  "Equivalent freshly allocated aggregates render only once."
+  (proofread-popup-test--with-posframe-recorder
+   (save-window-excursion
+     (with-temp-buffer
+       (switch-to-buffer (current-buffer))
+       (insert "helo")
+       (proofread-mode 1)
+       (let ((first
+              (proofread-popup-test--diagnostic-with-checker
+               (proofread-popup-test--diagnostic
+                1 5 "helo" '( "hello") "First message")
+               'first))
+             (second
+              (proofread-popup-test--diagnostic-with-checker
+               (proofread-popup-test--diagnostic
+                1 5 "helo" '( "hello") "Second message")
+               'second)))
+         (proofread-popup-test--install-diagnostics
+          (list first second))
+         (goto-char 2)
+         (let ((first-value (proofread-diagnostic-at-point))
+               (second-value (proofread-diagnostic-at-point)))
+           (should-not (eq first-value second-value))
+           (should
+            (equal (proofread-diagnostic-range first-value)
+                   (proofread-diagnostic-range second-value)))
+           (should
+            (equal (proofread-diagnostic-message first-value)
+                   (proofread-diagnostic-message second-value)))
+           (should
+            (equal (proofread-diagnostic-text first-value)
+                   (proofread-diagnostic-text second-value))))
+         (proofread-popup--update)
+         (proofread-popup--update)
+         (should (= (length proofread-popup-test--shows) 1)))))))
+
+(ert-deftest
+    proofread-popup-test-rendered-message-change-refreshes ()
+  "Changing rendered diagnostic content redraws the child frame."
+  (proofread-popup-test--with-posframe-recorder
+   (save-window-excursion
+     (with-temp-buffer
+       (switch-to-buffer (current-buffer))
+       (insert "helo")
+       (proofread-mode 1)
+       (let ((diagnostic
+              (proofread-popup-test--diagnostic
+               1 5 "helo" nil "First message")))
+         (proofread-popup-test--install-diagnostics (list diagnostic))
+         (goto-char 2)
+         (proofread-popup--update)
+         (setf (plist-get diagnostic :message) "Changed message")
+         (proofread-popup--update)
+         (should (= (length proofread-popup-test--shows) 2))
+         (should
+          (equal
+           (substring-no-properties
+            (plist-get (cdar proofread-popup-test--shows) :string))
+           "Changed message")))))))
+
+(ert-deftest proofread-popup-test-anchor-change-refreshes ()
+  "Changing the public diagnostic range redraws at its new anchor."
+  (proofread-popup-test--with-posframe-recorder
+   (save-window-excursion
+     (with-temp-buffer
+       (switch-to-buffer (current-buffer))
+       (insert "aa helo zz")
+       (proofread-mode 1)
+       (let* ((diagnostic
+               (proofread-popup-test--diagnostic 4 8 "helo"))
+              (overlay
+               (car
+                (proofread-popup-test--install-diagnostics
+                 (list diagnostic)))))
+         (goto-char 6)
+         (proofread-popup--update)
+         (move-overlay overlay 5 9)
+         (proofread-popup--update)
+         (should (= (length proofread-popup-test--shows) 2))
+         (should
+          (= (plist-get (cdar proofread-popup-test--shows) :position)
+             5)))))))
+
+(ert-deftest proofread-popup-test-selected-window-change-refreshes ()
+  "Changing the selected display window redraws the child frame."
+  (proofread-popup-test--with-posframe-recorder
+   (save-window-excursion
+     (with-temp-buffer
+       (switch-to-buffer (current-buffer))
+       (insert "helo")
+       (proofread-mode 1)
+       (let* ((diagnostic
+               (proofread-popup-test--diagnostic 1 5 "helo"))
+              (first-window (selected-window))
+              (second-window (split-window first-window nil 'below))
+              (snapshot '( :max-width 80)))
+         (proofread-popup-test--install-diagnostics (list diagnostic))
+         (goto-char 2)
+         (cl-letf
+             (((symbol-function 'proofread-popup--render-snapshot)
+               (lambda (_window) snapshot)))
+           (proofread-popup--update)
+           (set-window-point second-window 2)
+           (select-window second-window)
+           (proofread-popup--update))
+         (should (= (length proofread-popup-test--shows) 2))
+         (should (eq proofread-popup--window second-window)))))))
+
+(ert-deftest
     proofread-popup-test-refreshes-after-window-state-change ()
   "A window layout state change redraws the current diagnostic."
   (proofread-popup-test--with-posframe-recorder
@@ -422,7 +531,7 @@ SUGGESTIONS and MESSAGE supply the optional field values."
          (goto-char 10)
          (proofread-popup--update)
          (should proofread-popup-test--hides)
-         (should-not proofread-popup--diagnostic))))))
+         (should-not proofread-popup--render-signature))))))
 
 (ert-deftest
     proofread-popup-test-hide-and-delete-reset-display-state ()
@@ -440,7 +549,7 @@ SUGGESTIONS and MESSAGE supply the optional field values."
          (proofread-popup--update)
          (let ((popup-buffer-name proofread-popup--buffer-name))
            (should popup-buffer-name)
-           (should (eq proofread-popup--diagnostic diagnostic))
+           (should proofread-popup--render-signature)
            (should (= proofread-popup--position 1))
            (should (eq proofread-popup--window (selected-window)))
            (should proofread-popup--render-state)
@@ -449,7 +558,7 @@ SUGGESTIONS and MESSAGE supply the optional field values."
                           (list popup-buffer-name)))
            (should (equal proofread-popup--buffer-name
                           popup-buffer-name))
-           (should-not proofread-popup--diagnostic)
+           (should-not proofread-popup--render-signature)
            (should-not proofread-popup--position)
            (should-not proofread-popup--window)
            (should-not proofread-popup--render-state)
@@ -463,7 +572,7 @@ SUGGESTIONS and MESSAGE supply the optional field values."
            (should (equal proofread-popup-test--deletes
                           (list popup-buffer-name)))
            (should-not proofread-popup--buffer-name)
-           (should-not proofread-popup--diagnostic)
+           (should-not proofread-popup--render-signature)
            (should-not proofread-popup--position)
            (should-not proofread-popup--window)
            (should-not proofread-popup--render-state)
@@ -501,7 +610,7 @@ SUGGESTIONS and MESSAGE supply the optional field values."
                  (with-current-buffer source
                    (should (equal proofread-popup--buffer-name
                                   popup-buffer-name))
-                   (should-not proofread-popup--diagnostic)
+                   (should-not proofread-popup--render-signature)
                    (should-not proofread-popup--position)
                    (should-not proofread-popup--window)
                    (should-not proofread-popup--render-state))
@@ -553,7 +662,7 @@ SUGGESTIONS and MESSAGE supply the optional field values."
              (proofread-popup--update)))
          (should (= (length proofread-popup-test--shows) 1))
          (should (= (length proofread-popup-test--hides) 1))
-         (should-not proofread-popup--diagnostic)
+         (should-not proofread-popup--render-signature)
          (should-not proofread-popup--position)
          (should-not proofread-popup--window)
          (should-not proofread-popup--render-state))))))
@@ -601,7 +710,7 @@ SUGGESTIONS and MESSAGE supply the optional field values."
           (memq #'proofread-popup--update post-command-hook))
          (should-not (memq #'proofread-popup--update
                            proofread-diagnostics-changed-hook))
-         (should-not proofread-popup--diagnostic))))))
+         (should-not proofread-popup--render-signature))))))
 
 (ert-deftest proofread-popup-test-major-mode-change-cleans-up ()
   "Changing major mode deletes the popup and removes local hooks."
@@ -661,10 +770,10 @@ SUGGESTIONS and MESSAGE supply the optional field values."
          (proofread-popup-test--install-diagnostics (list diagnostic))
          (goto-char 5)
          (proofread-popup--update)
-         (should proofread-popup--diagnostic)
+         (should proofread-popup--render-signature)
          (proofread-correct-at-point)
          (should proofread-popup-test--hides)
-         (should-not proofread-popup--diagnostic)
+         (should-not proofread-popup--render-signature)
          (should (equal (buffer-string) "aa hello zz")))))))
 
 (ert-deftest proofread-popup-test-unload-cleans-existing-buffers ()
