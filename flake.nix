@@ -228,6 +228,47 @@
               hasPrefix "test/" (elispRelativePath source)
             ) elispSources;
 
+            proofreadImplementationElispSources = filter (
+              source:
+              hasPrefix "lisp/proofread/" (
+                elispRelativePath source
+              )
+            ) implementationElispSources;
+
+            proofreadPopupImplementationElispSources =
+              filter
+                (
+                  source:
+                  hasPrefix "lisp/proofread-popup/" (
+                    elispRelativePath source
+                  )
+                )
+                implementationElispSources;
+
+            # The popup 0.1 compatibility suite
+            # exercises the current core API.
+            proofreadTestElispSources = filter (
+              source:
+              let
+                relative = elispRelativePath source;
+              in
+              hasPrefix "test/proofread-" relative
+              && relative != "test/proofread-popup-tests.el"
+              && relative != "test/proofread-release-tests.el"
+            ) testElispSources;
+
+            proofreadPopupTestElispSources = filter (
+              source:
+              elispRelativePath source
+              == "test/proofread-popup-tests.el"
+            ) testElispSources;
+
+            releaseTestElispSources = filter (
+              source:
+              elispRelativePath source
+              == "test/proofread-release-tests.el"
+            ) testElispSources;
+
             languageToolServer = pkgs.callPackage (
               projectRoot
               + /tool/languagetool-server/package.nix
@@ -336,6 +377,22 @@
                           ];
 
                           text = ''
+                            if test "$#" -gt 1; then
+                              printf 'Usage: %s [all|proofread|proofread-popup]\n' \
+                                "$0" >&2
+                              exit 2
+                            fi
+                            checkPackage="''${1:-all}"
+                            case "$checkPackage" in
+                              all|proofread|proofread-popup)
+                                ;;
+                              *)
+                                printf 'Unknown package check: %s\n' \
+                                  "$checkPackage" >&2
+                                exit 2
+                                ;;
+                            esac
+
                             testRoot="$(mktemp --tmpdir -d emacs-proofread-tests-XXXXXX)"
                             trap 'rm -rf "$testRoot"' EXIT
 
@@ -354,44 +411,48 @@
                               "$popupInitdir" \
                               "$releaseInitdir"
 
-                            "${emacs-with-proofread}/bin/emacs" --batch \
-                              --init-directory "$coreInitdir" \
-                              -l "${projectRoot + /test}/proofread-tests.el" \
-                              -f ert-run-tests-batch-and-exit
+                            if test "$checkPackage" != proofread-popup; then
+                              "${emacs-with-proofread}/bin/emacs" --batch \
+                                --init-directory "$coreInitdir" \
+                                -l "${projectRoot + /test}/proofread-tests.el" \
+                                -f ert-run-tests-batch-and-exit
 
-                            "${emacs-with-proofread}/bin/emacs" --batch \
-                              --init-directory "$llmInitdir" \
-                              -l "${
-                                projectRoot + /test/proofread-llm-tests.el
-                              }" \
-                              -f ert-run-tests-batch-and-exit
+                              "${emacs-with-proofread}/bin/emacs" --batch \
+                                --init-directory "$llmInitdir" \
+                                -l "${
+                                  projectRoot + /test/proofread-llm-tests.el
+                                }" \
+                                -f ert-run-tests-batch-and-exit
 
-                            "${emacs-with-proofread}/bin/emacs" --batch \
-                              --init-directory "$languageToolInitdir" \
-                              -l "${
+                              "${emacs-with-proofread}/bin/emacs" --batch \
+                                --init-directory "$languageToolInitdir" \
+                                -l "${
+                                  projectRoot
+                                  + /test/proofread-languagetool-tests.el
+                                }" \
+                                -f ert-run-tests-batch-and-exit
+
+                              PROOFREAD_POPUP_V0_1_0_FIXTURE="${
                                 projectRoot
-                                + /test/proofread-languagetool-tests.el
+                                + /test/fixtures/proofread-popup-v0.1.0.el.in
                               }" \
-                              -f ert-run-tests-batch-and-exit
+                              "${emacs-with-proofread-popup}/bin/emacs" --batch \
+                                --init-directory "$popupCompatInitdir" \
+                                -l "${
+                                  projectRoot
+                                  + /test/proofread-popup-v0.1.0-tests.el
+                                }" \
+                                -f ert-run-tests-batch-and-exit
+                            fi
 
-                            PROOFREAD_POPUP_V0_1_0_FIXTURE="${
-                              projectRoot
-                              + /test/fixtures/proofread-popup-v0.1.0.el.in
-                            }" \
-                            "${emacs-with-proofread-popup}/bin/emacs" --batch \
-                              --init-directory "$popupCompatInitdir" \
-                              -l "${
-                                projectRoot
-                                + /test/proofread-popup-v0.1.0-tests.el
-                              }" \
-                              -f ert-run-tests-batch-and-exit
-
-                            "${emacs-with-proofread-popup}/bin/emacs" --batch \
-                              --init-directory "$popupInitdir" \
-                              -l "${
-                                projectRoot + /test/proofread-popup-tests.el
-                              }" \
-                              -f ert-run-tests-batch-and-exit
+                            if test "$checkPackage" != proofread; then
+                              "${emacs-with-proofread-popup}/bin/emacs" --batch \
+                                --init-directory "$popupInitdir" \
+                                -l "${
+                                  projectRoot + /test/proofread-popup-tests.el
+                                }" \
+                                -f ert-run-tests-batch-and-exit
+                            fi
 
                             "${releaseEmacs}/bin/emacs" --batch \
                               --init-directory "$releaseInitdir" \
@@ -415,6 +476,22 @@
                           ];
 
                           text = ''
+                            if test "$#" -gt 1; then
+                              printf 'Usage: %s [all|proofread|proofread-popup]\n' \
+                                "$0" >&2
+                              exit 2
+                            fi
+                            checkPackage="''${1:-all}"
+                            case "$checkPackage" in
+                              all|proofread|proofread-popup)
+                                ;;
+                              *)
+                                printf 'Unknown package check: %s\n' \
+                                  "$checkPackage" >&2
+                                exit 2
+                                ;;
+                            esac
+
                             initdir="$(mktemp --tmpdir -d emacs-proofread-byte-compile-XXXXXX)"
                             workdir="$(mktemp --tmpdir -d emacs-proofread-byte-compile-src-XXXXXX)"
                             trap 'rm -rf "$initdir" "$workdir"' EXIT
@@ -433,30 +510,112 @@
                             cp "${proofreadRelease}/bin/proofread-release" \
                               "$workdir/tool/proofread-release.el"
 
-                            implementationSources=(
-                              ${concatMapStringsSep "\n"
-                                (
-                                  source: ''"$workdir/${elispRelativePath source}"''
+                            case "$checkPackage" in
+                              all)
+                                checkEmacs="${emacs-with-proofread-popup}/bin/emacs"
+                                mainSource="$workdir/lisp/proofread/proofread.el"
+                                implementationSources=(
+                                  ${concatMapStringsSep "\n"
+                                    (
+                                      source: ''"$workdir/${elispRelativePath source}"''
+                                    )
+                                    (
+                                      filter (
+                                        source:
+                                        elispRelativePath source
+                                        != "lisp/proofread/proofread.el"
+                                      ) implementationElispSources
+                                    )
+                                  }
                                 )
-                                (
-                                  filter (
-                                    source:
-                                    elispRelativePath source
-                                    != "lisp/proofread/proofread.el"
-                                  ) implementationElispSources
+                                testSources=(
+                                  ${concatMapStringsSep "\n" (
+                                    source: ''"$workdir/${elispRelativePath source}"''
+                                  ) testElispSources}
                                 )
-                              }
-                            )
-                            testSources=(
-                              ${concatMapStringsSep "\n" (
-                                source: ''"$workdir/${elispRelativePath source}"''
-                              ) testElispSources}
-                            )
+                                loadExpression='(progn
+                                  (require (quote proofread))
+                                  (require (quote proofread-llm))
+                                  (require (quote proofread-languagetool))
+                                  (require (quote proofread-popup))
+                                  (unless (executable-find
+                                           "languagetool-http-server")
+                                    (error
+                                     "LanguageTool server is unavailable")))'
+                                ;;
+                              proofread)
+                                checkEmacs="${emacs-with-proofread}/bin/emacs"
+                                mainSource="$workdir/lisp/proofread/proofread.el"
+                                implementationSources=(
+                                  ${concatMapStringsSep "\n"
+                                    (
+                                      source: ''"$workdir/${elispRelativePath source}"''
+                                    )
+                                    (
+                                      filter (
+                                        source:
+                                        elispRelativePath source
+                                        != "lisp/proofread/proofread.el"
+                                      ) proofreadImplementationElispSources
+                                    )
+                                  }
+                                )
+                                testSources=(
+                                  ${concatMapStringsSep "\n"
+                                    (
+                                      source: ''"$workdir/${elispRelativePath source}"''
+                                    )
+                                    (
+                                      proofreadTestElispSources
+                                      ++ releaseTestElispSources
+                                    )
+                                  }
+                                )
+                                loadExpression='(progn
+                                  (require (quote proofread))
+                                  (require (quote proofread-llm))
+                                  (require (quote proofread-languagetool))
+                                  (unless (executable-find
+                                           "languagetool-http-server")
+                                    (error
+                                     "LanguageTool server is unavailable")))'
+                                ;;
+                              proofread-popup)
+                                checkEmacs="${emacs-with-proofread-popup}/bin/emacs"
+                                mainSource="$workdir/lisp/proofread-popup/proofread-popup.el"
+                                implementationSources=(
+                                  ${concatMapStringsSep "\n"
+                                    (
+                                      source: ''"$workdir/${elispRelativePath source}"''
+                                    )
+                                    (
+                                      filter (
+                                        source:
+                                        elispRelativePath source
+                                        != "lisp/proofread-popup/proofread-popup.el"
+                                      ) proofreadPopupImplementationElispSources
+                                    )
+                                  }
+                                )
+                                testSources=(
+                                  ${concatMapStringsSep "\n"
+                                    (
+                                      source: ''"$workdir/${elispRelativePath source}"''
+                                    )
+                                    (
+                                      proofreadPopupTestElispSources
+                                      ++ releaseTestElispSources
+                                    )
+                                  }
+                                )
+                                loadExpression='(require (quote proofread-popup))'
+                                ;;
+                            esac
 
                             compileLog="$workdir/byte-compile.log"
 
                             {
-                              "${emacs-with-proofread-popup}/bin/emacs" --batch \
+                              "$checkEmacs" --batch \
                                 --init-directory "$initdir" \
                                 -L "$workdir/lisp/proofread" \
                                 -L "$workdir/lisp/proofread-popup" \
@@ -464,17 +623,19 @@
                                 -L "$workdir/tool" \
                                 --eval '(setq byte-compile-error-on-warn t)' \
                                 -f batch-byte-compile \
-                                "$workdir/lisp/proofread/proofread.el"
+                                "$mainSource"
 
-                              "${emacs-with-proofread-popup}/bin/emacs" --batch \
-                                --init-directory "$initdir" \
-                                -L "$workdir/lisp/proofread" \
-                                -L "$workdir/lisp/proofread-popup" \
-                                -L "$workdir/test" \
-                                -L "$workdir/tool" \
-                                --eval '(setq byte-compile-error-on-warn t)' \
-                                -f batch-byte-compile \
-                                "''${implementationSources[@]}"
+                              if test "''${#implementationSources[@]}" -gt 0; then
+                                "$checkEmacs" --batch \
+                                  --init-directory "$initdir" \
+                                  -L "$workdir/lisp/proofread" \
+                                  -L "$workdir/lisp/proofread-popup" \
+                                  -L "$workdir/test" \
+                                  -L "$workdir/tool" \
+                                  --eval '(setq byte-compile-error-on-warn t)' \
+                                  -f batch-byte-compile \
+                                  "''${implementationSources[@]}"
+                              fi
 
                               "${releaseEmacs}/bin/emacs" --batch \
                                 --init-directory "$initdir" \
@@ -483,7 +644,7 @@
                                 -f batch-byte-compile \
                                 "$workdir/tool/proofread-release.el"
 
-                              "${emacs-with-proofread-popup}/bin/emacs" --batch \
+                              "$checkEmacs" --batch \
                                 --init-directory "$initdir" \
                                 -L "$workdir/lisp/proofread" \
                                 -L "$workdir/lisp/proofread-popup" \
@@ -500,19 +661,11 @@
                               exit 1
                             fi
 
-                            "${emacs-with-proofread-popup}/bin/emacs" --batch \
+                            "$checkEmacs" --batch \
                               --init-directory "$initdir" \
                               -L "$workdir/lisp/proofread" \
                               -L "$workdir/lisp/proofread-popup" \
-                              --eval '(progn
-                                (require (quote proofread))
-                                (require (quote proofread-llm))
-                                (require (quote proofread-languagetool))
-                                (require (quote proofread-popup))
-                                (unless (executable-find
-                                         "languagetool-http-server")
-                                  (error
-                                   "LanguageTool server is unavailable")))'
+                              --eval "$loadExpression"
                           '';
                         };
 
@@ -526,22 +679,73 @@
                           ];
 
                           text = ''
+                            if test "$#" -gt 1; then
+                              printf 'Usage: %s [all|proofread|proofread-popup]\n' \
+                                "$0" >&2
+                              exit 2
+                            fi
+                            checkPackage="''${1:-all}"
+                            case "$checkPackage" in
+                              all)
+                                checkdocSources=(
+                                  ${concatMapStringsSep "\n" (
+                                    source:
+                                    ''"${projectRoot}/${elispRelativePath source}"''
+                                  ) elispSources}
+                                )
+                                ;;
+                              proofread)
+                                checkdocSources=(
+                                  ${concatMapStringsSep "\n"
+                                    (
+                                      source:
+                                      ''"${projectRoot}/${elispRelativePath source}"''
+                                    )
+                                    (
+                                      proofreadImplementationElispSources
+                                      ++ proofreadTestElispSources
+                                      ++ releaseTestElispSources
+                                    )
+                                  }
+                                )
+                                ;;
+                              proofread-popup)
+                                checkdocSources=(
+                                  ${concatMapStringsSep "\n"
+                                    (
+                                      source:
+                                      ''"${projectRoot}/${elispRelativePath source}"''
+                                    )
+                                    (
+                                      proofreadPopupImplementationElispSources
+                                      ++ proofreadPopupTestElispSources
+                                      ++ releaseTestElispSources
+                                    )
+                                  }
+                                )
+                                ;;
+                              *)
+                                printf 'Unknown package check: %s\n' \
+                                  "$checkPackage" >&2
+                                exit 2
+                                ;;
+                            esac
+
                             initdir="$(mktemp --tmpdir -d emacs-proofread-checkdoc-XXXXXX)"
                             trap 'rm -rf "$initdir"' EXIT
 
+                            CHECKDOC_SOURCES="$(
+                              printf '%s\n' "''${checkdocSources[@]}"
+                            )" \
                             "${emacs-with-proofread-popup}/bin/emacs" --batch \
                               --init-directory "$initdir" \
                               --eval '(progn
                                 (require (quote checkdoc))
                                 (dolist
                                     (file
-                                     (quote
-                                      (
-                                       ${concatMapStringsSep "\n" (
-                                         source:
-                                         ''"${projectRoot}/${elispRelativePath source}"''
-                                       ) elispSources}
-                                       )))
+                                     (split-string
+                                      (getenv "CHECKDOC_SOURCES")
+                                      "\n" t))
                                   (let ((buffer
                                          (find-file-noselect file)))
                                     (unwind-protect

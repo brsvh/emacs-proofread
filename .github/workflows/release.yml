@@ -10,6 +10,7 @@ permissions: {}
 concurrency:
   group: emacs-proofread-release
   cancel-in-progress: false
+  queue: max
 
 env:
   GITHUB_API_VERSION: "2026-03-10"
@@ -17,19 +18,20 @@ env:
   UPSTREAM_REPOSITORY: brsvh/emacs-proofread
 
 jobs:
-  build:
-    name: Build and verify
+  identify:
+    name: Identify release
     if: >-
       github.repository == 'brsvh/emacs-proofread' &&
       github.ref_type == 'tag'
     runs-on: ubuntu-24.04
-    timeout-minutes: 60
+    timeout-minutes: 20
 
     permissions:
       contents: read
 
     outputs:
-      artifact_id: ${{ steps.upload.outputs.artifact-id }}
+      release_package: ${{ steps.release.outputs.release_package }}
+      release_version: ${{ steps.release.outputs.release_version }}
 
     steps:
       - name: Check out release commit
@@ -44,7 +46,20 @@ jobs:
         with:
           github_access_token: ${{ github.token }}
 
+      - name: Restore Nix store cache
+        uses: nix-community/cache-nix-action@v7.0.2
+        with:
+          primary-key: >-
+            emacs-proofread-nix-${{ runner.os }}-flake-${{
+              hashFiles('**/*.nix', '**/flake.lock')
+            }}
+          restore-prefixes-first-match: |
+            emacs-proofread-nix-${{ runner.os }}-flake-
+            emacs-proofread-nix-${{ runner.os }}-
+          save: false
+
       - name: Identify package release
+        id: release
         shell: bash
         env:
           RELEASE_TAG: ${{ github.ref_name }}
@@ -82,9 +97,9 @@ jobs:
           fi
 
           {
-            printf 'RELEASE_PACKAGE=%s\n' "$release_package"
-            printf 'RELEASE_VERSION=%s\n' "$release_version"
-          } >> "$GITHUB_ENV"
+            printf 'release_package=%s\n' "$release_package"
+            printf 'release_version=%s\n' "$release_version"
+          } >> "$GITHUB_OUTPUT"
 
       - name: Validate release source
         shell: bash
@@ -95,12 +110,162 @@ jobs:
 
           git fetch --force --no-tags origin \
             refs/heads/main:refs/remotes/origin/main
-          git fetch --force --no-tags origin \
-            "refs/heads/${RELEASE_BRANCH}:refs/remotes/origin/${RELEASE_BRANCH}"
 
           test "$(git rev-parse HEAD)" = "$RELEASE_SHA"
           git merge-base --is-ancestor \
             "$RELEASE_SHA" refs/remotes/origin/main
+
+  check:
+    name: Verify / ${{ matrix.check }}
+    needs: identify
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+
+    permissions:
+      contents: read
+
+    strategy:
+      fail-fast: false
+      matrix:
+        check:
+          - flake
+          - test
+          - byte-compilation
+          - checkdoc
+
+    steps:
+      - name: Check out release commit
+        uses: actions/checkout@v6.0.3
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      - name: Install Nix
+        uses: cachix/install-nix-action@v31.10.7
+        with:
+          github_access_token: ${{ github.token }}
+
+      - name: Restore Nix store cache
+        uses: nix-community/cache-nix-action@v7.0.2
+        with:
+          primary-key: >-
+            emacs-proofread-nix-${{ runner.os }}-${{ matrix.check }}-${{
+              hashFiles('**/*.nix', '**/flake.lock')
+            }}
+          restore-prefixes-first-match: |
+            emacs-proofread-nix-${{ runner.os }}-${{ matrix.check }}-
+            emacs-proofread-nix-${{ runner.os }}-
+          save: false
+
+      - name: Run ${{ matrix.check }}
+        env:
+          CHECK: ${{ matrix.check }}
+          RELEASE_PACKAGE: ${{ needs.identify.outputs.release_package }}
+        run: |
+          set -euo pipefail
+          status=0
+          run_check() {
+            if ! "$@"; then
+              status=1
+            fi
+          }
+
+          case "$CHECK" in
+            flake)
+              run_check nix flake check --all-systems
+              run_check nix fmt -- --fail-on-change
+              run_check \
+                nix develop .#release --command \
+                  actionlint \
+                  -ignore 'unexpected key "queue"' \
+                  .github/workflows/release.yml
+              ;;
+            test)
+              run_check \
+                nix run .#emacs30-run-proofread-tests -- \
+                  "$RELEASE_PACKAGE"
+              run_check \
+                nix run .#emacs31-run-proofread-tests -- \
+                  "$RELEASE_PACKAGE"
+              ;;
+            byte-compilation)
+              run_check \
+                nix run .#emacs30-byte-compile-proofread -- \
+                  "$RELEASE_PACKAGE"
+              run_check \
+                nix run .#emacs31-byte-compile-proofread -- \
+                  "$RELEASE_PACKAGE"
+              ;;
+            checkdoc)
+              run_check \
+                nix run .#emacs30-checkdoc-proofread -- \
+                  "$RELEASE_PACKAGE"
+              run_check \
+                nix run .#emacs31-checkdoc-proofread -- \
+                  "$RELEASE_PACKAGE"
+              ;;
+            *)
+              printf 'Unknown check: %s\n' "$CHECK" >&2
+              status=1
+              ;;
+          esac
+
+          exit "$status"
+
+  build:
+    name: Build release
+    needs:
+      - identify
+      - check
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+
+    env:
+      RELEASE_PACKAGE: ${{ needs.identify.outputs.release_package }}
+      RELEASE_VERSION: ${{ needs.identify.outputs.release_version }}
+
+    permissions:
+      contents: read
+
+    outputs:
+      artifact_id: ${{ steps.upload.outputs.artifact-id }}
+
+    steps:
+      - name: Check out release commit
+        uses: actions/checkout@v6.0.3
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Install Nix
+        uses: cachix/install-nix-action@v31.10.7
+        with:
+          github_access_token: ${{ github.token }}
+
+      - name: Restore Nix store cache
+        uses: nix-community/cache-nix-action@v7.0.2
+        with:
+          primary-key: >-
+            emacs-proofread-nix-${{ runner.os }}-byte-compilation-${{
+              hashFiles('**/*.nix', '**/flake.lock')
+            }}
+          restore-prefixes-first-match: |
+            emacs-proofread-nix-${{ runner.os }}-byte-compilation-
+            emacs-proofread-nix-${{ runner.os }}-
+          save: false
+
+      - name: Fetch release history
+        shell: bash
+        env:
+          RELEASE_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+
+          git fetch --force --no-tags origin \
+            "refs/heads/${RELEASE_BRANCH}:refs/remotes/origin/${RELEASE_BRANCH}"
+
+          test "$(git rev-parse HEAD)" = "$RELEASE_SHA"
 
       - name: Read and verify release history
         shell: bash
@@ -204,34 +369,6 @@ jobs:
               release-input/latest-manifest.json \
               release-input/previous-manifest.json
           fi
-
-      - name: Check flake and formatting
-        run: |
-          set -euo pipefail
-          nix flake check --all-systems
-          nix fmt -- --fail-on-change
-          nix develop .#release --command \
-            actionlint \
-            -ignore 'unexpected key "queue"' \
-            .github/workflows/release.yml
-
-      - name: Run tests
-        run: |
-          set -euo pipefail
-          nix run .#emacs30-run-proofread-tests
-          nix run .#emacs31-run-proofread-tests
-
-      - name: Run strict byte compilation
-        run: |
-          set -euo pipefail
-          nix run .#emacs30-byte-compile-proofread
-          nix run .#emacs31-byte-compile-proofread
-
-      - name: Run checkdoc
-        run: |
-          set -euo pipefail
-          nix run .#emacs30-checkdoc-proofread
-          nix run .#emacs31-checkdoc-proofread
 
       - name: Build reproducible package archive
         shell: bash
@@ -491,6 +628,7 @@ jobs:
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
+          RELEASE_SHA: ${{ github.sha }}
           RELEASE_TAG: ${{ github.ref_name }}
         run: |
           set -euo pipefail
@@ -501,19 +639,80 @@ jobs:
               "$@"
           }
 
-          release_by_tag() {
+          # An update without tag_name detaches a draft as untagged-*.
+          # Recover only a unique Actions-owned placeholder.
+          release_for_tag() {
             api --paginate --slurp \
               "repos/${GITHUB_REPOSITORY}/releases?per_page=100" \
-              | jq -e --arg tag "$RELEASE_TAG" '
-                  [.[][] | select(.tag_name == $tag)]
-                  | if length == 1 then
-                      .[0]
-                    elif length == 0 then
-                      empty
+              | jq --arg tag "$RELEASE_TAG" '
+                  . as $pages |
+                  [$pages[][] | select(.tag_name == $tag)] as $tagged |
+                  if ($tagged | length) == 1 then
+                    $tagged[0]
+                  elif ($tagged | length) > 1 then
+                    error("multiple releases found for tag")
+                  else
+                    [$pages[][] |
+                     select(
+                       .draft == true and
+                       .immutable == false and
+                       .published_at == null and
+                       .name == $tag and
+                       (.tag_name |
+                        test("^untagged-[0-9a-f]+$")) and
+                       .author.login == "github-actions[bot]" and
+                       .author.id == 41898282 and
+                       .author.type == "Bot"
+                     )] as $untagged |
+                    if ($untagged | length) == 1 then
+                      $untagged[0]
+                    elif ($untagged | length) == 0 then
+                      null
                     else
-                      error("multiple releases found for tag")
+                      error("multiple recoverable untagged drafts found")
                     end
+                  end
                 '
+          }
+
+          release_by_id() {
+            local release_id=$1
+
+            api "repos/${GITHUB_REPOSITORY}/releases/${release_id}"
+          }
+
+          release_tag_index_matches() {
+            local release_id=$1
+            local indexed_release
+            local status
+
+            indexed_release="$(mktemp)"
+            if release_for_tag > "$indexed_release" \
+              && jq -e \
+                --arg tag "$RELEASE_TAG" \
+                --argjson release_id "$release_id" \
+                '.id == $release_id and .tag_name == $tag' \
+                "$indexed_release" >/dev/null; then
+              status=0
+            else
+              status=1
+            fi
+            rm -f "$indexed_release"
+            return "$status"
+          }
+
+          verify_release_tag() {
+            local tag_sha
+
+            tag_sha="$(
+              api "repos/${GITHUB_REPOSITORY}/commits/${RELEASE_TAG}" \
+                | jq -er '.sha'
+            )"
+            if test "$tag_sha" != "$RELEASE_SHA"; then
+              printf 'Release tag moved: %s != %s\n' \
+                "$tag_sha" "$RELEASE_SHA" >&2
+              return 1
+            fi
           }
 
           asset_digest_from_release() {
@@ -564,15 +763,121 @@ jobs:
             fi
           }
 
+          release_is_owned_draft() {
+            local release_file=$1
+
+            jq -e \
+              --arg tag "$RELEASE_TAG" \
+              --arg release_sha "$RELEASE_SHA" \
+              --rawfile expected_assets \
+                release-handoff/expected-assets.txt \
+              --rawfile expected_body release-handoff/release-notes.md '
+              def actions_bot:
+                .login == "github-actions[bot]" and
+                .id == 41898282 and
+                .type == "Bot";
+              def normalized_body:
+                . as $draft_body |
+                (capture(
+                   "Repository snapshot `" + $tag +
+                   "` at `(?<commit>[0-9a-f]{40})`\\."
+                 ).commit) as $commit |
+                ($draft_body | gsub($commit; $release_sha));
+              ($expected_assets |
+               split("\n") |
+               map(select(length > 0))) as $expected_names |
+              .draft == true and
+              .immutable == false and
+              .prerelease == false and
+              .published_at == null and
+              (.author | actions_bot) and
+              (.tag_name == $tag or
+               ((.tag_name | test("^untagged-[0-9a-f]+$")) and
+                .name == $tag)) and
+              (try ((.body | normalized_body) == $expected_body)
+               catch false) and
+              (.assets | type == "array") and
+              (([.assets[]?.name] | length) ==
+               ([.assets[]?.name] | unique | length)) and
+              (.tag_name == $tag or
+               all(.assets[]?; .state == "uploaded")) and
+              all(.assets[]?;
+                  (.uploader | actions_bot) and
+                  (.name as $name |
+                   ($expected_names | index($name)) != null))
+            ' "$release_file" >/dev/null
+          }
+
+          release_metadata_matches() {
+            local release_file=$1
+
+            jq -e \
+              --arg tag "$RELEASE_TAG" \
+              --rawfile body release-handoff/release-notes.md \
+              '(.tag_name == $tag and
+                .name == $tag and
+                .body == $body and
+                .prerelease == false)' \
+              "$release_file" >/dev/null
+          }
+
+          verify_release_metadata() {
+            local release_file=$1
+
+            if ! release_metadata_matches "$release_file"; then
+              jq -r \
+                --arg tag "$RELEASE_TAG" \
+                --rawfile body release-handoff/release-notes.md '
+                "Release metadata mismatch: " +
+                "tag_name=\(.tag_name | @json), " +
+                "name=\(.name | @json), " +
+                "expected_tag=\($tag | @json), " +
+                "body_matches=\(.body == $body), " +
+                "prerelease=\(.prerelease)"
+              ' "$release_file" >&2
+              return 1
+            fi
+          }
+
+          release_assets_match() {
+            local release_file=$1
+            local name
+            local expected
+            local actual
+
+            while IFS= read -r name; do
+              expected="sha256:$(
+                sha256sum "release-handoff/assets/${name}" \
+                  | cut -d ' ' -f 1
+              )"
+              actual="$(
+                jq -r --arg name "$name" \
+                  '[.assets[]? | select(.name == $name)] |
+                   if length == 1 and .[0].state == "uploaded" then
+                     .[0].digest // empty
+                   else
+                     empty
+                   end' \
+                  "$release_file"
+              )"
+              if test "$actual" != "$expected"; then
+                return 1
+              fi
+            done < release-handoff/expected-assets.txt
+          }
+
           release_json=release-handoff/release.json
-          if release_by_tag > "$release_json"; then
+          release_for_tag > "$release_json"
+          if jq -e 'type == "object"' "$release_json" >/dev/null; then
             :
           else
             jq -n \
               --arg tag "$RELEASE_TAG" \
+              --arg target "$RELEASE_SHA" \
               --rawfile body release-handoff/release-notes.md \
               '{
                 tag_name: $tag,
+                target_commitish: $target,
                 name: $tag,
                 body: $body,
                 draft: true
@@ -583,10 +888,56 @@ jobs:
               > "$release_json"
           fi
 
-          jq -e \
-            --arg tag "$RELEASE_TAG" \
-            '.tag_name == $tag and (.draft == true or .immutable == true)' \
-            "$release_json"
+          # A new draft may not appear in the release list immediately.
+          # Refresh it by its stable ID after the initial lookup or creation.
+          release_id="$(
+            jq -er '.id | select(type == "number")' "$release_json"
+          )"
+          release_by_id "$release_id" > "$release_json"
+          verify_release_tag
+          if jq -e '.draft == true' "$release_json" >/dev/null; then
+            release_is_owned_draft "$release_json"
+            # Every release update must preserve the tag explicitly.
+            jq -n \
+              --arg tag "$RELEASE_TAG" \
+              --arg target "$RELEASE_SHA" \
+              --rawfile body release-handoff/release-notes.md \
+              '{
+                tag_name: $tag,
+                target_commitish: $target,
+                name: $tag,
+                body: $body,
+                draft: true,
+                prerelease: false
+              }' > release-handoff/update-release.json
+            api --method PATCH \
+              --input release-handoff/update-release.json \
+              "repos/${GITHUB_REPOSITORY}/releases/${release_id}" \
+              > "$release_json"
+            for _attempt in 1 2 3 4 5; do
+              release_by_id "$release_id" > "$release_json"
+              if release_is_owned_draft "$release_json" \
+                && release_metadata_matches "$release_json" \
+                && release_tag_index_matches "$release_id"; then
+                break
+              fi
+              sleep 2
+            done
+            release_is_owned_draft "$release_json"
+            verify_release_metadata "$release_json"
+            if ! release_tag_index_matches "$release_id"; then
+              printf 'Release tag index did not converge for ID: %s\n' \
+                "$release_id" >&2
+              exit 1
+            fi
+          else
+            jq -e \
+              --arg tag "$RELEASE_TAG" \
+              '.tag_name == $tag and
+               .draft == false and
+               .immutable == true' \
+              "$release_json"
+          fi
 
           jq -r '.assets[]?.name' "$release_json" \
             | sort > release-handoff/remote-assets.txt
@@ -595,19 +946,57 @@ jobs:
               printf 'Unexpected remote release asset: %s\n' "$name" >&2
               exit 1
             }
-            rm -rf release-handoff/remote-asset
-            mkdir release-handoff/remote-asset
-            gh release download "$RELEASE_TAG" \
-              --repo "$GITHUB_REPOSITORY" \
-              --pattern "$name" \
-              --dir release-handoff/remote-asset
-            cmp \
-              "release-handoff/assets/${name}" \
-              "release-handoff/remote-asset/${name}"
-            verify_github_asset_digest \
-              "$release_json" \
-              "$name" \
-              "release-handoff/assets/${name}"
+            expected_digest="sha256:$(
+              sha256sum "release-handoff/assets/${name}" \
+                | cut -d ' ' -f 1
+            )"
+            actual_digest="$(
+              jq -r --arg name "$name" \
+                '[.assets[]? | select(.name == $name)] |
+                 if length == 1 and .[0].state == "uploaded" then
+                   .[0].digest // empty
+                 else
+                   empty
+                 end' \
+                "$release_json"
+            )"
+            if test "$actual_digest" = "$expected_digest"; then
+              rm -rf release-handoff/remote-asset
+              mkdir release-handoff/remote-asset
+              gh release download "$RELEASE_TAG" \
+                --repo "$GITHUB_REPOSITORY" \
+                --pattern "$name" \
+                --dir release-handoff/remote-asset
+              cmp \
+                "release-handoff/assets/${name}" \
+                "release-handoff/remote-asset/${name}"
+              verify_github_asset_digest \
+                "$release_json" \
+                "$name" \
+                "release-handoff/assets/${name}"
+            elif jq -e \
+              --arg name "$name" \
+              '([.assets[]? | select(.name == $name)]) as $assets |
+               .draft == true and
+               .immutable == false and
+               .author.login == "github-actions[bot]" and
+               .author.id == 41898282 and
+               .author.type == "Bot" and
+               ($assets | length == 1) and
+               $assets[0].uploader.login == "github-actions[bot]" and
+               $assets[0].uploader.id == 41898282 and
+               $assets[0].uploader.type == "Bot"' \
+              "$release_json" >/dev/null; then
+              printf 'Replacing stale draft asset: %s\n' "$name"
+              gh release upload "$RELEASE_TAG" \
+                --repo "$GITHUB_REPOSITORY" \
+                --clobber \
+                "release-handoff/assets/${name}"
+            else
+              printf 'Release asset differs and is not replaceable: %s\n' \
+                "$name" >&2
+              exit 1
+            fi
           done < release-handoff/remote-assets.txt
 
           if jq -e '.draft == true' "$release_json" >/dev/null; then
@@ -620,12 +1009,26 @@ jobs:
               fi
             done < release-handoff/expected-assets.txt
 
-            release_by_tag > "$release_json"
-            jq -r '.assets[]?.name' "$release_json" \
-              | sort > release-handoff/remote-assets.txt
+            for _attempt in 1 2 3 4 5; do
+              release_by_id "$release_id" > "$release_json"
+              jq -r '.assets[]?.name' "$release_json" \
+                | sort > release-handoff/remote-assets.txt
+              if release_is_owned_draft "$release_json" \
+                && release_metadata_matches "$release_json" \
+                && cmp --silent \
+                release-handoff/expected-assets.txt \
+                release-handoff/remote-assets.txt \
+                && release_assets_match "$release_json"; then
+                break
+              fi
+              sleep 2
+            done
+            release_is_owned_draft "$release_json"
+            verify_release_metadata "$release_json"
             cmp \
               release-handoff/expected-assets.txt \
               release-handoff/remote-assets.txt
+            release_assets_match "$release_json"
 
             while IFS= read -r name; do
               verify_github_asset_digest \
@@ -634,14 +1037,37 @@ jobs:
                 "release-handoff/assets/${name}"
             done < release-handoff/expected-assets.txt
 
-            gh release edit "$RELEASE_TAG" \
-              --repo "$GITHUB_REPOSITORY" \
-              --draft=false
+            verify_release_tag
+
+            jq -n \
+              --arg tag "$RELEASE_TAG" \
+              --arg target "$RELEASE_SHA" \
+              --rawfile body release-handoff/release-notes.md \
+              '{
+                tag_name: $tag,
+                target_commitish: $target,
+                name: $tag,
+                body: $body,
+                draft: false,
+                prerelease: false
+              }' \
+              > release-handoff/publish-release.json
+            api --method PATCH \
+              --input release-handoff/publish-release.json \
+              "repos/${GITHUB_REPOSITORY}/releases/${release_id}" \
+              > "$release_json"
           fi
 
           for _attempt in 1 2 3 4 5; do
-            release_by_tag > "$release_json"
-            if jq -e \
+            release_by_id "$release_id" > "$release_json"
+            jq -r '.assets[]?.name' "$release_json" \
+              | sort > release-handoff/remote-assets.txt
+            if release_metadata_matches "$release_json" \
+              && cmp --silent \
+                release-handoff/expected-assets.txt \
+                release-handoff/remote-assets.txt \
+              && release_assets_match "$release_json" \
+              && jq -e \
               '.draft == false and .immutable == true' \
               "$release_json" >/dev/null; then
               break
@@ -651,6 +1077,11 @@ jobs:
           jq -e \
             '.draft == false and .immutable == true' \
             "$release_json"
+          verify_release_metadata "$release_json"
+          cmp \
+            release-handoff/expected-assets.txt \
+            release-handoff/remote-assets.txt
+          release_assets_match "$release_json"
 
           rm -rf published-assets
           mkdir published-assets
