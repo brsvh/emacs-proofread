@@ -29,16 +29,20 @@ https://github.com/user-attachments/assets/9dc5c4ee-a43e-45b8-a9fc-a372079ed528
 
 ### Installation
 
-The `proofread` package requires GNU Emacs and GNU ELPA `llm`, and contains the
-core, LLM, and LanguageTool libraries. LanguageTool itself is an optional
-runtime dependency used only by LanguageTool checkers; the core and LLM backend
-neither load nor start it. The LanguageTool backend can reuse any compatible
-local v2 HTTP server; automatic startup additionally requires a
-`languagetool-http-server` executable on `exec-path`. The optional
-`proofread-popup` 0.1.1 package additionally requires `proofread` 0.2.0 or later
-and `posframe`.
+The `proofread` package includes the core library and a set of supported
+backends. It depends on:
 
-Clone this repository and add its package directories to `load-path`:
+- GNU Emacs 30.1 or later
+- [emacs-llm](https://github.com/ahyatt/llm) `0.31.1`
+
+The backends currently supported by `proofread` include:
+
+- `proofread-llm`, a backend for llm that defines the request and response
+  protocol and automatically registers itself as a Proofread Backend when loaded
+- `proofread-languagetool`, a Proofread Backend for
+  [LanguageTool](https://languagetool.org/)
+
+Clone this repository and add its package directory to `load-path`:
 
 ```sh
 git clone https://github.com/brsvh/emacs-proofread.git
@@ -46,39 +50,14 @@ git clone https://github.com/brsvh/emacs-proofread.git
 
 ```elisp
 (add-to-list 'load-path "/path/to/emacs-proofread/lisp/proofread")
-(add-to-list 'load-path "/path/to/emacs-proofread/lisp/proofread-popup")
 (require 'proofread)
 ```
-
-### Building packages
-
-The repository's `Makefile` builds the core `proofread` package and the optional
-`proofread-popup` package. Building uses GNU Make, GNU tar, and GNU Emacs. The
-package dependencies listed above must be visible to the Emacs used for byte
-compilation. Run these commands from the repository root:
-
-```sh
-make all
-make proofread
-make proofread-popup
-make clean
-```
-
-`make all` builds both packages. The package-specific targets build just one
-package, and `make clean` removes generated files. Set `EMACS` to choose another
-executable, for example `make EMACS=/path/to/emacs all`.
-
-Build outputs are written under `lisp/` and `dist/`: package metadata,
-autoloads, byte-compiled files, and ELPA-compatible source archives. Individual
-stage targets such as `make proofread-compile` or `make proofread-archive`
-remain available for release work, but the summary targets above are normally
-enough.
 
 ### Configuration
 
 > [!WARNING]
 > The API in the current main branch is unstable; it is recommended that you use
-> the v0.1.0 tag instead.
+> the v0.2.0 tag instead.
 
 Proofread dispatch is profile-driven. Define `proofread-profiles`, select one
 with `proofread-profile`, and require the backend libraries used by that
@@ -452,6 +431,7 @@ loaded, `proofread-popup-mode` automatically follows `proofread-mode` in each
 buffer:
 
 ```elisp
+(add-to-list 'load-path "/path/to/emacs-proofread/lisp/proofread-popup")
 (require 'proofread-popup)
 ```
 
@@ -647,6 +627,30 @@ default of `3` to `1`.
   such a change.
 - Records created by `proofread-ignore` persist only for the current Emacs
   session; they are not saved, and there is no command to remove one.
+
+### Building packages
+
+The repository's `Makefile` builds the core `proofread` package and the optional
+`proofread-popup` package. Building uses GNU Make, GNU tar, and GNU Emacs. The
+package dependencies listed above must be visible to the Emacs used for byte
+compilation. Run these commands from the repository root:
+
+```sh
+make all
+make proofread
+make proofread-popup
+make clean
+```
+
+`make all` builds both packages. The package-specific targets build just one
+package, and `make clean` removes generated files. Set `EMACS` to choose another
+executable, for example `make EMACS=/path/to/emacs all`.
+
+Build outputs are written under `lisp/` and `dist/`: package metadata,
+autoloads, byte-compiled files, and ELPA-compatible source archives. Individual
+stage targets such as `make proofread-compile` or `make proofread-archive`
+remain available for release work, but the summary targets above are normally
+enough.
 
 ## Guide for Nix users
 

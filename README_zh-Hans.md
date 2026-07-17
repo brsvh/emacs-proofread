@@ -26,11 +26,16 @@ https://github.com/user-attachments/assets/3c77758b-00ab-48e2-9e23-e54e8845d251
 
 ### 安装
 
-`proofread` 包依赖 GNU Emacs 和 GNU ELPA `llm`，其中同时包含核心、LLM 和 LanguageTool
-库。LanguageTool 本身是可选运行时依赖，仅在使用 LanguageTool checker 时需要；核心与 LLM
-后端不会加载或启动它。LanguageTool 后端可以复用任意兼容的本地 v2 HTTP 服务；只有自动启动功能额外要求
-`languagetool-http-server` 位于 `exec-path`。可选的 `proofread-popup` 0.1.1 包还要求
-`proofread` 0.2.0 或更高版本，并依赖 `posframe`。
+`proofread` 包括核心库与一组受支持的后端，它的依赖情况为：
+
+- GNU Emacs 30.1 或之后的版本
+- [emacs-llm](https://github.com/ahyatt/llm) `0.31.1`
+
+`proofread` 目前支持的后端包括：
+
+- `proofread-llm`，适用于 llm 的后端，定义了请求与响应协议，`load` 后自动注册为 Proofread Backend
+- `proofread-languagetool` 适用于 [languagetool](https://languagetool.org/) 的
+  Proofread Backend。
 
 克隆本仓库并将其中的软件包目录加入 `load-path`：
 
@@ -40,33 +45,13 @@ git clone https://github.com/brsvh/emacs-proofread.git
 
 ```elisp
 (add-to-list 'load-path "/path/to/emacs-proofread/lisp/proofread")
-(add-to-list 'load-path "/path/to/emacs-proofread/lisp/proofread-popup")
 (require 'proofread)
 ```
-
-### 构建软件包
-
-仓库中的 `Makefile` 可构建核心包 `proofread` 和可选包 `proofread-popup`。构建使用 GNU Make、GNU tar
-和 GNU Emacs；进行字节编译时，上文列出的包依赖必须对所用 Emacs 可见。请从仓库根目录运行这些命令：
-
-```sh
-make all
-make proofread
-make proofread-popup
-make clean
-```
-
-`make all` 会构建两个包。包专用目标只构建其中一个包，`make clean` 会删除生成文件。可通过 `EMACS` 选择其他 Emacs
-可执行文件，例如 `make EMACS=/path/to/emacs all`。
-
-构建输出位于 `lisp/` 和 `dist/` 下：包元数据、autoload 文件、字节编译文件，以及符合 ELPA
-规范的源码归档。`make proofread-compile` 或 `make proofread-archive`
-等单阶段目标仍可用于发布工作，但普通使用通常只需要上面的汇总目标。
 
 ### 配置
 
 > [!WARNING]
-> 当前主分支的代码 API 并不稳定，建议您使用 v0.1.0 tag。
+> 当前主分支的代码 API 并不稳定，建议您使用 v0.2.0 tag。
 
 Proofread 的派发由 profile 驱动。先定义 `proofread-profiles`，再用 `proofread-profile` 选中一个
 profile，并加载该 profile 使用的后端库。Profile 是命名语言配置，包含 `:language`、`:display-language`
@@ -384,6 +369,7 @@ https://github.com/user-attachments/assets/8ce73c38-69af-4b51-bcc8-f913753751fc
 `proofread-mode`：
 
 ```elisp
+(add-to-list 'load-path "/path/to/emacs-proofread/lisp/proofread-popup")
 (require 'proofread-popup)
 ```
 
@@ -540,6 +526,25 @@ LanguageTool 库另有一个 `proofread-languagetool` Customize 组：
 - 若外部管理的 LanguageTool 服务在 URL 不变的情况下升级或更换模型，缓存无法自动识别该变化。此时请运行
   `proofread-clear-cache`。
 - 由 `proofread-ignore` 创建的记录仅在当前 Emacs 会话中持续有效；这些记录不会保存，也没有用于移除记录的命令。
+
+### 构建软件包
+
+仓库中的 `Makefile` 可构建核心包 `proofread` 和可选包 `proofread-popup`。构建使用 GNU Make、GNU tar
+和 GNU Emacs；进行字节编译时，上文列出的包依赖必须对所用 Emacs 可见。请从仓库根目录运行这些命令：
+
+```sh
+make all
+make proofread
+make proofread-popup
+make clean
+```
+
+`make all` 会构建两个包。包专用目标只构建其中一个包，`make clean` 会删除生成文件。可通过 `EMACS` 选择其他 Emacs
+可执行文件，例如 `make EMACS=/path/to/emacs all`。
+
+构建输出位于 `lisp/` 和 `dist/` 下：包元数据、autoload 文件、字节编译文件，以及符合 ELPA
+规范的源码归档。`make proofread-compile` 或 `make proofread-archive`
+等单阶段目标仍可用于发布工作，但普通使用通常只需要上面的汇总目标。
 
 ## Nix 用户指南
 
