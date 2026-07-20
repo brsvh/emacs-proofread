@@ -169,6 +169,8 @@ POINT-OFFSET is a zero-based offset or the symbol `end'."
                 #'proofread-languagetool--check))
     (should (eq (plist-get descriptor :identity)
                 #'proofread-languagetool--identity))
+    (should (eq (plist-get descriptor :snapshot-options)
+                #'proofread-languagetool--snapshot-checker-options))
     (should (eq (plist-get descriptor :checker-identity)
                 #'proofread-languagetool--checker-identity))
     (should (eq (plist-get descriptor :source-label)
@@ -178,10 +180,264 @@ POINT-OFFSET is a zero-based offset or the symbol `end'."
       (funcall (plist-get descriptor :source-label)
                '( :profile test :name local
                   :backend languagetool
-                  :options ( :source-label "ignored")))
+                  :options ( :language "de-DE")))
       "languagetool"))
     (should (eq (plist-get descriptor :cancel)
                 #'proofread-languagetool--cancel))))
+
+(ert-deftest
+    proofread-languagetool-test-checker-options-normalize-and-detach ()
+  "Normalize checker options without retaining mutable input values."
+  (let* ((property-value (list "secret"))
+         (language
+          (propertize (copy-sequence " en-US ")
+                      'proofread-test property-value))
+         (variant-de
+          (propertize (copy-sequence " de-DE ")
+                      'proofread-test property-value))
+         (variant-en (copy-sequence "en-US"))
+         (preferred-variants
+          (list variant-de variant-en variant-de))
+         (mother-tongue
+          (propertize (copy-sequence " zh-CN ")
+                      'proofread-test property-value))
+         (rule-b (copy-sequence " RULE_B "))
+         (rule-a
+          (propertize (copy-sequence "RULE_A")
+                      'proofread-test property-value))
+         (enabled-rules (list rule-b rule-a rule-b))
+         (disabled-rules (list (copy-sequence " OFF ")))
+         (enabled-categories (list (copy-sequence " STYLE ")))
+         (disabled-categories (list (copy-sequence " TYPO ")))
+         (raw-options
+          (list :language language
+                :level 'picky
+                :preferred-variants preferred-variants
+                :mother-tongue mother-tongue
+                :enabled-rules enabled-rules
+                :disabled-rules disabled-rules
+                :enabled-categories enabled-categories
+                :disabled-categories disabled-categories
+                :enabled-only nil))
+         (expected
+          '( :language "en-US"
+             :level picky
+             :preferred-variants ( "de-DE" "en-US")
+             :mother-tongue "zh-CN"
+             :enabled-rules ( "RULE_A" "RULE_B")
+             :disabled-rules ( "OFF")
+             :enabled-categories ( "STYLE")
+             :disabled-categories ( "TYPO")
+             :enabled-only nil))
+         (snapshot
+          (proofread-languagetool--snapshot-checker-options
+           raw-options)))
+    (should (equal snapshot expected))
+    (should-not (eq language (plist-get snapshot :language)))
+    (should-not (eq mother-tongue
+                    (plist-get snapshot :mother-tongue)))
+    (let ((strings
+           (list (plist-get snapshot :language)
+                 (plist-get snapshot :mother-tongue))))
+      (dolist (key '( :preferred-variants
+                      :enabled-rules
+                      :disabled-rules
+                      :enabled-categories
+                      :disabled-categories))
+        (setq strings (append strings (plist-get snapshot key))))
+      (dolist (value strings)
+        (should-not (text-properties-at 0 value))))
+    (dolist (key '( :preferred-variants
+                    :enabled-rules
+                    :disabled-rules
+                    :enabled-categories
+                    :disabled-categories))
+      (let ((input (plist-get raw-options key))
+            (output (plist-get snapshot key)))
+        (should-not (eq input output))
+        (dolist (value output)
+          (should-not (memq value input)))))
+    (aset language 1 ?X)
+    (aset mother-tongue 1 ?X)
+    (aset variant-de 1 ?X)
+    (aset rule-a 0 ?X)
+    (setcdr preferred-variants nil)
+    (setcdr enabled-rules nil)
+    (setcar property-value "changed")
+    (should (equal snapshot expected))))
+
+(ert-deftest
+    proofread-languagetool-test-checker-options-preserve-explicit-nil ()
+  "Distinguish absent checker options from explicitly nil options."
+  (let ((proofread-languagetool-level 'picky)
+        (proofread-languagetool-preferred-variants '( "en-US"))
+        (proofread-languagetool-mother-tongue "zh-CN")
+        (proofread-languagetool-enabled-rules '( "RULE"))
+        (proofread-languagetool-disabled-rules '( "OFF"))
+        (proofread-languagetool-enabled-categories '( "STYLE"))
+        (proofread-languagetool-disabled-categories '( "TYPO"))
+        (proofread-languagetool-enabled-only nil))
+    (let ((fallbacks
+           (proofread-languagetool--snapshot-checker-options nil)))
+      (should-not (plist-member fallbacks :language))
+      (should (equal fallbacks
+                     '( :level picky
+                        :preferred-variants ( "en-US")
+                        :mother-tongue "zh-CN"
+                        :enabled-rules ( "RULE")
+                        :disabled-rules ( "OFF")
+                        :enabled-categories ( "STYLE")
+                        :disabled-categories ( "TYPO")
+                        :enabled-only nil))))
+    (dolist (key '( :language
+                    :preferred-variants
+                    :mother-tongue
+                    :enabled-rules
+                    :disabled-rules
+                    :enabled-categories
+                    :disabled-categories))
+      (let ((snapshot
+             (proofread-languagetool--snapshot-checker-options
+              (list key nil))))
+        (should (plist-member snapshot key))
+        (should-not (plist-get snapshot key)))))
+  (let ((proofread-languagetool-enabled-only t)
+        (proofread-languagetool-enabled-rules '( "RULE"))
+        (proofread-languagetool-disabled-rules nil)
+        (proofread-languagetool-enabled-categories nil)
+        (proofread-languagetool-disabled-categories nil))
+    (should
+     (plist-get
+      (proofread-languagetool--snapshot-checker-options nil)
+      :enabled-only))
+    (let ((snapshot
+           (proofread-languagetool--snapshot-checker-options
+            '( :enabled-only nil))))
+      (should (plist-member snapshot :enabled-only))
+      (should-not (plist-get snapshot :enabled-only)))))
+
+(ert-deftest
+    proofread-languagetool-test-checker-options-freeze-fallbacks ()
+  "Freeze fallback options for later identity and request construction."
+  (let* ((variant (copy-sequence "en-US"))
+         (mother-tongue (copy-sequence "zh-CN"))
+         (rule (copy-sequence "RULE_A"))
+         (proofread-languagetool-server-url
+          "http://127.0.0.1:8081/v2")
+         (proofread-languagetool-auto-start nil)
+         (proofread-languagetool-level 'picky)
+         (proofread-languagetool-preferred-variants (list variant))
+         (proofread-languagetool-mother-tongue mother-tongue)
+         (proofread-languagetool-enabled-rules (list rule))
+         (proofread-languagetool-disabled-rules nil)
+         (proofread-languagetool-enabled-categories nil)
+         (proofread-languagetool-disabled-categories nil)
+         (proofread-languagetool-enabled-only t)
+         (snapshot
+          (proofread-languagetool--snapshot-checker-options nil))
+         (checker
+          (list :profile 'test :name 'local :backend 'languagetool
+                :options snapshot))
+         (request
+          (proofread-languagetool-test--request
+           :language nil :checker-options snapshot))
+         (identity
+          (proofread-languagetool--checker-identity checker))
+         (body
+          (plist-get (proofread-languagetool--request-data request)
+                     :body)))
+    (should (equal snapshot
+                   '( :level picky
+                      :preferred-variants ( "en-US")
+                      :mother-tongue "zh-CN"
+                      :enabled-rules ( "RULE_A")
+                      :disabled-rules nil
+                      :enabled-categories nil
+                      :disabled-categories nil
+                      :enabled-only t)))
+    (aset variant 0 ?X)
+    (aset mother-tongue 0 ?X)
+    (aset rule 0 ?X)
+    (setq proofread-languagetool-level 'default
+          proofread-languagetool-preferred-variants nil
+          proofread-languagetool-mother-tongue nil
+          proofread-languagetool-enabled-rules nil
+          proofread-languagetool-enabled-only nil)
+    (should (equal (proofread-languagetool--checker-identity checker)
+                   identity))
+    (should (equal
+             (plist-get (proofread-languagetool--request-data request)
+                        :body)
+             body))))
+
+(ert-deftest
+    proofread-languagetool-test-checker-options-reject-invalid-input ()
+  "Reject malformed, unknown, duplicate, and invalid checker options."
+  (dolist
+      (options
+       '(not-a-plist
+         ( :language)
+         (language "en-US")
+         ( :unknown t)
+         ( :level picky :level default)
+         ( :language 42)
+         ( :language "  ")
+         ( :level nil)
+         ( :level ordinary)
+         ( :preferred-variants "en-US")
+         ( :preferred-variants ( "en-US" "en-GB"))
+         ( :preferred-variants ( "en-US" . "en-GB"))
+         ( :mother-tongue "")
+         ( :enabled-rules ( "RULE,"))
+         ( :enabled-rules ( "RULE" . "OTHER"))
+         ( :disabled-rules ( 42))
+         ( :enabled-categories t)
+         ( :enabled-only yes)
+         ( :enabled-only t
+           :enabled-rules nil
+           :enabled-categories nil
+           :disabled-rules nil
+           :disabled-categories nil)
+         ( :enabled-only t
+           :enabled-rules ( "RULE")
+           :disabled-rules ( "OTHER"))))
+    (should-error
+     (proofread-languagetool--snapshot-checker-options options)))
+  (dolist (case '( ( :preferred-variants . "en-US")
+                   ( :enabled-rules . "RULE")))
+    (let ((cycle (list (cdr case))))
+      (setcdr cycle cycle)
+      (unwind-protect
+          (should-error
+           (proofread-languagetool--snapshot-checker-options
+            (list (car case) cycle)))
+        (setcdr cycle nil)))))
+
+(ert-deftest
+    proofread-languagetool-test-explicit-nil-language-overrides-request ()
+  "An explicitly nil checker language selects automatic detection."
+  (let* ((options
+          (proofread-languagetool--snapshot-checker-options
+           '( :language nil)))
+         (explicit-request
+          (proofread-languagetool-test--request
+           :language "fr-FR" :checker-options options))
+         (absent-request
+          (proofread-languagetool-test--request
+           :language "fr-FR" :checker-options nil))
+         (checker
+          (list :profile 'test :name 'local :backend 'languagetool
+                :options options))
+         (identity
+          (proofread-languagetool--checker-identity checker)))
+    (should (equal (proofread-languagetool--request-language
+                    explicit-request)
+                   "auto"))
+    (should (equal (proofread-languagetool--request-language
+                    absent-request)
+                   "fr-FR"))
+    (should (plist-member identity :language))
+    (should (equal (plist-get identity :language) "auto"))))
 
 (ert-deftest proofread-languagetool-test-identity-covers-rules ()
   "Cache identity includes every response-affecting request option."
@@ -749,10 +1005,8 @@ The identity does not expose arguments."
         (proofread-languagetool-enabled-categories nil)
         (proofread-languagetool-disabled-categories nil)
         (proofread-languagetool-enabled-only nil))
-    (let* ((request
-            (proofread-languagetool-test--request
-             :language "fr-FR"
-             :checker-options
+    (let* ((options
+            (proofread-languagetool--snapshot-checker-options
              '( :language nil
                 :level picky
                 :preferred-variants ( "en-US")
@@ -761,8 +1015,11 @@ The identity does not expose arguments."
                 :disabled-rules nil
                 :enabled-categories ( "STYLE")
                 :disabled-categories nil
-                :enabled-only t
-                :url "http://127.0.0.1:9999/v2")))
+                :enabled-only t)))
+           (request
+            (proofread-languagetool-test--request
+             :language "fr-FR"
+             :checker-options options))
            (data (proofread-languagetool--request-data request))
            (body (plist-get data :body)))
       (dolist (part
@@ -776,43 +1033,46 @@ The identity does not expose arguments."
         (should (string-match-p (regexp-quote part) body)))
       (should-not (string-match-p
                    (regexp-quote "GLOBAL_OFF")
-                   body))
-      (should-not (string-match-p
-                   (regexp-quote "9999")
                    body)))))
 
 (ert-deftest
     proofread-languagetool-test-checker-identity-covers-options ()
-  "Checker identity covers request options and ignores checker URL."
+  "Checker identity covers detached normalized request options."
   (let ((proofread-languagetool-server-url
          "http://127.0.0.1:8081/v2/")
         (proofread-languagetool-level 'default)
         (proofread-languagetool-enabled-rules nil)
         (proofread-languagetool-auto-start nil))
-    (let* ((base
-            '( :profile multi
-               :name local
-               :backend languagetool
-               :options ( :language nil
-                          :level picky
-                          :enabled-rules ( "RULE_B" "RULE_A")
-                          :url "http://127.0.0.1:9999/v2")))
-           (same-url-changed
-            '( :profile multi
-               :name local
-               :backend languagetool
-               :options ( :language nil
-                          :level picky
-                          :enabled-rules ( "RULE_B" "RULE_A")
-                          :url "http://127.0.0.1:9998/v2")))
+    (let* ((base-options
+            (proofread-languagetool--snapshot-checker-options
+             '( :language nil
+                :level picky
+                :enabled-rules ( "RULE_B" "RULE_A"))))
+           (equivalent-options
+            (proofread-languagetool--snapshot-checker-options
+             '( :enabled-rules ( " RULE_A " "RULE_B" "RULE_A")
+                :language nil
+                :level picky)))
+           (changed-options
+            (proofread-languagetool--snapshot-checker-options
+             '( :language nil
+                :level default
+                :enabled-rules ( "RULE_B" "RULE_A"))))
+           (base
+            (list :profile 'multi
+                  :name 'local
+                  :backend 'languagetool
+                  :options base-options))
+           (equivalent
+            (list :profile 'multi
+                  :name 'local
+                  :backend 'languagetool
+                  :options equivalent-options))
            (changed-option
-            '( :profile multi
-               :name local
-               :backend languagetool
-               :options ( :language nil
-                          :level default
-                          :enabled-rules ( "RULE_B" "RULE_A")
-                          :url "http://127.0.0.1:9999/v2")))
+            (list :profile 'multi
+                  :name 'local
+                  :backend 'languagetool
+                  :options changed-options))
            (identity
             (proofread-languagetool--checker-identity base)))
       (should (equal (plist-get identity :server-url)
@@ -823,14 +1083,11 @@ The identity does not expose arguments."
                      '( "RULE_A" "RULE_B")))
       (should (equal identity
                      (proofread-languagetool--checker-identity
-                      same-url-changed)))
+                      equivalent)))
       (should-not (equal
                    identity
                    (proofread-languagetool--checker-identity
-                    changed-option)))
-      (should-not (string-match-p
-                   (regexp-quote "9999")
-                   (prin1-to-string identity))))))
+                    changed-option))))))
 
 (ert-deftest proofread-languagetool-test-preferred-variant-order ()
   "Preferred variants preserve order and reject base conflicts."
@@ -1580,7 +1837,7 @@ A stale timeout leaves readiness unchanged."
             (add-hook 'kill-buffer-hook
                       (lambda () (error "Kill hook failure")) nil t))
           (cl-letf (((symbol-function 'remove-hook) #'ignore)
-                    ((symbol-function 'proofread--unregister-backend)
+                    ((symbol-function 'proofread-unregister-backend)
                      #'ignore)
                     ((symbol-function
                       'proofread-languagetool--teardown)

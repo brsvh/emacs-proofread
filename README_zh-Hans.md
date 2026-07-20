@@ -137,6 +137,11 @@ key 的稳定 provider 标识：
 Schema，否则回退到仅由提示词约束的 JSON。如果提供 `:instructions-function`，也应提供稳定的
 `:instructions-identity`，以便指令变化时缓存身份同步变化。
 
+Provider 对象与 provider identity 构成一对。Checker 显式覆盖 `:provider` 却省略
+`:provider-identity` 时，会为该对象使用 session-local identity，而不会继承默认 provider 的
+identity。同理，显式的非 `nil` `:instructions-function` 必须有 checker-local
+`:instructions-identity`；只有继承默认说明函数时才使用默认说明 identity。
+
 `proofread-llm-request-timeout` 是由 Proofread 管理的请求 watchdog，默认值为 `120` 秒；将其设为
 `nil` 可在全局禁用 watchdog，所有非 `nil` 值都必须是正数。只要 checker 局部 `:options` 中存在
 `:request-timeout` 键，就会覆盖全局值，因此显式的 `nil` 会只为该 checker 禁用 watchdog。超时设置只控制请求的
@@ -461,11 +466,11 @@ https://github.com/user-attachments/assets/2dda228e-f85c-4500-aea0-549500628c6e
 | `proofread-llm-provider`                  | `nil`  | LLM checker 省略 `:provider` 时使用的默认提供程序                |
 | `proofread-llm-response-strategy`         | `auto` | LLM checker 省略 `:response-strategy` 时使用的默认响应策略       |
 | `proofread-llm-request-timeout`           | `120`  | 设置 LLM watchdog 与 mode-local plz 连接超时；`nil` 表示禁用两者 |
-| `proofread-llm-provider-identity`         | `nil`  | LLM checker 省略 `:provider-identity` 时使用的默认稳定标识       |
+| `proofread-llm-provider-identity`         | `nil`  | LLM checker 继承默认 provider 时使用的稳定标识                   |
 | `proofread-llm-source-label`              | `nil`  | 默认诊断来源标签；`nil` 表示使用有效 provider 名称               |
 | `proofread-llm-max-diagnostic-passes`     | `3`    | LLM checker 省略 `:diagnostic-passes` 时使用的默认诊断轮数       |
 | `proofread-llm-instructions-function`     | `nil`  | LLM checker 省略 `:instructions-function` 时使用的默认附加说明   |
-| `proofread-llm-instructions-identity`     | `nil`  | LLM checker 省略说明标识时使用的默认稳定标识                     |
+| `proofread-llm-instructions-identity`     | `nil`  | LLM checker 继承默认附加说明时使用的稳定标识                     |
 | `proofread-cache-max-entries`             | `128`  | 限制每个缓冲区的 LRU 缓存条目数；`0` 表示禁用缓存                |
 | `proofread-request-log-max-records`       | `100`  | 限制每个受监视缓冲区保留的记录数                                 |
 | `proofread-ignored-faces`                 | `nil`  | 排除 `face` 属性与指定 `face` 匹配的文本                         |
@@ -548,6 +553,60 @@ make clean
 构建输出位于 `lisp/` 和 `dist/` 下：包元数据、autoload 文件、字节编译文件，以及符合 ELPA
 规范的源码归档。`make proofread-compile` 或 `make proofread-archive`
 等单阶段目标仍可用于发布工作，但普通使用通常只需要上面的汇总目标。
+
+## 编写后端
+
+计划用于 0.3.0 的公共后端 API 包括 `proofread-register-backend` 和
+`proofread-unregister-backend`。第三方后端使用 descriptor 注册一个符号，不得调用或依赖任何
+`proofread--*` 符号。
+
+```elisp
+(proofread-register-backend
+ 'example
+ :check #'example-check
+ :identity #'example-identity
+ :snapshot-options #'example-snapshot-options)
+```
+
+| Descriptor 属性     | 是否必需 | 操作契约                                                                          |
+| ------------------- | -------- | --------------------------------------------------------------------------------- |
+| `:check`            | 必需     | `(REQUEST CALLBACK)` 启动非阻塞工作、至多结算一次 `CALLBACK`，并返回不透明 handle |
+| `:identity`         | 必需     | `()` 返回该后端所有 checker 共享的完整、稳定、非机密 identity                     |
+| `:snapshot-options` | 必需     | `(RAW-OPTIONS)` 验证并规范化选项，再返回下文所述、由后端拥有的快照                |
+| `:checker-identity` | 可选     | `(CHECKER)` 返回该 checker 的完整有效 identity，以此取代后端全局 identity         |
+| `:source-label`     | 可选     | `(CHECKER)` 返回 `nil` 或非空、非机密的显示标签                                   |
+| `:cancel`           | 可选     | `(HANDLE)` 使用 `:check` 返回的不透明 handle 幂等地取消工作                       |
+
+两个 identity 操作都返回 property list，其中包含值为已注册后端符号的 `:backend`，以及
+`:contract-version`。`:checker-identity` 的结果不会与 `:identity` 合并；它必须是该 checker
+的完整有效后端 identity。省略 `:checker-identity` 时，Proofread 会把后端全局 identity
+与后端拥有的选项快照组合起来；提供该操作时，Proofread 不再自动加入选项快照，因此该操作必须自行表示所有会影响 identity 的后端局部选项。
+
+`:snapshot-options` 是后端局部数据的所有权边界。它接收的原始 checker 选项为 `nil` 或 keyword property
+list。后端自行验证并规范化输入，再返回与输入脱离、结构正确的 keyword property list；`nil` 是有效的空结果。后端按值处理的可变
+集合不得与原始输入共享。返回的快照按约定不可变；checker identity、source label 和请求构造共享同一个快照对象。若保持 `eq`
+identity 属于后端语义，不透明的 provider、record 或 identity 对象可以保留原有 identity。Proofread 会在
+freshness 检查时再次调用该操作，因此它必须确定性地解析当前后端默认值：有效含义相同的配置必须产生 `equal` 的快照。
+
+所有可能影响可复用诊断内容的后端局部值都必须反映在有效 checker identity 中，从而进入诊断缓存 identity。Profile
+language 等核心拥有的维度由核心单独编码；timeout 等仅影响生命周期的设置则不必影响缓存兼容性。Identity
+必须稳定、足以完整描述缓存兼容性，并且不得包含凭据或其他机密。
+
+`:check` 必须在不阻塞 Emacs 的情况下提交请求，并且至多结算一次 callback。`REQUEST` 是只读 property
+list；面向后端的载荷包括缓冲区、绝对范围、文本、周边上下文、语言、major mode、target kind、source label、checker
+identity，以及位于 `:checker-options` 中的同一个选项快照。后端在结果中原样返回该 request 对象。终结成功结果的形状为
+`(:status ok :request REQUEST :diagnostics LIST)`。成功结果还可包含 `:partial t`；此时
+Proofread 会合并诊断，而不替换现有诊断或将结果写入缓存。错误结果的形状为
+`(:status error :request REQUEST :error VALUE)`。两种结果都可包含安全的 `:message`。
+
+每个 diagnostic 都是 property list，其中 `:beg` 和 `:end` 是 request
+范围内绝对、左闭右开的边界，`:text` 是该范围中的文本；此外还包含 `:kind`、`:message`、由字符串组成的 proper list
+`:suggestions`、`:source` 和 `:target-kind`。`:check` 的返回 handle 对核心保持不透明。当
+descriptor 提供 `:cancel` 时，Proofread 会在提交时捕获该操作，之后将 handle
+原样传给它。提交、callback、取消、identity 和选项快照失败只影响拥有该工作的 checker，其他 checker 可以继续运行。
+
+请求日志只保留安全投影，不会暴露原始 checker 选项、已快照的后端局部对象或不透明 handle。后端应只在 identity 和 source
+label 中放入安全摘要，而不应依赖日志功能为嵌入其中的机密进行脱敏。
 
 ## Nix 用户指南
 

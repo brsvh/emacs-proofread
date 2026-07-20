@@ -39,6 +39,14 @@
 (defvar proofread-test--profile-language nil
   "Language used by the minimal test profile fixture.")
 
+(cl-defstruct
+    (proofread-test--hash-option-snapshot
+     (:constructor
+      proofread-test--make-hash-option-snapshot (test entries)))
+  "Comparable fake-backend snapshot of a hash-table option."
+  test
+  entries)
+
 ;;;; Test helpers
 
 (defun proofread-test--tree-member-p (needle tree)
@@ -546,6 +554,50 @@ When HANDLE is non-nil, attach it as the backend handle."
         :token proofread-test--backend-identity-token
         :contract-version 1))
 
+(defun proofread-test--snapshot-option-entry-less-p (left right)
+  "Return non-nil when snapshot entry LEFT precedes RIGHT."
+  (string< (prin1-to-string left)
+           (prin1-to-string right)))
+
+(defun proofread-test--snapshot-option-value (value)
+  "Return the test backend's snapshot of option VALUE.
+Mutable collection values are detached recursively.  Objects whose
+identity belongs to a provider remain opaque to this fake backend.
+Hash tables become ordered value representations that `equal' can
+compare across freshness snapshots."
+  (cond
+   ((or (markerp value) (recordp value)) value)
+   ((consp value)
+    (cons (proofread-test--snapshot-option-value (car value))
+          (proofread-test--snapshot-option-value (cdr value))))
+   ((stringp value) (substring-no-properties value))
+   ((bool-vector-p value) (copy-sequence value))
+   ((vectorp value)
+    (let ((copy (copy-sequence value)))
+      (dotimes (index (length copy))
+        (aset copy index
+              (proofread-test--snapshot-option-value
+               (aref copy index))))
+      copy))
+   ((hash-table-p value)
+    (let (entries)
+      (maphash
+       (lambda (key item)
+         (push
+          (list (proofread-test--snapshot-option-value key)
+                (proofread-test--snapshot-option-value item))
+          entries))
+       value)
+      (proofread-test--make-hash-option-snapshot
+       (hash-table-test value)
+       (sort entries
+             #'proofread-test--snapshot-option-entry-less-p))))
+   (t value)))
+
+(defun proofread-test--snapshot-checker-options (options)
+  "Return the fake backend-owned snapshot of checker OPTIONS."
+  (proofread-test--snapshot-option-value options))
+
 (defun proofread-test--profiles (&optional language backend)
   "Return a minimal test profile using LANGUAGE and BACKEND.
 When LANGUAGE is nil, the profile has no language hint.  When
@@ -624,12 +676,13 @@ When PROFILE is nil, use the current profile."
 (defun proofread-test--register-cancellable-backend
     (backend check cancel)
   "Register BACKEND with CHECK, CANCEL, and a minimal identity."
-  (proofread--register-backend
+  (proofread-register-backend
    backend
    :check check
    :identity
    (lambda ()
      (list :backend backend :contract-version 1))
+   :snapshot-options #'proofread-test--snapshot-checker-options
    :cancel cancel))
 
 (defun proofread-test--assert-no-pending-request-work ()
@@ -4212,6 +4265,98 @@ This covers URLs, email, invisible text, faces, and properties."
       (should (eq (plist-get languagetool-checker :backend)
                   'languagetool)))))
 
+(ert-deftest proofread-test-profile-normalization-keeps-raw-options ()
+  "Leave opaque checker options untouched during core normalization."
+  (let* ((provider
+          (record 'proofread-test-provider 'opaque-identity))
+         (mutable-value (list "initial"))
+         (options (list :provider provider
+                        :mutable-value mutable-value))
+         (proofread-profile 'raw-options)
+         (proofread-profiles
+          (list
+           (list
+            'raw-options
+            :checkers
+            (list
+             (list :name 'only
+                   :backend proofread-test--backend
+                   :options options)))))
+         (checker
+          (car (plist-get (proofread--current-profile) :checkers))))
+    (should (eq (plist-get checker :options) options))
+    (should (eq (plist-get (plist-get checker :options) :provider)
+                provider))
+    (should (eq (plist-get (plist-get checker :options)
+                           :mutable-value)
+                mutable-value))))
+
+(ert-deftest proofread-test-fake-backend-snapshots-owned-options ()
+  "Detach fake backend collections while preserving opaque identities."
+  (with-temp-buffer
+    (insert "Alpha")
+    (let* ((provider
+            (record 'proofread-test-provider 'opaque-identity))
+           (position (copy-marker (point-min)))
+           (name (copy-sequence "formal"))
+           (vector-value (vector (list "nested")))
+           (table-value (make-hash-table :test #'equal))
+           (table-key (list "key"))
+           (table-list (list "table"))
+           (options
+            (list :provider provider
+                  :position position
+                  :name name
+                  :vector vector-value
+                  :table table-value)))
+      (puthash table-key table-list table-value)
+      (let* ((checker
+              (list :profile 'multi
+                    :name 'only
+                    :backend proofread-test--backend
+                    :options options))
+             (snapshot-checker
+              (proofread--checker-with-options-snapshot checker))
+             (snapshot (plist-get snapshot-checker :options)))
+        (should-not (eq snapshot options))
+        (should (eq (plist-get snapshot :provider) provider))
+        (should (eq (plist-get snapshot :position) position))
+        (should-not (eq (plist-get snapshot :name) name))
+        (should-not (eq (plist-get snapshot :vector) vector-value))
+        (should-not (eq (aref (plist-get snapshot :vector) 0)
+                        (aref vector-value 0)))
+        (should-not (eq (plist-get snapshot :table) table-value))
+        (let ((table-snapshot (plist-get snapshot :table)))
+          (should
+           (proofread-test--hash-option-snapshot-p table-snapshot))
+          (should
+           (eq (proofread-test--hash-option-snapshot-test
+                table-snapshot)
+               'equal))
+          (should
+           (equal (proofread-test--hash-option-snapshot-entries
+                   table-snapshot)
+                  '(( ("key") ("table"))))))
+        (should
+         (equal
+          snapshot
+          (plist-get
+           (proofread--checker-with-options-snapshot checker)
+           :options)))
+        (setcar (aref vector-value 0) "changed")
+        (setcar table-list "changed")
+        (aset name 0 ?X)
+        (should
+         (equal (plist-get snapshot :name) "formal"))
+        (should
+         (equal (aref (plist-get snapshot :vector) 0)
+                '( "nested")))
+        (should
+         (equal
+          (proofread-test--hash-option-snapshot-entries
+           (plist-get snapshot :table))
+          '(( ("key") ("table")))))))))
+
 (ert-deftest proofread-test-profile-can-be-buffer-local ()
   "Allow buffers to explicitly select different profiles."
   (let ((proofread-profile 'english)
@@ -4553,10 +4698,16 @@ This covers URLs, email, invisible text, faces, and properties."
   (let ((proofread-profile 'multi)
         (proofread-profiles
          (proofread-test--ordered-profiles '( only)))
+        (snapshot-calls 0)
         (identity-calls 0)
         reports)
     (cl-letf
-        (((symbol-function 'proofread--checker-request-identities)
+        (((symbol-function
+           'proofread-test--snapshot-checker-options)
+          (lambda (_options)
+            (setq snapshot-calls (1+ snapshot-calls))
+            (error "Options must not be snapshotted for empty chunks")))
+         ((symbol-function 'proofread--checker-request-identities)
           (lambda (_checker)
             (setq identity-calls (1+ identity-calls))
             (error "Identity must not be requested for empty chunks")))
@@ -4568,8 +4719,170 @@ This covers URLs, email, invisible text, faces, and properties."
         (proofread--dispatch-profile-request-ready-chunks-result
          nil (proofread--current-profile))
         '( :requests nil :supported-count 1 :failures nil))))
+    (should (zerop snapshot-calls))
     (should (zerop identity-calls))
     (should-not reports)))
+
+(ert-deftest proofread-test-unsupported-checker-skips-options-snapshot
+    ()
+  "Do not call a checker snapshot hook for an unsupported backend."
+  (let* ((backend 'proofread-test-unavailable-snapshot-backend)
+         (proofread--backend-registry (make-hash-table :test #'eq))
+         (snapshot-calls 0)
+         (profile '( :name multi :checkers nil))
+         (checker
+          (list :profile 'multi
+                :name 'only
+                :checker-ordinal 0
+                :backend backend
+                :options (list :tone 'formal))))
+    (should
+     (equal
+      (proofread--prepare-profile-checker-dispatch
+       '(unused-chunk) profile checker)
+      '( :status unsupported)))
+    (proofread-register-backend
+     backend
+     :check #'ignore
+     :identity
+     (lambda ()
+       (list :backend backend :contract-version 1))
+     :snapshot-options
+     (lambda (options)
+       (setq snapshot-calls (1+ snapshot-calls))
+       (proofread-test--snapshot-checker-options options)))
+    (should
+     (equal
+      (proofread--prepare-profile-checker-dispatch
+       nil profile checker)
+      '( :status prepared :supported t :work nil)))
+    (should (zerop snapshot-calls))))
+
+(ert-deftest proofread-test-ad-hoc-dispatch-snapshots-options-once ()
+  "Snapshot ad-hoc checker options once before request construction."
+  (with-temp-buffer
+    (insert "Alpha")
+    (let* ((backend 'proofread-test-ad-hoc-snapshot-backend)
+           (proofread-auto-check nil)
+           (proofread-context-size 0)
+           (proofread--backend-registry
+            (make-hash-table :test #'eq))
+           (snapshot-calls 0)
+           snapshot)
+      (proofread-register-backend
+       backend
+       :check #'ignore
+       :identity
+       (lambda ()
+         (list :backend backend :contract-version 1))
+       :snapshot-options
+       (lambda (options)
+         (should-not options)
+         (setq snapshot-calls (1+ snapshot-calls))
+         (setq snapshot (list :resolved t))))
+      (proofread-mode 1)
+      (let* ((chunk
+              (car
+               (proofread-test--request-ready-chunks-for-ranges
+                (list (cons (point-min) (point-max))))))
+             (requests
+              (cl-letf
+                  (((symbol-function
+                     'proofread--dispatch-prepared-checker-work)
+                    (lambda (prepared _backend)
+                      (mapcar #'car prepared))))
+                (proofread--dispatch-request-ready-chunks
+                 (list chunk) backend)))
+             (request (car requests))
+             (checker-identity
+              (plist-get request :checker-identity)))
+        (should (= snapshot-calls 1))
+        (should (= (length requests) 1))
+        (should (eq (plist-get request :checker-options) snapshot))
+        (should (eq (plist-get checker-identity :options)
+                    snapshot))))))
+
+(ert-deftest
+    proofread-test-checker-preparation-shares-one-options-snapshot ()
+  "Share one backend-owned snapshot across one checker preparation."
+  (with-temp-buffer
+    (text-mode)
+    (set-syntax-table (copy-syntax-table (syntax-table)))
+    (modify-syntax-entry ?\n ".")
+    (modify-syntax-entry ?\r ".")
+    (insert "First. Second.")
+    (let* ((backend 'proofread-test-options-sharing-backend)
+           (tone (copy-sequence "formal"))
+           (mutable (list "original"))
+           (raw-options (list :tone tone :mutable mutable))
+           (proofread-auto-check nil)
+           (proofread-context-size 0)
+           (proofread-profile 'multi)
+           (proofread-profiles
+            (list
+             (list
+              'multi
+              :checkers
+              (list
+               (list :name 'only
+                     :backend backend
+                     :options raw-options)))))
+           (proofread--backend-registry
+            (make-hash-table :test #'eq))
+           (snapshot-calls 0)
+           snapshot-input
+           snapshot
+           identity-options
+           source-options)
+      (proofread-register-backend
+       backend
+       :check #'ignore
+       :identity
+       (lambda ()
+         (list :backend backend :contract-version 1))
+       :snapshot-options
+       (lambda (options)
+         (setq snapshot-calls (1+ snapshot-calls))
+         (setq snapshot-input options)
+         (setq snapshot
+               (proofread-test--snapshot-checker-options options)))
+       :checker-identity
+       (lambda (checker)
+         (setq identity-options (plist-get checker :options))
+         (list :backend backend
+               :tone (plist-get identity-options :tone)
+               :contract-version 1))
+       :source-label
+       (lambda (checker)
+         (setq source-options (plist-get checker :options))
+         "test model"))
+      (proofread-mode 1)
+      (let* ((profile (proofread--current-profile))
+             (checker (car (plist-get profile :checkers)))
+             (chunks
+              (proofread-test--request-ready-chunks-for-ranges
+               (list (cons (point-min) (point-max)))))
+             (preparation
+              (proofread--prepare-profile-checker-dispatch
+               chunks profile checker))
+             (requests (mapcar #'car
+                               (plist-get preparation :work))))
+        (should (eq (plist-get preparation :status) 'prepared))
+        (should (= (length requests) 2))
+        (should (= snapshot-calls 1))
+        (should (eq snapshot-input raw-options))
+        (should (eq identity-options snapshot))
+        (should (eq source-options snapshot))
+        (dolist (request requests)
+          (should (eq (plist-get request :checker-options)
+                      snapshot)))
+        (aset tone 0 ?X)
+        (setcar mutable "changed")
+        (dolist (request requests)
+          (let ((options (plist-get request :checker-options)))
+            (should (equal (plist-get options :tone) "formal"))
+            (should (equal (plist-get options :mutable)
+                           '( "original")))))))))
 
 (ert-deftest
     proofread-test-profile-source-label-is-snapshotted-once-per-checker
@@ -4590,10 +4903,11 @@ This covers URLs, email, invisible text, faces, and properties."
            (proofread--backend-registry (make-hash-table :test #'eq))
            (recorder (proofread-test--make-backend-recorder))
            calls)
-      (proofread--register-backend
+      (proofread-register-backend
        proofread-test--backend
        :check (plist-get recorder :function)
        :identity #'proofread-test--backend-identity
+       :snapshot-options #'proofread-test--snapshot-checker-options
        :source-label
        (lambda (checker)
          (push (copy-sequence checker) calls)
@@ -4657,10 +4971,11 @@ This covers URLs, email, invisible text, faces, and properties."
              (recorder (proofread-test--make-backend-recorder))
              (calls 0)
              reports)
-        (proofread--register-backend
+        (proofread-register-backend
          proofread-test--backend
          :check (plist-get recorder :function)
          :identity #'proofread-test--backend-identity
+         :snapshot-options #'proofread-test--snapshot-checker-options
          :source-label
          (lambda (_checker)
            (setq calls (1+ calls))
@@ -4709,10 +5024,11 @@ This covers URLs, email, invisible text, faces, and properties."
            (recorder (proofread-test--make-backend-recorder))
            (label "old-model")
            cancelled-handles)
-      (proofread--register-backend
+      (proofread-register-backend
        proofread-test--backend
        :check (plist-get recorder :function)
        :identity #'proofread-test--backend-identity
+       :snapshot-options #'proofread-test--snapshot-checker-options
        :source-label (lambda (_checker) label)
        :cancel (lambda (handle)
                  (push handle cancelled-handles)))
@@ -4766,10 +5082,11 @@ This covers URLs, email, invisible text, faces, and properties."
   (let ((proofread--backend-registry (make-hash-table :test #'eq))
         (calls 0)
         reports)
-    (proofread--register-backend
+    (proofread-register-backend
      proofread-test--backend
      :check #'ignore
      :identity #'proofread-test--backend-identity
+     :snapshot-options #'proofread-test--snapshot-checker-options
      :source-label
      (lambda (_checker)
        (setq calls (1+ calls))
@@ -4873,6 +5190,102 @@ This covers URLs, email, invisible text, faces, and properties."
               (proofread-test--assert-one-checker-report reports))))))))
 
 (ert-deftest
+    proofread-test-profile-checker-options-failure-isolates-checker
+    ()
+  "Continue later checkers after an options snapshot cannot be made."
+  (dolist (failure '( error invalid))
+    (with-temp-buffer
+      (text-mode)
+      (insert "First. Second.")
+      (let* ((sentinel
+              "PROOFREAD-TEST-SNAPSHOT-SECRET-MUST-NOT-APPEAR")
+             (provider
+              (vector 'proofread-test-provider :api-key sentinel))
+             (proofread-auto-check nil)
+             (proofread-cache-max-entries 0)
+             (proofread-context-size 0)
+             (proofread-max-concurrent-requests 20)
+             (proofread-profile 'multi)
+             (proofread-profiles
+              (list
+               (list
+                'multi
+                :checkers
+                (list
+                 (list :name 'failed
+                       :backend proofread-test--backend
+                       :options
+                       (list :failure failure
+                             :provider provider))
+                 (list :name 'later
+                       :backend proofread-test--backend)))))
+             (proofread--backend-registry
+              (make-hash-table :test #'eq))
+             (recorder (proofread-test--make-backend-recorder))
+             (failed-snapshot-calls 0)
+             raw-error-text
+             events
+             progress
+             reports)
+        (proofread-register-backend
+         proofread-test--backend
+         :check (plist-get recorder :function)
+         :identity #'proofread-test--backend-identity
+         :snapshot-options
+         (lambda (options)
+           (if-let* ((kind (plist-get options :failure)))
+               (progn
+                 (setq failed-snapshot-calls
+                       (1+ failed-snapshot-calls))
+                 (pcase kind
+                   ('error
+                    (setq raw-error-text
+                          (format "Snapshot failure for %S" provider))
+                    (error "%s" raw-error-text))
+                   ('invalid (vector :provider provider))))
+             (proofread-test--snapshot-checker-options options))))
+        (proofread-mode 1)
+        (let ((proofread-request-log-hook
+               (list (lambda (event)
+                       (push event events)))))
+          (cl-letf
+              (((symbol-function
+                 'proofread-report-warning-without-window)
+                (lambda (detail summary)
+                  (push (list detail summary) reports)))
+               ((symbol-function 'proofread--progress-message)
+                (lambda (format-string &rest args)
+                  (push (apply #'format format-string args)
+                        progress))))
+            (proofread-check-buffer)
+            (let ((requests
+                   (funcall (plist-get recorder :requests))))
+              (should (= failed-snapshot-calls 1))
+              (when (eq failure 'error)
+                (should (string-match-p (regexp-quote sentinel)
+                                        raw-error-text)))
+              (proofread-test--assert-secret-not-printed
+               sentinel events)
+              (proofread-test--assert-secret-not-printed
+               sentinel reports)
+              (proofread-test--assert-checker-dispatch-failure-event
+               events 'checker-options)
+              (proofread-test--assert-one-checker-report reports)
+              (proofread-test--assert-successful-checker-requests
+               requests '( later))
+              (proofread-test--assert-dispatch-progress
+               progress (length requests))
+              (should-not
+               (memq 'failed
+                     (proofread-test--scheduled-checker-names)))
+              (should
+               (equal
+                (proofread-test--complete-recorded-requests recorder)
+                (make-list (length requests) 'applied)))
+              (proofread-test--assert-request-diagnostics requests)
+              (proofread-test--assert-requests-settled requests))))))))
+
+(ert-deftest
     proofread-test-profile-checker-identity-error-isolates-checker ()
   "Continue later profile checkers after one identity calculation fails."
   (dolist (position '( first middle))
@@ -4896,10 +5309,11 @@ This covers URLs, email, invisible text, faces, and properties."
              events
              progress
              reports)
-        (proofread--register-backend
+        (proofread-register-backend
          proofread-test--backend
          :check (plist-get recorder :function)
          :identity #'proofread-test--backend-identity
+         :snapshot-options #'proofread-test--snapshot-checker-options
          :checker-identity
          (lambda (checker)
            (if (eq (plist-get checker :name) 'failed)
@@ -6158,10 +6572,11 @@ This covers URLs, email, invisible text, faces, and properties."
                   :backend ,proofread-test--backend)))))
            (proofread--backend-registry (make-hash-table :test #'eq))
            (label "old-model"))
-      (proofread--register-backend
+      (proofread-register-backend
        proofread-test--backend
        :check #'proofread-test--backend-check
        :identity #'proofread-test--backend-identity
+       :snapshot-options #'proofread-test--snapshot-checker-options
        :source-label (lambda (_checker) label))
       (proofread-mode 1)
       (let* ((profile (proofread--current-profile))
@@ -6305,16 +6720,17 @@ This covers URLs, email, invisible text, faces, and properties."
 
 (ert-deftest
     proofread-test-profile-cache-key-uses-backend-checker-identity ()
-  "Let backend checker identity own raw checker options in cache keys."
+  "Let backend checker identity own snapshotted options in cache keys."
   (let ((proofread--backend-registry (make-hash-table :test #'eq))
         identity-checkers)
-    (proofread--register-backend
+    (proofread-register-backend
      proofread-test--backend
      :check (lambda (_request _callback) nil)
      :identity
      (lambda ()
        '( :backend proofread-test-backend
           :contract-version 1))
+     :snapshot-options #'proofread-test--snapshot-checker-options
      :checker-identity
      (lambda (checker)
        (push (copy-sequence checker) identity-checkers)
@@ -6376,9 +6792,9 @@ This covers URLs, email, invisible text, faces, and properties."
           (prin1-to-string
            (plist-get formal-a-request :cache-key))))))))
 
-(ert-deftest proofread-test-cache-contract-v3-isolates-v0.1-namespace
+(ert-deftest proofread-test-cache-contract-v4-isolates-v3-namespace
     ()
-  "Keep released v0.1 cache entries out of the current namespace."
+  "Keep pre-snapshot checker cache entries out of the namespace."
   (with-temp-buffer
     (insert "Alpha")
     (let ((proofread-auto-check nil)
@@ -6392,26 +6808,15 @@ This covers URLs, email, invisible text, faces, and properties."
                (request
                 (proofread-test--make-profile-request chunk))
                (new-key (plist-get request :cache-key))
-               (v0.1-key
-                (list
-                 :text-hash (plist-get new-key :text-hash)
-                 :language (plist-get new-key :language)
-                 :major-mode (plist-get new-key :major-mode)
-                 :target-policy (plist-get new-key :target-policy)
-                 :target-kind (plist-get new-key :target-kind)
-                 :backend (plist-get new-key :backend)
-                 :contract-version 2
-                 :context (plist-get new-key :context)
-                 :response-schema '( :type "object"))))
-          (should (= proofread--contract-version 3))
-          (should (= (plist-get new-key :contract-version) 3))
+               (v3-key (copy-tree new-key)))
+          (setf (plist-get v3-key :contract-version) 3)
+          (should (= proofread--contract-version 4))
+          (should (= (plist-get new-key :contract-version) 4))
+          (should (= (plist-get v3-key :contract-version) 3))
           (should (plist-member new-key :checker))
           (should (plist-member new-key :display-language))
-          (should-not (plist-member v0.1-key :checker))
-          (should-not (plist-member v0.1-key :display-language))
-          (should (plist-member v0.1-key :response-schema))
-          (should (proofread--cache-write v0.1-key 'old-value))
-          (should (eq (proofread--cache-read v0.1-key) 'old-value))
+          (should (proofread--cache-write v3-key 'old-value))
+          (should (eq (proofread--cache-read v3-key) 'old-value))
           (should-not (proofread--cache-read new-key)))))))
 
 (ert-deftest proofread-test-request-requires-current-checker-provenance ()
@@ -6486,6 +6891,143 @@ This covers URLs, email, invisible text, faces, and properties."
                      :backend ,proofread-test--backend
                      :options ( :tone relaxed)))))))
           (should-not (proofread--fresh-request-p request)))))))
+
+(ert-deftest
+    proofread-test-backend-options-snapshot-defines-cache-freshness ()
+  "Use backend-normalized options for cache and freshness identity."
+  (let* ((backend 'proofread-test-normalizing-options-backend)
+         (proofread--backend-registry (make-hash-table :test #'eq))
+         (snapshot-calls 0))
+    (proofread-register-backend
+     backend
+     :check #'ignore
+     :identity
+     (lambda ()
+       (list :backend backend :contract-version 1))
+     :snapshot-options
+     (lambda (options)
+       (setq snapshot-calls (1+ snapshot-calls))
+       (list :tone (downcase (plist-get options :tone)))))
+    (with-temp-buffer
+      (insert "Alpha")
+      (let* ((raw-tone (copy-sequence "FORMAL"))
+             (proofread-auto-check nil)
+             (proofread-context-size 0)
+             (proofread-profile 'multi)
+             (proofread-profiles
+              (list
+               (list
+                'multi
+                :checkers
+                (list
+                 (list :name 'only
+                       :backend backend
+                       :options
+                       (list :tone raw-tone
+                             :volatile '( first))))))))
+        (proofread-mode 1)
+        (let* ((profile (proofread--current-profile))
+               (checker (car (plist-get profile :checkers)))
+               (chunk
+                (car
+                 (proofread-test--request-ready-chunks-for-ranges
+                  (list (cons (point-min) (point-max))))))
+               (request
+                (proofread--make-backend-request
+                 chunk backend checker profile)))
+          (should (equal (plist-get request :checker-options)
+                         '( :tone "formal")))
+          (aset raw-tone 0 ?X)
+          (should (equal (plist-get request :checker-options)
+                         '( :tone "formal")))
+          (setq proofread-profiles
+                (list
+                 (list
+                  'multi
+                  :checkers
+                  (list
+                   (list :name 'only
+                         :backend backend
+                         :options
+                         '( :tone "formal"
+                            :volatile (second)))))))
+          (should (proofread--request-current-checker-p request))
+          (should (proofread--fresh-request-p request))
+          (let* ((equivalent-profile (proofread--current-profile))
+                 (equivalent-checker
+                  (car (plist-get equivalent-profile :checkers)))
+                 (equivalent-request
+                  (proofread--make-backend-request
+                   chunk backend equivalent-checker
+                   equivalent-profile)))
+            (should
+             (equal (plist-get equivalent-request :cache-key)
+                    (plist-get request :cache-key))))
+          (setq proofread-profiles
+                (list
+                 (list
+                  'multi
+                  :checkers
+                  (list
+                   (list :name 'only
+                         :backend backend
+                         :options '( :tone "relaxed"))))))
+          (should-not (proofread--request-current-checker-p request))
+          (should-not (proofread--fresh-request-p request))
+          (let* ((changed-profile (proofread--current-profile))
+                 (changed-checker
+                  (car (plist-get changed-profile :checkers)))
+                 (changed-request
+                  (proofread--make-backend-request
+                   chunk backend changed-checker changed-profile)))
+            (should-not
+             (equal (plist-get changed-request :cache-key)
+                    (plist-get request :cache-key))))
+          (should (> snapshot-calls 1)))))))
+
+(ert-deftest proofread-test-hash-option-snapshot-is-cache-stable ()
+  "Keep backend-normalized hash options comparable across snapshots."
+  (with-temp-buffer
+    (insert "Alpha")
+    (let* ((table (make-hash-table :test #'eq))
+           (key (copy-sequence "key"))
+           (proofread-auto-check nil)
+           (proofread-context-size 0)
+           (proofread-profile 'hash-options)
+           (proofread-profiles
+            (list
+             (list
+              'hash-options
+              :checkers
+              (list
+               (list :name 'only
+                     :backend proofread-test--backend
+                     :options (list :table table)))))))
+      (puthash key (list "value") table)
+      (proofread-mode 1)
+      (let* ((profile (proofread--current-profile))
+             (checker (car (plist-get profile :checkers)))
+             (chunk
+              (car
+               (proofread-test--request-ready-chunks-for-ranges
+                (list (cons (point-min) (point-max))))))
+             (request
+              (proofread--make-backend-request
+               chunk proofread-test--backend checker profile))
+             (current-profile (proofread--current-profile))
+             (current-checker
+              (car (plist-get current-profile :checkers)))
+             (equivalent
+              (proofread--make-backend-request
+               chunk proofread-test--backend current-checker
+               current-profile)))
+        (should (proofread--request-current-checker-p request))
+        (should (proofread--fresh-request-p request))
+        (should (equal (plist-get equivalent :cache-key)
+                       (plist-get request :cache-key)))
+        (aset key 0 ?X)
+        (should-not (proofread--request-current-checker-p request))
+        (should-not (proofread--fresh-request-p request))))))
 
 (ert-deftest
     proofread-test-profile-display-language-affects-cache-and-freshness
@@ -6675,7 +7217,7 @@ This covers URLs, email, invisible text, faces, and properties."
           (let ((request (car proofread--active-requests)))
             (pcase transition
               ('unregister
-               (proofread--unregister-backend backend))
+               (proofread-unregister-backend backend))
               ('reregister
                (proofread-test--register-cancellable-backend
                 backend
@@ -6875,7 +7417,7 @@ This covers URLs, email, invisible text, faces, and properties."
                    (error "Unexpected cancellation")))
          checked
          result)
-    (proofread--register-backend
+    (proofread-register-backend
      proofread-test--backend
      :check
      (lambda (request callback)
@@ -6887,6 +7429,7 @@ This covers URLs, email, invisible text, faces, and properties."
      :identity
      (lambda ()
        '( :backend proofread-test-backend :contract-version 1))
+     :snapshot-options #'proofread-test--snapshot-checker-options
      :cancel cancel)
     (should (proofread--supported-backend-p proofread-test--backend))
     (should
@@ -6912,7 +7455,7 @@ This covers URLs, email, invisible text, faces, and properties."
       (should-not result)
       (should (proofread-test--wait-for (lambda () result)))
       (should (eq (plist-get result :status) 'ok)))
-    (proofread--unregister-backend proofread-test--backend)
+    (proofread-unregister-backend proofread-test--backend)
     (should-not
      (proofread--supported-backend-p proofread-test--backend))))
 
@@ -6921,13 +7464,84 @@ This covers URLs, email, invisible text, faces, and properties."
   "Reject a non-callable backend source-label operation."
   (let ((proofread--backend-registry (make-hash-table :test #'eq)))
     (should-error
-     (proofread--register-backend
+     (proofread-register-backend
       proofread-test--backend
       :check #'ignore
       :identity #'proofread-test--backend-identity
+      :snapshot-options #'proofread-test--snapshot-checker-options
       :source-label 'not-callable))
     (should-not
      (gethash proofread-test--backend proofread--backend-registry))))
+
+(ert-deftest proofread-test-backend-registry-requires-options-snapshot
+    ()
+  "Reject absent, non-callable, duplicate, and unknown operations."
+  (let ((proofread--backend-registry (make-hash-table :test #'eq))
+        (base
+         (list :check #'ignore
+               :identity #'proofread-test--backend-identity)))
+    (dolist
+        (descriptor
+         (list
+          base
+          (append base '( :snapshot-options not-callable))
+          (append
+           base
+           (list :snapshot-options
+                 #'proofread-test--snapshot-checker-options
+                 :snapshot-options
+                 #'proofread-test--snapshot-checker-options))
+          (append
+           base
+           (list :snapshot-options
+                 #'proofread-test--snapshot-checker-options
+                 :unknown-operation #'ignore))))
+      (should-error
+       (apply #'proofread-register-backend
+              proofread-test--backend descriptor))
+      (should-not
+       (gethash proofread-test--backend
+                proofread--backend-registry)))))
+
+(ert-deftest proofread-test-backend-options-snapshot-must-be-plist ()
+  "Reject every malformed checker options snapshot envelope."
+  (dolist (invalid
+           (list [:tone formal]
+                 '( :tone . formal)
+                 '( :tone)
+                 '(tone formal)))
+    (let ((proofread--backend-registry
+           (make-hash-table :test #'eq)))
+      (proofread-register-backend
+       proofread-test--backend
+       :check #'ignore
+       :identity #'proofread-test--backend-identity
+       :snapshot-options (lambda (_options) invalid))
+      (should-error
+       (proofread--checker-with-options-snapshot
+        (list :profile 'multi
+              :name 'only
+              :backend proofread-test--backend
+              :options '( :tone formal))))))
+  (let* ((cycle (list :tone 'formal))
+         (tail (last cycle))
+         (proofread--backend-registry
+          (make-hash-table :test #'eq)))
+    (setcdr tail cycle)
+    (unwind-protect
+        (progn
+          (proofread-register-backend
+           proofread-test--backend
+           :check #'ignore
+           :identity #'proofread-test--backend-identity
+           :snapshot-options (lambda (_options) cycle))
+          (should-error
+           (proofread--checker-with-options-snapshot
+            (list :profile 'multi
+                  :name 'only
+                  :backend proofread-test--backend
+                  :options '( :tone formal)))))
+      (setcdr tail nil))))
 
 (ert-deftest proofread-test-backend-registry-lazily-loads-feature ()
   "Load a known backend feature once before resolving its descriptor."
@@ -6938,13 +7552,15 @@ This covers URLs, email, invisible text, faces, and properties."
     (cl-letf (((symbol-function 'require)
                (lambda (feature &optional _filename _noerror)
                  (setq loaded-feature feature)
-                 (proofread--register-backend
+                 (proofread-register-backend
                   'proofread-test-lazy
                   :check (lambda (_request _callback) 'test-handle)
                   :identity
                   (lambda ()
                     '( :backend proofread-test-lazy
-                       :contract-version 1)))
+                       :contract-version 1))
+                  :snapshot-options
+                  #'proofread-test--snapshot-checker-options)
                  t)))
       (should (proofread--supported-backend-p 'proofread-test-lazy))
       (should (eq loaded-feature 'proofread-test-lazy-feature))
@@ -11822,8 +12438,8 @@ This covers URLs, email, invisible text, faces, and properties."
             (kill-buffer buffer)))))))
 
 (ert-deftest
-    proofread-test-request-monitor-redacts-checker-failure ()
-  "Redact opaque condition data from checker preparation failures."
+    proofread-test-request-monitor-redacts-checker-options-failure ()
+  "Redact opaque condition data from options snapshot failures."
   (save-window-excursion
     (let* ((sentinel
             "PROOFREAD-TEST-CHECKER-KEY-MUST-NOT-APPEAR")
@@ -11845,7 +12461,7 @@ This covers URLs, email, invisible text, faces, and properties."
            reports
            records
            list-buffer)
-      (proofread--register-backend
+      (proofread-register-backend
        backend
        :check
        (lambda (&rest _)
@@ -11854,10 +12470,10 @@ This covers URLs, email, invisible text, faces, and properties."
        :identity
        (lambda ()
          (list :backend backend :contract-version 1))
-       :checker-identity
-       (lambda (_normalized-checker)
+       :snapshot-options
+       (lambda (_options)
          (setq raw-error-text
-               (format "Identity failure for %S" provider))
+               (format "Options snapshot failure for %S" provider))
          (error "%s" raw-error-text))
        :cancel #'ignore)
       (unwind-protect
@@ -11917,17 +12533,17 @@ This covers URLs, email, invisible text, faces, and properties."
               (should (eq (plist-get failure :checker-name) checker))
               (should (eq (plist-get failure :backend) backend))
               (should (eq (plist-get failure :phase)
-                          'checker-identity))
+                          'checker-options))
               (should (eq (plist-get failure :status) 'error))
               (should (eq (plist-get failure :error) 'error))
               (should (string-match-p
-                       "checker identity calculation"
+                       "checker options snapshot"
                        (plist-get failure :message)))
               (should (eq (plist-get record :profile) profile))
               (should (eq (plist-get record :checker-name) checker))
               (should (eq (plist-get record :backend) backend))
               (should (eq (plist-get record :phase)
-                          'checker-identity))
+                          'checker-options))
               (should (eq (plist-get record :status) 'error)))
             (with-current-buffer list-buffer
               (proofread-test--assert-secret-not-printed
@@ -15091,10 +15707,11 @@ This covers URLs, email, invisible text, faces, and properties."
 ;;;; Runtime setup
 
 (progn
-  (proofread--register-backend
+  (proofread-register-backend
    proofread-test--backend
    :check #'proofread-test--backend-check
    :identity #'proofread-test--backend-identity
+   :snapshot-options #'proofread-test--snapshot-checker-options
    :cancel #'proofread-test--backend-cancel))
 
 (provide 'proofread-tests)

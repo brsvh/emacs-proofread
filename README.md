@@ -153,6 +153,13 @@ JSON. If you provide `:instructions-function`, also provide a stable
 `:instructions-identity` so cache identity changes when your instructions
 change.
 
+Provider objects and provider identities form a pair. When a checker explicitly
+overrides `:provider` but omits `:provider-identity`, it receives a
+session-local identity for that object instead of inheriting the identity of the
+default provider. Likewise, an explicit non-`nil` `:instructions-function` must
+have a checker-local `:instructions-identity`; the default instructions identity
+is used only with the default instructions function.
+
 `proofread-llm-request-timeout` is a Proofread-owned request watchdog. It
 defaults to `120` seconds. Every non-`nil` value must be a positive number; set
 it to `nil` to disable the watchdog globally. A checker-local `:request-timeout`
@@ -543,11 +550,11 @@ Run `M-x customize-group RET proofread RET` to edit the core options:
 | `proofread-llm-provider`                  | `nil`   | Default provider when an LLM checker omits `:provider`                            |
 | `proofread-llm-response-strategy`         | `auto`  | Default response strategy when an LLM checker omits `:response-strategy`          |
 | `proofread-llm-request-timeout`           | `120`   | Set the LLM watchdog and mode-local plz connect timeout; `nil` disables both      |
-| `proofread-llm-provider-identity`         | `nil`   | Default stable provider identity when an LLM checker omits `:provider-identity`   |
+| `proofread-llm-provider-identity`         | `nil`   | Stable identity used when an LLM checker inherits the default provider            |
 | `proofread-llm-source-label`              | `nil`   | Default diagnostic source label; `nil` uses the effective provider name           |
 | `proofread-llm-max-diagnostic-passes`     | `3`     | Default pass limit when an LLM checker omits `:diagnostic-passes`                 |
 | `proofread-llm-instructions-function`     | `nil`   | Default extra instructions when an LLM checker omits `:instructions-function`     |
-| `proofread-llm-instructions-identity`     | `nil`   | Default stable instructions identity when an LLM checker omits it                 |
+| `proofread-llm-instructions-identity`     | `nil`   | Stable identity used when an LLM checker inherits the default instructions        |
 | `proofread-cache-max-entries`             | `128`   | Limit per-buffer LRU cache entries; `0` disables caching                          |
 | `proofread-request-log-max-records`       | `100`   | Limit records retained for each monitored buffer                                  |
 | `proofread-ignored-faces`                 | `nil`   | Exclude text whose `face` property matches one of these faces                     |
@@ -655,6 +662,84 @@ autoloads, byte-compiled files, and ELPA-compatible source archives. Individual
 stage targets such as `make proofread-compile` or `make proofread-archive`
 remain available for release work, but the summary targets above are normally
 enough.
+
+## Writing a backend
+
+The planned public backend API for 0.3.0 consists of
+`proofread-register-backend` and `proofread-unregister-backend`. A third-party
+backend registers a symbol with a descriptor and must not call or depend on any
+`proofread--*` symbol.
+
+```elisp
+(proofread-register-backend
+ 'example
+ :check #'example-check
+ :identity #'example-identity
+ :snapshot-options #'example-snapshot-options)
+```
+
+| Descriptor property | Presence | Operation contract                                                                                              |
+| ------------------- | -------- | --------------------------------------------------------------------------------------------------------------- |
+| `:check`            | Required | `(REQUEST CALLBACK)` starts nonblocking work, settles `CALLBACK` at most once, and returns an opaque handle     |
+| `:identity`         | Required | `()` returns the complete stable, non-secret identity shared by the backend's checkers                          |
+| `:snapshot-options` | Required | `(RAW-OPTIONS)` validates and normalizes options, then returns the backend-owned snapshot described below       |
+| `:checker-identity` | Optional | `(CHECKER)` returns the complete effective identity for that checker instead of using the backend-wide identity |
+| `:source-label`     | Optional | `(CHECKER)` returns `nil` or a nonempty, non-secret display label                                               |
+| `:cancel`           | Optional | `(HANDLE)` idempotently cancels work using the opaque handle returned by `:check`                               |
+
+Both identity operations return a property list containing `:backend`, whose
+value is the registered backend symbol, and `:contract-version`. A
+`:checker-identity` result is not merged with `:identity`; it must be a complete
+effective backend identity for that checker. When `:checker-identity` is absent,
+Proofread combines the backend-wide identity with the backend-owned options
+snapshot. When it is present, Proofread does not add the options snapshot, so
+that operation must itself represent every backend-local option that affects
+identity.
+
+`:snapshot-options` is the ownership boundary for backend-local data. It
+receives raw checker options as either `nil` or a keyword property list. The
+backend itself validates and normalizes that input and returns a detached,
+proper keyword property list; `nil` is a valid empty result. Mutable collections
+that the backend treats as value data must not alias the raw input. The returned
+snapshot is immutable by convention, and the same snapshot object is shared with
+checker identity, source-label, and request construction. Opaque provider,
+record, or identity objects may retain `eq` identity when that is part of the
+backend's semantics. Proofread invokes the operation again for freshness checks,
+so it must resolve current backend defaults deterministically: configurations
+with the same effective meaning must produce `equal` snapshots.
+
+Every backend-local value that can affect reusable diagnostic content must be
+represented in the effective checker identity and therefore in the diagnostic
+cache identity. Core-owned dimensions such as profile language are encoded
+separately, while lifecycle-only settings such as a timeout need not affect
+cache compatibility. Identities must be stable, complete for cache
+compatibility, and free of credentials or other secrets.
+
+`:check` must submit without blocking Emacs and must settle its callback at most
+once. `REQUEST` is a read-only property list whose backend-facing payload
+includes the buffer, absolute range, text, surrounding context, languages, major
+mode, target kind, source label, checker identity, and the exact options
+snapshot as `:checker-options`. The backend returns that same request object. A
+terminal success has the shape
+`(:status ok :request REQUEST :diagnostics LIST)`. A success may additionally
+contain `:partial t`; Proofread then merges its diagnostics without replacing
+existing diagnostics or writing them to the cache. An error has the shape
+`(:status error :request REQUEST :error VALUE)`. Either form may include a safe
+`:message`.
+
+Each diagnostic is a property list with absolute, half-open `:beg` and `:end`
+positions inside the request range. Its `:text` is the text in that range, and
+it also contains `:kind`, `:message`, a proper list of string `:suggestions`,
+`:source`, and `:target-kind`. The handle returned by `:check` is opaque to the
+core. When `:cancel` is present, Proofread captures that operation at submission
+time and later passes the handle to it unchanged. Submission, callback,
+cancellation, identity, and option-snapshot failures are isolated to the owning
+checker so that other checkers can continue.
+
+Request logging retains only safe projections. It does not expose raw checker
+options, snapshotted backend-local objects, or opaque handles. Backends should
+put only safe summaries in identities and source labels rather than relying on
+logging to redact secrets embedded there.
 
 ## Guide for Nix users
 

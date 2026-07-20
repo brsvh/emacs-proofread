@@ -185,7 +185,9 @@ A profile may contain:
      `:options' property.  Checker names are stable identifiers, not
      display labels, and must be unique inside one profile.  Checker
      options are backend-local data interpreted by the selected
-     backend."
+     backend.  Before dispatch, the backend validates and snapshots
+     these options through its registered `:snapshot-options'
+     operation."
   :type '(alist :key-type symbol :value-type sexp)
   :group 'proofread)
 
@@ -284,11 +286,16 @@ request-ready chunks."
   '( :name :backend :options)
   "Property keys accepted in proofread profile checker definitions.")
 
+(defconst proofread--backend-descriptor-keys
+  '( :check :identity :snapshot-options
+     :checker-identity :source-label :cancel)
+  "Property keys accepted in proofread backend descriptors.")
+
 (defconst proofread--diagnostic-keys
   '( :beg :end :text :kind :message :suggestions :source :target-kind)
   "Required keys for proofread diagnostic plists.")
 
-(defconst proofread--contract-version 3
+(defconst proofread--contract-version 4
   "Version of the internal diagnostic cache-key contract.")
 
 (defconst proofread--backend-request-keys
@@ -586,39 +593,62 @@ interrupting proofreading.")
 (defvar proofread--backend-descriptor-snapshot nil
   "Dynamically captured `(BACKEND . DESCRIPTOR)' for submission.")
 
-(defun proofread--register-backend (backend &rest descriptor)
-  "Register BACKEND using functions in DESCRIPTOR.
-DESCRIPTOR must contain callable `:check' and `:identity' entries.  An
-optional callable `:checker-identity' entry returns the effective
-identity for one normalized profile checker.  An optional callable
-`:source-label' entry returns nil or a nonempty display string for one
-normalized profile checker, and an optional callable `:cancel' entry
-receives unchanged the opaque handle returned by `:check'."
-  (unless (symbolp backend)
-    (error "Proofread backend name must be a symbol: %S" backend))
-  (dolist (key '( :check :identity))
+(defun proofread--validate-backend-descriptor (backend descriptor)
+  "Return BACKEND DESCRIPTOR after validating its public contract."
+  (let ((context (format "Proofread backend %S descriptor" backend))
+        seen)
+    (dolist (key (proofread--plist-keys descriptor context))
+      (unless (memq key proofread--backend-descriptor-keys)
+        (error "%s contains unknown property %S" context key))
+      (when (memq key seen)
+        (error "%s contains duplicate property %S" context key))
+      (push key seen)))
+  (dolist (key '( :check :identity :snapshot-options))
     (unless (functionp (plist-get descriptor key))
       (error "Proofread backend %S has invalid %S function"
              backend key)))
-  (when (and (plist-member descriptor :cancel)
-             (not (functionp (plist-get descriptor :cancel))))
-    (error "Proofread backend %S has invalid :cancel function"
-           backend))
-  (when (and (plist-member descriptor :checker-identity)
-             (not (functionp (plist-get descriptor :checker-identity))))
-    (error "Proofread backend %S has invalid :checker-identity function"
-           backend))
-  (when (and (plist-member descriptor :source-label)
-             (not (functionp (plist-get descriptor :source-label))))
-    (error "Proofread backend %S has invalid :source-label function"
-           backend))
+  (dolist (key '( :checker-identity :source-label :cancel))
+    (when (and (plist-member descriptor key)
+               (not (functionp (plist-get descriptor key))))
+      (error "Proofread backend %S has invalid %S function"
+             backend key)))
+  descriptor)
+
+(defun proofread-register-backend (backend &rest descriptor)
+  "Register BACKEND using operations in DESCRIPTOR.
+DESCRIPTOR must contain callable `:check', `:identity', and
+`:snapshot-options' entries.  The snapshot operation receives raw
+checker options and must return a detached property-list snapshot.
+The identity operation takes no arguments and must return a property
+list containing `:backend' and `:contract-version'.  The check
+operation receives a read-only request and a callback, submits without
+blocking, and returns an opaque handle.
+
+An optional callable `:checker-identity' entry returns the effective
+complete identity for one normalized profile checker instead of the
+backend-wide identity.  An optional callable `:source-label' entry
+returns nil or a nonempty display string for one normalized profile
+checker.  An optional callable `:cancel' entry receives unchanged the
+opaque handle returned by `:check'.
+
+Signal an error for malformed, duplicate, or unknown descriptor
+properties.  Return BACKEND after registering a shallow copy of the
+descriptor."
+  (unless (symbolp backend)
+    (error "Proofread backend name must be a symbol: %S" backend))
+  (proofread--validate-backend-descriptor backend descriptor)
   (puthash backend (copy-sequence descriptor)
            proofread--backend-registry)
   backend)
 
-(defun proofread--unregister-backend (backend)
-  "Remove BACKEND from the loaded backend registry."
-  (remhash backend proofread--backend-registry))
+(defun proofread-unregister-backend (backend)
+  "Remove BACKEND from the loaded backend registry.
+Return non-nil when BACKEND had a registered descriptor."
+  (let ((registered (and (gethash backend
+                                  proofread--backend-registry)
+                         t)))
+    (remhash backend proofread--backend-registry)
+    registered))
 
 (defun proofread--backend-descriptor (backend)
   "Return BACKEND's loaded descriptor, loading its feature if known."
@@ -634,17 +664,18 @@ receives unchanged the opaque handle returned by `:check'."
   "Return property keys from VALUE, or signal an error for CONTEXT."
   (unless (listp value)
     (error "%s must be a property list" context))
-  (let ((tail value)
+  (let ((value-length (proper-list-p value))
+        (tail value)
         keys)
+    (unless (integerp value-length)
+      (error "%s must be a proper property list" context))
+    (unless (zerop (% value-length 2))
+      (error "%s must contain values for every property" context))
     (while tail
-      (unless (consp tail)
-        (error "%s must be a proper property list" context))
       (let ((key (pop tail)))
         (unless (keywordp key)
           (error "%s contains non-keyword property %S" context key))
         (push key keys))
-      (unless (consp tail)
-        (error "%s must contain values for every property" context))
       (pop tail))
     (nreverse keys)))
 
@@ -716,7 +747,7 @@ hash table used to reject duplicate checker names inside the profile."
             :name name
             :checker-ordinal ordinal
             :backend backend
-            :options (proofread--snapshot-value options)))))
+            :options options))))
 
 (defun proofread--normalize-profile-checkers
     (profile-name checkers)
@@ -767,6 +798,25 @@ explicit profile checkers."
           :backend backend
           :options nil
           :ad-hoc t)))
+
+(defun proofread--checker-with-options-snapshot (checker)
+  "Return CHECKER with its backend-owned options snapshot.
+The registered backend receives CHECKER's raw `:options' value.  The
+core validates only the returned property-list envelope and retains
+the returned object unchanged."
+  (let* ((backend (plist-get checker :backend))
+         (descriptor (proofread--backend-descriptor backend)))
+    (unless descriptor
+      (error "Unsupported proofread backend %S" backend))
+    (let* ((function (plist-get descriptor :snapshot-options))
+           (options (funcall function
+                             (plist-get checker :options))))
+      (proofread--validate-plist
+       options
+       (format "Proofread backend %S checker options snapshot"
+               backend))
+      (let ((snapshot (copy-sequence checker)))
+        (plist-put snapshot :options options)))))
 
 (defun proofread--current-profile ()
   "Return the normalized selected proofreading profile."
@@ -894,9 +944,8 @@ effective backend identity."
            (proofread--snapshot-value
             (or backend-identity
                 (proofread--backend-checker-identity checker)))
-           :options (proofread--snapshot-value
-                     (unless backend-owns-options
-                       (plist-get checker :options))))
+           :options (unless backend-owns-options
+                      (plist-get checker :options)))
      (proofread--checker-discriminator checker))))
 
 (defun proofread--current-profile-supported-checkers (profile)
@@ -920,9 +969,12 @@ effective backend identity."
               (checker-name (plist-get request :checker-name)))
          (cond
           ((plist-get owner :ad-hoc)
-           (when-let* ((checker
+           (when-let* ((raw-checker
                         (proofread--ad-hoc-checker
-                         (plist-get request :backend))))
+                         (plist-get request :backend)))
+                       (checker
+                        (proofread--checker-with-options-snapshot
+                         raw-checker)))
              (and (equal owner (proofread--checker-owner checker))
                   (equal (plist-get request :checker-identity)
                          (proofread--checker-identity checker)))))
@@ -935,6 +987,10 @@ effective backend identity."
                             (plist-get profile :checkers)
                             :key (lambda (candidate)
                                    (plist-get candidate :name)))))
+             (when checker
+               (setq checker
+                     (proofread--checker-with-options-snapshot
+                      checker)))
              (and (eq profile-name (plist-get profile :name))
                   (equal (plist-get request :language)
                          (plist-get profile :language))
@@ -1449,6 +1505,7 @@ Position values are frozen as integers; other values are detached."
   "Return a caller-readable label for checker dispatch PHASE."
   (pcase phase
     ('backend-loading "backend loading")
+    ('checker-options "checker options snapshot")
     ('checker-identity "checker identity calculation")
     ('request-construction "request construction")
     (_ (format "%s" phase))))
@@ -2930,6 +2987,12 @@ contains precomputed identity and source-label snapshots for CHECKER."
                       (proofread--ad-hoc-checker backend)))
          (backend-name (or (plist-get checker :backend)
                            backend))
+         (checker
+          (if (or identities
+                  (null checker)
+                  (null (proofread--backend-descriptor backend-name)))
+              checker
+            (proofread--checker-with-options-snapshot checker)))
          (backend-identity
           (if identities
               (plist-get identities :backend-identity)
@@ -2979,8 +3042,7 @@ contains precomputed identity and source-label snapshots for CHECKER."
                         (plist-get checker :checker-ordinal)))
                      ( :checker-owner checker-owner)
                      ( :checker-options
-                       (proofread--snapshot-value
-                        (plist-get checker :options)))
+                       (plist-get checker :options))
                      ( :checker-identity checker-identity)
                      ( :source-label
                        (proofread--snapshot-value source-label))
@@ -4343,7 +4405,9 @@ Do not scan unrelated requests."
        (plist-member value :contract-version)))
 
 (defun proofread--snapshot-value (value)
-  "Return a detached snapshot of mutable data in VALUE."
+  "Return a detached snapshot of core-owned mutable data in VALUE.
+Backend-local checker options cross their backend's registered
+`:snapshot-options' boundary instead."
   (cond
    ((consp value)
     (cons (proofread--snapshot-value (car value))
@@ -4410,6 +4474,9 @@ Do not scan unrelated requests."
                                     (plist-get chunk :backend)))
                   (checker
                    (proofread--ad-hoc-checker backend-name)))
+        (when (proofread--backend-descriptor backend-name)
+          (setq checker
+                (proofread--checker-with-options-snapshot checker)))
         (if (plist-member chunk :backend-identity)
             (proofread--checker-identity
              checker (plist-get chunk :backend-identity))
@@ -4801,6 +4868,8 @@ requests."
          (checker (or checker (proofread--ad-hoc-checker backend))))
     (when (proofread--supported-backend-p backend)
       (when chunks
+        (setq checker
+              (proofread--checker-with-options-snapshot checker))
         (proofread--dispatch-prepared-checker-work
          (proofread--prepare-checker-request-work
           chunks backend checker profile
@@ -4829,18 +4898,30 @@ includes one checker-level `:failure'."
       (unless chunks
         (throw 'result
                '( :status prepared :supported t :work nil)))
-      (let ((identities
-             (condition-case err
-                 (proofread--checker-request-identities checker)
-               (error
-                (throw
-                 'result
-                 (list
-                  :status 'failed
-                  :supported t
-                  :failure
-                  (proofread--make-checker-dispatch-failure
-                   profile checker 'checker-identity err)))))))
+      (let* ((checker
+              (condition-case err
+                  (proofread--checker-with-options-snapshot checker)
+                (error
+                 (throw
+                  'result
+                  (list
+                   :status 'failed
+                   :supported t
+                   :failure
+                   (proofread--make-checker-dispatch-failure
+                    profile checker 'checker-options err))))))
+             (identities
+              (condition-case err
+                  (proofread--checker-request-identities checker)
+                (error
+                 (throw
+                  'result
+                  (list
+                   :status 'failed
+                   :supported t
+                   :failure
+                   (proofread--make-checker-dispatch-failure
+                    profile checker 'checker-identity err)))))))
         (condition-case err
             (list
              :status 'prepared

@@ -20,6 +20,17 @@ the profile's ':language' property, represent each backend with a named checker
 whose ':backend' property selects it, and select the profile with
 'proofread-profile'.
 
+---
+*** Third-party backend descriptors now require ':snapshot-options'.
+The public 'proofread-register-backend' and 'proofread-unregister-backend'
+functions are now the supported registration interface; third-party backends
+must not depend on private 'proofread--*' symbols.  In addition to the existing
+required ':check' and ':identity' operations, every descriptor must provide a
+':snapshot-options' operation.  It validates and normalizes raw checker options
+and returns a detached proper keyword property list that the core treats as
+immutable.  Existing third-party registrations that omit ':snapshot-options'
+are rejected.
+
 ** User interface
 
 ---
