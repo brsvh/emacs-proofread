@@ -7556,21 +7556,12 @@ progress messages are inhibited."
           (if force-feedback
               #'message
             #'proofread--progress-message))
-         (normalized-ranges
-          (proofread--normalize-accessible-ranges ranges))
          (profile (proofread--current-profile))
-         (islands
-          (proofread--target-islands-for-ranges
-           normalized-ranges))
-         (domains
-          (cl-delete-duplicates
-           (mapcar
-            (lambda (island)
-              (list :kind (plist-get island :kind)
-                    :domain-beg (plist-get island :domain-beg)
-                    :domain-end (plist-get island :domain-end)))
-            islands)
-           :test #'equal)))
+         (plan (proofread--selection-plan-for-ranges ranges))
+         (normalized-ranges
+          (proofread--selection-plan-ranges plan))
+         (domains (proofread--selection-plan-domains plan))
+         (islands (proofread--selection-plan-islands plan)))
     (proofread--prune-diagnostics-outside-targets
      normalized-ranges domains)
     (proofread--prune-inactive-checker-diagnostics

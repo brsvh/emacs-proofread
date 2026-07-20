@@ -1408,6 +1408,182 @@ When PROFILE is nil, use the current profile."
               (should (= (point-min) before-min))
               (should (= (point-max) before-max)))))))))
 
+(ert-deftest proofread-test-check-ranges-consumes-selection-plan-once
+    ()
+  "Use one selection plan throughout the main check pipeline."
+  (with-temp-buffer
+    (insert "abcd")
+    (setq-local proofread-auto-check nil)
+    (proofread-mode 1)
+    (let* ((raw-ranges (list (cons 4 1)))
+           (selected-ranges (list (cons 1 2) (cons 3 5)))
+           (domain-token (list 'complete-domain))
+           (domains
+            (list (list :kind 'text
+                        :target-policy 'all
+                        :domain-beg 1
+                        :domain-end 5
+                        :token domain-token)))
+           (islands
+            (list (list :beg 1 :end 2 :kind 'text)
+                  (list :beg 3 :end 5 :kind 'text)))
+           (plan
+            (proofread--make-selection-plan
+             selected-ranges domains islands))
+           (profile (list :language "en" :checkers '( checker)))
+           (chunks (list (list :text "a") (list :text "cd")))
+           (dispatch-result
+            (list :supported-count 1
+                  :requests '( request-a request-b)))
+           (plan-count 0)
+           (profile-count 0)
+           (chunk-count 0)
+           (dispatch-count 0)
+           target-prune-arguments
+           checker-prune-arguments
+           chunk-arguments
+           dispatch-arguments
+           messages)
+      (cl-letf
+          (((symbol-function 'proofread--current-profile)
+            (lambda ()
+              (setq profile-count (1+ profile-count))
+              profile))
+           ((symbol-function 'proofread--selection-plan-for-ranges)
+            (lambda (ranges)
+              (setq plan-count (1+ plan-count))
+              (should (eq ranges raw-ranges))
+              plan))
+           ((symbol-function 'proofread--normalize-accessible-ranges)
+            (lambda (&rest _)
+              (ert-fail "Check path normalized ranges outside plan")))
+           ((symbol-function
+             'proofread--prune-diagnostics-outside-targets)
+            (lambda (ranges received-domains)
+              (setq target-prune-arguments
+                    (list ranges received-domains))))
+           ((symbol-function
+             'proofread--prune-inactive-checker-diagnostics)
+            (lambda (ranges received-profile)
+              (setq checker-prune-arguments
+                    (list ranges received-profile))))
+           ((symbol-function
+             'proofread--request-ready-chunks-for-islands)
+            (lambda (received-islands language)
+              (setq chunk-count (1+ chunk-count))
+              (setq chunk-arguments
+                    (list received-islands language))
+              chunks))
+           ((symbol-function
+             'proofread--dispatch-profile-request-ready-chunks-result)
+            (lambda (received-chunks received-profile)
+              (setq dispatch-count (1+ dispatch-count))
+              (setq dispatch-arguments
+                    (list received-chunks received-profile))
+              dispatch-result))
+           ((symbol-function 'proofread--target-domains-for-ranges)
+            (lambda (&rest _)
+              (ert-fail "Check path rediscovered target domains")))
+           ((symbol-function 'proofread--target-islands-for-ranges)
+            (lambda (&rest _)
+              (ert-fail "Check path rediscovered target islands")))
+           ((symbol-function 'message)
+            (lambda (format-string &rest arguments)
+              (push (apply #'format format-string arguments)
+                    messages))))
+        (proofread--check-ranges raw-ranges "selected" t))
+      (should (= plan-count 1))
+      (should (= profile-count 1))
+      (should (= chunk-count 1))
+      (should (= dispatch-count 1))
+      (should (eq (car target-prune-arguments) selected-ranges))
+      (should (eq (cadr target-prune-arguments) domains))
+      (should (eq (car checker-prune-arguments) selected-ranges))
+      (should (eq (cadr checker-prune-arguments) profile))
+      (should (eq (car chunk-arguments) islands))
+      (should (equal (cadr chunk-arguments) "en"))
+      (should (eq (car dispatch-arguments) chunks))
+      (should (eq (cadr dispatch-arguments) profile))
+      (should
+       (equal messages
+              '( "proofread: dispatched 2 requests from 2 selected \
+ranges"))))))
+
+(ert-deftest proofread-test-check-ranges-preserves-empty-dispatch-states
+    ()
+  "Keep empty, unsupported, and supported-zero-chunk feedback distinct."
+  (dolist
+      (case
+       '( (:checkers nil
+                     :islands (island)
+                     :chunks (chunk)
+                     :result nil
+                     :chunk-count 0
+                     :dispatch-count 0
+                     :message
+                     "proofread: collected 1 buffer range; \
+no available backend")
+          (:checkers (checker)
+                     :islands (island)
+                     :chunks (chunk)
+                     :result (:supported-count 0 :requests nil)
+                     :chunk-count 1
+                     :dispatch-count 1
+                     :message
+                     "proofread: collected 1 buffer range; \
+no available backend")
+          (:checkers (checker)
+                     :islands nil
+                     :chunks nil
+                     :result (:supported-count 1 :requests nil)
+                     :chunk-count 1
+                     :dispatch-count 1
+                     :message
+                     "proofread: dispatched 0 requests from 1 buffer range")))
+    (with-temp-buffer
+      (insert "a")
+      (setq-local proofread-auto-check nil)
+      (proofread-mode 1)
+      (let* ((ranges (list (cons (point-min) (point-max))))
+             (plan
+              (proofread--make-selection-plan
+               ranges nil (plist-get case :islands)))
+             (profile
+              (list :language "en"
+                    :checkers (plist-get case :checkers)))
+             (chunk-count 0)
+             (dispatch-count 0)
+             messages)
+        (cl-letf
+            (((symbol-function 'proofread--current-profile)
+              (lambda () profile))
+             ((symbol-function 'proofread--selection-plan-for-ranges)
+              (lambda (_ranges) plan))
+             ((symbol-function
+               'proofread--prune-diagnostics-outside-targets)
+              #'ignore)
+             ((symbol-function
+               'proofread--prune-inactive-checker-diagnostics)
+              #'ignore)
+             ((symbol-function
+               'proofread--request-ready-chunks-for-islands)
+              (lambda (_islands _language)
+                (setq chunk-count (1+ chunk-count))
+                (plist-get case :chunks)))
+             ((symbol-function
+               'proofread--dispatch-profile-request-ready-chunks-result)
+              (lambda (_chunks _profile)
+                (setq dispatch-count (1+ dispatch-count))
+                (plist-get case :result)))
+             ((symbol-function 'message)
+              (lambda (format-string &rest arguments)
+                (push (apply #'format format-string arguments)
+                      messages))))
+          (proofread--check-ranges ranges "buffer" t))
+        (should (= chunk-count (plist-get case :chunk-count)))
+        (should (= dispatch-count (plist-get case :dispatch-count)))
+        (should (equal messages (list (plist-get case :message))))))))
+
 (ert-deftest proofread-test-programming-checks-preserve-window-state
     ()
   "Preserve point and window position during programming checks."
