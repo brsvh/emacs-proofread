@@ -638,9 +638,6 @@ every request prepared for that checker."
   "Return the backend frozen in WORK's immutable request."
   (plist-get (proofread--scheduled-work-request work) :backend))
 
-(defvar proofread--backend-descriptor-snapshot nil
-  "Dynamically captured `(BACKEND . DESCRIPTOR)' for submission.")
-
 (defun proofread--validate-backend-descriptor (backend descriptor)
   "Return BACKEND DESCRIPTOR after validating its public contract."
   (let ((context (format "Proofread backend %S descriptor" backend))
@@ -3514,22 +3511,6 @@ The report is delivered asynchronously."
     'unsupported-backend
     (format "Unsupported proofread backend: %S" backend))))
 
-(defun proofread--backend-check (request callback)
-  "Submit REQUEST and invoke CALLBACK asynchronously.
-The return value is a backend handle."
-  (let* ((backend (plist-get request :backend))
-         (descriptor
-          (if (and (consp proofread--backend-descriptor-snapshot)
-                   (eq (car proofread--backend-descriptor-snapshot)
-                       backend))
-              (cdr proofread--backend-descriptor-snapshot)
-            (proofread--backend-descriptor backend)))
-         (check (plist-get descriptor :check)))
-    (if check
-        (funcall check request callback)
-      (proofread--unsupported-backend-check
-       backend request callback))))
-
 (defun proofread--backend-submission-error-result
     (request error detail)
   "Return a checker-aware submission error for REQUEST.
@@ -3577,21 +3558,22 @@ ERROR identifies the failure and DETAIL describes it."
                         (setq callback-state 'failed))))))
                (submission
                 (condition-case err
-                    (let* (;; Capture one adapter snapshot before
+                    (let* (;; Capture one descriptor snapshot before
                            ;; submission.  Later registry changes must
                            ;; not redirect cleanup for its handle.
                            (descriptor
                             (proofread--backend-descriptor backend))
+                           (check (plist-get descriptor :check))
                            (cancel
                             (if descriptor
                                 (plist-get descriptor :cancel)
                               ;; This fallback timer is core-owned.
                               #'cancel-timer))
-                           (proofread--backend-descriptor-snapshot
-                            (cons backend descriptor))
                            (handle
-                            (proofread--backend-check
-                             request wrapped-callback)))
+                            (if check
+                                (funcall check request wrapped-callback)
+                              (proofread--unsupported-backend-check
+                               backend request wrapped-callback))))
                       (list :handle handle :cancel cancel))
                   (error
                    (pcase callback-state

@@ -982,7 +982,7 @@ When PROFILE is nil, use the current profile."
            (request (proofread--make-backend-request chunk 'llm))
            result)
       (let ((handle
-             (proofread--backend-check
+             (proofread-llm--backend-check
               request
               (lambda (backend-result)
                 (setq result backend-result)))))
@@ -1061,7 +1061,7 @@ When PROFILE is nil, use the current profile."
                  (lambda (&rest _)
                    (error "Unexpected llm-chat-async call"))))
         (let ((handle
-               (proofread--backend-check
+               (proofread-llm--backend-check
                 request
                 (lambda (backend-result)
                   (setq result backend-result)))))
@@ -1562,7 +1562,7 @@ When PROFILE is nil, use the current profile."
                    (setq captured-prompt prompt)
                    (funcall success content)
                    'proofread-llm-test-handle)))
-        (should (proofread--backend-check
+        (should (proofread-llm--backend-check
                  request
                  (lambda (backend-result)
                    (setq result backend-result))))
@@ -1804,7 +1804,7 @@ When PROFILE is nil, use the current profile."
                   ((symbol-function 'llm-capabilities)
                    #'proofread-llm-test--capabilities))
           (let ((handle
-                 (proofread--backend-check
+                 (proofread-llm--backend-check
                   request
                   (lambda (backend-result)
                     (setq result backend-result)))))
@@ -1946,7 +1946,7 @@ When PROFILE is nil, use the current profile."
                   (proofread-llm-test--make-profile-request
                    chunk))
                  (handle
-                  (proofread--backend-check
+                  (proofread-llm--backend-check
                    request #'ignore)))
             (let* ((interaction
                     (car (llm-chat-prompt-interactions
@@ -3328,7 +3328,7 @@ When PROFILE is nil, use the current profile."
       (let* ((chunk (proofread-llm-test--whole-buffer-chunk))
              (request (proofread--make-backend-request chunk 'llm))
              result)
-        (should (proofread--backend-check
+        (should (proofread-llm--backend-check
                  request
                  (lambda (backend-result)
                    (setq result backend-result))))
@@ -3347,7 +3347,7 @@ When PROFILE is nil, use the current profile."
       (let* ((chunk (proofread-llm-test--whole-buffer-chunk))
              (request (proofread--make-backend-request chunk 'llm))
              result)
-        (should (proofread--backend-check
+        (should (proofread-llm--backend-check
                  request
                  (lambda (backend-result)
                    (setq result backend-result))))
