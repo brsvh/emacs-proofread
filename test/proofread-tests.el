@@ -685,15 +685,123 @@ When PROFILE is nil, use the current profile."
 
 ;;;; Range and diagnostic tests
 
-(ert-deftest proofread-test-normalize-ranges-merges-adjacent-ranges ()
-  "Normalize visible ranges, dropping invalid or duplicate ranges."
+(ert-deftest proofread-test-range-normalization-table ()
+  "Keep the two range normalization adjacency policies explicit."
+  (dolist
+      (case
+       '((((8 . 10) (1 . 3))
+          ((1 . 3) (8 . 10))
+          ((1 . 3) (8 . 10)))
+         (((3 . 7) (1 . 4)) ((1 . 7)) ((1 . 7)))
+         (((1 . 8) (2 . 4) (1 . 8)) ((1 . 8)) ((1 . 8)))
+         (((4 . 6) (1 . 4)) ((1 . 6)) ((1 . 4) (4 . 6)))
+         (((1 . 3) (3 . 5) (4 . 7))
+          ((1 . 7))
+          ((1 . 3) (3 . 7)))))
+    (pcase-let ((`(,ranges ,touching ,strict) case))
+      (let ((original (copy-tree ranges)))
+        (should (equal (proofread--normalize-ranges ranges)
+                       touching))
+        (should (equal ranges original))
+        (should (equal (proofread--normalize-overlapping-ranges
+                        ranges)
+                       strict))
+        (should (equal ranges original))))))
+
+(ert-deftest proofread-test-normalize-ranges-discards-empty-ranges ()
+  "Drop malformed, reversed, and zero-width selectable ranges."
+  (dolist (range '(nil invalid (1 . invalid) (2 . 1)))
+    (should-not (proofread--range-valid-p range)))
   (should (equal (proofread--normalize-ranges
-                  '((30 . 35)
-                    (1 . 1)
-                    (10 . 20)
-                    (40 . 39)
-                    (20 . 30)))
+                  '((30 . 35) invalid (1 . 1) (10 . 20)
+                    (40 . 39) (20 . 30)))
                  '((10 . 35)))))
+
+(ert-deftest proofread-test-range-relations-table ()
+  "Define overlap, conflict, containment, and intersection boundaries."
+  (dolist
+      (case
+       '(((1 . 4) (1 . 4) t t t t)
+         ((1 . 4) (3 . 6) t t nil nil)
+         ((1 . 6) (2 . 4) t t t nil)
+         ((1 . 3) (3 . 5) nil nil nil nil)
+         ((1 . 2) (4 . 5) nil nil nil nil)
+         ((1 . 4) (1 . 1) nil t t nil)
+         ((1 . 4) (2 . 2) nil t t nil)
+         ((1 . 4) (4 . 4) nil t t nil)
+         ((2 . 2) (2 . 2) nil t t t)
+         ((2 . 2) (3 . 3) nil nil nil nil)))
+    (pcase-let
+        ((`(,left ,right ,overlap ,conflict
+                  ,left-contains ,right-contains)
+          case))
+      (should (proofread--range-valid-p left))
+      (should (proofread--range-valid-p right))
+      (should (eq (proofread--range-overlaps-p left right)
+                  overlap))
+      (should (eq (proofread--range-overlaps-p right left)
+                  overlap))
+      (should (eq (proofread--range-conflicts-p left right)
+                  conflict))
+      (should (eq (proofread--range-conflicts-p right left)
+                  conflict))
+      (should (eq (proofread--range-contains-p left right)
+                  left-contains))
+      (should (eq (proofread--range-contains-p right left)
+                  right-contains))
+      (should
+       (equal
+        (proofread--range-intersection left right)
+        (and overlap
+             (cons (max (car left) (car right))
+                   (min (cdr left) (cdr right)))))))))
+
+(ert-deftest proofread-test-range-point-coverage-table ()
+  "Define half-open, strict, and zero-width point coverage."
+  (dolist
+      (case
+       '(((1 . 4) 0 nil nil)
+         ((1 . 4) 1 t nil)
+         ((1 . 4) 2 t t)
+         ((1 . 4) 3 t t)
+         ((1 . 4) 4 nil nil)
+         ((2 . 2) 1 nil nil)
+         ((2 . 2) 2 t nil)
+         ((2 . 2) 3 nil nil)))
+    (pcase-let ((`(,range ,position ,covers ,strict) case))
+      (should (eq (proofread--range-covers-position-p
+                   range position)
+                  covers))
+      (should
+       (eq (proofread--range-strictly-contains-position-p
+            range position)
+           strict))))
+  (let ((dead-marker (make-marker)))
+    (should-not
+     (proofread--range-covers-position-p '(1 . 4) dead-marker))
+    (should-not
+     (proofread--range-strictly-contains-position-p
+      '(1 . 4) dead-marker))))
+
+(ert-deftest proofread-test-range-edit-invalidation-table ()
+  "Define insertion, replacement, adjacency, and zero-width effects."
+  (dolist
+      (case
+       '(((1 . 4) (1 . 1) nil)
+         ((1 . 4) (2 . 2) t)
+         ((1 . 4) (4 . 4) nil)
+         ((4 . 4) (4 . 4) t)
+         ((4 . 4) (3 . 3) nil)
+         ((1 . 3) (3 . 5) nil)
+         ((5 . 7) (3 . 5) nil)
+         ((2 . 4) (3 . 5) t)
+         ((3 . 3) (3 . 5) t)
+         ((5 . 5) (3 . 5) t)
+         ((6 . 6) (3 . 5) nil)))
+    (pcase-let ((`(,range ,edit ,affected) case))
+      (should
+       (eq (proofread--range-affected-by-edit-p range edit)
+           affected)))))
 
 (ert-deftest proofread-test-normalize-region-range-preserves-bounds ()
   "Normalize region order without clipping accessible bounds."
@@ -7857,6 +7965,22 @@ This covers URLs, email, invisible text, faces, and properties."
       (should (eq (proofread--previous-diagnostic-before 9) second))
       (should (eq (proofread--previous-diagnostic-before 11)
                   third)))))
+
+(ert-deftest
+    proofread-test-navigation-treats-zero-width-diagnostic-as-current
+    ()
+  "Navigate from a zero-width diagnostic through equal-start entries."
+  (with-temp-buffer
+    (insert "abcdef")
+    (proofread-mode 1)
+    (let ((zero (proofread-test--diagnostic-for-range 3 3 ""))
+          (nonempty
+           (proofread-test--diagnostic-for-range 3 5 "cd")))
+      (proofread-test--install-diagnostics (list nonempty zero))
+      (setq proofread--current-diagnostic zero)
+      (should (eq (proofread--next-diagnostic-after 3) nonempty))
+      (setq proofread--current-diagnostic nonempty)
+      (should (eq (proofread--previous-diagnostic-before 3) zero)))))
 
 (ert-deftest
     proofread-test-proofread-next-moves-to-nearest-diagnostic ()

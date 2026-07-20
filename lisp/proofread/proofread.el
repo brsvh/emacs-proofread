@@ -1591,6 +1591,175 @@ The returned plist contains the keys in `proofread--diagnostic-keys'."
       (and (markerp position)
            (eq (marker-buffer position) (current-buffer)))))
 
+;;;; Range algebra
+
+;; Proofread represents buffer ranges as half-open (BEG . END) pairs.
+;; Most operations accept zero-width ranges, but selectable check ranges
+;; are always nonempty.  Relations below state their zero-width and
+;; adjacency behavior explicitly so callers do not invent local variants.
+
+(defun proofread--range-valid-p (range)
+  "Return non-nil when RANGE is a valid integer buffer range.
+The half-open RANGE may be zero-width."
+  (and (consp range)
+       (integerp (car range))
+       (integerp (cdr range))
+       (<= (car range) (cdr range))))
+
+(defun proofread--range-less-p (left right)
+  "Return non-nil if range LEFT should sort before range RIGHT.
+Compare beginnings first and ends second.  LEFT and RIGHT must be
+valid integer ranges."
+  (or (< (car left) (car right))
+      (and (= (car left) (car right))
+           (< (cdr left) (cdr right)))))
+
+(defun proofread--range-overlaps-p (left right)
+  "Return non-nil when half-open ranges LEFT and RIGHT overlap.
+Adjacent ranges do not overlap.  A zero-width range never overlaps
+another range, including a zero-width range at the same position.
+LEFT and RIGHT must be valid integer ranges."
+  (and (< (car left) (cdr left))
+       (< (car right) (cdr right))
+       (< (car left) (cdr right))
+       (< (car right) (cdr left))))
+
+(defun proofread--range-conflicts-p (left right)
+  "Return non-nil when ranges LEFT and RIGHT conflict.
+Strictly overlapping half-open ranges conflict, but adjacent nonempty
+ranges do not.  A zero-width range conflicts when its position lies on
+either closed boundary of the other range; equal zero-width ranges
+therefore conflict.  LEFT and RIGHT must be valid integer ranges."
+  (or (proofread--range-overlaps-p left right)
+      (and (= (car left) (cdr left))
+           (<= (car right) (car left))
+           (<= (car left) (cdr right)))
+      (and (= (car right) (cdr right))
+           (<= (car left) (car right))
+           (<= (car right) (cdr left)))))
+
+(defun proofread--range-contains-p (outer inner)
+  "Return non-nil if range INNER is contained in range OUTER.
+Containment compares both boundaries inclusively.  Thus a zero-width
+INNER at either boundary of OUTER is contained, including at OUTER's
+half-open end.  A zero-width OUTER contains only the equal zero-width
+range.  OUTER and INNER must be valid integer ranges."
+  (and (<= (car outer) (car inner))
+       (<= (cdr inner) (cdr outer))))
+
+(defun proofread--range-covers-position-p (range position)
+  "Return non-nil when half-open RANGE covers POSITION.
+A nonempty range covers its beginning but not its end.  A zero-width
+range covers only its own position.  RANGE must be a valid integer
+range; POSITION may be an integer or live marker."
+  (let ((position (proofread--position-integer position)))
+    (and position
+         (<= (car range) position)
+         (or (< position (cdr range))
+             (and (= (car range) (cdr range))
+                  (= position (car range)))))))
+
+(defun proofread--range-strictly-contains-position-p (range position)
+  "Return non-nil when POSITION is strictly inside RANGE.
+Neither boundary is contained, and a zero-width range contains no
+position.  RANGE must be a valid integer range; POSITION may be an
+integer or live marker."
+  (let ((position (proofread--position-integer position)))
+    (and position
+         (< (car range) position)
+         (< position (cdr range)))))
+
+(defun proofread--range-intersection (left right)
+  "Return the nonempty intersection of ranges LEFT and RIGHT.
+Return nil for adjacent ranges and whenever either range is
+zero-width.  LEFT and RIGHT must be valid integer ranges."
+  (when (proofread--range-overlaps-p left right)
+    (cons (max (car left) (car right))
+          (min (cdr left) (cdr right)))))
+
+(defun proofread--range-affected-by-edit-p (range edit)
+  "Return non-nil when EDIT affects RANGE.
+For a zero-width EDIT (an insertion), a nonempty RANGE is affected only
+when the insertion is strictly inside it; insertion at either boundary
+does not affect it.  A zero-width RANGE is affected by insertion at its
+exact position.  A nonempty EDIT uses `proofread--range-conflicts-p',
+so adjacent nonempty ranges remain unaffected while zero-width ranges
+at either edit boundary are affected.  RANGE and EDIT must be valid
+integer ranges."
+  (if (= (car edit) (cdr edit))
+      (if (= (car range) (cdr range))
+          (= (car edit) (car range))
+        (proofread--range-strictly-contains-position-p
+         range (car edit)))
+    (proofread--range-conflicts-p edit range)))
+
+(defun proofread--range-conflicts-any-p (range ranges)
+  "Return non-nil when RANGE conflicts with one of RANGES."
+  (cl-some
+   (lambda (candidate)
+     (proofread--range-conflicts-p range candidate))
+   ranges))
+
+(defun proofread--range-precedes-without-conflict-p (left right)
+  "Return non-nil if LEFT precedes RIGHT without a conflict."
+  (and (<= (cdr left) (car right))
+       (not (proofread--range-conflicts-p left right))))
+
+(defun proofread--range-conflicting-entries (ranges entries)
+  "Return ENTRIES whose ranges conflict with one of RANGES.
+Each element of ENTRIES must have the form \=(OBJECT . RANGE).  RANGE
+and every element of RANGES must be valid integer ranges of the form
+\=(BEG . END).  Inputs may be unsorted and are not modified.  Return
+entries ordered by range while retaining original entries, duplicate
+occurrences, and object identity."
+  (let* ((remaining-ranges
+          (sort (copy-sequence ranges) #'proofread--range-less-p))
+         (sorted-entries
+          (sort (copy-sequence entries)
+                (lambda (left right)
+                  (proofread--range-less-p (cdr left) (cdr right)))))
+         conflicts)
+    (dolist (entry sorted-entries)
+      (let ((range (cdr entry)))
+        (while (and remaining-ranges
+                    (proofread--range-precedes-without-conflict-p
+                     (car remaining-ranges) range))
+          (setq remaining-ranges (cdr remaining-ranges)))
+        (when (and remaining-ranges
+                   (proofread--range-conflicts-p
+                    range (car remaining-ranges)))
+          (push entry conflicts))))
+    (nreverse conflicts)))
+
+(defun proofread--range-contained-in-any-p (range ranges)
+  "Return non-nil if RANGE is completely contained in RANGES."
+  (cl-some
+   (lambda (outer)
+     (proofread--range-contains-p outer range))
+   ranges))
+
+(defun proofread--merge-ranges (ranges merge-adjacent-p)
+  "Return sorted copies of nonempty RANGES with overlaps merged.
+RANGES must contain valid, nonempty integer ranges.  When
+MERGE-ADJACENT-P is non-nil, merge adjacent ranges too.  Zero-width
+ranges are outside this helper's contract."
+  (let (merged)
+    (dolist (range
+             (sort
+              (mapcar (lambda (range)
+                        (cons (car range) (cdr range)))
+                      ranges)
+              #'proofread--range-less-p))
+      (if (and merged
+               (if merge-adjacent-p
+                   (<= (car range) (cdar merged))
+                 (proofread--range-overlaps-p
+                  (car merged) range)))
+          (setcdr (car merged)
+                  (max (cdar merged) (cdr range)))
+        (push range merged)))
+    (nreverse merged)))
+
 (defun proofread--normalize-region-range (beg end)
   "Return an ordered range for BEG and END in `current-buffer'.
 Signal a `user-error' when either position is missing, is neither an
@@ -1609,32 +1778,20 @@ Do not clip the range to the accessible portion of the buffer."
 
 (defun proofread--normalize-ranges (ranges)
   "Return sorted, deduplicated RANGES.
-Each range is a cons cell of the form (BEG . END).  Empty or invalid
-ranges are discarded.  Overlapping or adjacent ranges are merged."
-  (let (normalized)
-    (dolist (range
-             (sort
-              (delq nil
-                    (mapcar
-                     (lambda (range)
-                       (when (consp range)
-                         (let
-                             ((beg
-                               (proofread--position-integer
-                                (car range)))
-                              (end
-                               (proofread--position-integer
-                                (cdr range))))
-                           (when (and beg end (< beg end))
-                             (cons beg end)))))
-                     ranges))
-              (lambda (a b)
-                (< (car a) (car b)))))
-      (if (and normalized (<= (car range) (cdar normalized)))
-          (setcdr (car normalized)
-                  (max (cdar normalized) (cdr range)))
-        (push range normalized)))
-    (nreverse normalized)))
+Each range is a cons cell of the form (BEG . END).  Convert markers to
+integers and discard reversed, malformed, and zero-width ranges.  Merge
+both strictly overlapping and adjacent ranges."
+  (proofread--merge-ranges
+   (delq nil
+         (mapcar
+          (lambda (range)
+            (when (consp range)
+              (let ((beg (proofread--position-integer (car range)))
+                    (end (proofread--position-integer (cdr range))))
+                (when (and beg end (< beg end))
+                  (cons beg end)))))
+          ranges))
+   t))
 
 (defun proofread--normalize-accessible-ranges (ranges)
   "Return normalized RANGES clipped to the accessible buffer portion."
@@ -1711,24 +1868,12 @@ intersections with RANGES."
            (with-syntax-table (or syntax-ppss-table (syntax-table))
              ,@body))))))
 
-(defun proofread--syntax-container-overlaps-range-p (container range)
-  "Return non-nil when CONTAINER and RANGE overlap."
-  (and (< (car container) (cdr range))
-       (< (car range) (cdr container))))
-
 (defun proofread--normalize-overlapping-ranges (ranges)
-  "Return sorted RANGES with duplicates and overlaps merged.
-Unlike `proofread--normalize-ranges', keep adjacent ranges separate."
-  (let (normalized)
-    (dolist (range
-             (sort (mapcar #'copy-tree ranges)
-                   (lambda (left right)
-                     (< (car left) (car right)))))
-      (if (and normalized (< (car range) (cdar normalized)))
-          (setcdr (car normalized)
-                  (max (cdar normalized) (cdr range)))
-        (push range normalized)))
-    (nreverse normalized)))
+  "Return sorted nonempty RANGES with strict overlaps merged.
+RANGES must contain valid, nonempty integer ranges.  Unlike
+`proofread--normalize-ranges', keep adjacent ranges separate.
+Zero-width ranges are outside this function's contract."
+  (proofread--merge-ranges ranges nil))
 
 (defun proofread--advance-to-syntax-container-end
     (position state buffer-end kind)
@@ -1763,8 +1908,7 @@ BUFFER-END is the end of the widened buffer."
               (proofread--advance-to-syntax-container-end
                position state buffer-end kind))
              (container (cons container-beg (car advanced))))
-        (when (proofread--syntax-container-overlaps-range-p
-               container range)
+        (when (proofread--range-overlaps-p container range)
           (push container containers))
         (setq position (car advanced)
               state (cdr advanced))))
@@ -1783,8 +1927,7 @@ BUFFER-END is the end of the widened buffer."
                 (proofread--advance-to-syntax-container-end
                  position state buffer-end kind))
                (container (cons container-beg (car advanced))))
-          (when (proofread--syntax-container-overlaps-range-p
-                 container range)
+          (when (proofread--range-overlaps-p container range)
             (push container containers))
           (setq position (car advanced)
                 state (cdr advanced)))))
@@ -1814,8 +1957,8 @@ beyond the restriction."
   (proofread--syntax-containers-in-normalized-ranges
    (proofread--normalize-accessible-ranges ranges) kind))
 
-(defun proofread--horizontally-adjacent-ranges-p (left right)
-  "Return non-nil if horizontal space separates LEFT and RIGHT."
+(defun proofread--ranges-separated-by-horizontal-space-p (left right)
+  "Return non-nil if only horizontal space separates LEFT and RIGHT."
   (save-excursion
     (goto-char (cdr left))
     (skip-chars-forward " \t" (car right))
@@ -1826,7 +1969,7 @@ beyond the restriction."
   (let (merged)
     (dolist (range ranges)
       (if (and merged
-               (proofread--horizontally-adjacent-ranges-p
+               (proofread--ranges-separated-by-horizontal-space-p
                 (car merged) range))
           (setcdr (car merged) (cdr range))
         (push (copy-tree range) merged)))
@@ -2027,8 +2170,8 @@ Search before POSITION."
                  (proofread--normalize-ranges unmatched-strings))
           (unless (cl-some
                    (lambda (face-domain)
-                     (and (<= (car face-domain) (car domain))
-                          (<= (cdr domain) (cdr face-domain))))
+                     (proofread--range-contains-p
+                      face-domain domain))
                    face-domains)
             (when (proofread--docstring-predicate-matches-p
                    (car domain) (cdr domain))
@@ -2102,15 +2245,17 @@ selection snapshot as RANGES."
   "Return intersections of normalized RANGES and complete DOMAINS."
   (let (islands)
     (dolist (domain domains)
-      (let ((domain-beg (plist-get domain :domain-beg))
-            (domain-end (plist-get domain :domain-end)))
+      (let ((domain-range
+             (cons (plist-get domain :domain-beg)
+                   (plist-get domain :domain-end))))
         (dolist (range ranges)
-          (let ((beg (max (car range) domain-beg))
-                (end (min (cdr range) domain-end)))
-            (when (< beg end)
-              (push (append (list :beg beg :end end)
-                            domain)
-                    islands))))))
+          (when-let* ((intersection
+                       (proofread--range-intersection
+                        range domain-range)))
+            (push (append (list :beg (car intersection)
+                                :end (cdr intersection))
+                          domain)
+                  islands)))))
     (sort islands
           (lambda (left right)
             (< (plist-get left :beg)
@@ -2979,13 +3124,12 @@ When MESSAGE is non-nil, include it as caller-readable error text."
 
 (defun proofread--request-relative-range-valid-p (request beg end)
   "Return non-nil if relative BEG and END are valid for REQUEST."
-  (let ((text (plist-get request :text)))
-    (and (integerp beg)
-         (integerp end)
-         (stringp text)
-         (<= 0 beg)
-         (<= beg end)
-         (<= end (length text)))))
+  (let ((text (plist-get request :text))
+        (range (cons beg end)))
+    (and (stringp text)
+         (proofread--range-valid-p range)
+         (proofread--range-contains-p
+          (cons 0 (length text)) range))))
 
 (defun proofread--syntax-state-in-container-p
     (state container-beg kind)
@@ -3116,8 +3260,8 @@ syntactic containers."
                           end-state
                           interior
                           (equal (nth 8 beg-state) (nth 8 end-state))
-                          (<= (car interior) beg)
-                          (<= end (cdr interior))
+                          (proofread--range-contains-p
+                           interior (cons beg end))
                           (not
                            (proofread--range-touches-syntax-escape-p
                             beg end))
@@ -3637,8 +3781,9 @@ Return one of the symbols `sent', `cached', `full', `stale', or
   "Return REQUEST's current integer range, or nil."
   (let ((beg (proofread--position-integer (plist-get request :beg)))
         (end (proofread--position-integer (plist-get request :end))))
-    (when (and beg end (<= beg end))
-      (cons beg end))))
+    (when-let* ((range (cons beg end))
+                ((proofread--range-valid-p range)))
+      range)))
 
 (defun proofread--same-request-owner-p (left right)
   "Return non-nil when LEFT and RIGHT belong to the same checker."
@@ -4066,12 +4211,9 @@ Do not scan unrelated requests."
 
 (defun proofread--request-range-valid-p (request)
   "Return non-nil if REQUEST range is valid in the current buffer."
-  (let ((beg (proofread--position-integer (plist-get request :beg)))
-        (end (proofread--position-integer (plist-get request :end))))
-    (and beg end
-         (<= (point-min) beg)
-         (<= beg end)
-         (<= end (point-max)))))
+  (when-let* ((range (proofread--request-range request)))
+    (proofread--range-contains-p
+     (cons (point-min) (point-max)) range)))
 
 (defun proofread--request-text-matches-p (request)
   "Return non-nil if REQUEST text still matches the current buffer."
@@ -4092,16 +4234,20 @@ Do not scan unrelated requests."
   "Return the current target domain containing REQUEST, or nil."
   (let ((kind (plist-get request :target-kind))
         (policy (plist-get request :target-policy))
-        (request-beg (plist-get request :beg))
-        (request-end (plist-get request :end)))
-    (cl-find-if
-     (lambda (domain)
-       (and (eq kind (plist-get domain :kind))
-            (<= (plist-get domain :domain-beg) request-beg)
-            (<= request-end (plist-get domain :domain-end))))
-     (proofread--target-domains-for-kind
-      (list (cons request-beg request-end))
-      kind policy (point-min) (point-max)))))
+        (request-range
+         (proofread--request-range request)))
+    (when request-range
+      (cl-find-if
+       (lambda (domain)
+         (and
+          (eq kind (plist-get domain :kind))
+          (proofread--range-contains-p
+           (cons (plist-get domain :domain-beg)
+                 (plist-get domain :domain-end))
+           request-range)))
+       (proofread--target-domains-for-kind
+        (list request-range)
+        kind policy (point-min) (point-max))))))
 
 (defun proofread--request-target-fresh-p (request domain)
   "Return non-nil when REQUEST still belongs to target DOMAIN."
@@ -4119,8 +4265,8 @@ Do not scan unrelated requests."
          domain
          (eq major-mode (plist-get request :major-mode))
          (eq policy (proofread--effective-target-policy))
-         (<= domain-beg beg)
-         (<= end domain-end)
+         (proofread--range-contains-p
+          (cons domain-beg domain-end) (cons beg end))
          (proofread--request-currently-included-p request))))
 
 (defun proofread--request-context-matches-p (request domain)
@@ -4466,14 +4612,10 @@ REQUEST-RANGE is the checked buffer range as a (BEG . END) pair."
          (or (equal owner-range request-range)
              (and diagnostic-range
                   (if (= (car diagnostic-range) (cdr diagnostic-range))
-                      (and (< (car request-range)
-                              (car diagnostic-range))
-                           (< (car diagnostic-range)
-                              (cdr request-range)))
-                    (proofread--ranges-intersect-p
-                     (car request-range) (cdr request-range)
-                     (car diagnostic-range)
-                     (cdr diagnostic-range))))))))
+                      (proofread--range-strictly-contains-position-p
+                       request-range (car diagnostic-range))
+                    (proofread--range-overlaps-p
+                     request-range diagnostic-range)))))))
 
 (defun proofread--diagnostic-owned-by-request-p (diagnostic request)
   "Return non-nil when REQUEST may replace DIAGNOSTIC.
@@ -4878,37 +5020,25 @@ of later requests can continue."
     (setq proofread--pending-work t)
     (proofread--schedule-idle-timer)))
 
-(defun proofread--range-affected-by-edit-p (range beg end)
-  "Return non-nil when editing BEG through END affects RANGE.
-For an insertion, nonempty ranges keep their diagnostic when text is
-inserted at either boundary, while a zero-width diagnostic is
-invalidated at its exact position."
-  (if (= beg end)
-      (if (= (car range) (cdr range))
-          (= beg (car range))
-        (and (< (car range) beg)
-             (< beg (cdr range))))
-    (proofread--ranges-conflict-p
-     beg end (car range) (cdr range))))
-
 (defun proofread--edit-affected-state (beg end)
   "Return state affected by editing from BEG through END.
 The car of the result contains overlays in tracked order.  The cdr
 contains diagnostics in diagnostic order.  Preserve the identity of
 every collected object."
-  (cons
-   (cl-remove-if-not
-    (lambda (overlay)
-      (let ((range (cons (overlay-start overlay)
-                         (overlay-end overlay))))
-        (proofread--range-affected-by-edit-p range beg end)))
-    proofread--overlays)
-   (cl-remove-if-not
-    (lambda (diagnostic)
-      (when-let* ((range
-                   (proofread--diagnostic-live-range diagnostic)))
-        (proofread--range-affected-by-edit-p range beg end)))
-    proofread--diagnostics)))
+  (let ((edit (cons beg end)))
+    (cons
+     (cl-remove-if-not
+      (lambda (overlay)
+        (let ((range (cons (overlay-start overlay)
+                           (overlay-end overlay))))
+          (proofread--range-affected-by-edit-p range edit)))
+      proofread--overlays)
+     (cl-remove-if-not
+      (lambda (diagnostic)
+        (when-let* ((range
+                     (proofread--diagnostic-live-range diagnostic)))
+          (proofread--range-affected-by-edit-p range edit)))
+      proofread--diagnostics))))
 
 (defun proofread--defer-correction-invalidation (beg end)
   "Remember diagnostics affected by a correction-time change.
@@ -5053,8 +5183,9 @@ BEG and END delimit the changed text."
               (plist-get diagnostic :beg)))
         (end (proofread--position-integer
               (plist-get diagnostic :end))))
-    (when (and beg end (<= beg end))
-      (cons beg end))))
+    (when-let* ((range (cons beg end))
+                ((proofread--range-valid-p range)))
+      range)))
 
 (defun proofread-diagnostic-range (diagnostic)
   "Return DIAGNOSTIC's current well-formed range, or nil.
@@ -5413,15 +5544,6 @@ restriction."
      (proofread--diagnostic-ui-equivalent-p
       (car entry) diagnostic))
    entries))
-
-(defun proofread--range-covers-position-p (range position)
-  "Return non-nil when RANGE covers POSITION."
-  (let ((point-position (proofread--position-integer position)))
-    (and point-position
-         (<= (car range) point-position)
-         (or (< point-position (cdr range))
-             (and (= (car range) (cdr range))
-                  (= point-position (car range)))))))
 
 (defun proofread--diagnostic-ignore-key (diagnostic)
   "Return the session ignore key for DIAGNOSTIC."
@@ -6094,11 +6216,10 @@ nil for a change to the default."
        (with-current-buffer source
          (save-restriction
            (widen)
-           (and (integerp beg)
-                (integerp end)
-                (<= (point-min) beg)
-                (<= beg end)
-                (<= end (point-max)))))))
+           (let ((range (cons beg end)))
+             (and (proofread--range-valid-p range)
+                  (proofread--range-contains-p
+                   (cons (point-min) (point-max)) range)))))))
 
 (defun proofread--request-log-record-range (record)
   "Return RECORD's source range as a cons cell, or nil."
@@ -6616,13 +6737,15 @@ events."
                 (current-column)))))))
 
 (defun proofread--diagnostics-in-range (beg end)
-  "Return proofread diagnostics intersecting BEG to END."
-  (let (diagnostics)
+  "Return proofread diagnostics conflicting with BEG to END.
+This includes zero-width diagnostics on either boundary."
+  (let ((selected-range (cons beg end))
+        diagnostics)
     (dolist (diagnostic (proofread--navigation-diagnostics))
       (let ((range (proofread--diagnostic-live-range diagnostic)))
         (when (and range
-                   (proofread--ranges-conflict-p
-                    beg end (car range) (cdr range)))
+                   (proofread--range-conflicts-p
+                    selected-range range))
           (push diagnostic diagnostics))))
     (nreverse diagnostics)))
 
@@ -6813,9 +6936,9 @@ When RESET is non-nil, move from the beginning of the buffer."
          (text (plist-get diagnostic :text)))
     (unless range
       (user-error "Proofread diagnostic is stale"))
-    (unless (and (<= (point-min) beg)
-                 (<= beg end)
-                 (<= end (point-max)))
+    (unless (and (proofread--range-valid-p range)
+                 (proofread--range-contains-p
+                  (cons (point-min) (point-max)) range))
       (user-error "Invalid proofread diagnostic range"))
     (unless (stringp text)
       (user-error "Invalid proofread diagnostic text"))
@@ -6879,71 +7002,6 @@ length change."
                       end-state (car expected-range) kind))
           (user-error
            "Proofread suggestion would alter a source delimiter"))))))
-
-(defun proofread--ranges-intersect-p (beg end other-beg other-end)
-  "Return non-nil if BEG to END intersects OTHER-BEG to OTHER-END."
-  (and (< beg other-end)
-       (< other-beg end)))
-
-(defun proofread--ranges-conflict-p (beg end other-beg other-end)
-  "Return non-nil if changing BEG to END affects another range.
-The other range extends from OTHER-BEG through OTHER-END.  Zero-width
-ranges conflict with ranges whose closed boundaries contain their
-position."
-  (or (proofread--ranges-intersect-p beg end other-beg other-end)
-      (and (= beg end)
-           (<= other-beg beg)
-           (<= beg other-end))
-      (and (= other-beg other-end)
-           (<= beg other-beg)
-           (<= other-beg end))))
-
-(defun proofread--range-conflicts-any-p (range ranges)
-  "Return non-nil when RANGE conflicts with one of RANGES."
-  (cl-some
-   (lambda (candidate)
-     (proofread--ranges-conflict-p
-      (car range) (cdr range) (car candidate) (cdr candidate)))
-   ranges))
-
-(defun proofread--range-precedes-without-conflict-p (left right)
-  "Return non-nil if LEFT precedes RIGHT without a conflict."
-  (and (<= (cdr left) (car right))
-       (not (proofread--ranges-conflict-p
-             (car left) (cdr left) (car right) (cdr right)))))
-
-(defun proofread--range-conflicting-entries (ranges entries)
-  "Return ENTRIES whose ranges conflict with one of RANGES.
-Each element of ENTRIES must have the form \=(OBJECT . RANGE).  RANGE
-and every element of RANGES must be valid integer ranges of the form
-\=(BEG . END).  Inputs may be unsorted and are not modified.  Return
-entries ordered by range while retaining original entries, duplicate
-occurrences, and object identity."
-  (let* ((range-less-p
-          (lambda (left right)
-            (or (< (car left) (car right))
-                (and (= (car left) (car right))
-                     (< (cdr left) (cdr right))))))
-         (remaining-ranges
-          (sort (copy-sequence ranges) range-less-p))
-         (sorted-entries
-          (sort (copy-sequence entries)
-                (lambda (left right)
-                  (funcall range-less-p (cdr left) (cdr right)))))
-         conflicts)
-    (dolist (entry sorted-entries)
-      (let ((range (cdr entry)))
-        (while (and remaining-ranges
-                    (proofread--range-precedes-without-conflict-p
-                     (car remaining-ranges) range))
-          (setq remaining-ranges (cdr remaining-ranges)))
-        (when (and remaining-ranges
-                   (proofread--ranges-conflict-p
-                    (car range) (cdr range)
-                    (caar remaining-ranges)
-                    (cdar remaining-ranges)))
-          (push entry conflicts))))
-    (nreverse conflicts)))
 
 (defun proofread--remove-diagnostics (diagnostics)
   "Remove DIAGNOSTICS from current buffer proofread state."
@@ -7013,9 +7071,9 @@ hook."
                          (proofread--diagnostic-range diagnostic)))
               (beg (car range))
               (end (cdr range)))
-    (and (<= (point-min) beg)
-         (<= beg end)
-         (<= end (point-max))
+    (and (proofread--range-valid-p range)
+         (proofread--range-contains-p
+          (cons (point-min) (point-max)) range)
          (equal (buffer-substring-no-properties beg end)
                 (plist-get diagnostic :text)))))
 
@@ -7057,20 +7115,20 @@ an atomic rollback."
           (proofread--mark-pending-work))))))
 
 (defun proofread--prepare-diagnostic-corrections (diagnostics)
-  "Return selected nonoverlapping corrections for DIAGNOSTICS.
+  "Return selected nonconflicting corrections for DIAGNOSTICS.
 Each returned element is a cons cell of the form (DIAGNOSTIC
 . SUGGESTION).  DIAGNOSTICS must be in navigation order.  An earlier
 diagnostic takes precedence over any later diagnostic whose range
-overlaps it."
+conflicts with it, including equal or boundary-conflicting zero-width
+ranges."
   (let (corrections previous-range)
     (dolist (diagnostic diagnostics)
       (let ((range
              (proofread--validate-suggestion-application
               diagnostic)))
         (unless (and previous-range
-                     (proofread--ranges-conflict-p
-                      (car range) (cdr range)
-                      (car previous-range) (cdr previous-range)))
+                     (proofread--range-conflicts-p
+                      range previous-range))
           (let ((suggestion
                  (proofread--select-diagnostic-suggestion
                   diagnostic)))
@@ -7494,14 +7552,6 @@ DIAGNOSTICS must be in navigation order.  Return `applied'."
     (user-error
      "Proofread mode is not enabled in the current buffer")))
 
-(defun proofread--range-contained-in-any-p (range ranges)
-  "Return non-nil if RANGE is completely contained in RANGES."
-  (cl-some
-   (lambda (candidate)
-     (and (<= (car candidate) (car range))
-          (<= (cdr range) (cdr candidate))))
-   ranges))
-
 (defun proofread--sorted-target-domains (domains)
   "Return a copy of DOMAINS sorted by beginning position."
   (sort (copy-sequence domains)
@@ -7511,20 +7561,20 @@ DIAGNOSTICS must be in navigation order.  Return `applied'."
 
 (defun proofread--range-in-sorted-domains-p (range domains)
   "Return non-nil when RANGE is contained in one of sorted DOMAINS."
-  (let ((beg (car range))
-        (end (cdr range)))
+  (let ((beg (car range)))
     (catch 'contained
       (dolist (domain domains)
         (let ((domain-beg (plist-get domain :domain-beg))
               (domain-end (plist-get domain :domain-end)))
           (when (> domain-beg beg)
             (throw 'contained nil))
-          (when (and (<= domain-beg beg) (<= end domain-end))
+          (when (proofread--range-contains-p
+                 (cons domain-beg domain-end) range)
             (throw 'contained t))))
       nil)))
 
 (defun proofread--checked-diagnostic-entries (ranges)
-  "Return diagnostics intersecting RANGES with positions sorted."
+  "Return diagnostics conflicting with RANGES, sorted by position."
   (let (entries)
     (dolist (diagnostic proofread--diagnostics)
       (when-let* ((range (proofread--diagnostic-range diagnostic)))
@@ -7637,12 +7687,12 @@ progress messages are inhibited."
 
 (defun proofread--span-at-position (spans position)
   "Return the most useful member of sorted SPANS for POSITION.
-Spans are half-open ranges.  At the end of the accessible buffer or
-the first sentence-ending separator whitespace, return the preceding
-span only when it ends exactly at POSITION."
+SPANS are nonempty half-open ranges.  At the end of the accessible
+buffer or the first sentence-ending separator whitespace, return the
+preceding span only when it ends exactly at POSITION."
   (or (cl-find-if (lambda (span)
-                    (and (<= (car span) position)
-                         (< position (cdr span))))
+                    (proofread--range-covers-position-p
+                     span position))
                   spans)
       (when (or (= position (point-max))
                 (and (< position (point-max))
@@ -7726,10 +7776,11 @@ Comments take precedence over docstrings when discovery reports both."
                                  (plist-get candidate
                                             :owner-domain)))
                             (and domain
-                                 (<= (plist-get domain :domain-beg)
-                                     position)
-                                 (< position
-                                    (plist-get domain :domain-end))
+                                 (proofread--range-covers-position-p
+                                  (cons
+                                   (plist-get domain :domain-beg)
+                                   (plist-get domain :domain-end))
+                                  position)
                                  (<= position
                                      (plist-get candidate :beg)))))
                         request-spans)))
