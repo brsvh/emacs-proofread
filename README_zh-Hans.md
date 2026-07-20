@@ -436,7 +436,8 @@ https://github.com/user-attachments/assets/2dda228e-f85c-4500-aea0-549500628c6e
 
 在请求列表中，`RET` 或 `C-m` 调用 `proofread-show-request` 以显示完整的请求生命周期。在诊断列表中，`RET` 或
 `C-m` 调用 `proofread-goto-diagnostic`，`SPC` 或 `C-o` 则调用
-`proofread-show-diagnostic`。
+`proofread-show-diagnostic`。两个列表的 `Col` 都是从零开始的 Emacs
+显示列，因此会反映制表符、宽字符和组合字符的显示宽度。
 
 ## 自定义选项
 

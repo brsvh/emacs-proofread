@@ -517,7 +517,9 @@ with `M-x` or bound by the user:
 In a request list, `RET` or `C-m` invokes `proofread-show-request` to display
 the complete request lifecycle. In a diagnostic list, `RET` or `C-m` invokes
 `proofread-goto-diagnostic`, while `SPC` or `C-o` invokes
-`proofread-show-diagnostic`.
+`proofread-show-diagnostic`. In both lists, `Col` is the zero-based Emacs
+display column, so tabs, wide characters, and combining characters are
+reflected.
 
 ## Customization options
 

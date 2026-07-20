@@ -20,6 +20,13 @@ the profile's ':language' property, represent each backend with a named checker
 whose ':backend' property selects it, and select the profile with
 'proofread-profile'.
 
+** User interface
+
+---
+*** Request and diagnostic lists now report display columns.
+The 'Col' field uses Emacs's zero-based display column, so tabs, wide
+characters, and combining characters are represented as they appear on screen.
+
 
 * Changes in proofread 0.2.0
 

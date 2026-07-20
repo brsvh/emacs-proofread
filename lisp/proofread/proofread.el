@@ -6047,7 +6047,7 @@ nil for a change to the default."
       (cons beg end))))
 
 (defun proofread--request-log-record-line-column (record)
-  "Return RECORD's source line and column as a cons cell."
+  "Return RECORD's source line and zero-based display column."
   (let* ((source (plist-get record :source-buffer))
          (range (proofread--request-log-record-range record))
          (beg (car-safe range))
@@ -6059,7 +6059,7 @@ nil for a change to the default."
           (save-excursion
             (goto-char beg)
             (cons (line-number-at-pos)
-                  (- (point) (line-beginning-position)))))))))
+                  (current-column))))))))
 
 (defun proofread--request-log-record-current-text (record)
   "Return RECORD's current source text, or nil when stale."
@@ -6544,7 +6544,7 @@ events."
               (overlay-end overlay))))))
 
 (defun proofread--diagnostic-line-column (diagnostic)
-  "Return DIAGNOSTIC's current line and column as a cons cell."
+  "Return DIAGNOSTIC's current line and zero-based display column."
   (let ((range (proofread--diagnostic-live-range diagnostic)))
     (when range
       (save-excursion
@@ -6552,7 +6552,7 @@ events."
           (widen)
           (goto-char (car range))
           (cons (line-number-at-pos)
-                (- (point) (line-beginning-position))))))))
+                (current-column)))))))
 
 (defun proofread--diagnostics-in-range (beg end)
   "Return proofread diagnostics intersecting BEG to END."

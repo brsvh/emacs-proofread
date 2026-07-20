@@ -10208,6 +10208,54 @@ This covers URLs, email, invisible text, faces, and properties."
 
 ;;;; Listing tests
 
+(ert-deftest proofread-test-list-columns-use-display-columns ()
+  "Show tab, wide, and combining characters as display columns."
+  (with-temp-buffer
+    (setq-local proofread-auto-check nil)
+    (setq-local tab-width 8)
+    (insert "\t中e" (string #x0301) "X")
+    (proofread-mode 1)
+    (narrow-to-region 2 (point-max))
+    (dolist (case '((2 . 8) (3 . 10) (5 . 11)))
+      (let* ((position (car case))
+             (expected-column (cdr case))
+             (record
+              (list :source-buffer (current-buffer)
+                    :key position
+                    :beg position
+                    :end position))
+             (diagnostic
+              (proofread--make-diagnostic
+               :beg position :end position :text ""
+               :kind 'style :message "Test" :source 'test))
+             (overlay (proofread--create-overlay diagnostic)))
+        (unwind-protect
+            (let ((request-line-column
+                   (proofread--request-log-record-line-column record))
+                  (diagnostic-line-column
+                   (proofread--diagnostic-line-column diagnostic))
+                  (request-entry
+                   (proofread--request-log-record-entry record))
+                  (request-summary
+                   (proofread--request-log-record-summary record))
+                  (diagnostic-columns
+                   (cadr (proofread--diagnostics-list-entry diagnostic))))
+              (should (equal request-line-column
+                             (cons 1 expected-column)))
+              (should (equal diagnostic-line-column
+                             (cons 1 expected-column)))
+              (should (= (plist-get (car request-entry) :column)
+                         expected-column))
+              (should (= (plist-get request-summary :column)
+                         expected-column))
+              (should
+               (equal (aref (cadr request-entry) 4)
+                      (number-to-string expected-column)))
+              (should
+               (equal (aref diagnostic-columns 1)
+                      (number-to-string expected-column))))
+          (proofread--delete-overlay overlay))))))
+
 (ert-deftest
     proofread-test-request-list-accepts-buffer-object-and-name ()
   "Resolve a live request-list source from its object or name."
