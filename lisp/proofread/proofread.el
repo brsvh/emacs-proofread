@@ -2656,11 +2656,9 @@ LANGUAGE is the language hint snapshotted for the check."
           :context-after
           (proofread--request-ready-context-after end))))
 
-(defun proofread--request-ready-chunks-for-spans
-    (spans &optional language)
-  "Return request-ready chunks for filtered chunk SPANS.
-LANGUAGE is the language hint snapshotted for the check."
-  (let (chunks)
+(defun proofread--retained-request-spans (spans)
+  "Return nonblank portions of SPANS after ignored text is removed."
+  (let (request-spans)
     (dolist (span spans)
       (let ((beg (car span))
             (end (cdr span)))
@@ -2669,10 +2667,8 @@ LANGUAGE is the language hint snapshotted for the check."
                   beg end
                   (proofread--ignored-ranges-in-region beg end)))
           (when (proofread--range-nonblank-p (car range) (cdr range))
-            (push (proofread--make-request-ready-chunk
-                   (car range) (cdr range) language)
-                  chunks)))))
-    (nreverse chunks)))
+            (push range request-spans)))))
+    (nreverse request-spans)))
 
 (defun proofread--chunk-with-target-metadata (chunk island)
   "Return CHUNK annotated with target metadata from ISLAND."
@@ -2682,18 +2678,17 @@ LANGUAGE is the language hint snapshotted for the check."
                 :domain-beg (plist-get island :domain-beg)
                 :domain-end (plist-get island :domain-end))))
 
-(defun proofread--chunk-has-target-prose-p (chunk island)
-  "Return non-nil when CHUNK has useful prose for target ISLAND."
+(defun proofread--request-span-has-target-prose-p (span island)
+  "Return non-nil when SPAN has useful prose for target ISLAND."
   (or (eq (plist-get island :kind) 'text)
-      (string-match-p "[[:alnum:]]" (plist-get chunk :text))))
+      (proofread--range-has-alphanumeric-p
+       (car span) (cdr span))))
 
-(defun proofread--request-ready-chunks-for-islands
-    (islands &optional language)
-  "Return request-ready chunks for target ISLANDS.
-LANGUAGE is the language hint snapshotted for the check."
+(defun proofread--request-spans-for-islands (islands)
+  "Return filtered request span records for target ISLANDS."
   (let ((accessible-beg (and (buffer-narrowed-p) (point-min)))
         (accessible-end (and (buffer-narrowed-p) (point-max)))
-        request-chunks)
+        request-spans)
     (save-mark-and-excursion
       (dolist (island islands)
         (let
@@ -2702,23 +2697,65 @@ LANGUAGE is the language hint snapshotted for the check."
           (save-restriction
             (narrow-to-region (plist-get island :domain-beg)
                               (plist-get island :domain-end))
-            (dolist (chunk
-                     (proofread--request-ready-chunks-for-spans
-                      (proofread--chunk-spans-for-ranges
-                       (list (cons (plist-get island :beg)
-                                   (plist-get island :end))))
-                      language))
-              (when (proofread--chunk-has-target-prose-p chunk island)
-                (let ((chunk (proofread--chunk-with-target-metadata
-                              chunk island)))
-                  (setq chunk
-                        (plist-put
-                         chunk :accessible-beg accessible-beg))
-                  (setq chunk
-                        (plist-put
-                         chunk :accessible-end accessible-end))
-                  (push chunk request-chunks))))))))
+            (dolist
+                (span
+                 (proofread--retained-request-spans
+                  (proofread--chunk-spans-for-ranges
+                   (list (cons (plist-get island :beg)
+                               (plist-get island :end))))))
+              (when (proofread--request-span-has-target-prose-p
+                     span island)
+                (let ((request-span (copy-sequence island)))
+                  (setq request-span
+                        (plist-put request-span :beg (car span)))
+                  (setq request-span
+                        (plist-put request-span :end (cdr span)))
+                  (setq request-span
+                        (plist-put request-span
+                                   :accessible-beg accessible-beg))
+                  (setq request-span
+                        (plist-put request-span
+                                   :accessible-end accessible-end))
+                  (push request-span request-spans))))))))
+    (nreverse request-spans)))
+
+(defun proofread--request-ready-chunks-for-request-spans
+    (request-spans &optional language)
+  "Materialize REQUEST-SPANS using snapshotted LANGUAGE."
+  (let (request-chunks)
+    (save-mark-and-excursion
+      (dolist (span request-spans)
+        (let
+            ((proofread--active-target-kind
+              (plist-get span :kind)))
+          (save-restriction
+            (narrow-to-region (plist-get span :domain-beg)
+                              (plist-get span :domain-end))
+            (let ((chunk
+                   (proofread--make-request-ready-chunk
+                    (plist-get span :beg)
+                    (plist-get span :end)
+                    language)))
+              (setq chunk
+                    (proofread--chunk-with-target-metadata
+                     chunk span))
+              (setq chunk
+                    (plist-put
+                     chunk :accessible-beg
+                     (plist-get span :accessible-beg)))
+              (setq chunk
+                    (plist-put
+                     chunk :accessible-end
+                     (plist-get span :accessible-end)))
+              (push chunk request-chunks))))))
     (nreverse request-chunks)))
+
+(defun proofread--request-ready-chunks-for-islands
+    (islands &optional language)
+  "Return request-ready chunks for target ISLANDS.
+LANGUAGE is the language hint snapshotted for the check."
+  (proofread--request-ready-chunks-for-request-spans
+   (proofread--request-spans-for-islands islands) language))
 
 ;;;; Backend requests
 
@@ -7544,20 +7581,21 @@ diagnostics and diagnostics owned by explicit ad-hoc requests."
              (mapcar #'proofread--overlay-for-diagnostic diagnostics))
        diagnostics))))
 
-(defun proofread--check-ranges (ranges scope &optional force-feedback)
-  "Check RANGES and describe them as SCOPE in progress feedback.
-When FORCE-FEEDBACK is non-nil, report feedback even when routine
-progress messages are inhibited."
-  (proofread--require-mode)
+(defun proofread--prepare-forced-check (force-feedback)
+  "Retire pending automatic work when FORCE-FEEDBACK is non-nil."
   (when force-feedback
     (setq proofread--pending-work nil)
-    (proofread--cancel-idle-timer))
+    (proofread--cancel-idle-timer)))
+
+(defun proofread--check-selection-plan
+    (plan profile scope &optional force-feedback request-spans)
+  "Check PLAN with PROFILE and describe it as SCOPE.
+When FORCE-FEEDBACK is non-nil, use `message' for feedback.  Optional
+REQUEST-SPANS are already selected and filtered request span records."
   (let* ((progress-message
           (if force-feedback
               #'message
             #'proofread--progress-message))
-         (profile (proofread--current-profile))
-         (plan (proofread--selection-plan-for-ranges ranges))
          (normalized-ranges
           (proofread--selection-plan-ranges plan))
          (domains (proofread--selection-plan-domains plan))
@@ -7569,8 +7607,11 @@ progress messages are inhibited."
     (let* ((dispatch-result
             (when (plist-get profile :checkers)
               (proofread--dispatch-profile-request-ready-chunks-result
-               (proofread--request-ready-chunks-for-islands
-                islands (plist-get profile :language))
+               (if request-spans
+                   (proofread--request-ready-chunks-for-request-spans
+                    request-spans (plist-get profile :language))
+                 (proofread--request-ready-chunks-for-islands
+                  islands (plist-get profile :language)))
                profile)))
            (supported-count
             (or (plist-get dispatch-result :supported-count) 0)))
@@ -7594,6 +7635,17 @@ progress messages are inhibited."
          (length normalized-ranges)
          scope
          (if (= (length normalized-ranges) 1) "" "s"))))))
+
+(defun proofread--check-ranges (ranges scope &optional force-feedback)
+  "Check RANGES and describe them as SCOPE in progress feedback.
+When FORCE-FEEDBACK is non-nil, report feedback even when routine
+progress messages are inhibited."
+  (proofread--require-mode)
+  (proofread--prepare-forced-check force-feedback)
+  (let ((profile (proofread--current-profile)))
+    (proofread--check-selection-plan
+     (proofread--selection-plan-for-ranges ranges)
+     profile scope force-feedback)))
 
 (defun proofread--span-at-position (spans position)
   "Return the most useful member of sorted SPANS for POSITION.
@@ -7635,64 +7687,107 @@ span only when it ends exactly at POSITION."
          (end (if (= beg domain-beg)
                   (min domain-end (+ beg (* 4 size)))
                 (min domain-end (+ beg (* 3 size))))))
-    (append (list :beg beg :end end) domain)))
+    (append (list :beg beg :end end :owner-domain domain)
+            domain)))
 
-(defun proofread--request-ready-chunks-at-point ()
-  "Return request-ready chunks in the target domain at point."
-  (let* ((position (point))
-         (ranges (proofread--point-probe-ranges))
-         (policy (proofread--effective-target-policy))
-         (minimum (point-min))
-         (maximum (point-max))
-         (domains
-          (cond
-           ((eq policy 'all)
-            (proofread--target-domains-for-kind
-             ranges 'text policy minimum maximum))
-           ((proofread--target-policy-includes-p policy 'comment)
-            (or (proofread--target-domains-for-kind
-                 ranges 'comment policy minimum maximum)
-                (when (proofread--target-policy-includes-p
-                       policy 'docstring)
-                  (proofread--target-domains-for-kind
-                   ranges 'docstring policy minimum maximum))))
-           (t
-            (proofread--target-domains-for-kind
-             ranges 'docstring policy minimum maximum)))))
-    (proofread--request-ready-chunks-for-islands
-     (mapcar
-      (lambda (domain)
-        (proofread--point-island-for-domain domain position))
-      domains))))
+(defun proofread--point-target-domains (plan)
+  "Return the preferred point target domains from PLAN.
+Comments take precedence over docstrings when discovery reports both."
+  (let ((domains (proofread--selection-plan-domains plan)))
+    (or (cl-remove-if-not
+         (lambda (domain)
+           (eq (plist-get domain :kind) 'comment))
+         domains)
+        (cl-remove-if-not
+         (lambda (domain)
+           (eq (plist-get domain :kind) 'docstring))
+         domains)
+        (cl-remove-if-not
+         (lambda (domain)
+           (eq (plist-get domain :kind) 'text))
+         domains))))
 
-(defun proofread--request-ready-range-at-point ()
-  "Return the request-ready chunk range selected by point, or nil."
-  (let* ((position (point))
-         (chunks (proofread--request-ready-chunks-at-point))
-         (spans
-          (mapcar (lambda (chunk)
-                    (cons (plist-get chunk :beg)
-                          (plist-get chunk :end)))
-                  chunks)))
-    (or (proofread--span-at-position spans position)
-        ;; A comment delimiter can form a punctuation-only chunk that
+(defun proofread--request-span-at-position
+    (request-spans position)
+  "Return the member of REQUEST-SPANS selected by POSITION."
+  (let* ((ranges
+          (mapcar
+           (lambda (span)
+             (cons (plist-get span :beg)
+                   (plist-get span :end)))
+           request-spans))
+         (range (proofread--span-at-position ranges position)))
+    (or (and range
+             (cl-find-if
+              (lambda (span)
+                (and (= (plist-get span :beg) (car range))
+                     (= (plist-get span :end) (cdr range))))
+              request-spans))
+        ;; A comment delimiter can form a punctuation-only span that
         ;; is intentionally filtered.  Select the following prose in
         ;; that same target domain when point is on the delimiter.
         (when (cl-some
-               (lambda (chunk)
-                 (memq (plist-get chunk :target-kind)
+               (lambda (span)
+                 (memq (plist-get span :kind)
                        '( comment docstring)))
-               chunks)
+               request-spans)
           (when-let* ((span
                        (cl-find-if
                         (lambda (candidate)
-                          (<= position (car candidate)))
-                        spans)))
-            (when (and (not (proofread--range-has-alphanumeric-p
-                             position (car span)))
-                       (null (proofread--ignored-ranges-in-region
-                              position (car span))))
+                          (let ((domain
+                                 (plist-get candidate
+                                            :owner-domain)))
+                            (and domain
+                                 (<= (plist-get domain :domain-beg)
+                                     position)
+                                 (< position
+                                    (plist-get domain :domain-end))
+                                 (<= position
+                                     (plist-get candidate :beg)))))
+                        request-spans)))
+            (when (and
+                   (not
+                    (proofread--range-has-alphanumeric-p
+                     position (plist-get span :beg)))
+                   (null
+                    (proofread--ignored-ranges-in-region
+                     position (plist-get span :beg))))
               span))))))
+
+(defun proofread--point-check-selection ()
+  "Return the point check selection, or nil when point has no prose.
+The return value is a cons whose car is the final selection plan and
+whose cdr contains its one filtered request span record."
+  (let* ((position (point))
+         (probe-plan
+          (proofread--selection-plan-for-ranges
+           (proofread--point-probe-ranges)))
+         (domains (proofread--point-target-domains probe-plan))
+         (islands
+          (mapcar
+           (lambda (domain)
+             (proofread--point-island-for-domain domain position))
+           domains))
+         (request-spans
+          (proofread--request-spans-for-islands islands)))
+    (when-let* ((span
+                 (proofread--request-span-at-position
+                  request-spans position))
+                (domain (plist-get span :owner-domain)))
+      (let* ((range
+              (cons (plist-get span :beg)
+                    (plist-get span :end)))
+             (island
+              (append (list :beg (car range) :end (cdr range))
+                      domain)))
+        (cons (proofread--make-selection-plan
+               (list range) (list domain) (list island))
+              (list span))))))
+
+(defun proofread--request-ready-range-at-point ()
+  "Return the request-ready chunk range selected by point, or nil."
+  (when-let* ((selection (proofread--point-check-selection)))
+    (car (proofread--selection-plan-ranges (car selection)))))
 
 ;;;; Minor mode
 
@@ -7763,10 +7858,14 @@ When FORCE-FEEDBACK is non-nil, report command feedback even when
 routine progress messages are inhibited."
   (interactive (list t))
   (proofread--require-mode)
-  (let ((range (proofread--request-ready-range-at-point)))
-    (unless range
+  (let ((selection (proofread--point-check-selection)))
+    (unless selection
       (user-error "No text to proofread at point"))
-    (proofread--check-ranges (list range) "point" force-feedback)))
+    (proofread--prepare-forced-check force-feedback)
+    (let ((profile (proofread--current-profile)))
+      (proofread--check-selection-plan
+       (car selection) profile "point" force-feedback
+       (cdr selection)))))
 
 ;;;###autoload
 (defun proofread-show-buffer-diagnostics (&optional diagnostic)

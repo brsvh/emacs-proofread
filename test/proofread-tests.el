@@ -1749,6 +1749,209 @@ no available backend")
                        "Third" (plist-get request :context-after))))
             (should (= (point) before-point))))))))
 
+(ert-deftest proofread-test-check-at-point-builds-selected-chunk-once
+    ()
+  "Build and dispatch the point selection without repeating stages."
+  (with-temp-buffer
+    (insert "Outside prefix. First.  Second sentence. Third. "
+            "Outside suffix.")
+    (goto-char (point-min))
+    (search-forward "First.")
+    (let ((narrow-beg (match-beginning 0)))
+      (search-forward "Third.")
+      (let ((narrow-end (match-end 0)))
+        (narrow-to-region narrow-beg narrow-end)
+        (goto-char (point-min))
+        (search-forward "Second sentence.")
+        (goto-char (+ (match-beginning 0) 3))
+        (push-mark (point-min) t t)
+        (setq-local proofread-auto-check nil)
+        (proofread-mode 1)
+        (let ((proofread-test--profile-language "en")
+              (proofread-context-size 100)
+              (proofread-context-sentences-before 1)
+              (proofread-context-sentences-after 1)
+              (plan-function
+               (symbol-function
+                'proofread--selection-plan-for-ranges))
+              (span-function
+               (symbol-function
+                'proofread--request-spans-for-islands))
+              (materialize-function
+               (symbol-function
+                'proofread--request-ready-chunks-for-request-spans))
+              (chunk-function
+               (symbol-function 'proofread--make-request-ready-chunk))
+              (profile-function
+               (symbol-function 'proofread--current-profile))
+              (check-function
+               (symbol-function 'proofread--check-selection-plan))
+              (before-text (buffer-string))
+              (before-tick (buffer-chars-modified-tick))
+              (before-point (point))
+              (before-mark (mark t))
+              (before-mark-active mark-active)
+              (before-min (point-min))
+              (before-max (point-max))
+              (plan-count 0)
+              (span-count 0)
+              (materialize-count 0)
+              (chunk-count 0)
+              (profile-count 0)
+              (check-count 0)
+              (dispatch-count 0)
+              discovered-domains
+              selected-plan
+              selected-profile
+              selected-request-spans
+              materialized-request-spans
+              dispatched-chunks
+              dispatched-profile)
+          (proofread-test--with-profile
+            (cl-letf
+                (((symbol-function
+                   'proofread--selection-plan-for-ranges)
+                  (lambda (ranges)
+                    (setq plan-count (1+ plan-count))
+                    (let ((plan (funcall plan-function ranges)))
+                      (setq discovered-domains
+                            (proofread--selection-plan-domains plan))
+                      plan)))
+                 ((symbol-function
+                   'proofread--request-spans-for-islands)
+                  (lambda (islands)
+                    (setq span-count (1+ span-count))
+                    (funcall span-function islands)))
+                 ((symbol-function
+                   'proofread--make-request-ready-chunk)
+                  (lambda (beg end &optional language)
+                    (setq chunk-count (1+ chunk-count))
+                    (funcall chunk-function beg end language)))
+                 ((symbol-function
+                   'proofread--request-ready-chunks-for-request-spans)
+                  (lambda (request-spans &optional language)
+                    (setq materialize-count (1+ materialize-count))
+                    (setq materialized-request-spans request-spans)
+                    (funcall materialize-function
+                             request-spans language)))
+                 ((symbol-function 'proofread--current-profile)
+                  (lambda ()
+                    (setq profile-count (1+ profile-count))
+                    (funcall profile-function)))
+                 ((symbol-function 'proofread--check-selection-plan)
+                  (lambda
+                    (plan profile scope &optional force-feedback
+                          request-spans)
+                    (setq check-count (1+ check-count))
+                    (setq selected-plan plan)
+                    (setq selected-profile profile)
+                    (setq selected-request-spans request-spans)
+                    (funcall check-function
+                             plan profile scope force-feedback
+                             request-spans)))
+                 ((symbol-function
+                   'proofread--dispatch-profile-request-ready-chunks-result)
+                  (lambda (chunks profile)
+                    (setq dispatch-count (1+ dispatch-count))
+                    (setq dispatched-chunks chunks)
+                    (setq dispatched-profile profile)
+                    '( :supported-count 1 :requests (request))))
+                 ((symbol-function
+                   'proofread--request-ready-chunks-for-islands)
+                  (lambda (&rest _)
+                    (ert-fail
+                     "Point check rebuilt chunks from islands")))
+                 ((symbol-function 'proofread--check-ranges)
+                  (lambda (&rest _)
+                    (ert-fail "Point check re-entered range checking"))))
+              (proofread-check-at-point)))
+          (should (= plan-count 1))
+          (should (= span-count 1))
+          (should (= materialize-count 1))
+          (should (= chunk-count 1))
+          (should (= profile-count 1))
+          (should (= check-count 1))
+          (should (= dispatch-count 1))
+          (should (proofread--selection-plan-p selected-plan))
+          (should (= (length selected-request-spans) 1))
+          (should (eq materialized-request-spans
+                      selected-request-spans))
+          (should (eq dispatched-profile selected-profile))
+          (let* ((range
+                  (car (proofread--selection-plan-ranges
+                        selected-plan)))
+                 (domain
+                  (car (proofread--selection-plan-domains
+                        selected-plan)))
+                 (island
+                  (car (proofread--selection-plan-islands
+                        selected-plan)))
+                 (span (car selected-request-spans)))
+            (should (= (length discovered-domains) 1))
+            (should (eq domain (car discovered-domains)))
+            (should (eq (plist-get span :owner-domain) domain))
+            (should (= (cl-count :beg span) 1))
+            (should (= (cl-count :end span) 1))
+            (should (equal range
+                           (cons (plist-get span :beg)
+                                 (plist-get span :end))))
+            (should (= (plist-get island :beg) (car range)))
+            (should (= (plist-get island :end) (cdr range))))
+          (let ((chunk (car dispatched-chunks)))
+            (should (= (length dispatched-chunks) 1))
+            (should (equal (plist-get chunk :text)
+                           "Second sentence."))
+            (should (equal (plist-get chunk :language) "en"))
+            (should (string-match-p
+                     "First" (plist-get chunk :context-before)))
+            (should (string-match-p
+                     "Third" (plist-get chunk :context-after)))
+            (should-not (string-match-p
+                         "Outside" (plist-get chunk :context-before)))
+            (should-not (string-match-p
+                         "Outside" (plist-get chunk :context-after))))
+          (should (equal (buffer-string) before-text))
+          (should (= (buffer-chars-modified-tick) before-tick))
+          (should (= (point) before-point))
+          (should (= (mark t) before-mark))
+          (should (eq mark-active before-mark-active))
+          (should (= (point-min) before-min))
+          (should (= (point-max) before-max)))))))
+
+(ert-deftest
+    proofread-test-check-at-point-rejects-before-forced-retirement ()
+  "Reject an invalid point before retiring pending automatic work."
+  (with-temp-buffer
+    (insert "Alpha SECRET beta.")
+    (goto-char (point-min))
+    (search-forward "SECRET")
+    (let ((beg (match-beginning 0))
+          (end (match-end 0)))
+      (add-text-properties beg end '( proofread-test-ignore t))
+      (goto-char beg)
+      (setq-local proofread-auto-check nil)
+      (proofread-mode 1)
+      (let ((proofread-ignored-properties '( proofread-test-ignore))
+            (proofread--pending-work 'pending-token)
+            (proofread--idle-timer 'timer-token)
+            (cancel-count 0)
+            (profile-count 0))
+        (cl-letf
+            (((symbol-function 'proofread--cancel-idle-timer)
+              (lambda ()
+                (setq cancel-count (1+ cancel-count))
+                (setq proofread--idle-timer nil)))
+             ((symbol-function 'proofread--current-profile)
+              (lambda ()
+                (setq profile-count (1+ profile-count))
+                nil)))
+          (should-error (proofread-check-at-point t)
+                        :type 'user-error))
+        (should (= cancel-count 0))
+        (should (= profile-count 0))
+        (should (eq proofread--pending-work 'pending-token))
+        (should (eq proofread--idle-timer 'timer-token))))))
+
 (ert-deftest proofread-test-request-ready-range-at-point-boundaries ()
   "Select point ranges at sentences, whitespace, and buffer edges."
   (with-temp-buffer
@@ -1792,7 +1995,61 @@ no available backend")
     (setq-local proofread-auto-check nil)
     (proofread-mode 1)
     (goto-char (point-max))
+    (should-not (proofread--request-ready-range-at-point)))
+  (with-temp-buffer
+    (insert "Alpha user@example.com Beta")
+    (goto-char (point-min))
+    (search-forward "user@example.com")
+    (goto-char (+ (match-beginning 0) 2))
+    (setq-local proofread-auto-check nil)
+    (proofread-mode 1)
     (should-not (proofread--request-ready-range-at-point))))
+
+(ert-deftest proofread-test-check-at-point-programming-delimiters ()
+  "Select comment and docstring prose from their opening delimiters."
+  (dolist
+      (case
+       '((";; Comment delimiter prose.\n"
+          comment "Comment delimiter prose" ";;")
+         ("(defun sample ()\n  \"Docstring delimiter prose.\")\n"
+          docstring "Docstring delimiter prose" "\"Docstring")))
+    (with-temp-buffer
+      (emacs-lisp-mode)
+      (insert (nth 0 case))
+      (goto-char (point-min))
+      (search-forward (nth 3 case))
+      (goto-char (match-beginning 0))
+      (setq-local proofread-auto-check nil)
+      (proofread-mode 1)
+      (let ((proofread-context-size 0)
+            (recorder (proofread-test--make-backend-recorder)))
+        (proofread-test--with-profile
+          (cl-letf (((symbol-function 'proofread--backend-check)
+                     (plist-get recorder :function)))
+            (proofread-check-at-point)
+            (let* ((requests (funcall (plist-get recorder :requests)))
+                   (request (car requests)))
+              (should (= (length requests) 1))
+              (should (eq (plist-get request :target-kind)
+                          (nth 1 case)))
+              (should (string-match-p
+                       (nth 2 case) (plist-get request :text))))))))))
+
+(ert-deftest proofread-test-check-at-point-rejects-empty-selections ()
+  "Reject empty, whitespace-only, and zero-width selections."
+  (dolist (text '("" " \t\n"))
+    (with-temp-buffer
+      (insert text)
+      (setq-local proofread-auto-check nil)
+      (proofread-mode 1)
+      (should-error (proofread-check-at-point) :type 'user-error)))
+  (with-temp-buffer
+    (insert "Alpha prose.")
+    (goto-char 4)
+    (setq-local proofread-auto-check nil)
+    (proofread-mode 1)
+    (narrow-to-region (point) (point))
+    (should-error (proofread-check-at-point) :type 'user-error)))
 
 (ert-deftest proofread-test-check-at-point-rejects-ignored-text ()
   "Reject point text excluded by ignored properties."
