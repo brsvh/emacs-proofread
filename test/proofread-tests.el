@@ -1437,10 +1437,10 @@ When PROFILE is nil, use the current profile."
                   :requests '( request-a request-b)))
            (plan-count 0)
            (profile-count 0)
+           (prune-count 0)
            (chunk-count 0)
            (dispatch-count 0)
-           target-prune-arguments
-           checker-prune-arguments
+           prune-arguments
            chunk-arguments
            dispatch-arguments
            messages)
@@ -1458,15 +1458,11 @@ When PROFILE is nil, use the current profile."
             (lambda (&rest _)
               (ert-fail "Check path normalized ranges outside plan")))
            ((symbol-function
-             'proofread--prune-diagnostics-outside-targets)
-            (lambda (ranges received-domains)
-              (setq target-prune-arguments
-                    (list ranges received-domains))))
-           ((symbol-function
-             'proofread--prune-inactive-checker-diagnostics)
-            (lambda (ranges received-profile)
-              (setq checker-prune-arguments
-                    (list ranges received-profile))))
+             'proofread--prune-invalid-checked-diagnostics)
+            (lambda (received-plan received-profile)
+              (setq prune-count (1+ prune-count))
+              (setq prune-arguments
+                    (list received-plan received-profile))))
            ((symbol-function
              'proofread--request-ready-chunks-for-islands)
             (lambda (received-islands language)
@@ -1494,12 +1490,11 @@ When PROFILE is nil, use the current profile."
         (proofread--check-ranges raw-ranges "selected" t))
       (should (= plan-count 1))
       (should (= profile-count 1))
+      (should (= prune-count 1))
       (should (= chunk-count 1))
       (should (= dispatch-count 1))
-      (should (eq (car target-prune-arguments) selected-ranges))
-      (should (eq (cadr target-prune-arguments) domains))
-      (should (eq (car checker-prune-arguments) selected-ranges))
-      (should (eq (cadr checker-prune-arguments) profile))
+      (should (eq (car prune-arguments) plan))
+      (should (eq (cadr prune-arguments) profile))
       (should (eq (car chunk-arguments) islands))
       (should (equal (cadr chunk-arguments) "en"))
       (should (eq (car dispatch-arguments) chunks))
@@ -1560,10 +1555,7 @@ no available backend")
              ((symbol-function 'proofread--selection-plan-for-ranges)
               (lambda (_ranges) plan))
              ((symbol-function
-               'proofread--prune-diagnostics-outside-targets)
-              #'ignore)
-             ((symbol-function
-               'proofread--prune-inactive-checker-diagnostics)
+               'proofread--prune-invalid-checked-diagnostics)
               #'ignore)
              ((symbol-function
                'proofread--request-ready-chunks-for-islands)
@@ -12318,15 +12310,146 @@ This covers URLs, email, invisible text, faces, and properties."
              :source 'test :target-kind 'text))
            (overlay
             (car (proofread-test--install-diagnostics
-                  (list diagnostic)))))
-      (proofread--prune-diagnostics-outside-targets
-       (list (cons (point-min) (point-max)))
-       (list (list :kind 'text
-                   :target-policy 'all
-                   :domain-beg (point-min)
-                   :domain-end (point-max))))
+                  (list diagnostic))))
+           (ranges (list (cons (point-min) (point-max))))
+           (domains
+            (list (list :kind 'text
+                        :target-policy 'all
+                        :domain-beg (point-min)
+                        :domain-end (point-max))))
+           (plan
+            (proofread--make-selection-plan ranges domains nil)))
+      (proofread--prune-invalid-checked-diagnostics
+       plan '( :checkers nil))
       (should (equal proofread--diagnostics (list diagnostic)))
       (should (overlay-buffer overlay)))))
+
+(ert-deftest
+    proofread-test-check-pruning-is-atomic-and-owner-complete ()
+  "Prune all invalid checked diagnostics in one observable change."
+  (with-temp-buffer
+    (insert "abcdefghijklmnopqrst")
+    (setq-local proofread-auto-check nil)
+    (proofread-mode 1)
+    (let* ((active-checker
+            (list :profile 'multi
+                  :name 'active
+                  :backend proofread-test--backend))
+           (unsupported-checker
+            (list :profile 'multi
+                  :name 'unsupported
+                  :backend 'proofread-test-pruning-unsupported))
+           (profile
+            (list :name 'multi
+                  :checkers
+                  (list active-checker unsupported-checker)))
+           (active-owner
+            (proofread--checker-owner active-checker))
+           (unsupported-owner
+            (proofread--checker-owner unsupported-checker))
+           (inactive-owner
+            '( :profile multi :checker-name inactive))
+           (ad-hoc-owner
+            '( :profile ad-hoc :checker-name ad-hoc :ad-hoc t))
+           (active
+            (proofread-test--diagnostic-with-checker
+             (proofread-test--diagnostic-for-range 1 2 "a")
+             'active))
+           (unsupported
+            (proofread-test--diagnostic-with-checker
+             (proofread-test--diagnostic-for-range 3 4 "c")
+             'unsupported))
+           (inactive
+            (proofread-test--diagnostic-with-checker
+             (proofread-test--diagnostic-for-range 5 6 "e")
+             'inactive))
+           (unowned
+            (proofread-test--diagnostic-for-range 7 8 "g"))
+           (ad-hoc
+            (plist-put
+             (proofread-test--diagnostic-for-range 8 9 "h")
+             :checker-owner ad-hoc-owner))
+           (ignored
+            (plist-put
+             (proofread-test--diagnostic-for-range 9 10 "i")
+             :checker-owner ad-hoc-owner))
+           (outside-target
+            (proofread-test--diagnostic-for-range 12 13 "l"))
+           (unchecked
+            (plist-put
+             (proofread-test--diagnostic-for-range 17 18 "q")
+             :checker-owner inactive-owner))
+           (diagnostics
+            (list active unsupported inactive unowned ad-hoc ignored
+                  outside-target unchecked))
+           (overlays
+            (proofread-test--install-diagnostics diagnostics))
+           (retained
+            (list active unsupported unowned ad-hoc unchecked))
+           (retained-overlays
+            (list (nth 0 overlays) (nth 1 overlays) (nth 3 overlays)
+                  (nth 4 overlays) (nth 7 overlays)))
+           (invalid-overlays
+            (list (nth 2 overlays) (nth 5 overlays) (nth 6 overlays)))
+           (ranges '((1 . 15)))
+           (domains
+            '(( :kind text :target-policy all
+                :domain-beg 1 :domain-end 11)))
+           (plan
+            (proofread--make-selection-plan ranges domains nil))
+           (checked-function
+            (symbol-function 'proofread--checked-diagnostic-entries))
+           (sort-function
+            (symbol-function 'proofread--sorted-target-domains))
+           (candidate-scan-count 0)
+           (domain-sort-count 0)
+           (hook-count 0)
+           reentrant-p
+           observed)
+      (should-not
+       (proofread--supported-backend-p
+        'proofread-test-pruning-unsupported))
+      (should (equal active-owner
+                     (plist-get active :checker-owner)))
+      (should (equal unsupported-owner
+                     (plist-get unsupported :checker-owner)))
+      (add-text-properties 9 10 '( proofread-test-ignore t))
+      (let ((proofread-ignored-properties '( proofread-test-ignore)))
+        (add-hook
+         'proofread-diagnostics-changed-hook
+         (lambda ()
+           (setq hook-count (1+ hook-count))
+           (push (copy-sequence proofread--diagnostics) observed)
+           (when (= hook-count 1)
+             (setq reentrant-p t)
+             (unwind-protect
+                 (proofread--prune-invalid-checked-diagnostics
+                  plan profile)
+               (setq reentrant-p nil))))
+         nil t)
+        (cl-letf
+            (((symbol-function 'proofread--checked-diagnostic-entries)
+              (lambda (checked-ranges)
+                (unless reentrant-p
+                  (setq candidate-scan-count
+                        (1+ candidate-scan-count)))
+                (funcall checked-function checked-ranges)))
+             ((symbol-function 'proofread--sorted-target-domains)
+              (lambda (target-domains)
+                (unless reentrant-p
+                  (setq domain-sort-count (1+ domain-sort-count)))
+                (funcall sort-function target-domains))))
+          (proofread--prune-invalid-checked-diagnostics
+           plan profile)))
+      (should (= candidate-scan-count 1))
+      (should (= domain-sort-count 1))
+      (should (= hook-count 1))
+      (should (equal (car observed) retained))
+      (should (equal proofread--diagnostics retained))
+      (dolist (overlay retained-overlays)
+        (should (overlay-buffer overlay)))
+      (dolist (overlay invalid-overlays)
+        (should-not (overlay-buffer overlay))))))
 
 (ert-deftest
     proofread-test-consecutive-line-comments-share-context-domain ()

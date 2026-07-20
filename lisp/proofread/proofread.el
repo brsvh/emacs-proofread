@@ -7534,46 +7534,38 @@ DIAGNOSTICS must be in navigation order.  Return `applied'."
           (lambda (left right)
             (< (cadr left) (cadr right))))))
 
-(defun proofread--prune-inactive-checker-diagnostics
-    (ranges profile)
-  "Remove checked diagnostics whose checker is absent from PROFILE.
-Only remove diagnostics intersecting RANGES.  Keep unowned
-diagnostics and diagnostics owned by explicit ad-hoc requests."
-  (let ((owners
+(defun proofread--prune-invalid-checked-diagnostics (plan profile)
+  "Remove checked diagnostics invalid under PLAN or PROFILE.
+A diagnostic selected by PLAN must remain wholly within one target
+domain, avoid ignored text, and, when profile-owned, belong to a
+checker in PROFILE.  Unowned and ad-hoc diagnostics are exempt only
+from the profile-owner requirement."
+  (let ((ranges (proofread--selection-plan-ranges plan))
+        (remaining-domains
+         (proofread--sorted-target-domains
+          (proofread--selection-plan-domains plan)))
+        (owners
          (mapcar #'proofread--checker-owner
                  (plist-get profile :checkers)))
         diagnostics)
     (dolist (entry (proofread--checked-diagnostic-entries ranges))
       (let* ((diagnostic (car entry))
-             (owner (plist-get diagnostic :checker-owner)))
-        (when (and owner
-                   (not (plist-get owner :ad-hoc))
-                   (not (member owner owners)))
-          (push diagnostic diagnostics))))
-    (when diagnostics
-      (proofread--invalidate-affected-diagnostics
-       (delq nil
-             (mapcar #'proofread--overlay-for-diagnostic diagnostics))
-       diagnostics))))
-
-(defun proofread--prune-diagnostics-outside-targets (ranges domains)
-  "Remove checked diagnostics in RANGES that are invalid in DOMAINS."
-  (let ((remaining-domains (proofread--sorted-target-domains domains))
-        diagnostics)
-    (dolist (entry (proofread--checked-diagnostic-entries ranges))
-      (let* ((diagnostic (car entry))
              (range (cdr entry))
              (beg (car range))
-             (end (cdr range)))
+             (end (cdr range))
+             (owner (plist-get diagnostic :checker-owner)))
         (while (and remaining-domains
                     (< (plist-get (car remaining-domains) :domain-end)
                        beg))
           (setq remaining-domains (cdr remaining-domains)))
-        (unless (and (proofread--range-in-sorted-domains-p
-                      range remaining-domains)
-                     (null
-                      (proofread--ignored-ranges-in-region
-                       beg end)))
+        (unless
+            (and
+             (proofread--range-in-sorted-domains-p
+              range remaining-domains)
+             (null (proofread--ignored-ranges-in-region beg end))
+             (or (null owner)
+                 (plist-get owner :ad-hoc)
+                 (member owner owners)))
           (push diagnostic diagnostics))))
     (when diagnostics
       (proofread--invalidate-affected-diagnostics
@@ -7598,12 +7590,8 @@ REQUEST-SPANS are already selected and filtered request span records."
             #'proofread--progress-message))
          (normalized-ranges
           (proofread--selection-plan-ranges plan))
-         (domains (proofread--selection-plan-domains plan))
          (islands (proofread--selection-plan-islands plan)))
-    (proofread--prune-diagnostics-outside-targets
-     normalized-ranges domains)
-    (proofread--prune-inactive-checker-diagnostics
-     normalized-ranges profile)
+    (proofread--prune-invalid-checked-diagnostics plan profile)
     (let* ((dispatch-result
             (when (plist-get profile :checkers)
               (proofread--dispatch-profile-request-ready-chunks-result

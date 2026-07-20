@@ -177,6 +177,13 @@ low-level diagnostics, while diagnostics from current checkers remain visible
 until their replacement results are applied.
 
 ---
+*** Checked diagnostic pruning is now published atomically.
+Each check evaluates target boundaries, ignored text, and selected checker
+owners before notifying frontends.  'proofread-diagnostics-changed-hook' no
+longer observes a partial pruning state when diagnostics fail different
+validity rules in the same checked range.
+
+---
 *** Matching diagnostics from multiple checkers are aggregated.
 Diagnostics for the same text and range remain independent internally but are
 presented as one source-aware diagnostic for navigation, descriptions,
