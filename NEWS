@@ -27,6 +27,14 @@ whose ':backend' property selects it, and select the profile with
 The 'Col' field uses Emacs's zero-based display column, so tabs, wide
 characters, and combining characters are represented as they appear on screen.
 
+** Target selection
+
+---
+*** Org structural boundaries now follow Org's element parser.
+Proofread recognizes planning lines, horizontal rules, drawers, tables, lists,
+and nested blocks according to Org's public syntax model.  Context selection
+continues to honor buffer narrowing without including inaccessible text.
+
 
 * Changes in proofread 0.2.0
 

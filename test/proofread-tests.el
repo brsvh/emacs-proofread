@@ -2888,18 +2888,110 @@ range; no available backend"))))))
       (should (equal (plist-get chunk :context-before) ""))
       (should (equal (plist-get chunk :context-after) "")))))
 
+(ert-deftest proofread-test-org-structural-lines-use-element-api ()
+  "Recognize Org structural lines using Org's element model."
+  (with-temp-buffer
+    (org-mode)
+    (let ((lines
+           '( (t "* Heading")
+              (t "SCHEDULED: <2026-07-20 Mon>")
+              (t ":PROPERTIES:")
+              (t ":CUSTOM_ID: example")
+              (t ":END:")
+              (skip "")
+              (t "#+TITLE: Title")
+              (t "#+CAPTION: Caption")
+              (nil "Captioned paragraph.")
+              (skip "")
+              (t "-----")
+              (skip "")
+              (t "| First | Second |")
+              (t "|-------+--------|")
+              (skip "")
+              (t "- First item")
+              (nil "  continuation")
+              (t "+ Second item")
+              (skip "")
+              (t ":NOTES:")
+              (t "Drawer prose.")
+              (t "- Drawer item")
+              (t ":END:")
+              (skip "")
+              (t "#+begin_quote")
+              (t "Quote prose.")
+              (t "#+begin_example")
+              (t "Nested example.")
+              (t "#+end_example")
+              (t "#+end_quote")
+              (skip "")
+              (nil "Plain paragraph."))))
+      (dolist (entry lines)
+        (insert (cadr entry) "\n"))
+      (goto-char (point-min))
+      (string-match "\\(match\\)" "match")
+      (let ((saved-match-data (match-data)))
+        (should (proofread--org-structural-line-p))
+        (should (equal (match-data) saved-match-data)))
+      (dolist (entry lines)
+        (unless (eq (car entry) 'skip)
+          (should
+           (eq (and (proofread--org-structural-line-p) t)
+               (car entry))))
+        (forward-line 1))))
+  (with-temp-buffer
+    (text-mode)
+    (insert "* Org-looking text\n")
+    (goto-char (point-min))
+    (should-not (proofread--org-structural-line-p))
+    (should-not (proofread--context-stop-line-at-point-p))))
+
+(ert-deftest proofread-test-org-structural-lines-respect-narrowing ()
+  "Recognize an Org block whose delimiters are outside the restriction."
+  (with-temp-buffer
+    (org-mode)
+    (insert "Outside before.\n")
+    (insert "#+begin_quote\n")
+    (let ((content-beg (point)))
+      (insert "Inside target.")
+      (let ((content-end (point)))
+        (insert "\n#+end_quote\nOutside after.")
+        (goto-char content-beg)
+        (should (proofread--org-structural-line-p))
+        (narrow-to-region content-beg content-end)
+        (goto-char (point-min))
+        (let ((beg (point-min))
+              (end (point-max))
+              (position (point)))
+          (should (proofread--org-structural-line-p))
+          (should (= (point-min) beg))
+          (should (= (point-max) end))
+          (should (= (point) position))
+          (let* ((proofread-context-size 300)
+                 (chunks
+                  (proofread-test--request-ready-chunks-for-ranges
+                   (list (cons beg end))))
+                 (chunk (proofread-test--chunk-with-text
+                         chunks "Inside target.")))
+            (should chunk)
+            (should (equal (plist-get chunk :context-before) ""))
+            (should (equal (plist-get chunk :context-after) ""))))))))
+
 (ert-deftest
     proofread-test-request-ready-context-stops-at-org-structure ()
   "Org structural lines stop request-ready sentence context search."
   (dolist
       (text
        '( "前文。\n* 标题\n目标句。"
+          "前文。\n* 标题\nSCHEDULED: <2026-07-20 Mon>\n目标句。"
           "前文。\n#+TITLE: 标题\n目标句。"
+          "前文。\n-----\n目标句。"
           "前文。\n:PROPERTIES:\n\
 :CUSTOM_ID: x\n:END:\n目标句。"
+          "前文。\n:NOTES:\n抽屉内容。\n:END:\n目标句。"
           "前文。\n- 项目\n目标句。"
           "前文。\n| 表格 |\n目标句。"
           "前文。\n#+begin_quote\n引用。\n\
+#+begin_example\n嵌套块。\n#+end_example\n\
 #+end_quote\n目标句。"))
     (with-temp-buffer
       (org-mode)

@@ -49,6 +49,14 @@
                   (&optional n))
 (declare-function previous-error-this-buffer-no-select "simple"
                   (&optional n))
+(declare-function org-element-at-point "org-element"
+                  (&optional epom cached-only))
+(declare-function org-element-lineage "org-element-ast"
+                  (datum &optional types with-self))
+(declare-function org-element-property "org-element-ast"
+                  (property node &optional dflt force-undefer))
+(declare-function org-element-type "org-element-ast"
+                  (node &optional anonymous))
 
 ;;;; Customization
 
@@ -494,12 +502,6 @@ request-ready chunks."
 
 (defvar-local proofread--idle-timer nil
   "Idle timer for pending proofreading work in this buffer.")
-
-(defvar-local proofread--org-block-cache-key nil
-  "Buffer state represented by `proofread--org-block-ranges'.")
-
-(defvar-local proofread--org-block-ranges nil
-  "Sorted Org block content ranges for the current buffer state.")
 
 (defvar proofread-mode)
 
@@ -2427,80 +2429,33 @@ boundaries unless the preceding text ends with sentence punctuation."
         (substring text 0 size)
       text)))
 
-(defun proofread--refresh-org-block-ranges ()
-  "Refresh cached Org block content ranges when the buffer changed."
-  (let ((key (list (buffer-chars-modified-tick)
-                   (point-min) (point-max))))
-    (unless (equal key proofread--org-block-cache-key)
-      (setq proofread--org-block-cache-key key)
-      (setq proofread--org-block-ranges nil)
-      (save-excursion
-        (goto-char (point-min))
-        (let ((case-fold-search t)
-              openings)
-          (while (re-search-forward
-                  "^[ \t]*#\\+\\(begin\\|end\\)_" nil t)
-            (if (string-equal-ignore-case (match-string 1) "begin")
-                (push (min (point-max)
-                           (1+ (line-end-position)))
-                      openings)
-              (when openings
-                (push (cons (pop openings) (line-beginning-position))
-                      proofread--org-block-ranges))))
-          (dolist (beg openings)
-            (push (cons beg (point-max))
-                  proofread--org-block-ranges))))
-      (setq proofread--org-block-ranges
-            (vconcat
-             (proofread--normalize-ranges
-              proofread--org-block-ranges))))))
-
-(defun proofread--position-in-sorted-ranges-p (position ranges)
-  "Return non-nil when POSITION belongs to one of sorted RANGES."
-  (let ((low 0)
-        (high (1- (length ranges)))
-        found)
-    (while (and (not found) (<= low high))
-      (let* ((middle (/ (+ low high) 2))
-             (range (aref ranges middle)))
-        (cond
-         ((< position (car range)) (setq high (1- middle)))
-         ((>= position (cdr range)) (setq low (1+ middle)))
-         (t (setq found t)))))
-    found))
-
-(defun proofread--org-block-content-line-p ()
-  "Return non-nil when point is on a line inside an Org block."
+(defun proofread--org-structural-line-p ()
+  "Return non-nil when point is on an Org structural boundary.
+Ordinary paragraph lines are not boundaries unless they are affiliated
+keywords or belong to an Org block or drawer."
   (when (derived-mode-p 'org-mode)
-    (proofread--refresh-org-block-ranges)
-    (proofread--position-in-sorted-ranges-p
-     (line-beginning-position) proofread--org-block-ranges)))
-
-(defun proofread--org-structural-line-p (line)
-  "Return non-nil when LINE is an Org structural boundary."
-  (and (derived-mode-p 'org-mode)
-       (or (string-match-p "\\`[ \t]*\\*+\\(?:[ \t]\\|\\'\\)" line)
-           (string-match-p "\\`[ \t]*#\\+[[:alpha:]_]+:" line)
-           (let ((case-fold-search t))
-             (string-match-p
-              (concat
-               "\\`[ \t]*#\\+\\(?:begin\\|end\\)_[[:alnum:]_-]+"
-               "\\(?:[ \t]\\|\\'\\)")
-              line))
-           (string-match-p "\\`[ \t]*:[[:alnum:]_@#%]+:" line)
-           (string-match-p "\\`[ \t]*|" line)
-           (string-match-p
-            "\\`[ \t]*\\(?:[-+]\\|[0-9]+[.)]\\)\\(?:[ \t]\\|\\'\\)"
-            line)
-           (string-match-p "\\`[ \t]+\\*\\(?:[ \t]\\|\\'\\)" line))))
+    (require 'org-element)
+    (save-match-data
+      (let* ((element (org-element-at-point))
+             (type (org-element-type element))
+             (post-affiliated
+              (org-element-property :post-affiliated element)))
+        (or (not (memq type '( org-data paragraph section)))
+            (and (eq type 'paragraph)
+                 (integerp post-affiliated)
+                 (< (line-beginning-position) post-affiliated))
+            (org-element-lineage
+             element
+             '( center-block drawer dynamic-block footnote-definition
+                property-drawer quote-block special-block)
+             t))))))
 
 (defun proofread--context-stop-line-at-point-p ()
   "Return non-nil when the current line stops context search."
   (let ((line (buffer-substring-no-properties
                (line-beginning-position) (line-end-position))))
     (or (string-blank-p line)
-        (proofread--org-structural-line-p line)
-        (proofread--org-block-content-line-p))))
+        (proofread--org-structural-line-p))))
 
 (defun proofread--context-search-beg (beg)
   "Return the nearest structural context boundary before BEG."
