@@ -7,7 +7,7 @@
 ;; Author: Bingshan Chang <chang@bingshan.org>
 ;; Keywords: convenience, wp
 ;; Package-Requires: ((emacs "30.1") (llm "0.31.1"))
-;; Version: 0.2.0
+;; Version: 0.3.0
 
 ;; This file is not part of GNU Emacs.
 
