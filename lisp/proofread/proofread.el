@@ -3250,37 +3250,9 @@ When MESSAGE is non-nil, include it as caller-readable error text."
         (delq work proofread--active-requests))
   (proofread--forget-request-work work))
 
-(defun proofread--invoke-backend-callback (callback result)
-  "Invoke CALLBACK with backend RESULT when CALLBACK is non-nil."
-  (when callback
-    (funcall callback result)))
-
 (defun proofread--defer-backend-callback (callback result)
   "Invoke CALLBACK with RESULT after the current call stack unwinds."
-  (run-at-time
-   0 nil #'proofread--invoke-backend-callback callback result))
-
-(defun proofread--wrap-backend-callback (work callback)
-  "Return a wrapper for CALLBACK that cleans WORK state once."
-  (let (finished)
-    (lambda (result)
-      (unless finished
-        (setq finished t)
-        (let* ((request (proofread--scheduled-work-request work))
-               (buffer (plist-get request :buffer))
-               callback-value)
-          (when (buffer-live-p buffer)
-            (with-current-buffer buffer
-              (proofread--remove-active-request work)))
-          (unwind-protect
-              (setq callback-value
-                    (proofread--invoke-backend-callback
-                     callback result))
-            (when (buffer-live-p buffer)
-              (with-current-buffer buffer
-                (when proofread-mode
-                  (proofread--dispatch-queued-requests)))))
-          callback-value)))))
+  (run-at-time 0 nil callback result))
 
 (defun proofread--supported-backend-p (&optional backend)
   "Return non-nil if non-nil BACKEND is a supported backend."
@@ -3542,20 +3514,28 @@ ERROR identifies the failure and DETAIL describes it."
           (progn
             (proofread--retire-active-request work)
             proofread--stale-dispatch-result)
-        (let* ((callback-state 'pending)
-               (lifecycle-callback
-                (proofread--wrap-backend-callback work callback))
-               (wrapped-callback
+        (let* ((settlement-state 'pending)
+               (settle
                 (lambda (result)
-                  (when (eq callback-state 'pending)
-                    (setq callback-state 'running)
+                  (when (eq settlement-state 'pending)
+                    (setq settlement-state 'running)
                     (unwind-protect
                         (prog1
-                            (proofread--invoke-backend-callback
-                             lifecycle-callback result)
-                          (setq callback-state 'completed))
-                      (when (eq callback-state 'running)
-                        (setq callback-state 'failed))))))
+                            (progn
+                              (when (buffer-live-p buffer)
+                                (with-current-buffer buffer
+                                  (proofread--remove-active-request
+                                   work)))
+                              (unwind-protect
+                                  (when callback
+                                    (funcall callback result))
+                                (when (buffer-live-p buffer)
+                                  (with-current-buffer buffer
+                                    (when proofread-mode
+                                      (proofread--dispatch-queued-requests))))))
+                          (setq settlement-state 'completed))
+                      (when (eq settlement-state 'running)
+                        (setq settlement-state 'failed))))))
                (submission
                 (condition-case err
                     (let* (;; Capture one descriptor snapshot before
@@ -3571,15 +3551,15 @@ ERROR identifies the failure and DETAIL describes it."
                               #'cancel-timer))
                            (handle
                             (if check
-                                (funcall check request wrapped-callback)
+                                (funcall check request settle)
                               (proofread--unsupported-backend-check
-                               backend request wrapped-callback))))
+                               backend request settle))))
                       (list :handle handle :cancel cancel))
                   (error
-                   (pcase callback-state
+                   (pcase settlement-state
                      ('pending
-                      (proofread--invoke-backend-callback
-                       wrapped-callback
+                      (funcall
+                       settle
                        (proofread--backend-submission-error-result
                         request err (error-message-string err)))
                       nil)
@@ -3598,9 +3578,9 @@ ERROR identifies the failure and DETAIL describes it."
                 (and handle
                      (proofread--make-request-handle
                       handle cancel))))
-          (when (and (null handle) (eq callback-state 'pending))
-            (proofread--invoke-backend-callback
-             wrapped-callback
+          (when (and (null handle) (eq settlement-state 'pending))
+            (funcall
+             settle
              (proofread--backend-submission-error-result
               request 'backend-returned-no-handle
               "backend returned no handle without delivering a result")))

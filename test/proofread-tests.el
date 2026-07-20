@@ -662,8 +662,7 @@ When PROFILE is nil, use the current profile."
            0 nil
            (lambda ()
              (unless (plist-get handle :cancelled)
-               (proofread--invoke-backend-callback
-                callback result)))))
+               (funcall callback result)))))
     handle))
 
 (defun proofread-test--backend-check (request callback)
@@ -14373,21 +14372,147 @@ This covers URLs, email, invisible text, faces, and properties."
             (proofread-test--make-request-work
              chunk proofread-test--backend))
            (request (proofread-test--work-request work))
+           (original-remove-active-request
+            (symbol-function 'proofread--remove-active-request))
+           (original-dispatch-queued-requests
+            (symbol-function 'proofread--dispatch-queued-requests))
            captured-callback
-           (calls 0))
+           (callback-calls 0)
+           (cleanup-calls 0)
+           (queue-continuations 0))
       (let ((proofread-test--backend-check-function
              (lambda (_request callback)
                (setq captured-callback callback)
                'proofread-test-handle)))
-        (proofread--dispatch-backend-request
-         work
-         (lambda (_result)
-           (setq calls (1+ calls))))
-        (let ((result (proofread--backend-success-result request
-                                                         nil)))
-          (funcall captured-callback result)
-          (funcall captured-callback result))
-        (should (= calls 1))
+        (cl-letf
+            (((symbol-function 'proofread--remove-active-request)
+              (lambda (active-work)
+                (setq cleanup-calls (1+ cleanup-calls))
+                (funcall original-remove-active-request active-work)))
+             ((symbol-function 'proofread--dispatch-queued-requests)
+              (lambda ()
+                (setq queue-continuations (1+ queue-continuations))
+                (funcall original-dispatch-queued-requests))))
+          (proofread--dispatch-backend-request
+           work
+           (lambda (_result)
+             (setq callback-calls (1+ callback-calls))
+             'proofread-test-callback-value))
+          (let ((result (proofread--backend-success-result request nil)))
+            (should (eq (funcall captured-callback result)
+                        'proofread-test-callback-value))
+            (should-not (funcall captured-callback result))))
+        (should (= callback-calls 1))
+        (should (= cleanup-calls 1))
+        (should (= queue-continuations 1))
+        (should-not proofread--active-requests)))))
+
+(ert-deftest proofread-test-running-backend-callback-is-at-most-once ()
+  "Ignore a reentrant backend callback while settlement is running."
+  (with-temp-buffer
+    (insert "Alpha")
+    (proofread-mode 1)
+    (let* ((chunk
+            (car (proofread-test--request-ready-chunks-for-ranges
+                  (list (cons (point-min) (point-max))))))
+           (work
+            (proofread-test--make-request-work
+             chunk proofread-test--backend))
+           (request (proofread-test--work-request work))
+           (original-remove-active-request
+            (symbol-function 'proofread--remove-active-request))
+           (original-dispatch-queued-requests
+            (symbol-function 'proofread--dispatch-queued-requests))
+           captured-callback
+           reentrant-value
+           (callback-calls 0)
+           (cleanup-calls 0)
+           (queue-continuations 0))
+      (let ((proofread-test--backend-check-function
+             (lambda (_request callback)
+               (setq captured-callback callback)
+               'proofread-test-handle)))
+        (cl-letf
+            (((symbol-function 'proofread--remove-active-request)
+              (lambda (active-work)
+                (setq cleanup-calls (1+ cleanup-calls))
+                (funcall original-remove-active-request active-work)))
+             ((symbol-function 'proofread--dispatch-queued-requests)
+              (lambda ()
+                (setq queue-continuations (1+ queue-continuations))
+                (funcall original-dispatch-queued-requests))))
+          (proofread--dispatch-backend-request
+           work
+           (lambda (result)
+             (setq callback-calls (1+ callback-calls))
+             (setq reentrant-value
+                   (funcall captured-callback result))
+             'proofread-test-callback-value))
+          (should
+           (eq
+            (funcall captured-callback
+                     (proofread--backend-success-result request nil))
+            'proofread-test-callback-value)))
+        (should-not reentrant-value)
+        (should (= callback-calls 1))
+        (should (= cleanup-calls 1))
+        (should (= queue-continuations 1))
+        (should-not proofread--active-requests)))))
+
+(ert-deftest proofread-test-failed-backend-callback-cleans-up-once ()
+  "Clean active state and continue the queue once when a callback fails."
+  (with-temp-buffer
+    (insert "Alpha")
+    (proofread-mode 1)
+    (let* ((chunk
+            (car (proofread-test--request-ready-chunks-for-ranges
+                  (list (cons (point-min) (point-max))))))
+           (work
+            (proofread-test--make-request-work
+             chunk proofread-test--backend))
+           (request (proofread-test--work-request work))
+           (original-remove-active-request
+            (symbol-function 'proofread--remove-active-request))
+           (original-dispatch-queued-requests
+            (symbol-function 'proofread--dispatch-queued-requests))
+           captured-callback
+           active-at-callback
+           (callback-calls 0)
+           (cleanup-calls 0)
+           (queue-continuations 0))
+      (let ((proofread-test--backend-check-function
+             (lambda (_request callback)
+               (setq captured-callback callback)
+               'proofread-test-handle)))
+        (cl-letf
+            (((symbol-function 'proofread--remove-active-request)
+              (lambda (active-work)
+                (setq cleanup-calls (1+ cleanup-calls))
+                (funcall original-remove-active-request active-work)))
+             ((symbol-function 'proofread--dispatch-queued-requests)
+              (lambda ()
+                (setq queue-continuations (1+ queue-continuations))
+                (funcall original-dispatch-queued-requests))))
+          (proofread--dispatch-backend-request
+           work
+           (lambda (_result)
+             (setq callback-calls (1+ callback-calls))
+             (setq active-at-callback
+                   (proofread--active-request-p work))
+             (error "Simulated callback failure")))
+          (let* ((result (proofread--backend-success-result request nil))
+                 (condition
+                  (should-error
+                   (funcall captured-callback result)
+                   :type 'error)))
+            (should
+             (equal (error-message-string condition)
+                    "Simulated callback failure"))
+            (should-not (funcall captured-callback result))))
+        (should-not active-at-callback)
+        (should (= callback-calls 1))
+        (should (= cleanup-calls 1))
+        (should (= queue-continuations 1))
         (should-not proofread--active-requests)))))
 
 (ert-deftest proofread-test-repeated-mode-enable-resets-owned-state ()
