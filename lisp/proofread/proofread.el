@@ -831,8 +831,7 @@ operation signals an error or returns an invalid non-nil value."
                ((null label) nil)
                ((stringp label)
                 (let ((normalized
-                       (replace-regexp-in-string
-                        "[[:space:]]+" " " (string-trim label))))
+                       (string-clean-whitespace label)))
                   (if (string-empty-p normalized)
                       (progn
                         (proofread--report-checker-source-label-warning
@@ -995,9 +994,8 @@ effective backend identity."
   "Display FORMAT-STRING with ARGS as a bounded single-line message."
   (let* ((message-truncate-lines t)
          (message
-          (replace-regexp-in-string
-           "[[:space:]]+" " "
-           (string-trim (apply #'format format-string args)))))
+          (string-clean-whitespace
+           (apply #'format format-string args))))
     (message "%s"
              (truncate-string-to-width message 120 nil nil "..."))))
 
@@ -1481,9 +1479,8 @@ original error value."
   "Record and report one bounded checker dispatch FAILURE."
   (let* ((message
           (truncate-string-to-width
-           (replace-regexp-in-string
-            "[[:space:]]+" " "
-            (string-trim (plist-get failure :message)))
+           (string-clean-whitespace
+            (plist-get failure :message))
            320 nil nil "..."))
          (event
           (proofread--request-log-safe-event
@@ -5177,16 +5174,16 @@ using their printed representation."
   "Return VALUE as a clean diagnostic display field, or nil.
 When SINGLE-LINE is non-nil, collapse whitespace to single spaces."
   (when value
-    (let ((field
-           (string-trim
+    (let* ((field
             (substring-no-properties
              (if (stringp value)
                  value
-               (proofread-format-diagnostic-field value))))))
+               (proofread-format-diagnostic-field value))))
+           (field (if single-line
+                      (string-clean-whitespace field)
+                    (string-trim field))))
       (unless (string-empty-p field)
-        (if single-line
-            (replace-regexp-in-string "[[:space:]]+" " " field)
-          field)))))
+        field))))
 
 (defun proofread--format-diagnostic-message-fallback
     (diagnostic single-line)
@@ -6093,10 +6090,7 @@ nil for a change to the default."
                 ((stringp value) value)
                 ((symbolp value) (symbol-name value))
                 (t (format "%S" value))))
-         (single-line (string-trim
-                       (replace-regexp-in-string "[[:space:]\n\r]+"
-                                                 " "
-                                                 text))))
+         (single-line (string-clean-whitespace text)))
     (if (and width (> (string-width single-line) width))
         (truncate-string-to-width single-line width nil nil "...")
       single-line)))

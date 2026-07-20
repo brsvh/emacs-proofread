@@ -393,6 +393,15 @@ When PROFILE is nil, use the current profile."
     (dolist (invalid '(42 "" " \t\n"))
       (should-error
        (funcall (get symbol 'custom-set) symbol invalid))))
+  (with-temp-buffer
+    (set-syntax-table (copy-syntax-table (syntax-table)))
+    (modify-syntax-entry ?\n ".")
+    (modify-syntax-entry ?\r ".")
+    (let ((label
+           (proofread-llm--validate-source-label
+            (propertize "　Global\nlabel\rname　" 'face 'bold))))
+      (should (equal label "Global label name"))
+      (should-not (text-properties-at 0 label))))
   (let ((proofread-llm-provider 'global-provider)
         (proofread-llm-source-label
          (propertize "  Global\nlabel  " 'face 'bold))

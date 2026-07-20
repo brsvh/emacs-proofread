@@ -3914,6 +3914,9 @@ This covers URLs, email, invisible text, faces, and properties."
   "Snapshot one safe source label for every dispatched checker."
   (with-temp-buffer
     (text-mode)
+    (set-syntax-table (copy-syntax-table (syntax-table)))
+    (modify-syntax-entry ?\n ".")
+    (modify-syntax-entry ?\r ".")
     (insert "First. Second.")
     (let* ((proofread-auto-check nil)
            (proofread-cache-max-entries 0)
@@ -3932,7 +3935,8 @@ This covers URLs, email, invisible text, faces, and properties."
        (lambda (checker)
          (push (copy-sequence checker) calls)
          (propertize
-          (format " \n%s\nmodel\tname " (plist-get checker :name))
+          (format "　\n%s\rmodel\tname　"
+                  (plist-get checker :name))
           'proofread-test-secret t)))
       (proofread-mode 1)
       (proofread-check-buffer)
@@ -4000,7 +4004,7 @@ This covers URLs, email, invisible text, faces, and properties."
            (pcase failure
              ('error (error "secret source-label failure"))
              ('invalid '( secret invalid value))
-             ('blank " \n\t "))))
+             ('blank "　\n\t "))))
         (proofread-mode 1)
         (cl-letf
             (((symbol-function
@@ -6985,7 +6989,7 @@ This covers URLs, email, invisible text, faces, and properties."
   "Log full background warnings but echo a short summary."
   (let* ((detail (concat "Backend detail line one\n"
                          (make-string 600 ?x)))
-         (summary (concat "backend request failed\n"
+         (summary (concat "　backend\trequest\r\nfailed　"
                           (make-string 600 ?y)))
          captured-echo
          captured-minimum-level
@@ -7000,7 +7004,11 @@ This covers URLs, email, invisible text, faces, and properties."
                  (setq captured-truncation message-truncate-lines)
                  (setq captured-echo
                        (apply #'format format-string args)))))
-      (proofread-report-warning-without-window detail summary))
+      (with-temp-buffer
+        (set-syntax-table (copy-syntax-table (syntax-table)))
+        (modify-syntax-entry ?\n ".")
+        (modify-syntax-entry ?\r ".")
+        (proofread-report-warning-without-window detail summary)))
     (should (equal captured-warning-args
                    (list 'proofread detail :warning)))
     (should (eq captured-minimum-level :error))
@@ -7009,6 +7017,37 @@ This covers URLs, email, invisible text, faces, and properties."
                              captured-echo))
     (should (<= (string-width captured-echo) 120))
     (should-not (string-match-p "[\n\r]" captured-echo))))
+
+(ert-deftest
+    proofread-test-checker-failure-cleans-before-truncating-warning ()
+  "Clean checker failure warnings before bounding their width."
+  (with-temp-buffer
+    (set-syntax-table (copy-syntax-table (syntax-table)))
+    (modify-syntax-entry ?\n ".")
+    (modify-syntax-entry ?\r ".")
+    (let* ((raw-message
+            (concat "　First\n\tsecond\rthird　"
+                    (make-string 400 ?x)))
+           (failure
+            (list :profile 'multi
+                  :checker-name 'failed
+                  :backend proofread-test--backend
+                  :phase 'request-construction
+                  :error 'error
+                  :message raw-message))
+           (proofread-request-log-hook nil)
+           captured-detail)
+      (cl-letf
+          (((symbol-function
+             'proofread-report-warning-without-window)
+            (lambda (detail _summary)
+              (setq captured-detail detail))))
+        (proofread--report-checker-dispatch-failure failure))
+      (should (string-prefix-p "First second third "
+                               captured-detail))
+      (should (<= (string-width captured-detail) 320))
+      (should-not (string-match-p "[\t\n\r　]"
+                                  captured-detail)))))
 
 (ert-deftest
     proofread-test-backend-errors-are-aggregated-per-request-batch ()
@@ -8026,6 +8065,43 @@ This covers URLs, email, invisible text, faces, and properties."
                  "spelling"))
   (should (equal (proofread-format-diagnostic-field '( bad "text"))
                  "(bad \"text\")")))
+
+(ert-deftest proofread-test-diagnostic-message-field-whitespace-modes
+    ()
+  "Clean single-line fields while preserving multiline content."
+  (with-temp-buffer
+    (set-syntax-table (copy-syntax-table (syntax-table)))
+    (modify-syntax-entry ?\n ".")
+    (modify-syntax-entry ?\r ".")
+    (let ((field
+           (propertize "　Alpha\tBeta\r\nGamma　"
+                       'face 'error)))
+      (should
+       (equal (proofread--format-diagnostic-message-field field t)
+              "Alpha Beta Gamma"))
+      (should-not
+       (text-properties-at
+        0 (proofread--format-diagnostic-message-field field t)))
+      (should
+       (equal
+        (proofread--format-diagnostic-message-field
+         "  Alpha\n Beta  " nil)
+        "Alpha\n Beta"))
+      (should-not
+       (proofread--format-diagnostic-message-field "　\t\r\n" t)))))
+
+(ert-deftest proofread-test-list-field-cleans-before-truncation ()
+  "Clean list fields before applying their display width bound."
+  (let* ((raw
+          (propertize "　Alpha\tBeta\r\nGamma　" 'face 'bold))
+         (clean (proofread--format-list-field raw))
+         (bounded (proofread--format-list-field raw 10)))
+    (should (equal clean "Alpha Beta Gamma"))
+    (should (eq (get-text-property 0 'face clean) 'bold))
+    (should (<= (string-width bounded) 10))
+    (should-not (string-match-p "[\t\n\r　]" bounded))
+    (should (equal (proofread--format-list-field "　\t\r\n") ""))
+    (should (equal (proofread--format-list-field nil) "-"))))
 
 (ert-deftest proofread-test-public-diagnostic-message-formatting-faces ()
   "The shared message formatter owns exact face boundaries."

@@ -58,9 +58,8 @@ Signal an error unless a non-nil value is a nonempty string."
     (unless (stringp value)
       (error "Proofread LLM source label must be nil or a string"))
     (let ((label
-           (replace-regexp-in-string
-            "[[:space:]]+" " "
-            (string-trim (substring-no-properties value)))))
+           (string-clean-whitespace
+            (substring-no-properties value))))
       (when (string-empty-p label)
         (error "Proofread LLM source label must not be empty"))
       label)))
