@@ -1921,14 +1921,13 @@ Search before POSITION."
 
 (defun proofread--docstring-predicate-matches-p (beg end)
   "Return non-nil if a predicate accepts BEG through END."
-  (catch 'matches
-    (dolist (predicate proofread-docstring-predicate-functions)
-      (when (and (functionp predicate)
-                 (condition-case nil
-                     (funcall predicate beg end)
-                   (error nil)))
-        (throw 'matches t)))
-    nil))
+  (cl-some
+   (lambda (predicate)
+     (and (functionp predicate)
+          (condition-case nil
+              (and (funcall predicate beg end) t)
+            (error nil))))
+   proofread-docstring-predicate-functions))
 
 (defun proofread--expand-range-over-doc-face (range)
   "Expand RANGE over adjacent text marked with a doc face."
@@ -3111,11 +3110,10 @@ bounds."
 
 (defun proofread--diagnostic-member-p (diagnostic diagnostics)
   "Return non-nil when DIAGNOSTIC is already in DIAGNOSTICS."
-  (catch 'found
-    (dolist (candidate diagnostics)
-      (when (proofread--same-diagnostic-p diagnostic candidate)
-        (throw 'found t)))
-    nil))
+  (cl-some
+   (lambda (candidate)
+     (proofread--same-diagnostic-p diagnostic candidate))
+   diagnostics))
 
 (defun proofread--new-diagnostics (diagnostics existing)
   "Return unique DIAGNOSTICS that are not represented in EXISTING.
@@ -5053,12 +5051,10 @@ nil.  Callers may safely modify the returned records and values."
 
 (defun proofread--diagnostic-source-labels (diagnostic)
   "Return unique source labels for DIAGNOSTIC in display order."
-  (let (labels)
-    (dolist (member (proofread--diagnostic-members diagnostic))
-      (when-let* ((label (proofread--diagnostic-source-label member)))
-        (unless (member label labels)
-          (setq labels (append labels (list label))))))
-    labels))
+  (delete-dups
+   (delq nil
+         (mapcar #'proofread--diagnostic-source-label
+                 (proofread--diagnostic-members diagnostic)))))
 
 (defun proofread--diagnostic-source-summary (diagnostic)
   "Return a source summary string for DIAGNOSTIC, or nil."

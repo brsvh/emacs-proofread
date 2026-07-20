@@ -746,6 +746,44 @@ When PROFILE is nil, use the current profile."
     (should (eq (cadr result) earlier-range))))
 
 (ert-deftest
+    proofread-test-diagnostic-membership-uses-semantic-fields ()
+  "Deduplicate diagnostics by the core semantic field contract."
+  (let* ((first
+          (proofread-test--diagnostic-for-range 1 5 "helo"))
+         (duplicate (copy-sequence first))
+         (different-owner (copy-sequence first)))
+    (setq duplicate (plist-put duplicate :source 'other))
+    (setq duplicate
+          (plist-put duplicate :suggestions '( "different")))
+    (setq different-owner
+          (plist-put different-owner :checker-owner
+                     '( :profile multi :checker-name other)))
+    (let ((result
+           (proofread--new-diagnostics
+            (list first duplicate different-owner) nil)))
+      (should (equal result (list first different-owner)))
+      (should (eq (car result) first)))))
+
+(ert-deftest
+    proofread-test-diagnostic-source-labels-preserve-first-occurrence
+    ()
+  "Keep unique non-nil source labels in member order."
+  (let* ((first (copy-sequence "first"))
+         (first-copy (copy-sequence first))
+         (second (copy-sequence "second"))
+         (diagnostic
+          (list :proofread-aggregate t
+                :diagnostics
+                (list nil
+                      (list :checker-name first)
+                      (list :checker-name second)
+                      (list :checker-name first-copy)
+                      (list :source 'fallback))))
+         (labels (proofread--diagnostic-source-labels diagnostic)))
+    (should (equal labels '( "first" "second" "fallback")))
+    (should (eq (car labels) first))))
+
+(ert-deftest
     proofread-test-range-conflicting-entries-orders-and-preserves-items
     ()
   "Scan unsorted conflicts without deduplicating or copying entries."
@@ -11777,6 +11815,41 @@ This covers URLs, email, invisible text, faces, and properties."
         (setq-local proofread-ignored-properties
                     '( proofread-test-ignore))
         (should (proofread--fresh-request-p request))))))
+
+(ert-deftest
+    proofread-test-docstring-predicates-isolate-errors-and-short-circuit
+    ()
+  "Continue after predicate errors and stop after the first match."
+  (let (calls)
+    (let ((proofread-docstring-predicate-functions
+           (list
+            'not-a-function
+            (lambda (beg end)
+              (push (list 'error beg end) calls)
+              (error "Simulated predicate failure"))
+            (lambda (beg end)
+              (push (list 'miss beg end) calls)
+              nil)
+            (lambda (beg end)
+              (push (list 'match beg end) calls)
+              'accepted)
+            (lambda (_beg _end)
+              (ert-fail "Predicate evaluation did not short-circuit")))))
+      (should (eq (proofread--docstring-predicate-matches-p 3 9)
+                  t))
+      (should (equal (nreverse calls)
+                     '((error 3 9) (miss 3 9) (match 3 9)))))
+    (setq calls nil)
+    (let ((proofread-docstring-predicate-functions
+           (list
+            (lambda (_beg _end)
+              (push 'error calls)
+              (error "Simulated predicate failure"))
+            (lambda (_beg _end)
+              (push 'miss calls)
+              nil))))
+      (should-not (proofread--docstring-predicate-matches-p 1 2))
+      (should (equal (nreverse calls) '( error miss))))))
 
 (ert-deftest
     proofread-test-python-docstring-predicate-receives-full-triple-string
