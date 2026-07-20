@@ -215,11 +215,12 @@ LANGUAGE is the language hint snapshotted for the chunks."
 
 (defun proofread-test--queue-entry-work (entry)
   "Return the scheduled work owned by queue ENTRY."
-  (plist-get entry :work))
+  (proofread--queue-entry-work entry))
 
 (defun proofread-test--make-request-work
     (chunk &optional backend checker profile preparation)
-  "Return scheduled work for a backend request built from CHUNK."
+  "Return scheduled work for a backend request built from CHUNK.
+Use BACKEND, CHECKER, PROFILE, and PREPARATION when provided."
   (let ((request
          (proofread--make-backend-request
           chunk backend checker profile preparation)))
@@ -330,67 +331,77 @@ CHECKER-ORDER defaults to first followed by second."
    (append
     proofread--active-requests
     proofread--claimed-requests
-    (mapcar (lambda (entry)
-              (proofread-test--queue-entry-work entry))
-            proofread--request-queue))))
+    (proofread--request-queue-works))))
 
 (defun proofread-test--assert-queue-cache-index-consistent ()
-  "Assert that request queue links and cache-key indexes agree."
-  (let ((queued (make-hash-table :test #'eq))
-        (cell proofread--request-queue)
-        previous
-        (queue-count 0)
-        (indexed-count 0))
-    (when cell
-      (should (hash-table-p proofread--request-queue-index))
-      (should (hash-table-p proofread--request-queue-links))
-      (should (hash-table-p proofread--cache-woken-queue-entries)))
-    (while cell
-      (let* ((entry (car cell))
-             (link (gethash entry proofread--request-queue-links))
-             (key (proofread--request-queue-entry-cache-key entry))
-             (bucket (gethash key proofread--request-queue-index)))
+  "Assert that queue-state links and cache-key indexes agree.
+This checker only reads queue records; it must not repair malformed
+state as part of an assertion."
+  (if (null proofread--queue-state)
+      (should (proofread--request-queue-empty-p))
+    (let* ((state proofread--queue-state)
+           (index (proofread--queue-state-index state))
+           (woken (proofread--queue-state-woken state))
+           (queued (make-hash-table :test #'eq))
+           (entry (proofread--queue-state-head state))
+           previous
+           previous-sequence
+           (queue-count 0)
+           (indexed-count 0))
+      (should (proofread--queue-state-p state))
+      (should (hash-table-p index))
+      (should (hash-table-p woken))
+      (while entry
+        (should (proofread--queue-entry-p entry))
         (should-not (gethash entry queued))
         (puthash entry t queued)
-        (should link)
-        (should (eq (car link) cell))
-        (should (eq (cdr link) previous))
-        (should (natnump
-                 (proofread--request-queue-entry-sequence entry)))
-        (should (hash-table-p bucket))
-        (should (gethash entry bucket)))
-      (setq queue-count (1+ queue-count))
-      (setq previous cell)
-      (setq cell (cdr cell)))
-    (should (eq proofread--request-queue-tail previous))
-    (when (hash-table-p proofread--request-queue-links)
-      (should (= (hash-table-count proofread--request-queue-links)
-                 queue-count))
-      (maphash
-       (lambda (entry _link)
-         (should (gethash entry queued)))
-       proofread--request-queue-links))
-    (when (hash-table-p proofread--request-queue-index)
+        (should (eq (proofread--queue-entry-owner entry) state))
+        (should (eq (proofread--queue-entry-previous entry)
+                    previous))
+        (let* ((sequence (proofread--queue-entry-sequence entry))
+               (key
+                (proofread--request-queue-entry-cache-key entry))
+               (bucket (gethash key index)))
+          (should (natnump sequence))
+          (when previous-sequence
+            (should (< previous-sequence sequence)))
+          (setq previous-sequence sequence)
+          (should (hash-table-p bucket))
+          (should (gethash entry bucket)))
+        (setq queue-count (1+ queue-count))
+        (setq previous entry)
+        (setq entry (proofread--queue-entry-next entry)))
+      (should (eq (proofread--queue-state-tail state) previous))
+      (when-let* ((tail (proofread--queue-state-tail state)))
+        (should-not (proofread--queue-entry-next tail)))
+      (when previous-sequence
+        (should (<= previous-sequence
+                    (proofread--queue-state-next-sequence state))))
       (maphash
        (lambda (key bucket)
          (should (hash-table-p bucket))
          (should (> (hash-table-count bucket) 0))
          (maphash
-          (lambda (entry _value)
+          (lambda (indexed-entry _value)
             (setq indexed-count (1+ indexed-count))
-            (should (gethash entry queued))
+            (should (gethash indexed-entry queued))
             (should (equal
                      key
                      (proofread--request-queue-entry-cache-key
-                      entry))))
+                      indexed-entry))))
           bucket))
-       proofread--request-queue-index)
-      (should (= indexed-count queue-count)))
-    (when (hash-table-p proofread--cache-woken-queue-entries)
+       index)
+      (should (= indexed-count queue-count))
       (maphash
-       (lambda (entry _value)
-         (should (gethash entry queued)))
-       proofread--cache-woken-queue-entries))))
+       (lambda (woken-entry _value)
+         (should (gethash woken-entry queued))
+         (should
+          (gethash
+           woken-entry
+           (gethash
+            (proofread--request-queue-entry-cache-key woken-entry)
+            index))))
+       woken))))
 
 (defun proofread-test--assert-requests-settled (works)
   "Assert that WORKS and current scheduler state are settled."
@@ -403,8 +414,7 @@ CHECKER-ORDER defaults to first followed by second."
     (should (zerop (plist-get batch :pending))))
   (should-not proofread--active-requests)
   (should-not proofread--claimed-requests)
-  (should-not proofread--request-queue)
-  (should-not proofread--request-queue-tail)
+  (should (proofread--request-queue-empty-p))
   (should-not proofread--queue-dispatch-active-p)
   (should-not proofread--queue-dispatch-requested-p)
   (proofread-test--assert-queue-cache-index-consistent)
@@ -704,8 +714,7 @@ When PROFILE is nil, use the current profile."
   "Assert that the current buffer has no pending request work."
   (should-not proofread--active-requests)
   (should-not proofread--claimed-requests)
-  (should-not proofread--request-queue)
-  (should-not proofread--request-queue-tail)
+  (should (proofread--request-queue-empty-p))
   (proofread-test--assert-queue-cache-index-consistent)
   (should
    (zerop (hash-table-count proofread--pending-request-keys))))
@@ -1081,16 +1090,29 @@ When PROFILE is nil, use the current profile."
            'queued-retained-last 9 10))
          (queued-last
           (proofread-test--lifecycle-request 'queued-last 10 11))
+         (proofread--queue-state (proofread--make-queue-state))
          (queued-first-entry
-          (list :work queued-first :backend 'first-backend))
+          (proofread--append-request-queue-entry
+           proofread--queue-state
+           (proofread--new-request-queue-entry
+            proofread--queue-state queued-first 'first-backend)))
          (queued-retained-first-entry
-          (list :work queued-retained-first
-                :backend 'retained-first-backend))
+          (proofread--append-request-queue-entry
+           proofread--queue-state
+           (proofread--new-request-queue-entry
+            proofread--queue-state queued-retained-first
+            'retained-first-backend)))
          (queued-retained-last-entry
-          (list :work queued-retained-last
-                :backend 'retained-last-backend))
+          (proofread--append-request-queue-entry
+           proofread--queue-state
+           (proofread--new-request-queue-entry
+            proofread--queue-state queued-retained-last
+            'retained-last-backend)))
          (queued-last-entry
-          (list :work queued-last :backend 'last-backend))
+          (proofread--append-request-queue-entry
+           proofread--queue-state
+           (proofread--new-request-queue-entry
+            proofread--queue-state queued-last 'last-backend)))
          (active-input
           (list active-first active-retained active-last))
          (claimed-input
@@ -1104,37 +1126,86 @@ When PROFILE is nil, use the current profile."
          (queue-snapshot (copy-sequence queue-input))
          (all-requests
           (append active-input claimed-input
-                  (mapcar (lambda (entry)
-                            (plist-get entry :work))
-                          queue-input)))
-         (request-value-snapshot (copy-tree all-requests))
-         (queue-value-snapshot (copy-tree queue-input))
+                  (mapcar #'proofread--queue-entry-work queue-input)))
+         (request-value-snapshot
+          (mapcar
+           (lambda (work)
+             (copy-tree (proofread--scheduled-work-request work)))
+           all-requests))
+         (queue-metadata-snapshot
+          (mapcar
+           (lambda (entry)
+             (list (proofread--queue-entry-work entry)
+                   (proofread--queue-entry-backend entry)
+                   (proofread--queue-entry-sequence entry)))
+           queue-input))
          (selected
           (list active-first active-last claimed-selected
                 queued-first queued-last))
          (expected-visits all-requests)
          (proofread--active-requests active-input)
          (proofread--claimed-requests claimed-input)
-         (proofread--request-queue queue-input)
-         (original-tail (last queue-input))
-         (proofread--request-queue-tail original-tail)
          (proofread--pending-request-keys
           (proofread-test--pending-request-table all-requests))
          (unpublished t)
          visits
          events
          cancelled-handles
+         queue-index-snapshot
+         queue-woken-snapshot
+         queue-bucket-snapshot
          result)
+    (proofread--wake-queued-cache-key
+     (proofread--request-queue-entry-cache-key queued-first-entry))
+    (proofread--wake-queued-cache-key
+     (proofread--request-queue-entry-cache-key
+      queued-retained-first-entry))
+    (setq queue-index-snapshot
+          (proofread--queue-state-index proofread--queue-state))
+    (setq queue-woken-snapshot
+          (proofread--queue-state-woken proofread--queue-state))
+    (setq queue-bucket-snapshot
+          (mapcar
+           (lambda (entry)
+             (gethash
+              (proofread--request-queue-entry-cache-key entry)
+              queue-index-snapshot))
+           queue-input))
     (should-error
      (proofread--partition-pending-requests
       (lambda (request)
-        (when (eq request claimed-selected)
+        (when (eq request queued-retained-last)
           (error "Simulated predicate failure"))
         (memq request selected))))
     (should (eq proofread--active-requests active-input))
     (should (eq proofread--claimed-requests claimed-input))
-    (should (eq proofread--request-queue queue-input))
-    (should (eq proofread--request-queue-tail original-tail))
+    (should (eq (proofread--queue-state-head proofread--queue-state)
+                queued-first-entry))
+    (should (eq (proofread--queue-state-tail proofread--queue-state)
+                queued-last-entry))
+    (should
+     (cl-every #'eq
+               (proofread--request-queue-entries)
+               queue-input))
+    (should (eq (proofread--queue-state-index proofread--queue-state)
+                queue-index-snapshot))
+    (should (eq (proofread--queue-state-woken proofread--queue-state)
+                queue-woken-snapshot))
+    (should
+     (cl-every
+      #'eq
+      (mapcar
+       (lambda (entry)
+         (gethash
+          (proofread--request-queue-entry-cache-key entry)
+          queue-index-snapshot))
+       queue-input)
+      queue-bucket-snapshot))
+    (should (= (hash-table-count queue-woken-snapshot) 2))
+    (should (gethash queued-first-entry queue-woken-snapshot))
+    (should (gethash queued-retained-first-entry
+                     queue-woken-snapshot))
+    (proofread-test--assert-queue-cache-index-consistent)
     (let ((proofread-request-log-hook
            (list (lambda (event)
                    (push event events)))))
@@ -1149,10 +1220,18 @@ When PROFILE is nil, use the current profile."
                                   active-input)
                               (eq proofread--claimed-requests
                                   claimed-input)
-                              (eq proofread--request-queue
-                                  queue-input)
-                              (eq proofread--request-queue-tail
-                                  original-tail))
+                              (cl-every
+                               #'eq
+                               (proofread--request-queue-entries)
+                               queue-input)
+                              (eq
+                               (proofread--queue-state-head
+                                proofread--queue-state)
+                               queued-first-entry)
+                              (eq
+                               (proofread--queue-state-tail
+                                proofread--queue-state)
+                               queued-last-entry))
                    (setq unpublished nil))
                  (memq request selected))))))
     (should unpublished)
@@ -1182,25 +1261,42 @@ When PROFILE is nil, use the current profile."
      (cl-every #'eq proofread--claimed-requests
                (list claimed-retained-first claimed-retained-last)))
     (should
-     (equal proofread--request-queue
-            (list queued-retained-first-entry
-                  queued-retained-last-entry)))
-    (should
-     (cl-every #'eq proofread--request-queue
+     (cl-every #'eq (proofread--request-queue-entries)
                (list queued-retained-first-entry
                      queued-retained-last-entry)))
-    (should (eq proofread--request-queue-tail
-                (last proofread--request-queue)))
-    (should (eq (car proofread--request-queue-tail)
+    (should (eq (proofread--queue-state-tail proofread--queue-state)
                 queued-retained-last-entry))
+    (should (eq (proofread--queue-state-index proofread--queue-state)
+                queue-index-snapshot))
+    (should (eq (proofread--queue-state-woken proofread--queue-state)
+                queue-woken-snapshot))
+    (should-not (gethash queued-first-entry queue-woken-snapshot))
+    (should (gethash queued-retained-first-entry
+                     queue-woken-snapshot))
+    (proofread-test--assert-queue-cache-index-consistent)
     (should (equal active-input active-snapshot))
     (should (cl-every #'eq active-input active-snapshot))
     (should (equal claimed-input claimed-snapshot))
     (should (cl-every #'eq claimed-input claimed-snapshot))
     (should (equal queue-input queue-snapshot))
     (should (cl-every #'eq queue-input queue-snapshot))
-    (should (equal all-requests request-value-snapshot))
-    (should (equal queue-input queue-value-snapshot))
+    (should
+     (equal
+      (mapcar #'proofread--scheduled-work-request all-requests)
+      request-value-snapshot))
+    (should
+     (equal
+      (mapcar
+       (lambda (entry)
+         (list (proofread--queue-entry-work entry)
+               (proofread--queue-entry-backend entry)
+               (proofread--queue-entry-sequence entry)))
+       queue-input)
+      queue-metadata-snapshot))
+    (dolist (entry (list queued-first-entry queued-last-entry))
+      (should-not (proofread--queue-entry-owner entry))
+      (should-not (proofread--queue-entry-previous entry))
+      (should-not (proofread--queue-entry-next entry)))
     (dolist (work all-requests)
       (should (eq (proofread--request-work-pending-p work)
                   work))
@@ -2453,20 +2549,24 @@ range; no available backend"))))))
     (let* ((manual-work
             (proofread-test--lifecycle-request
              'manual-request 1 1))
-           (manual-entry
-            (list :work manual-work :backend 'manual-backend))
-           (proofread--request-queue (list manual-entry))
            timer-count)
-      (cl-letf (((symbol-function 'run-with-idle-timer)
-                 (lambda (_seconds _repeat _function &rest _args)
-                   (setq timer-count (1+ (or timer-count 0)))
-                   'proofread-test-timer)))
-        (insert "!")
-        (should-not timer-count)
-        (should-not proofread--pending-work)
-        (should-not proofread--idle-timer)
-        (should (equal proofread--request-queue
-                       (list manual-entry)))))))
+      (proofread--enqueue-requests
+       (list manual-work) 'manual-backend)
+      (let ((state proofread--queue-state)
+            (manual-entry (proofread--request-queue-head)))
+        (cl-letf (((symbol-function 'run-with-idle-timer)
+                   (lambda (_seconds _repeat _function &rest _args)
+                     (setq timer-count (1+ (or timer-count 0)))
+                     'proofread-test-timer)))
+          (insert "!")
+          (should-not timer-count)
+          (should-not proofread--pending-work)
+          (should-not proofread--idle-timer)
+          (should (eq proofread--queue-state state))
+          (should
+           (equal (proofread--request-queue-entries)
+                  (list manual-entry)))
+          (proofread-test--assert-queue-cache-index-consistent))))))
 
 (ert-deftest
     proofread-test-auto-check-disabled-does-not-schedule-window-work
@@ -2481,21 +2581,30 @@ range; no available backend"))))))
             (insert "Alpha")
             (setq-local proofread-auto-check nil)
             (proofread-mode 1)
-            (let ((proofread--request-queue '( manual-request))
+            (let ((manual-work
+                   (proofread-test--lifecycle-request
+                    'manual-request 1 1))
                   timer-count)
-              (cl-letf (((symbol-function 'run-with-idle-timer)
-                         (lambda (_seconds _repeat _function &rest
-                                           _args)
-                           (setq timer-count (1+ (or timer-count 0)))
-                           'proofread-test-timer)))
-                (proofread--window-scroll (selected-window)
-                                          (point-min))
-                (run-hooks 'window-configuration-change-hook)
-                (should-not timer-count)
-                (should-not proofread--pending-work)
-                (should-not proofread--idle-timer)
-                (should (equal proofread--request-queue
-                               '( manual-request))))))
+              (proofread--enqueue-requests
+               (list manual-work) 'manual-backend)
+              (let ((state proofread--queue-state)
+                    (manual-entry (proofread--request-queue-head)))
+                (cl-letf (((symbol-function 'run-with-idle-timer)
+                           (lambda (_seconds _repeat _function &rest
+                                             _args)
+                             (setq timer-count (1+ (or timer-count 0)))
+                             'proofread-test-timer)))
+                  (proofread--window-scroll (selected-window)
+                                            (point-min))
+                  (run-hooks 'window-configuration-change-hook)
+                  (should-not timer-count)
+                  (should-not proofread--pending-work)
+                  (should-not proofread--idle-timer)
+                  (should (eq proofread--queue-state state))
+                  (should
+                   (equal (proofread--request-queue-entries)
+                          (list manual-entry)))
+                  (proofread-test--assert-queue-cache-index-consistent)))))
         (kill-buffer buffer)))))
 
 (ert-deftest
@@ -4621,7 +4730,7 @@ This covers URLs, email, invisible text, faces, and properties."
         (should (zerop backend-calls))
         (should-not proofread--active-requests)
         (should-not proofread--claimed-requests)
-        (should-not proofread--request-queue)
+        (should (proofread--request-queue-empty-p))
         (should
          (zerop
           (hash-table-count proofread--pending-request-keys)))))))
@@ -6249,7 +6358,7 @@ This covers URLs, email, invisible text, faces, and properties."
         (should-not (proofread--request-work-pending-p work))
         (should-not proofread--active-requests)
         (should-not proofread--claimed-requests)
-        (should-not proofread--request-queue)
+        (should (proofread--request-queue-empty-p))
         (should
          (zerop
           (hash-table-count proofread--pending-request-keys)))))))
@@ -6279,9 +6388,7 @@ This covers URLs, email, invisible text, faces, and properties."
                (list (cons (point-min) (point-max))))))
         (proofread--dispatch-profile-request-ready-chunks
          chunks profile)
-        (let* ((queued
-                (mapcar #'proofread-test--queue-entry-work
-                        proofread--request-queue))
+        (let* ((queued (proofread--request-queue-works))
                (requests
                 (mapcar #'proofread-test--work-request queued)))
           (should (= (length queued) 2))
@@ -7729,7 +7836,7 @@ This covers URLs, email, invisible text, faces, and properties."
                          :request-id (plist-get request :id)))))
         (proofread-check-region (point-min) (point-max))
         (should (= (length proofread--active-requests) 1))
-        (should (= (length proofread--request-queue) 1))
+        (should (= (proofread--request-queue-length) 1))
         (let ((owners
                (mapcar
                 (lambda (work)
@@ -7737,8 +7844,7 @@ This covers URLs, email, invisible text, faces, and properties."
                              :checker-name))
                 (append
                  proofread--active-requests
-                 (mapcar #'proofread-test--queue-entry-work
-                         proofread--request-queue)))))
+                 (proofread--request-queue-works)))))
           (should (equal (sort owners
                                (lambda (left right)
                                  (string< (symbol-name left)
@@ -8480,13 +8586,13 @@ This covers URLs, email, invisible text, faces, and properties."
                                       (plist-get recorder :requests)))
                              2))
                   (should (= (length proofread--active-requests) 2))
-                  (should (= (length proofread--request-queue) 1))
+                  (should (= (proofread--request-queue-length) 1))
                   (proofread-check-visible-range)
                   (should (= (length (funcall
                                       (plist-get recorder :requests)))
                              2))
                   (should (= (length proofread--active-requests) 2))
-                  (should (= (length proofread--request-queue) 1))
+                  (should (= (proofread--request-queue-length) 1))
                   (proofread-test--flush-request-log-refresh buffer)
                   (with-current-buffer name
                     (let ((statuses (mapcar (lambda (entry)
@@ -8522,7 +8628,7 @@ This covers URLs, email, invisible text, faces, and properties."
                       (should (= (length all-requests) 3))
                       (should (= (length proofread--active-requests)
                                  2))
-                      (should-not proofread--request-queue)
+                      (should (proofread--request-queue-empty-p))
                       (proofread-test--flush-request-log-refresh
                        buffer)
                       (with-current-buffer name
@@ -14271,7 +14377,7 @@ This covers URLs, email, invisible text, faces, and properties."
       (should-not (overlay-buffer overlay))
       (should-not proofread--diagnostics)
       (should-not proofread--active-requests)
-      (should-not proofread--request-queue)
+      (should (proofread--request-queue-empty-p))
       (should (= (hash-table-count proofread--cache) 0))
       (should (= (cl-count #'proofread--window-scroll
                            window-scroll-functions)
@@ -14478,12 +14584,13 @@ This covers URLs, email, invisible text, faces, and properties."
              107 40 42))
            (replacement
             (proofread-test--lifecycle-request 108 10 20))
+           (queue-state (proofread--make-queue-state))
            (queued-selected-entry
-            (list :work queued-selected
-                  :backend proofread-test--backend))
+            (proofread--new-request-queue-entry
+             queue-state queued-selected proofread-test--backend))
            (queued-retained-entry
-            (list :work queued-retained
-                  :backend proofread-test--backend))
+            (proofread--new-request-queue-entry
+             queue-state queued-retained proofread-test--backend))
            (selected
             (list active-first active-last claimed-selected
                   queued-selected))
@@ -14494,10 +14601,13 @@ This covers URLs, email, invisible text, faces, and properties."
             (list active-first active-retained active-last))
            (proofread--claimed-requests
             (list claimed-retained claimed-selected))
-           (proofread--request-queue
-            (list queued-selected-entry queued-retained-entry))
-           (proofread--request-queue-tail
-            (last proofread--request-queue))
+           (proofread--queue-state
+            (progn
+              (proofread--append-request-queue-entry
+               queue-state queued-selected-entry)
+              (proofread--append-request-queue-entry
+               queue-state queued-retained-entry)
+              queue-state))
            (proofread--pending-request-keys
             (proofread-test--pending-request-table old-requests))
            (original-partition
@@ -14521,12 +14631,13 @@ This covers URLs, email, invisible text, faces, and properties."
                            (equal proofread--claimed-requests
                                   (list claimed-retained))
                            (equal
-                            (mapcar
-                             #'proofread-test--queue-entry-work
-                             proofread--request-queue)
+                            (proofread--request-queue-works)
                             (list queued-retained replacement))
-                           (eq proofread--request-queue-tail
-                               (last proofread--request-queue))
+                           (eq
+                            (proofread--queue-state-tail
+                             proofread--queue-state)
+                            (car (last
+                                  (proofread--request-queue-entries))))
                            (cl-every
                             (lambda (request)
                               (and
@@ -14584,10 +14695,11 @@ This covers URLs, email, invisible text, faces, and properties."
               request :superseded))
             (should
              (proofread--request-work-pending-p request)))
-          (should (eq (car proofread--request-queue)
+          (should (eq (proofread--request-queue-head)
                       queued-retained-entry))
-          (should (eq proofread--request-queue-tail
-                      (last proofread--request-queue)))
+          (should (eq (proofread--queue-state-tail
+                       proofread--queue-state)
+                      queued-retained-entry))
           (should-not event-trace)
           (should-not cancelled-handles)
           (proofread--enqueue-requests
@@ -14640,9 +14752,10 @@ This covers URLs, email, invisible text, faces, and properties."
              206 5 15 'queued-selected-handle))
            (late
             (proofread-test--lifecycle-request 207 50 52))
+           (queue-state (proofread--make-queue-state))
            (queued-selected-entry
-            (list :work queued-selected
-                  :backend proofread-test--backend))
+            (proofread--new-request-queue-entry
+             queue-state queued-selected proofread-test--backend))
            (selected
             (list active-first active-last claimed-selected
                   queued-selected))
@@ -14653,10 +14766,11 @@ This covers URLs, email, invisible text, faces, and properties."
             (list active-first active-retained active-last))
            (proofread--claimed-requests
             (list claimed-retained claimed-selected))
-           (proofread--request-queue
-            (list queued-selected-entry))
-           (proofread--request-queue-tail
-            (last proofread--request-queue))
+           (proofread--queue-state
+            (progn
+              (proofread--append-request-queue-entry
+               queue-state queued-selected-entry)
+              queue-state))
            (proofread--pending-request-keys
             (proofread-test--pending-request-table all-requests))
            (original-partition
@@ -14680,8 +14794,9 @@ This covers URLs, email, invisible text, faces, and properties."
                                   (list active-retained))
                            (equal proofread--claimed-requests
                                   (list claimed-retained))
-                           (null proofread--request-queue)
-                           (null proofread--request-queue-tail)
+                           (proofread--request-queue-empty-p)
+                           (null (proofread--queue-state-tail
+                                  proofread--queue-state))
                            (cl-every
                             (lambda (request)
                               (and
@@ -14726,12 +14841,13 @@ This covers URLs, email, invisible text, faces, and properties."
                               '( active-first-handle
                                  active-last-handle))
                        (equal
-                        (mapcar
-                         #'proofread-test--queue-entry-work
-                         proofread--request-queue)
+                        (proofread--request-queue-works)
                         (list late))
-                       (eq proofread--request-queue-tail
-                           (last proofread--request-queue))))
+                       (eq
+                        (proofread--queue-state-tail
+                         proofread--queue-state)
+                        (car (last
+                              (proofread--request-queue-entries))))))
                 'scheduled)))
           (proofread--invalidate-position-shifted-requests 10)))
       (should (= partition-calls 1))
@@ -14848,11 +14964,12 @@ This covers URLs, email, invisible text, faces, and properties."
                   (proofread--scheduled-work-cache-key unrelated-a)))
           (proofread--enqueue-requests
            works proofread-test--backend)
-          (setq entries (copy-sequence proofread--request-queue))
+          (setq entries (proofread--request-queue-entries))
           (proofread-test--assert-queue-cache-index-consistent)
           (proofread--cache-write-request matching-a nil)
           (should (= (hash-table-count
-                      proofread--cache-woken-queue-entries)
+                      (proofread--queue-state-woken
+                       proofread--queue-state))
                      2))
           (add-hook
            'proofread-diagnostics-changed-hook
@@ -14876,10 +14993,10 @@ This covers URLs, email, invisible text, faces, and properties."
            (equal (nreverse cache-hit-log-ids)
                   (list (proofread--scheduled-work-log-id matching-a)
                         (proofread--scheduled-work-log-id matching-b))))
-          (should (= (length proofread--request-queue) 2))
-          (should (eq (nth 0 proofread--request-queue)
+          (should (= (proofread--request-queue-length) 2))
+          (should (eq (nth 0 (proofread--request-queue-entries))
                       (nth 0 entries)))
-          (should (eq (nth 1 proofread--request-queue)
+          (should (eq (nth 1 (proofread--request-queue-entries))
                       (nth 2 entries)))
           (should (proofread--request-work-pending-p unrelated-a))
           (should (proofread--request-work-pending-p unrelated-b))
@@ -14916,10 +15033,11 @@ This covers URLs, email, invisible text, faces, and properties."
                superseded)
           (proofread--enqueue-requests
            (list request-a request-b) proofread-test--backend)
-          (setq entry-b (nth 1 proofread--request-queue))
+          (setq entry-b (nth 1 (proofread--request-queue-entries)))
           (proofread--cache-write-request request-a nil)
           (should (= (hash-table-count
-                      proofread--cache-woken-queue-entries)
+                      (proofread--queue-state-woken
+                       proofread--queue-state))
                      1))
           (setq superseded
                 (proofread--supersede-conflicting-requests
@@ -14928,8 +15046,9 @@ This covers URLs, email, invisible text, faces, and properties."
                          (list request-a)))
           (should-not
            (gethash (proofread--scheduled-work-cache-key request-a)
-                    proofread--request-queue-index))
-          (should (eq (car proofread--request-queue) entry-b))
+                    (proofread--queue-state-index
+                     proofread--queue-state)))
+          (should (eq (proofread--request-queue-head) entry-b))
           (should-not (proofread--cache-wakeup-pending-p))
           (proofread-test--assert-queue-cache-index-consistent)
           (proofread--finish-superseded-requests superseded)
@@ -14940,10 +15059,11 @@ This covers URLs, email, invisible text, faces, and properties."
           (should (proofread--cache-wakeup-pending-p))
           (proofread-clear-cache)
           (should-not (proofread--cache-wakeup-pending-p))
-          (should (eq (car proofread--request-queue) entry-b))
+          (should (eq (proofread--request-queue-head) entry-b))
           (should
            (gethash (proofread--scheduled-work-cache-key request-b)
-                    proofread--request-queue-index))
+                    (proofread--queue-state-index
+                     proofread--queue-state)))
           (proofread-test--assert-queue-cache-index-consistent)
 
           (proofread--cache-write-request request-b nil)
@@ -14991,7 +15111,7 @@ This covers URLs, email, invisible text, faces, and properties."
                            cache-hit-log-ids))))))
           (proofread--enqueue-requests
            works proofread-test--backend)
-          (setq entries (copy-sequence proofread--request-queue))
+          (setq entries (proofread--request-queue-entries))
           (proofread--cache-write-request matching-a nil)
           (add-hook
            'proofread-diagnostics-changed-hook
@@ -15016,10 +15136,10 @@ This covers URLs, email, invisible text, faces, and properties."
                          (list
                           (proofread--scheduled-work-log-id
                            matching-a))))
-          (should (= (length proofread--request-queue) 2))
-          (should (eq (nth 0 proofread--request-queue)
+          (should (= (proofread--request-queue-length) 2))
+          (should (eq (nth 0 (proofread--request-queue-entries))
                       (nth 0 entries)))
-          (should (eq (nth 1 proofread--request-queue)
+          (should (eq (nth 1 (proofread--request-queue-entries))
                       (nth 2 entries)))
           (should (proofread--request-work-pending-p unrelated))
           (should (proofread--request-work-pending-p matching-b))
@@ -15054,7 +15174,7 @@ This covers URLs, email, invisible text, faces, and properties."
                entries)
           (proofread--enqueue-requests
            (list unrelated matching) proofread-test--backend)
-          (setq entries (copy-sequence proofread--request-queue))
+          (setq entries (proofread--request-queue-entries))
           (proofread--cache-write-request matching nil)
           (should (proofread--cache-wakeup-pending-p))
           (setq proofread-cache-max-entries 0)
@@ -15072,10 +15192,10 @@ This covers URLs, email, invisible text, faces, and properties."
               (should-not (proofread--dispatch-queued-requests))))
           (should (<= wakeup-checks 2))
           (should-not (proofread--cache-wakeup-pending-p))
-          (should (= (length proofread--request-queue) 2))
-          (should (eq (nth 0 proofread--request-queue)
+          (should (= (proofread--request-queue-length) 2))
+          (should (eq (nth 0 (proofread--request-queue-entries))
                       (nth 0 entries)))
-          (should (eq (nth 1 proofread--request-queue)
+          (should (eq (nth 1 (proofread--request-queue-entries))
                       (nth 1 entries)))
           (should (proofread--request-work-pending-p unrelated))
           (should (proofread--request-work-pending-p matching))
@@ -15128,7 +15248,7 @@ This covers URLs, email, invisible text, faces, and properties."
                          (list
                           (proofread--scheduled-work-log-id waiting))))
           (should-not (proofread--request-work-pending-p waiting))
-          (should-not proofread--request-queue)
+          (should (proofread--request-queue-empty-p))
           (should-not proofread--claimed-requests)
           (should (equal proofread--active-requests (list active)))
           (should-not (proofread--cache-wakeup-pending-p))
@@ -15181,12 +15301,12 @@ This covers URLs, email, invisible text, faces, and properties."
         (proofread--enqueue-requests
          (list second-work first-work)
          proofread-test--backend)
-        (setq second-entry (car proofread--request-queue))
+        (setq second-entry (proofread--request-queue-head))
         (proofread--cache-write-request first-work nil)
         (should-not (proofread--dispatch-queued-requests))
         (should (equal cache-hit-checkers '( first)))
-        (should (= (length proofread--request-queue) 1))
-        (should (eq (car proofread--request-queue) second-entry))
+        (should (= (proofread--request-queue-length) 1))
+        (should (eq (proofread--request-queue-head) second-entry))
         (should (proofread--request-work-pending-p second-work))
         (should-not (proofread--request-work-pending-p first-work))
         (proofread-test--assert-queue-cache-index-consistent)))))
@@ -15222,21 +15342,166 @@ This covers URLs, email, invisible text, faces, and properties."
                            cache-hit-texts))))))
           (proofread--enqueue-requests
            (list request-a request-b) proofread-test--backend)
-          (setq entry-a (car proofread--request-queue))
+          (setq entry-a (proofread--request-queue-head))
           (proofread--cache-write-request request-a nil)
           (proofread--cache-write-request request-b nil)
           (should-not (proofread--cache-read-request request-a))
           (should (proofread--cache-read-request request-b))
           (should-not (proofread--dispatch-queued-requests))
           (should (equal cache-hit-texts '( "bb")))
-          (should (= (length proofread--request-queue) 1))
-          (should (eq (car proofread--request-queue) entry-a))
+          (should (= (proofread--request-queue-length) 1))
+          (should (eq (proofread--request-queue-head) entry-a))
           (should (proofread--request-work-pending-p request-a))
           (proofread-test--assert-queue-cache-index-consistent)
           (proofread--cache-write-request request-a nil)
           (should-not (proofread--dispatch-queued-requests))
           (should (equal cache-hit-texts '( "aa" "bb")))
           (proofread-test--assert-no-pending-request-work))))))
+
+(ert-deftest
+    proofread-test-cache-woken-miss-restores-the-same-fifo-entry ()
+  "Restore a claimed cache waiter without changing its FIFO identity."
+  (with-temp-buffer
+    (insert "aa bb cc")
+    (let ((proofread-auto-check nil)
+          (proofread-context-size 0)
+          (proofread-max-concurrent-requests 0))
+      (proofread-mode 1)
+      (proofread-test--with-profile
+        (let* ((chunks
+                (proofread-test--request-ready-chunks-for-ranges
+                 '((1 . 3) (4 . 6) (7 . 9))))
+               (works
+                (mapcar
+                 (lambda (chunk)
+                   (proofread--make-request-work
+                    (proofread-test--make-profile-request chunk)
+                    proofread-test--backend))
+                 chunks))
+               (target (nth 1 works))
+               entries
+               freshness-called)
+          (proofread--enqueue-requests
+           works proofread-test--backend)
+          (setq entries (proofread--request-queue-entries))
+          (proofread--cache-write-request target nil)
+          (should (gethash
+                   (nth 1 entries)
+                   (proofread--queue-state-woken
+                    proofread--queue-state)))
+          ;; Clear the cache from a freshness hook after the exact
+          ;; waiter is claimed but before its cache entry can apply.
+          (let ((original-fresh-request-p
+                 (symbol-function 'proofread--fresh-request-p))
+                (target-entry (nth 1 entries)))
+            (cl-letf (((symbol-function 'proofread--fresh-request-p)
+                       (lambda (work)
+                         (should (eq work target))
+                         (setq freshness-called t)
+                         (should (memq target
+                                       proofread--claimed-requests))
+                         (should-not
+                          (proofread--queue-entry-owner target-entry))
+                         (should-not
+                          (proofread--queue-entry-previous target-entry))
+                         (should-not
+                          (proofread--queue-entry-next target-entry))
+                         (let* ((key
+                                 (proofread--request-queue-entry-cache-key
+                                  target-entry))
+                                (bucket
+                                 (gethash
+                                  key
+                                  (proofread--queue-state-index
+                                   proofread--queue-state))))
+                           (should-not
+                            (and bucket
+                                 (gethash target-entry bucket))))
+                         (should-not
+                          (gethash
+                           target-entry
+                           (proofread--queue-state-woken
+                            proofread--queue-state)))
+                         (proofread-clear-cache)
+                         (funcall original-fresh-request-p work))))
+              (should (= (proofread--drain-cache-woken-requests) 1))))
+          (should freshness-called)
+          (should (cl-every #'eq
+                            (proofread--request-queue-entries)
+                            entries))
+          (should-not proofread--claimed-requests)
+          (should-not (proofread--cache-wakeup-pending-p))
+          (should (proofread--request-work-pending-p target))
+          (proofread-test--assert-queue-cache-index-consistent))))))
+
+(ert-deftest proofread-test-queue-state-mutations-preserve-invariants ()
+  "Keep queue record links and indexes consistent across mutations."
+  (with-temp-buffer
+    (proofread-mode 1)
+    (cl-labels
+        ((assert-detached
+           (entry)
+           (should-not (proofread--queue-entry-owner entry))
+           (should-not (proofread--queue-entry-previous entry))
+           (should-not (proofread--queue-entry-next entry))))
+      (let* ((state proofread--queue-state)
+             (works
+              (mapcar
+               (lambda (id)
+                 (proofread-test--lifecycle-request id id (1+ id)))
+               '( 1 2 3 4)))
+             entries
+             sequences)
+        (dolist (work works)
+          (proofread--append-request-queue-entry
+           state
+           (proofread--new-request-queue-entry
+            state work proofread-test--backend))
+          (proofread-test--assert-queue-cache-index-consistent))
+        (setq entries (proofread--request-queue-entries))
+        (setq sequences
+              (mapcar #'proofread--queue-entry-sequence entries))
+        (should (equal (mapcar #'proofread--queue-entry-work entries)
+                       works))
+        (should (cl-every #'< sequences (cdr sequences)))
+        (let ((middle (nth 1 entries)))
+          (should (eq (proofread--claim-request-queue-entry middle)
+                      middle))
+          (assert-detached middle)
+          (proofread-test--assert-queue-cache-index-consistent)
+          (should (eq (car proofread--claimed-requests)
+                      (nth 1 works)))
+          (should (eq (proofread--insert-request-queue-entry middle)
+                      middle))
+          (proofread--release-claimed-request (nth 1 works))
+          (proofread-test--assert-queue-cache-index-consistent)
+          (should (cl-every #'eq
+                            (proofread--request-queue-entries)
+                            entries))
+          (should
+           (equal (mapcar #'proofread--queue-entry-sequence entries)
+                  sequences)))
+        (let ((head (car entries)))
+          (should (eq (proofread--unlink-request-queue-entry head)
+                      head))
+          (assert-detached head))
+        (proofread-test--assert-queue-cache-index-consistent)
+        (let ((tail (car (last entries))))
+          (should (eq (proofread--unlink-request-queue-entry tail)
+                      tail))
+          (assert-detached tail))
+        (proofread-test--assert-queue-cache-index-consistent)
+        (let ((cleared (proofread--clear-request-queue state)))
+          (should
+           (cl-every
+            #'eq cleared
+            (list (nth 1 entries) (nth 2 entries))))
+          (dolist (entry cleared)
+            (assert-detached entry)))
+        (proofread-test--assert-queue-cache-index-consistent)
+        (should (proofread--request-queue-empty-p))
+        (should-not (proofread--queue-state-head state))
+        (should-not (proofread--queue-state-tail state))))))
 
 (ert-deftest proofread-test-cache-reply-dispatch-scales-linearly ()
   "Bound reply dispatch work for a large asynchronous core check."
@@ -15302,7 +15567,7 @@ This covers URLs, email, invisible text, faces, and properties."
                     concurrency))
                 (should (= (length proofread--active-requests)
                            concurrency))
-                (should (= (length proofread--request-queue)
+                (should (= (proofread--request-queue-length)
                            (- request-count concurrency)))
                 (setq submit-attempts 0)
                 (setq freshness-checks 0)
@@ -15332,8 +15597,9 @@ This covers URLs, email, invisible text, faces, and properties."
                             (* 16 request-count)))
                 (should-not proofread--active-requests)
                 (should-not proofread--claimed-requests)
-                (should-not proofread--request-queue)
-                (should-not proofread--request-queue-tail)
+                (should (proofread--request-queue-empty-p))
+                (should-not
+                 (proofread--queue-state-tail proofread--queue-state))
                 (should (= (hash-table-count proofread--cache)
                            request-count))
                 (should (= (hash-table-count
@@ -15380,9 +15646,9 @@ This covers URLs, email, invisible text, faces, and properties."
       (proofread--set-request-state-flag superseded :superseded)
       (let ((proofread-max-concurrent-requests 0))
         (should-not (proofread--dispatch-queued-requests))
-        (should (= (length proofread--request-queue) 1))
-        (should (eq (proofread-test--queue-entry-work
-                     (car proofread--request-queue))
+        (should (= (proofread--request-queue-length) 1))
+        (should (eq (proofread--queue-entry-work
+                     (proofread--request-queue-head))
                     ready))
         (should-not (proofread--request-work-pending-p invalidated))
         (should-not (proofread--request-work-pending-p superseded))
@@ -15395,8 +15661,9 @@ This covers URLs, email, invisible text, faces, and properties."
           (should (equal (proofread--dispatch-queued-requests)
                          (list ready-request)))))
       (should (eq dispatched ready-request))
-      (should-not proofread--request-queue)
-      (should-not proofread--request-queue-tail)
+      (should (proofread--request-queue-empty-p))
+      (should-not
+       (proofread--queue-state-tail proofread--queue-state))
       (should (proofread--active-request-p ready)))))
 
 (ert-deftest proofread-test-reentrant-queue-dispatch-submits-once ()
@@ -15431,7 +15698,7 @@ This covers URLs, email, invisible text, faces, and properties."
           (should (equal (proofread--dispatch-queued-requests)
                          (list request)))
           (should (equal submitted-log-ids (list log-id)))
-          (should-not proofread--request-queue)
+          (should (proofread--request-queue-empty-p))
           (should-not proofread--claimed-requests)
           (should (= (length proofread--active-requests) 1))
           (should (equal
@@ -15483,9 +15750,9 @@ This covers URLs, email, invisible text, faces, and properties."
         (should (equal submitted (list old-request)))
         (should (proofread--request-state-flag-p
                  old-request :cancelled))
-        (should (= (length proofread--request-queue) 1))
-        (should (eq (proofread-test--queue-entry-work
-                     (car proofread--request-queue))
+        (should (= (proofread--request-queue-length) 1))
+        (should (eq (proofread--queue-entry-work
+                     (proofread--request-queue-head))
                     new-request))
         (should (proofread--request-work-pending-p new-request))
         (should-not proofread--queue-dispatch-active-p)
@@ -15568,7 +15835,7 @@ This covers URLs, email, invisible text, faces, and properties."
             (should (proofread--request-state-flag-p old :superseded))
             (should (proofread--request-state-flag-p old :cancelled))
             (should (= (length submitted) 1))
-            (should-not proofread--request-queue)
+            (should (proofread--request-queue-empty-p))
             (should-not proofread--claimed-requests)
             (should (equal proofread--active-requests
                            (list new-work)))
@@ -15644,10 +15911,10 @@ This covers URLs, email, invisible text, faces, and properties."
                                                    :superseded))
           (should (proofread--request-state-flag-p victim :cancelled))
           (should-not proofread--claimed-requests)
-          (should (= (length proofread--request-queue) 1))
+          (should (= (proofread--request-queue-length) 1))
           (let* ((new-work
-                  (proofread-test--queue-entry-work
-                   (car proofread--request-queue)))
+                  (proofread--queue-entry-work
+                   (proofread--request-queue-head)))
                  (new-request
                   (proofread-test--work-request new-work)))
             (funcall (cdr (assq unrelated-request callbacks))
@@ -15659,7 +15926,7 @@ This covers URLs, email, invisible text, faces, and properties."
             (should (= (cl-count new-request submitted-requests
                                  :test #'eq)
                        1))
-            (should-not proofread--request-queue)
+            (should (proofread--request-queue-empty-p))
             (should-not proofread--claimed-requests)
             (funcall (cdr (assq new-request callbacks))
                      (proofread--backend-success-result
@@ -15703,7 +15970,7 @@ This covers URLs, email, invisible text, faces, and properties."
         (should (proofread--request-state-flag-p request :cancelled))
         (should-not proofread--active-requests)
         (should-not proofread--claimed-requests)
-        (should-not proofread--request-queue)
+        (should (proofread--request-queue-empty-p))
         (should (= (hash-table-count proofread--pending-request-keys)
                    0))))))
 
@@ -15747,7 +16014,7 @@ This covers URLs, email, invisible text, faces, and properties."
         (should (proofread--request-state-flag-p request :cancelled))
         (should-not proofread--active-requests)
         (should-not proofread--claimed-requests)
-        (should-not proofread--request-queue)
+        (should (proofread--request-queue-empty-p))
         (should (= (hash-table-count proofread--pending-request-keys)
                    0))))))
 
@@ -15798,7 +16065,7 @@ This covers URLs, email, invisible text, faces, and properties."
           (should (proofread--request-state-flag-p active :cancelled))
           (should-not (proofread--active-request-p active))
           (should (proofread--active-request-p waiting))
-          (should-not proofread--request-queue)
+          (should (proofread--request-queue-empty-p))
           (should-not proofread--claimed-requests)
           (should (= (hash-table-count
                       proofread--pending-request-keys) 1))
@@ -15863,7 +16130,7 @@ This covers URLs, email, invisible text, faces, and properties."
                                                      :cancelled))
             (should-not (proofread--active-request-p active))
             (should (proofread--active-request-p waiting))
-            (should-not proofread--request-queue)
+            (should (proofread--request-queue-empty-p))
             (should-not proofread--claimed-requests)))))))
 
 (ert-deftest proofread-test-context-stale-active-resumes-queued-work
@@ -15923,7 +16190,7 @@ This covers URLs, email, invisible text, faces, and properties."
                                                      :cancelled))
             (should-not (proofread--active-request-p active))
             (should (proofread--active-request-p waiting))
-            (should-not proofread--request-queue)
+            (should (proofread--request-queue-empty-p))
             (should-not proofread--claimed-requests)))))))
 
 (ert-deftest proofread-test-queue-inhibition-is-buffer-specific ()
@@ -15961,7 +16228,7 @@ This covers URLs, email, invisible text, faces, and properties."
                   (should (equal (proofread--dispatch-queued-requests)
                                  (list request))))
                 (should (equal submitted-log-ids (list log-id)))
-                (should-not proofread--request-queue)
+                (should (proofread--request-queue-empty-p))
                 (should-not proofread--claimed-requests)))))
       (when (buffer-live-p source)
         (kill-buffer source))
@@ -15989,7 +16256,7 @@ This covers URLs, email, invisible text, faces, and properties."
         (should-not proofread--queue-dispatch-active-p)
         (should-not proofread--active-requests)
         (should-not proofread--claimed-requests)
-        (should-not proofread--request-queue)
+        (should (proofread--request-queue-empty-p))
         (should (= (hash-table-count proofread--pending-request-keys)
                    0))))))
 
@@ -16061,8 +16328,9 @@ This covers URLs, email, invisible text, faces, and properties."
           events))
         (should-not proofread--active-requests)
         (should-not proofread--claimed-requests)
-        (should-not proofread--request-queue)
-        (should-not proofread--request-queue-tail)
+        (should (proofread--request-queue-empty-p))
+        (should-not
+         (proofread--queue-state-tail proofread--queue-state))
         (should-not proofread--queue-dispatch-timer)
         (should (= (hash-table-count proofread--pending-request-keys)
                    0))))))
@@ -16102,7 +16370,7 @@ This covers URLs, email, invisible text, faces, and properties."
         (should rejected-log-id)
         (should-not proofread--active-requests)
         (should-not proofread--claimed-requests)
-        (should-not proofread--request-queue)
+        (should (proofread--request-queue-empty-p))
         (should (= (hash-table-count proofread--pending-request-keys)
                    0))))))
 
@@ -16215,7 +16483,7 @@ This covers URLs, email, invisible text, faces, and properties."
             (list first second)))
           (should (= calls 1))
           (should (equal (buffer-string) "aaa aaa aaa"))
-          (should-not proofread--request-queue)
+          (should (proofread--request-queue-empty-p))
           (should (= (hash-table-count
                       proofread--pending-request-keys) 0)))))))
 
@@ -16262,7 +16530,7 @@ This covers URLs, email, invisible text, faces, and properties."
                     nil t)
           (should-not (proofread--dispatch-queued-requests))
           (should (= calls 1))
-          (should-not proofread--request-queue)
+          (should (proofread--request-queue-empty-p))
           (should (proofread--request-invalidated-p waiting))
           (should-not (proofread--request-work-pending-p waiting))
           (should-not (proofread--request-work-pending-p cached)))))))
@@ -16316,8 +16584,10 @@ This covers URLs, email, invisible text, faces, and properties."
                                       :text))
                                    proofread--active-requests)
                            '( "bcde")))
-            (should-not proofread--request-queue)
-            (should-not proofread--request-queue-tail)))))))
+            (should (proofread--request-queue-empty-p))
+            (should-not
+             (proofread--queue-state-tail
+              proofread--queue-state))))))))
 
 (ert-deftest
     proofread-test-superseding-cache-hit-drains-unrelated-queue ()
@@ -16367,7 +16637,7 @@ This covers URLs, email, invisible text, faces, and properties."
               (should older-request)
               (proofread--enqueue-requests
                (list unrelated) proofread-test--backend)
-              (should (= (length proofread--request-queue) 1))
+              (should (= (proofread--request-queue-length) 1))
               (should
                (equal
                 (proofread-test--dispatch-profile-chunks
@@ -16382,8 +16652,10 @@ This covers URLs, email, invisible text, faces, and properties."
                              '( "abc" "def")))
               (should-not (proofread--active-request-p older))
               (should (proofread--active-request-p unrelated))
-              (should-not proofread--request-queue)
-              (should-not proofread--request-queue-tail))))))))
+              (should (proofread--request-queue-empty-p))
+              (should-not
+               (proofread--queue-state-tail
+                proofread--queue-state)))))))))
 
 (ert-deftest proofread-test-synchronous-queued-callback-drains-once ()
   "Drain synchronous callbacks without duplicate submissions."
@@ -16427,8 +16699,9 @@ This covers URLs, email, invisible text, faces, and properties."
                                          submitted-request-ids)))
                    (length works)))
         (should-not proofread--active-requests)
-        (should-not proofread--request-queue)
-        (should-not proofread--request-queue-tail)
+        (should (proofread--request-queue-empty-p))
+        (should-not
+         (proofread--queue-state-tail proofread--queue-state))
         (should (= (hash-table-count proofread--pending-request-keys)
                    0))))))
 
