@@ -58,6 +58,11 @@
         (proofread-test--tree-member-p needle (cdr tree))))
    (t nil)))
 
+(defun proofread-test--identity-root-p (value root)
+  "Return non-nil when VALUE is a complete identity marked by ROOT."
+  (and (integerp (proper-list-p value))
+       (eq (plist-get value :proofread-test-identity-root) root)))
+
 (defun proofread-test--assert-secret-not-printed (secret value)
   "Assert that printing VALUE does not expose SECRET."
   (should-not
@@ -4698,29 +4703,46 @@ This covers URLs, email, invisible text, faces, and properties."
   (let ((proofread-profile 'multi)
         (proofread-profiles
          (proofread-test--ordered-profiles '( only)))
+        (proofread--backend-registry (make-hash-table :test #'eq))
+        (descriptor-calls 0)
         (snapshot-calls 0)
         (identity-calls 0)
+        (source-calls 0)
         reports)
-    (cl-letf
-        (((symbol-function
-           'proofread-test--snapshot-checker-options)
-          (lambda (_options)
-            (setq snapshot-calls (1+ snapshot-calls))
-            (error "Options must not be snapshotted for empty chunks")))
-         ((symbol-function 'proofread--checker-request-identities)
-          (lambda (_checker)
-            (setq identity-calls (1+ identity-calls))
-            (error "Identity must not be requested for empty chunks")))
-         ((symbol-function 'proofread-report-warning-without-window)
-          (lambda (detail summary)
-            (push (list detail summary) reports))))
-      (should
-       (equal
-        (proofread--dispatch-profile-request-ready-chunks-result
-         nil (proofread--current-profile))
-        '( :requests nil :supported-count 1 :failures nil))))
+    (proofread-register-backend
+     proofread-test--backend
+     :check #'ignore
+     :identity
+     (lambda ()
+       (setq identity-calls (1+ identity-calls))
+       (error "Identity must not be requested for empty chunks"))
+     :snapshot-options
+     (lambda (_options)
+       (setq snapshot-calls (1+ snapshot-calls))
+       (error "Options must not be snapshotted for empty chunks"))
+     :source-label
+     (lambda (_checker)
+       (setq source-calls (1+ source-calls))
+       (error "Source label must not be requested for empty chunks")))
+    (let ((original-descriptor
+           (symbol-function 'proofread--backend-descriptor)))
+      (cl-letf
+          (((symbol-function 'proofread--backend-descriptor)
+            (lambda (backend)
+              (setq descriptor-calls (1+ descriptor-calls))
+              (funcall original-descriptor backend)))
+           ((symbol-function 'proofread-report-warning-without-window)
+            (lambda (detail summary)
+              (push (list detail summary) reports))))
+        (should
+         (equal
+          (proofread--dispatch-profile-request-ready-chunks-result
+           nil (proofread--current-profile))
+          '( :requests nil :supported-count 1 :failures nil)))))
+    (should (= descriptor-calls 1))
     (should (zerop snapshot-calls))
     (should (zerop identity-calls))
+    (should (zerop source-calls))
     (should-not reports)))
 
 (ert-deftest proofread-test-unsupported-checker-skips-options-snapshot
@@ -4758,6 +4780,33 @@ This covers URLs, email, invisible text, faces, and properties."
       '( :status prepared :supported t :work nil)))
     (should (zerop snapshot-calls))))
 
+(ert-deftest
+    proofread-test-backend-wide-nil-identity-fails-preparation ()
+  "Reject a nil backend-wide identity during checker preparation."
+  (let* ((backend 'proofread-test-nil-identity-backend)
+         (proofread--backend-registry
+          (make-hash-table :test #'eq))
+         (profile '( :name multi :checkers nil))
+         (checker
+          (list :profile 'multi
+                :name 'only
+                :checker-ordinal 0
+                :backend backend
+                :options nil)))
+    (proofread-register-backend
+     backend
+     :check #'ignore
+     :identity (lambda () nil)
+     :snapshot-options (lambda (_options) nil))
+    (let* ((result
+            (proofread--prepare-profile-checker-dispatch
+             '(unused-chunk) profile checker))
+           (failure (plist-get result :failure)))
+      (should (eq (plist-get result :status) 'failed))
+      (should (plist-get result :supported))
+      (should (eq (plist-get failure :phase) 'checker-identity))
+      (should (eq (plist-get failure :error) 'error)))))
+
 (ert-deftest proofread-test-ad-hoc-dispatch-snapshots-options-once ()
   "Snapshot ad-hoc checker options once before request construction."
   (with-temp-buffer
@@ -4767,13 +4816,16 @@ This covers URLs, email, invisible text, faces, and properties."
            (proofread-context-size 0)
            (proofread--backend-registry
             (make-hash-table :test #'eq))
+           (descriptor-calls 0)
            (snapshot-calls 0)
+           (identity-calls 0)
            snapshot)
       (proofread-register-backend
        backend
        :check #'ignore
        :identity
        (lambda ()
+         (setq identity-calls (1+ identity-calls))
          (list :backend backend :contract-version 1))
        :snapshot-options
        (lambda (options)
@@ -4785,9 +4837,16 @@ This covers URLs, email, invisible text, faces, and properties."
               (car
                (proofread-test--request-ready-chunks-for-ranges
                 (list (cons (point-min) (point-max))))))
+             (original-descriptor
+              (symbol-function 'proofread--backend-descriptor))
              (requests
               (cl-letf
-                  (((symbol-function
+                  (((symbol-function 'proofread--backend-descriptor)
+                    (lambda (queried-backend)
+                      (setq descriptor-calls
+                            (1+ descriptor-calls))
+                      (funcall original-descriptor queried-backend)))
+                   ((symbol-function
                      'proofread--dispatch-prepared-checker-work)
                     (lambda (prepared _backend)
                       (mapcar #'car prepared))))
@@ -4796,7 +4855,9 @@ This covers URLs, email, invisible text, faces, and properties."
              (request (car requests))
              (checker-identity
               (plist-get request :checker-identity)))
+        (should (= descriptor-calls 1))
         (should (= snapshot-calls 1))
+        (should (= identity-calls 1))
         (should (= (length requests) 1))
         (should (eq (plist-get request :checker-options) snapshot))
         (should (eq (plist-get checker-identity :options)
@@ -4814,6 +4875,15 @@ This covers URLs, email, invisible text, faces, and properties."
     (let* ((backend 'proofread-test-options-sharing-backend)
            (tone (copy-sequence "formal"))
            (mutable (list "original"))
+           (identity-root (make-symbol "identity-root"))
+           (identity-token (copy-sequence "identity"))
+           (raw-identity
+            (list :proofread-test-identity-root identity-root
+                  :backend backend
+                  :contract-version 1
+                  :tone "formal"
+                  :token identity-token))
+           (source-label (copy-sequence "test model"))
            (raw-options (list :tone tone :mutable mutable))
            (proofread-auto-check nil)
            (proofread-context-size 0)
@@ -4830,6 +4900,11 @@ This covers URLs, email, invisible text, faces, and properties."
            (proofread--backend-registry
             (make-hash-table :test #'eq))
            (snapshot-calls 0)
+           (descriptor-calls 0)
+           (backend-identity-calls 0)
+           (identity-calls 0)
+           (identity-snapshot-calls 0)
+           (source-calls 0)
            snapshot-input
            snapshot
            identity-options
@@ -4839,6 +4914,8 @@ This covers URLs, email, invisible text, faces, and properties."
        :check #'ignore
        :identity
        (lambda ()
+         (setq backend-identity-calls
+               (1+ backend-identity-calls))
          (list :backend backend :contract-version 1))
        :snapshot-options
        (lambda (options)
@@ -4848,14 +4925,14 @@ This covers URLs, email, invisible text, faces, and properties."
                (proofread-test--snapshot-checker-options options)))
        :checker-identity
        (lambda (checker)
+         (setq identity-calls (1+ identity-calls))
          (setq identity-options (plist-get checker :options))
-         (list :backend backend
-               :tone (plist-get identity-options :tone)
-               :contract-version 1))
+         raw-identity)
        :source-label
        (lambda (checker)
+         (setq source-calls (1+ source-calls))
          (setq source-options (plist-get checker :options))
-         "test model"))
+         source-label))
       (proofread-mode 1)
       (let* ((profile (proofread--current-profile))
              (checker (car (plist-get profile :checkers)))
@@ -4863,26 +4940,402 @@ This covers URLs, email, invisible text, faces, and properties."
               (proofread-test--request-ready-chunks-for-ranges
                (list (cons (point-min) (point-max)))))
              (preparation
-              (proofread--prepare-profile-checker-dispatch
-               chunks profile checker))
+              (let ((original-descriptor
+                     (symbol-function
+                      'proofread--backend-descriptor))
+                    (original-snapshot
+                     (symbol-function 'proofread--snapshot-value)))
+                (cl-letf
+                    (((symbol-function 'proofread--backend-descriptor)
+                      (lambda (queried-backend)
+                        (setq descriptor-calls
+                              (1+ descriptor-calls))
+                        (funcall original-descriptor queried-backend)))
+                     ((symbol-function 'proofread--snapshot-value)
+                      (lambda (value)
+                        (when (proofread-test--identity-root-p
+                               value identity-root)
+                          (setq identity-snapshot-calls
+                                (1+ identity-snapshot-calls)))
+                        (funcall original-snapshot value))))
+                  (proofread--prepare-profile-checker-dispatch
+                   chunks profile checker))))
              (requests (mapcar #'car
-                               (plist-get preparation :work))))
+                               (plist-get preparation :work)))
+             (backend-identity
+              (plist-get (car requests) :backend-identity))
+             (checker-identity
+              (plist-get (car requests) :checker-identity))
+             (cache-keys
+              (mapcar (lambda (request)
+                        (copy-tree (plist-get request :cache-key)))
+                      requests)))
         (should (eq (plist-get preparation :status) 'prepared))
         (should (= (length requests) 2))
+        (should (= descriptor-calls 1))
         (should (= snapshot-calls 1))
+        (should (zerop backend-identity-calls))
+        (should (= identity-calls 1))
+        (should (= identity-snapshot-calls 1))
+        (should (= source-calls 1))
         (should (eq snapshot-input raw-options))
         (should (eq identity-options snapshot))
         (should (eq source-options snapshot))
+        (should-not (eq backend-identity raw-identity))
+        (should (eq backend-identity
+                    (plist-get checker-identity :backend-identity)))
         (dolist (request requests)
           (should (eq (plist-get request :checker-options)
-                      snapshot)))
+                      snapshot))
+          (should (eq (plist-get request :backend-identity)
+                      backend-identity))
+          (should (eq (plist-get request :checker-identity)
+                      checker-identity))
+          (should (eq (plist-get request :source-label)
+                      (plist-get (car requests) :source-label))))
         (aset tone 0 ?X)
+        (aset identity-token 0 ?X)
+        (aset source-label 0 ?X)
         (setcar mutable "changed")
         (dolist (request requests)
           (let ((options (plist-get request :checker-options)))
             (should (equal (plist-get options :tone) "formal"))
             (should (equal (plist-get options :mutable)
-                           '( "original")))))))))
+                           '( "original")))
+            (should (equal (plist-get
+                            (plist-get request :backend-identity)
+                            :token)
+                           "identity"))
+            (should (equal (plist-get request :source-label)
+                           "test model"))))
+        (should (equal cache-keys
+                       (mapcar (lambda (request)
+                                 (plist-get request :cache-key))
+                               requests)))))))
+
+(ert-deftest
+    proofread-test-checker-preparation-snapshots-backend-identity-once
+    ()
+  "Detach and share one backend-wide identity per preparation."
+  (with-temp-buffer
+    (text-mode)
+    (set-syntax-table (copy-syntax-table (syntax-table)))
+    (modify-syntax-entry ?\n ".")
+    (modify-syntax-entry ?\r ".")
+    (insert "First. Second.")
+    (let* ((backend 'proofread-test-backend-identity-snapshot)
+           (identity-root (make-symbol "identity-root"))
+           (token (copy-sequence "identity"))
+           (raw-identity
+            (list :proofread-test-identity-root identity-root
+                  :backend backend
+                  :contract-version 1
+                  :token token))
+           (raw-options '( :tone formal))
+           (profile
+            (list :name 'multi
+                  :checkers
+                  (list
+                   (list :profile 'multi
+                         :name 'only
+                         :checker-ordinal 0
+                         :backend backend
+                         :options raw-options))))
+           (checker (car (plist-get profile :checkers)))
+           (proofread--backend-registry
+            (make-hash-table :test #'eq))
+           (descriptor-calls 0)
+           (snapshot-calls 0)
+           (identity-calls 0)
+           (identity-snapshot-calls 0)
+           (source-calls 0)
+           options-snapshot)
+      (proofread-register-backend
+       backend
+       :check #'ignore
+       :identity
+       (lambda ()
+         (setq identity-calls (1+ identity-calls))
+         raw-identity)
+       :snapshot-options
+       (lambda (options)
+         (setq snapshot-calls (1+ snapshot-calls))
+         (setq options-snapshot (copy-tree options)))
+       :source-label
+       (lambda (_checker)
+         (setq source-calls (1+ source-calls))
+         nil))
+      (let* ((chunks
+              (proofread-test--request-ready-chunks-for-ranges
+               (list (cons (point-min) (point-max)))))
+             (original-descriptor
+              (symbol-function 'proofread--backend-descriptor))
+             (original-snapshot
+              (symbol-function 'proofread--snapshot-value))
+             (preparation
+              (cl-letf
+                  (((symbol-function 'proofread--backend-descriptor)
+                    (lambda (queried-backend)
+                      (setq descriptor-calls
+                            (1+ descriptor-calls))
+                      (funcall original-descriptor queried-backend)))
+                   ((symbol-function 'proofread--snapshot-value)
+                    (lambda (value)
+                      (when (proofread-test--identity-root-p
+                             value identity-root)
+                        (setq identity-snapshot-calls
+                              (1+ identity-snapshot-calls)))
+                      (funcall original-snapshot value))))
+                (proofread--prepare-profile-checker-dispatch
+                 chunks profile checker)))
+             (requests
+              (mapcar #'car (plist-get preparation :work)))
+             (backend-identity
+              (plist-get (car requests) :backend-identity))
+             (checker-identity
+              (plist-get (car requests) :checker-identity))
+             (cache-keys
+              (mapcar (lambda (request)
+                        (copy-tree (plist-get request :cache-key)))
+                      requests)))
+        (should (eq (plist-get preparation :status) 'prepared))
+        (should (= (length requests) 2))
+        (should (= descriptor-calls 1))
+        (should (= snapshot-calls 1))
+        (should (= identity-calls 1))
+        (should (= identity-snapshot-calls 1))
+        (should (= source-calls 1))
+        (should-not (eq backend-identity raw-identity))
+        (should (eq backend-identity
+                    (plist-get checker-identity :backend-identity)))
+        (should (eq options-snapshot
+                    (plist-get checker-identity :options)))
+        (dolist (request requests)
+          (should (eq (plist-get request :backend-identity)
+                      backend-identity))
+          (should (eq (plist-get request :checker-identity)
+                      checker-identity)))
+        (aset token 0 ?X)
+        (should (equal (plist-get backend-identity :token)
+                       "identity"))
+        (should (equal cache-keys
+                       (mapcar (lambda (request)
+                                 (plist-get request :cache-key))
+                               requests)))))))
+
+(ert-deftest
+    proofread-test-checker-preparation-keeps-captured-descriptor ()
+  "Keep one descriptor through preparation and recapture on submit."
+  (with-temp-buffer
+    (text-mode)
+    (insert "Alpha")
+    (let* ((backend 'proofread-test-descriptor-mutation-backend)
+           (proofread-auto-check nil)
+           (proofread-cache-max-entries 0)
+           (proofread-context-size 0)
+           (proofread-max-concurrent-requests 1)
+           (proofread-profile 'multi)
+           (proofread-profiles
+            (list
+             (list
+              'multi
+              :checkers
+              (list
+               (list :name 'only
+                     :backend backend
+                     :options '( :tone formal))))))
+           (proofread--backend-registry
+            (make-hash-table :test #'eq))
+           events
+           (old-checks 0)
+           (new-checks 0)
+           old-cancels
+           new-cancels)
+      (cl-labels
+          ((identity (checker event)
+             (push event events)
+             (list :backend backend
+                   :contract-version 1
+                   :tone
+                   (plist-get (plist-get checker :options) :tone)))
+           (register-new ()
+             (proofread-register-backend
+              backend
+              :check
+              (lambda (_request _callback)
+                (setq new-checks (1+ new-checks))
+                'new-handle)
+              :identity
+              (lambda ()
+                (list :backend backend :contract-version 1))
+              :snapshot-options
+              (lambda (_options)
+                (push 'new-snapshot events)
+                '( :tone formal))
+              :checker-identity
+              (lambda (checker)
+                (identity checker 'new-identity))
+              :source-label
+              (lambda (_checker)
+                (push 'new-source events)
+                "new source")
+              :cancel
+              (lambda (handle)
+                (push handle new-cancels)))))
+        (proofread-register-backend
+         backend
+         :check
+         (lambda (_request _callback)
+           (setq old-checks (1+ old-checks))
+           'old-handle)
+         :identity
+         (lambda ()
+           (list :backend backend :contract-version 1))
+         :snapshot-options
+         (lambda (_options)
+           (push 'old-snapshot events)
+           (register-new)
+           '( :tone formal))
+         :checker-identity
+         (lambda (checker)
+           (identity checker 'old-identity))
+         :source-label
+         (lambda (_checker)
+           (push 'old-source events)
+           "old source")
+         :cancel
+         (lambda (handle)
+           (push handle old-cancels)))
+        (proofread-mode 1)
+        (let* ((profile (proofread--current-profile))
+               (checker (car (plist-get profile :checkers)))
+               (chunks
+                (proofread-test--request-ready-chunks-for-ranges
+                 (list (cons (point-min) (point-max)))))
+               (old-preparation
+                (proofread--prepare-profile-checker-dispatch
+                 chunks profile checker))
+               (old-request
+                (caar (plist-get old-preparation :work))))
+          (should (eq (plist-get old-preparation :status) 'prepared))
+          (should (equal (nreverse events)
+                         '(old-snapshot old-identity old-source)))
+          (should (equal (plist-get old-request :source-label)
+                         "old source"))
+          (setq events nil)
+          (let* ((new-preparation
+                  (proofread--prepare-profile-checker-dispatch
+                   chunks profile checker))
+                 (new-request
+                  (caar (plist-get new-preparation :work))))
+            (should (eq (plist-get new-preparation :status)
+                        'prepared))
+            (should (equal (nreverse events)
+                           '(new-snapshot new-identity new-source)))
+            (should (equal (plist-get new-request :source-label)
+                           "new source"))
+            (should (equal (plist-get old-request :cache-key)
+                           (plist-get new-request :cache-key)))
+            (let ((descriptor-calls 0)
+                  (original-descriptor
+                   (symbol-function 'proofread--backend-descriptor)))
+              (cl-letf
+                  (((symbol-function 'proofread--backend-descriptor)
+                    (lambda (queried-backend)
+                      (setq descriptor-calls
+                            (1+ descriptor-calls))
+                      (funcall original-descriptor queried-backend))))
+                (should
+                 (equal (plist-get old-request :cache-key)
+                        (proofread--cache-key old-request backend))))
+              (should (zerop descriptor-calls))))
+          (setq events nil)
+          (let ((descriptor-calls 0)
+                (original-descriptor
+                 (symbol-function 'proofread--backend-descriptor)))
+            (cl-letf
+                (((symbol-function 'proofread--backend-descriptor)
+                  (lambda (queried-backend)
+                    (setq descriptor-calls
+                          (1+ descriptor-calls))
+                    (funcall original-descriptor queried-backend))))
+              (should (proofread--fresh-request-p old-request)))
+            (should (= descriptor-calls 1)))
+          (should (equal (nreverse events)
+                         '(new-snapshot new-identity)))
+          (setq events nil)
+          (proofread--dispatch-prepared-checker-work
+           (plist-get old-preparation :work) backend)
+          (should (zerop old-checks))
+          (should (= new-checks 1))
+          (should (proofread--active-request-p old-request))
+          (proofread--cancel-active-requests)
+          (should-not old-cancels)
+          (should (equal new-cancels '(new-handle))))))))
+
+(ert-deftest proofread-test-bare-cache-key-captures-one-descriptor ()
+  "Build both cache identities from one backend descriptor lookup."
+  (let* ((backend 'proofread-test-cache-descriptor-backend)
+         (identity-root (make-symbol "identity-root"))
+         (token (copy-sequence "identity"))
+         (raw-identity
+          (list :proofread-test-identity-root identity-root
+                :backend backend
+                :contract-version 1
+                :token token))
+         (proofread--backend-registry
+          (make-hash-table :test #'eq))
+         (descriptor-calls 0)
+         (snapshot-calls 0)
+         (identity-calls 0)
+         (identity-snapshot-calls 0))
+    (proofread-register-backend
+     backend
+     :check #'ignore
+     :identity
+     (lambda ()
+       (setq identity-calls (1+ identity-calls))
+       raw-identity)
+     :snapshot-options
+     (lambda (_options)
+       (setq snapshot-calls (1+ snapshot-calls))
+       nil))
+    (let* ((original-descriptor
+            (symbol-function 'proofread--backend-descriptor))
+           (original-snapshot
+            (symbol-function 'proofread--snapshot-value))
+           (key
+            (cl-letf
+                (((symbol-function 'proofread--backend-descriptor)
+                  (lambda (queried-backend)
+                    (setq descriptor-calls
+                          (1+ descriptor-calls))
+                    (funcall original-descriptor queried-backend)))
+                 ((symbol-function 'proofread--snapshot-value)
+                  (lambda (value)
+                    (when (proofread-test--identity-root-p
+                           value identity-root)
+                      (setq identity-snapshot-calls
+                            (1+ identity-snapshot-calls)))
+                    (funcall original-snapshot value))))
+              (proofread--cache-key
+               (list :backend backend
+                     :text "Alpha"
+                     :language "en-US"
+                     :major-mode 'text-mode
+                     :target-policy 'all
+                     :target-kind 'prose)
+               backend))))
+      (should (= descriptor-calls 1))
+      (should (= snapshot-calls 1))
+      (should (= identity-calls 1))
+      (should (= identity-snapshot-calls 1))
+      (should (eq (plist-get key :backend)
+                  (plist-get (plist-get key :checker)
+                             :backend-identity)))
+      (aset token 0 ?X)
+      (should (equal (plist-get (plist-get key :backend) :token)
+                     "identity")))))
 
 (ert-deftest
     proofread-test-profile-source-label-is-snapshotted-once-per-checker
@@ -5391,14 +5844,15 @@ This covers URLs, email, invisible text, faces, and properties."
           (cl-letf
               (((symbol-function 'proofread--make-backend-request)
                 (lambda (chunk &optional backend checker profile
-                               identities)
+                               preparation)
                   (if (eq (plist-get checker :name) 'failed)
                       (progn
                         (setq failed-construction-calls
                               (1+ failed-construction-calls))
                         (error "Simulated request construction failure"))
                     (funcall original-make-request
-                             chunk backend checker profile identities))))
+                             chunk backend checker profile
+                             preparation))))
                ((symbol-function 'proofread--backend-check)
                 (plist-get recorder :function))
                ((symbol-function
@@ -7581,10 +8035,23 @@ This covers URLs, email, invisible text, faces, and properties."
     (let* ((chunk
             (car (proofread-test--request-ready-chunks-for-ranges
                   (list (cons (point-min) (point-max))))))
+           (descriptor-calls 0)
+           (original-descriptor
+            (symbol-function 'proofread--backend-descriptor))
            (request
-            (proofread--make-backend-request
-             chunk 'unknown-backend))
+            (cl-letf
+                (((symbol-function 'proofread--backend-descriptor)
+                  (lambda (backend)
+                    (setq descriptor-calls
+                          (1+ descriptor-calls))
+                    (funcall original-descriptor backend))))
+              (proofread--make-backend-request
+               chunk 'unknown-backend)))
            result)
+      (should (= descriptor-calls 1))
+      (should
+       (eq (plist-get request :checker-identity)
+           (plist-get (plist-get request :cache-key) :checker)))
       (should-not (proofread--supported-backend-p 'unknown-backend))
       (should (proofread--backend-check
                request
