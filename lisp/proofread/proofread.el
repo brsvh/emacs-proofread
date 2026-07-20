@@ -521,9 +521,6 @@ interrupting proofreading.")
 (defvar proofread--mode-buffers nil
   "Live buffers where `proofread-mode' has installed local hooks.")
 
-(defvar proofread--window-hooks-installed nil
-  "Non-nil when global window activity hooks are installed.")
-
 (defvar proofread--inhibit-overlay-invalidation nil
   "Buffer whose correction edits must preserve proofread overlays.")
 
@@ -4920,31 +4917,9 @@ BEG and END delimit the changed text."
   (when proofread--request-queue
     (proofread--schedule-queue-dispatch)))
 
-(defun proofread--mark-window-buffer-pending (window)
-  "Mark WINDOW's buffer pending when it has active `proofread-mode'."
-  (when (and (window-live-p window)
-             (not (window-minibuffer-p window)))
-    (let ((buffer (window-buffer window)))
-      (when (buffer-live-p buffer)
-        (with-current-buffer buffer
-          (proofread--mark-pending-work))))))
-
-(defun proofread--window-scroll (window _display-start)
-  "Mark WINDOW's buffer pending after scroll activity."
-  (proofread--mark-window-buffer-pending window))
-
-(defun proofread--window-configuration-change ()
-  "Mark proofread buffers pending after a window change."
-  (dolist (window (window-list nil nil))
-    (proofread--mark-window-buffer-pending window)))
-
-(defun proofread--install-window-hooks ()
-  "Install global window activity hooks used by `proofread-mode'."
-  (unless proofread--window-hooks-installed
-    (add-hook 'window-scroll-functions #'proofread--window-scroll)
-    (add-hook 'window-configuration-change-hook
-              #'proofread--window-configuration-change)
-    (setq proofread--window-hooks-installed t)))
+(defun proofread--window-scroll (_window _display-start)
+  "Mark the current buffer pending after scroll activity."
+  (proofread--mark-pending-work))
 
 (defun proofread--live-mode-buffer-p (buffer)
   "Return non-nil if BUFFER is live and has `proofread-mode' enabled."
@@ -4960,27 +4935,17 @@ BEG and END delimit the changed text."
         (push buffer buffers)))
     (setq proofread--mode-buffers (nreverse buffers))))
 
-(defun proofread--uninstall-window-hooks-if-unused ()
-  "Uninstall global window hooks when no proofread buffers remain."
-  (proofread--prune-mode-buffers)
-  (unless proofread--mode-buffers
-    (remove-hook 'window-scroll-functions #'proofread--window-scroll)
-    (remove-hook 'window-configuration-change-hook
-                 #'proofread--window-configuration-change)
-    (setq proofread--window-hooks-installed nil)))
-
 (defun proofread--register-mode-buffer ()
   "Register the current buffer as using `proofread-mode' hooks."
   (setq proofread--mode-buffers
         (delq (current-buffer) proofread--mode-buffers))
-  (push (current-buffer) proofread--mode-buffers)
-  (proofread--install-window-hooks))
+  (push (current-buffer) proofread--mode-buffers))
 
 (defun proofread--unregister-mode-buffer ()
   "Unregister the current buffer from `proofread-mode' hooks."
   (setq proofread--mode-buffers
         (delq (current-buffer) proofread--mode-buffers))
-  (proofread--uninstall-window-hooks-if-unused))
+  (proofread--prune-mode-buffers))
 
 (defun proofread--kill-buffer ()
   "Clean up Proofread state before killing this buffer."
@@ -7471,6 +7436,9 @@ DIAGNOSTICS must be in navigation order.  Return `applied'."
   (add-hook 'kill-buffer-hook #'proofread--kill-buffer nil t)
   (add-hook 'change-major-mode-hook
             #'proofread--change-major-mode nil t)
+  (add-hook 'window-scroll-functions #'proofread--window-scroll nil t)
+  (add-hook 'window-configuration-change-hook
+            #'proofread--mark-pending-work nil t)
   (proofread--enable-echo-area)
   (proofread--register-mode-buffer)
   (proofread--mark-pending-work))
@@ -7482,6 +7450,9 @@ DIAGNOSTICS must be in navigation order.  Return `applied'."
   (remove-hook 'kill-buffer-hook #'proofread--kill-buffer t)
   (remove-hook 'change-major-mode-hook
                #'proofread--change-major-mode t)
+  (remove-hook 'window-scroll-functions #'proofread--window-scroll t)
+  (remove-hook 'window-configuration-change-hook
+               #'proofread--mark-pending-work t)
   (proofread--disable-echo-area)
   (proofread--clear-buffer-state)
   (proofread--unregister-mode-buffer))
@@ -8027,16 +7998,16 @@ buffer."
 
 (defun proofread-unload-function ()
   "Remove Proofread state and hooks before unloading this library."
-  (let (auxiliary-buffers)
+  (let ((registered-buffers
+         (copy-sequence proofread--mode-buffers))
+        auxiliary-buffers)
     (dolist (buffer (buffer-list))
       (with-current-buffer buffer
         (cond
          ((bound-and-true-p proofread-mode)
           (proofread-mode -1))
-         ((memq buffer proofread--mode-buffers)
-          (proofread--disable-echo-area)
-          (proofread--clear-buffer-state)
-          (proofread--unregister-mode-buffer)))
+         ((memq buffer registered-buffers)
+          (proofread--disable-buffer)))
         (when (memq major-mode
                     '( proofread-requests-buffer-mode
                        proofread-diagnostics-buffer-mode))
@@ -8044,16 +8015,12 @@ buffer."
     (dolist (buffer auxiliary-buffers)
       (when (buffer-live-p buffer)
         (kill-buffer buffer))))
-  (remove-hook 'window-scroll-functions #'proofread--window-scroll)
-  (remove-hook 'window-configuration-change-hook
-               #'proofread--window-configuration-change)
   (dolist (source (copy-sequence proofread--request-log-sources))
     (proofread--request-log-disable-source source))
   (remove-hook 'proofread-request-log-hook
                #'proofread--request-log-record-event)
   (setq proofread--request-log-sources nil)
   (setq proofread--mode-buffers nil)
-  (setq proofread--window-hooks-installed nil)
   (remove-variable-watcher
    'proofread-echo-area-messages
    #'proofread--echo-area-option-watcher)

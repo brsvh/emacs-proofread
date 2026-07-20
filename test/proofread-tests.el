@@ -1839,7 +1839,7 @@ range; no available backend"))))))
                            'proofread-test-timer)))
                 (proofread--window-scroll (selected-window)
                                           (point-min))
-                (proofread--window-configuration-change)
+                (run-hooks 'window-configuration-change-hook)
                 (should-not timer-count)
                 (should-not proofread--pending-work)
                 (should-not proofread--idle-timer)
@@ -2129,16 +2129,111 @@ range; no available backend"))))))
                                   "proofread-test-window-timer-%d"
                                   timer-count)))))
               (switch-to-buffer proofread-buffer)
-              (proofread--window-scroll (selected-window) (point-min))
+              (run-hook-with-args 'window-scroll-functions
+                                  (selected-window) (point-min))
               (with-current-buffer proofread-buffer
                 (should proofread--pending-work))
               (switch-to-buffer plain-buffer)
-              (proofread--window-scroll (selected-window) (point-min))
+              (run-hook-with-args 'window-scroll-functions
+                                  (selected-window) (point-min))
               (with-current-buffer plain-buffer
                 (should-not proofread--pending-work))
               (should (= timer-count 1))))
         (kill-buffer proofread-buffer)
         (kill-buffer plain-buffer)))))
+
+(ert-deftest proofread-test-window-activity-hooks-are-buffer-local ()
+  "Install window activity hooks only in enabled buffers."
+  (let ((first-buffer
+         (generate-new-buffer " *proofread-window-hooks-first*"))
+        (second-buffer
+         (generate-new-buffer " *proofread-window-hooks-second*")))
+    (unwind-protect
+        (progn
+          (dolist (buffer (list first-buffer second-buffer))
+            (with-current-buffer buffer
+              (setq-local proofread-auto-check nil)
+              (proofread-mode 1)))
+          (should-not
+           (memq #'proofread--window-scroll
+                 (default-value 'window-scroll-functions)))
+          (should-not
+           (memq #'proofread--mark-pending-work
+                 (default-value
+                  'window-configuration-change-hook)))
+          (with-current-buffer first-buffer
+            (should (local-variable-p 'window-scroll-functions))
+            (should
+             (local-variable-p
+              'window-configuration-change-hook))
+            (should (= (cl-count #'proofread--window-scroll
+                                 window-scroll-functions)
+                       1))
+            (should
+             (= (cl-count
+                 #'proofread--mark-pending-work
+                 window-configuration-change-hook)
+                1))
+            (proofread-mode 1)
+            (should (= (cl-count #'proofread--window-scroll
+                                 window-scroll-functions)
+                       1))
+            (should
+             (= (cl-count
+                 #'proofread--mark-pending-work
+                 window-configuration-change-hook)
+                1))
+            (proofread-mode -1)
+            (should-not
+             (memq #'proofread--window-scroll
+                   window-scroll-functions))
+            (should-not
+             (memq #'proofread--mark-pending-work
+                   window-configuration-change-hook)))
+          (with-current-buffer second-buffer
+            (should
+             (memq #'proofread--window-scroll
+                   window-scroll-functions))
+            (should
+             (memq #'proofread--mark-pending-work
+                   window-configuration-change-hook))))
+      (kill-buffer first-buffer)
+      (kill-buffer second-buffer))))
+
+(ert-deftest
+    proofread-test-window-activity-with-two-windows-schedules-once ()
+  "Schedule one idle check when two windows show the same buffer."
+  (save-window-excursion
+    (let ((buffer
+           (generate-new-buffer " *proofread-window-hooks-shared*")))
+      (unwind-protect
+          (progn
+            (switch-to-buffer buffer)
+            (insert "Alpha")
+            (setq-local proofread-auto-check nil)
+            (proofread-mode 1)
+            (let ((first-window (selected-window))
+                  (second-window (split-window-right))
+                  timer-count)
+              (set-window-buffer second-window buffer)
+              (setq proofread-auto-check t)
+              (cl-letf (((symbol-function 'run-with-idle-timer)
+                         (lambda (_seconds _repeat _function &rest
+                                           _args)
+                           (setq timer-count
+                                 (1+ (or timer-count 0)))
+                           'proofread-test-window-timer)))
+                (with-selected-window first-window
+                  (run-hook-with-args
+                   'window-scroll-functions first-window
+                   (window-start first-window)))
+                (with-selected-window second-window
+                  (run-hook-with-args
+                   'window-scroll-functions second-window
+                   (window-start second-window)))
+                (should (= timer-count 1))
+                (should proofread--pending-work))))
+        (kill-buffer buffer)))))
 
 (ert-deftest proofread-test-window-configuration-change-marks-buffer
     ()
@@ -2161,11 +2256,78 @@ range; no available backend"))))))
                                   "proofread-test-window-timer-%d"
                                   timer-count)))))
               (switch-to-buffer proofread-buffer)
-              (proofread--window-configuration-change)
+              (run-hooks 'window-configuration-change-hook)
               (with-current-buffer proofread-buffer
                 (should proofread--pending-work))
               (should (= timer-count 1))))
         (kill-buffer proofread-buffer)))))
+
+(ert-deftest
+    proofread-test-window-activity-does-not-enumerate-windows ()
+  "Handle window activity without scanning windows or frames."
+  (with-temp-buffer
+    (insert "Alpha")
+    (setq-local proofread-auto-check nil)
+    (proofread-mode 1)
+    (setq proofread-auto-check t)
+    (let (timer-count)
+      (cl-letf (((symbol-function 'run-with-idle-timer)
+                 (lambda (_seconds _repeat _function &rest _args)
+                   (setq timer-count (1+ (or timer-count 0)))
+                   'proofread-test-window-timer))
+                ((symbol-function 'window-list)
+                 (lambda (&rest _args)
+                   (ert-fail "Window activity enumerated windows")))
+                ((symbol-function 'frame-list)
+                 (lambda ()
+                   (ert-fail "Window activity enumerated frames"))))
+        (proofread--window-scroll (selected-window) (point-min))
+        (run-hooks 'window-configuration-change-hook)
+        (should (= timer-count 1))
+        (should proofread--pending-work)))))
+
+(ert-deftest proofread-test-unload-cleans-stale-local-window-hooks ()
+  "Unload local window hooks from stale registered buffers."
+  (let* ((first-buffer
+          (generate-new-buffer
+           " *proofread-window-hooks-stale-first*"))
+         (second-buffer
+          (generate-new-buffer
+           " *proofread-window-hooks-stale-second*"))
+         (buffers (list first-buffer second-buffer))
+         (proofread--mode-buffers nil)
+         (proofread--request-log-sources nil)
+         (proofread-request-log-hook
+          (copy-sequence proofread-request-log-hook)))
+    (unwind-protect
+        (progn
+          (dolist (buffer buffers)
+            (with-current-buffer buffer
+              (setq-local proofread-auto-check nil)
+              (proofread-mode 1)
+              (should
+               (memq #'proofread--window-scroll
+                     window-scroll-functions))
+              ;; Simulate an interrupted teardown that left the
+              ;; buffer registered after the mode variable changed.
+              (setq proofread-mode nil)))
+          (cl-letf (((symbol-function 'buffer-list)
+                     (lambda (&optional _frame) buffers))
+                    ((symbol-function 'remove-variable-watcher)
+                     (lambda (_symbol _function))))
+            (proofread-unload-function))
+          (dolist (buffer buffers)
+            (with-current-buffer buffer
+              (should-not
+               (memq #'proofread--window-scroll
+                     window-scroll-functions))
+              (should-not
+               (memq #'proofread--mark-pending-work
+                     window-configuration-change-hook)))
+            (should-not (memq buffer proofread--mode-buffers))))
+      (dolist (buffer buffers)
+        (when (buffer-live-p buffer)
+          (kill-buffer buffer))))))
 
 (ert-deftest proofread-test-disable-mode-clears-scheduled-work ()
   "Disabling `proofread-mode' clears pending work and timer state."
@@ -2181,7 +2343,12 @@ range; no available backend"))))))
       (should-not proofread--pending-work)
       (should-not proofread--idle-timer)
       (should-not (memq #'proofread--after-change
-                        after-change-functions)))))
+                        after-change-functions))
+      (should-not (memq #'proofread--window-scroll
+                        window-scroll-functions))
+      (should-not
+       (memq #'proofread--mark-pending-work
+             window-configuration-change-hook)))))
 
 (ert-deftest
     proofread-test-disabled-mode-stale-timer-does-not-check-visible ()
@@ -2209,6 +2376,7 @@ range; no available backend"))))))
       (proofread-mode 1))
     (kill-buffer buffer)
     (should-not (buffer-live-p buffer))
+    (should-not (memq buffer proofread--mode-buffers))
     (should-not (proofread--idle-timer-run buffer))))
 
 ;;;; Chunk and context tests
@@ -11567,7 +11735,14 @@ This covers URLs, email, invisible text, faces, and properties."
       (should-not proofread--diagnostics)
       (should-not proofread--active-requests)
       (should-not proofread--request-queue)
-      (should (= (hash-table-count proofread--cache) 0)))))
+      (should (= (hash-table-count proofread--cache) 0))
+      (should (= (cl-count #'proofread--window-scroll
+                           window-scroll-functions)
+                 1))
+      (should
+       (= (cl-count #'proofread--mark-pending-work
+                    window-configuration-change-hook)
+          1)))))
 
 (ert-deftest
     proofread-test-major-mode-change-tears-down-proofread-mode ()
@@ -11584,7 +11759,12 @@ This covers URLs, email, invisible text, faces, and properties."
       (should-not (overlay-buffer overlay))
       (should-not (memq (current-buffer) proofread--mode-buffers))
       (should-not (memq #'proofread--before-change
-                        before-change-functions)))))
+                        before-change-functions))
+      (should-not (memq #'proofread--window-scroll
+                        window-scroll-functions))
+      (should-not
+       (memq #'proofread--mark-pending-work
+             window-configuration-change-hook)))))
 
 (ert-deftest
     proofread-test-zero-width-diagnostic-invalidated-by-insertion ()
