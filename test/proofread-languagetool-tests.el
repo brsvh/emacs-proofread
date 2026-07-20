@@ -602,8 +602,7 @@ POINT-OFFSET is a zero-based offset or the symbol `end'."
                        (first-work
                         (proofread--make-request-work
                          (proofread--make-backend-request
-                          chunk 'languagetool)
-                         'languagetool))
+                          chunk 'languagetool)))
                        (diagnostic
                         '( :beg 1 :end 6 :text "Alpha"
                            :kind grammar :message "Cached"
@@ -615,8 +614,7 @@ POINT-OFFSET is a zero-based offset or the symbol `end'."
                    (proofread--cache-read-request
                     (proofread--make-request-work
                      (proofread--make-backend-request
-                      chunk 'languagetool)
-                     'languagetool)))
+                      chunk 'languagetool))))
                   (write-region second-content nil config nil 'silent)
                   (set-file-times config mtime)
                   (let* ((new-attributes (file-attributes config))
@@ -627,8 +625,7 @@ POINT-OFFSET is a zero-based offset or the symbol `end'."
                          (second-work
                           (proofread--make-request-work
                            (proofread--make-backend-request
-                            chunk 'languagetool)
-                           'languagetool)))
+                            chunk 'languagetool))))
                     (should
                      (= size
                         (file-attribute-size new-attributes)))
@@ -1767,13 +1764,11 @@ A stale timeout leaves readiness unchanged."
                   (proofread--make-backend-request
                    chunk 'languagetool))
                  (work
-                  (proofread--make-request-work
-                   request 'languagetool)))
+                  (proofread--make-request-work request)))
             (should
              (proofread--dispatch-backend-request
               work
-              (lambda (value) (setq result value))
-              'languagetool))
+              (lambda (value) (setq result value))))
             (should (proofread--active-request-p work))
             (proofread-languagetool-stop-server)
             (should (eq (plist-get result :error)

@@ -63,10 +63,9 @@ When PROFILE is nil, use the current profile."
     (proofread--make-backend-request
      chunk (plist-get checker :backend) checker profile)))
 
-(defun proofread-llm-test--make-work (request &optional backend)
-  "Return scheduled work owning backend REQUEST.
-BACKEND, when non-nil, selects the identity used for the cache key."
-  (proofread--make-request-work request backend))
+(defun proofread-llm-test--make-work (request)
+  "Return scheduled work owning backend REQUEST."
+  (proofread--make-request-work request))
 
 (defmacro proofread-llm-test--with-profile (language &rest body)
   "Run BODY with an LLM test profile using LANGUAGE."
@@ -986,8 +985,7 @@ BACKEND, when non-nil, selects the identity used for the cache key."
              (proofread--backend-check
               request
               (lambda (backend-result)
-                (setq result backend-result))
-              'llm)))
+                (setq result backend-result)))))
         (proofread-llm-test--assert-handle-shape handle))
       (should-not result)
       (should (proofread-llm-test--wait-for (lambda () result)))
@@ -1066,8 +1064,7 @@ BACKEND, when non-nil, selects the identity used for the cache key."
                (proofread--backend-check
                 request
                 (lambda (backend-result)
-                  (setq result backend-result))
-                'llm)))
+                  (setq result backend-result)))))
           (proofread-llm-test--assert-handle-shape handle))
         (should-not result)
         (should (proofread-llm-test--wait-for (lambda () result)))
@@ -1182,8 +1179,7 @@ BACKEND, when non-nil, selects the identity used for the cache key."
                  work
                  (lambda (value)
                    (cl-incf callbacks)
-                   (setq result value))
-                 'llm))
+                   (setq result value))))
           (push 'provider-request-b
                 (plist-get handle :requests))
           (should (timerp (plist-get handle :watchdog-timer)))
@@ -1433,8 +1429,7 @@ BACKEND, when non-nil, selects the identity used for the cache key."
                        (setq callback-saw-provider-cancel
                              (equal cancelled
                                     '( proofread-llm-test-request)))
-                       (setq result value))
-                     'llm))
+                       (setq result value))))
               (should (proofread--active-request-p work))
               (should (proofread--request-work-pending-p work))
               (should (= (proofread--active-request-slots) 0))
@@ -1570,8 +1565,7 @@ BACKEND, when non-nil, selects the identity used for the cache key."
         (should (proofread--backend-check
                  request
                  (lambda (backend-result)
-                   (setq result backend-result))
-                 'llm))
+                   (setq result backend-result))))
         (should-not result)
         (should (proofread-llm-test--wait-for (lambda () result)))
         (should (eq (plist-get result :status) 'ok))
@@ -1813,8 +1807,7 @@ BACKEND, when non-nil, selects the identity used for the cache key."
                  (proofread--backend-check
                   request
                   (lambda (backend-result)
-                    (setq result backend-result))
-                  'llm)))
+                    (setq result backend-result)))))
             (proofread-llm-test--assert-handle-shape handle)
             (should (equal (plist-get handle :requests)
                            '( proofread-llm-test-handle)))
@@ -1954,7 +1947,7 @@ BACKEND, when non-nil, selects the identity used for the cache key."
                    chunk))
                  (handle
                   (proofread--backend-check
-                   request #'ignore 'llm)))
+                   request #'ignore)))
             (let* ((interaction
                     (car (llm-chat-prompt-interactions
                           captured-prompt)))
@@ -1999,8 +1992,7 @@ BACKEND, when non-nil, selects the identity used for the cache key."
                  (lambda (backend-result)
                    (setq result backend-result)
                    (proofread--handle-backend-result
-                    work backend-result))
-                 'llm))
+                    work backend-result))))
         (should (proofread-llm-test--wait-for
                  (lambda ()
                    proofread--diagnostics)))
@@ -2069,8 +2061,7 @@ BACKEND, when non-nil, selects the identity used for the cache key."
         (let ((handle (proofread--dispatch-backend-request
                        work
                        (lambda (backend-result)
-                         (setq result backend-result))
-                       'llm)))
+                         (setq result backend-result)))))
           (should (= calls 3))
           (should (= (length (plist-get handle :requests)) 3))
           (let* ((later-prompt (car prompts))
@@ -2120,8 +2111,7 @@ BACKEND, when non-nil, selects the identity used for the cache key."
                  (work (proofread-llm-test--make-work request)))
             (proofread--dispatch-backend-request
              work (lambda (backend-result) (setq result
-                                                 backend-result))
-             'llm)
+                                                 backend-result)))
             (should (= calls 2))
             (should (proofread-llm-test--wait-for (lambda () result)))
             (should (eq (plist-get result :status) 'ok))
@@ -2169,8 +2159,7 @@ BACKEND, when non-nil, selects the identity used for the cache key."
                  (work (proofread-llm-test--make-work request)))
             (proofread--dispatch-backend-request
              work (lambda (backend-result) (setq result
-                                                 backend-result))
-             'llm)
+                                                 backend-result)))
             (should (= calls 3))
             (should (proofread-llm-test--wait-for (lambda () result)))
             (should (eq (plist-get result :status) 'error))
@@ -2209,8 +2198,7 @@ BACKEND, when non-nil, selects the identity used for the cache key."
                  (work (proofread-llm-test--make-work request)))
             (proofread--dispatch-backend-request
              work (lambda (backend-result) (setq result
-                                                 backend-result))
-             'llm)
+                                                 backend-result)))
             (should (= calls 3))
             (should (proofread-llm-test--wait-for (lambda () result)))
             (should (eq (plist-get result :status) 'error))
@@ -2250,8 +2238,7 @@ BACKEND, when non-nil, selects the identity used for the cache key."
                  (work (proofread-llm-test--make-work request)))
             (proofread--dispatch-backend-request
              work (lambda (backend-result) (setq result
-                                                 backend-result))
-             'llm)
+                                                 backend-result)))
             (should (= calls 2))
             (should (proofread-llm-test--wait-for (lambda () result)))
             (should (eq (plist-get result :status) 'ok))
@@ -2296,8 +2283,7 @@ BACKEND, when non-nil, selects the identity used for the cache key."
               (proofread--dispatch-backend-request
                work
                (lambda (backend-result)
-                 (setq result backend-result))
-               'llm)
+                 (setq result backend-result)))
               (should (= calls 1))
               (pcase scenario
                 ('edited
@@ -2333,8 +2319,7 @@ BACKEND, when non-nil, selects the identity used for the cache key."
           (should (proofread--dispatch-backend-request
                    work
                    (lambda (backend-result)
-                     (setq result backend-result))
-                   'llm))
+                     (setq result backend-result))))
           (should (proofread-llm-test--wait-for (lambda () result)))
           (should (eq (plist-get result :status) 'error))
           (should (eq (plist-get result :error) 'llm-error))
@@ -2368,8 +2353,7 @@ BACKEND, when non-nil, selects the identity used for the cache key."
                      (lambda (backend-result)
                        (setq result backend-result)
                        (proofread--handle-backend-result
-                        work backend-result))
-                     'llm))
+                        work backend-result))))
             (should (proofread-llm-test--wait-for (lambda () result)))
             (should (= calls 1))
             (should (eq (plist-get result :status) 'error))
@@ -2416,8 +2400,7 @@ BACKEND, when non-nil, selects the identity used for the cache key."
                            (lambda (backend-result)
                              (setq result
                                    (proofread--handle-backend-result
-                                    work backend-result)))
-                           'llm)))))
+                                    work backend-result))))))))
             (pcase scenario
               ('killed
                (kill-buffer buffer))
@@ -3343,13 +3326,12 @@ BACKEND, when non-nil, selects the identity used for the cache key."
     (proofread-llm-test--with-success
         (proofread-llm-test--response-content nil)
       (let* ((chunk (proofread-llm-test--whole-buffer-chunk))
-             (request (proofread--make-backend-request chunk))
+             (request (proofread--make-backend-request chunk 'llm))
              result)
         (should (proofread--backend-check
                  request
                  (lambda (backend-result)
-                   (setq result backend-result))
-                 'llm))
+                   (setq result backend-result))))
         (should-not result)
         (should (proofread-llm-test--wait-for (lambda () result)))
         (should (eq (plist-get result :status) 'ok))
@@ -3363,13 +3345,12 @@ BACKEND, when non-nil, selects the identity used for the cache key."
     (proofread-llm-test--with-error
         'llm-failure "LLM failure"
       (let* ((chunk (proofread-llm-test--whole-buffer-chunk))
-             (request (proofread--make-backend-request chunk))
+             (request (proofread--make-backend-request chunk 'llm))
              result)
         (should (proofread--backend-check
                  request
                  (lambda (backend-result)
-                   (setq result backend-result))
-                 'llm))
+                   (setq result backend-result))))
         (should-not result)
         (should (proofread-llm-test--wait-for (lambda () result)))
         (should (eq (plist-get result :status) 'error))
@@ -3414,8 +3395,7 @@ BACKEND, when non-nil, selects the identity used for the cache key."
                    (lambda (backend-result)
                      (setq status
                            (proofread--handle-backend-result
-                            work backend-result)))
-                   'llm))
+                            work backend-result)))))
           (should (proofread-llm-test--wait-for (lambda () status)))
           (setq events (nreverse events))
           (let ((types (mapcar (lambda (event)

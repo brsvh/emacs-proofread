@@ -597,13 +597,11 @@ work is published."
 (cl-defstruct
     (proofread--queue-entry
      (:constructor
-      proofread--make-queue-entry (work backend sequence)))
+      proofread--make-queue-entry (work sequence)))
   "One scheduled WORK linked into a request queue.
-BACKEND remains scheduler-owned until the scheduler call chain is
-normalized.  SEQUENCE is the immutable FIFO position assigned when
-the entry is created."
+SEQUENCE is the immutable FIFO position assigned when the entry is
+created."
   work
-  backend
   sequence
   previous
   next
@@ -635,6 +633,10 @@ every request prepared for that checker."
   backend-identity
   checker-identity
   source-label)
+
+(defun proofread--scheduled-work-backend (work)
+  "Return the backend frozen in WORK's immutable request."
+  (plist-get (proofread--scheduled-work-request work) :backend))
 
 (defvar proofread--backend-descriptor-snapshot nil
   "Dynamically captured `(BACKEND . DESCRIPTOR)' for submission.")
@@ -3160,13 +3162,12 @@ contains the checker and metadata snapshots to share across requests."
            proofread--backend-request-keys)))
     request))
 
-(defun proofread--make-request-work (request &optional backend)
-  "Return fresh scheduled work owning backend REQUEST.
-BACKEND, when non-nil, selects the identity used for the cache key."
+(defun proofread--make-request-work (request)
+  "Return fresh scheduled work owning backend REQUEST."
   (let ((work
          (proofread--make-scheduled-work
           request
-          (proofread--cache-key request backend)
+          (proofread--cache-key request)
           (cl-incf proofread--request-log-sequence))))
     (puthash request
              (proofread--scheduled-work-log-id work)
@@ -3513,11 +3514,10 @@ The report is delivered asynchronously."
     'unsupported-backend
     (format "Unsupported proofread backend: %S" backend))))
 
-(defun proofread--backend-check (request callback &optional backend)
-  "Submit REQUEST to BACKEND and invoke CALLBACK asynchronously.
-When BACKEND is nil, use REQUEST's `:backend'.  The return value is a
-backend handle."
-  (let* ((backend (or backend (plist-get request :backend)))
+(defun proofread--backend-check (request callback)
+  "Submit REQUEST and invoke CALLBACK asynchronously.
+The return value is a backend handle."
+  (let* ((backend (plist-get request :backend))
          (descriptor
           (if (and (consp proofread--backend-descriptor-snapshot)
                    (eq (car proofread--backend-descriptor-snapshot)
@@ -3546,12 +3546,10 @@ ERROR identifies the failure and DETAIL describes it."
            detail))))
     (plist-put result :phase 'submission)))
 
-(defun proofread--dispatch-backend-request
-    (work callback &optional backend)
-  "Register and submit WORK to BACKEND, then invoke CALLBACK.
-When BACKEND is nil, use WORK's backend request `:backend'."
+(defun proofread--dispatch-backend-request (work callback)
+  "Register and submit WORK, then invoke CALLBACK."
   (let* ((request (proofread--scheduled-work-request work))
-         (backend (or backend (plist-get request :backend)))
+         (backend (proofread--scheduled-work-backend work))
          (buffer (plist-get request :buffer)))
     (when (buffer-live-p buffer)
       (with-current-buffer buffer
@@ -3593,7 +3591,7 @@ When BACKEND is nil, use WORK's backend request `:backend'."
                             (cons backend descriptor))
                            (handle
                             (proofread--backend-check
-                             request wrapped-callback backend)))
+                             request wrapped-callback)))
                       (list :handle handle :cancel cancel))
                   (error
                    (pcase callback-state
@@ -3733,8 +3731,8 @@ there is no applicable entry."
       ('applied 'cached)
       ('stale 'stale))))
 
-(defun proofread--submit-request (work backend)
-  "Submit WORK through BACKEND when cache and concurrency permit.
+(defun proofread--submit-request (work)
+  "Submit WORK when cache and concurrency permit.
 Return one of the symbols `sent', `cached', `full', `stale', or
 `error'."
   (catch 'status
@@ -3768,8 +3766,7 @@ Return one of the symbols `sent', `cached', `full', `stale', or
             work
             (lambda (backend-result)
               (proofread--handle-backend-result
-               work backend-result))
-            backend)))
+               work backend-result)))))
       (cond
        ((eq result proofread--stale-dispatch-result) 'stale)
        (result 'sent)
@@ -3888,10 +3885,10 @@ value which the current claim already considered."
         (setq entry next)))
     (nreverse entries)))
 
-(defun proofread--new-request-queue-entry (state work backend)
-  "Return a fresh queue entry for WORK and BACKEND in STATE."
+(defun proofread--new-request-queue-entry (state work)
+  "Return a fresh queue entry for WORK in STATE."
   (proofread--make-queue-entry
-   work backend
+   work
    (cl-incf (proofread--queue-state-next-sequence state))))
 
 (defun proofread--append-request-queue-entry
@@ -3902,8 +3899,8 @@ When SUPPRESS-CACHE-WAKEUP is non-nil, forward it to the cache index."
    state entry (proofread--queue-state-tail state) nil
    suppress-cache-wakeup))
 
-(defun proofread--enqueue-requests (works backend)
-  "Append WORKS for BACKEND without running lifecycle hooks."
+(defun proofread--enqueue-requests (works)
+  "Append WORKS without running lifecycle hooks."
   (when (and works (not (proofread--clearing-scheduled-work-p)))
     (let ((state proofread--queue-state))
       (unless (proofread--queue-state-p state)
@@ -3911,7 +3908,7 @@ When SUPPRESS-CACHE-WAKEUP is non-nil, forward it to the cache index."
       (dolist (work works)
         (proofread--append-request-queue-entry
          state
-         (proofread--new-request-queue-entry state work backend))
+         (proofread--new-request-queue-entry state work))
         (puthash (proofread--request-work-key work)
                  work
                  proofread--pending-request-keys)))
@@ -4328,10 +4325,9 @@ Do not scan unrelated requests."
                 (proofread--queue-dispatch-transaction-current-p)
                 (not (proofread--request-queue-empty-p)))
       (let* ((entry (proofread--claim-request-queue-head))
-             (work (proofread--queue-entry-work entry))
-             (backend (proofread--queue-entry-backend entry)))
+             (work (proofread--queue-entry-work entry)))
         (unwind-protect
-            (pcase (proofread--submit-request work backend)
+            (pcase (proofread--submit-request work)
               ('sent
                (proofread--release-claimed-request work)
                (push (proofread--scheduled-work-request work)
@@ -4981,19 +4977,20 @@ range."
     status))
 
 (defun proofread--prepare-checker-request-work
-    (chunks backend profile preparation)
+    (chunks profile preparation)
   "Prepare unpublished request work from PREPARATION.
-CHUNKS, BACKEND, and PROFILE describe the work.  Return `(WORK .
-CHUNK)' pairs after removing duplicate pending work."
-  (let ((checker
-         (proofread--checker-preparation-checker preparation))
-        (new-work-keys (make-hash-table :test #'equal))
-        prepared)
+CHUNKS and PROFILE describe the work.  Return `(WORK . CHUNK)' pairs
+after removing duplicate pending work."
+  (let* ((checker
+          (proofread--checker-preparation-checker preparation))
+         (backend (plist-get checker :backend))
+         (new-work-keys (make-hash-table :test #'equal))
+         prepared)
     (dolist (chunk chunks)
       (let* ((request
               (proofread--make-backend-request
                chunk backend checker profile preparation))
-             (work (proofread--make-request-work request backend))
+             (work (proofread--make-request-work request))
              (work-key (proofread--request-work-key work)))
         (unless (or (proofread--request-work-pending-p work)
                     (gethash work-key new-work-keys))
@@ -5001,15 +4998,15 @@ CHUNK)' pairs after removing duplicate pending work."
           (push (cons work chunk) prepared))))
     (nreverse prepared)))
 
-(defun proofread--dispatch-prepared-checker-work (prepared backend)
-  "Publish and dispatch PREPARED request work through BACKEND."
+(defun proofread--dispatch-prepared-checker-work (prepared)
+  "Publish and dispatch PREPARED request work."
   (let* ((works (mapcar #'car prepared))
          (superseded
           (proofread--supersede-conflicting-requests works)))
     ;; Publish the complete batch before lifecycle hooks or
     ;; cancellation callbacks can edit the buffer or enqueue more work.
     (let ((enqueued
-           (proofread--enqueue-requests works backend)))
+           (proofread--enqueue-requests works)))
       (when enqueued
         (proofread--attach-request-batch works))
       (let ((proofread--inhibit-queue-dispatch (current-buffer)))
@@ -5022,7 +5019,8 @@ CHUNK)' pairs after removing duplicate pending work."
                  :chunk (cdr work))
                 (proofread--record-request-event
                  scheduled-work 'queued-request
-                 :backend backend)))
+                 :backend
+                 (proofread--scheduled-work-backend scheduled-work))))
           (dolist (work works)
             (proofread--reject-request-during-clear work))))
       (when enqueued
@@ -5031,12 +5029,11 @@ CHUNK)' pairs after removing duplicate pending work."
 (defun proofread--dispatch-request-ready-chunks
     (chunks &optional backend checker profile)
   "Dispatch request-ready CHUNKS through BACKEND.
-When BACKEND is nil, use CHECKER's backend.  CHECKER and PROFILE, when
-non-nil, identify the selected profile checker.  Return dispatched
-requests."
-  (let* ((backend (or backend
-                      (plist-get checker :backend)))
-         (checker (or checker (proofread--ad-hoc-checker backend)))
+When CHECKER is non-nil, its backend is canonical and BACKEND is
+ignored.  CHECKER and PROFILE identify the selected profile checker.
+Return dispatched requests."
+  (let* ((checker (or checker (proofread--ad-hoc-checker backend)))
+         (backend (plist-get checker :backend))
          (descriptor (proofread--backend-descriptor backend)))
     (when descriptor
       (when chunks
@@ -5044,8 +5041,7 @@ requests."
                (proofread--prepare-checker checker descriptor)))
           (proofread--dispatch-prepared-checker-work
            (proofread--prepare-checker-request-work
-            chunks backend profile preparation)
-           backend))))))
+            chunks profile preparation)))))))
 
 (defun proofread--prepare-profile-checker-dispatch
     (chunks profile checker)
@@ -5104,7 +5100,7 @@ includes one checker-level `:failure'."
              :supported t
              :work
              (proofread--prepare-checker-request-work
-              chunks backend profile preparation))
+              chunks profile preparation))
           (error
            (list
             :status 'failed
@@ -5132,8 +5128,7 @@ The result contains `:requests', `:supported-count', and `:failures'."
                  (nconc
                   requests
                   (proofread--dispatch-prepared-checker-work
-                   (plist-get preparation :work)
-                   (plist-get checker :backend)))))
+                   (plist-get preparation :work)))))
           ('failed
            (let ((failure (plist-get preparation :failure)))
              (push failure failures)
@@ -6652,7 +6647,7 @@ nil for a change to the default."
                :beg (plist-get request :beg)
                :end (plist-get request :end)
                :request request
-               :backend (proofread--queue-entry-backend entry)))))))
+               :backend (proofread--scheduled-work-backend work)))))))
 
 (defun proofread--install-source-list-cleanup ()
   "Install lifecycle cleanup for lists owned by the current source."
