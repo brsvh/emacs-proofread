@@ -69,16 +69,6 @@
   'proofread-set-positive-integer-option
   "0.2.0")
 
-(defcustom proofread-language nil
-  "Legacy language hint used when `proofread-profile' is nil.
-When nil, the selected legacy backend may infer the language from
-buffer contents or other configuration.
-
-This option is obsolete.  Set the `:language' property of the profile
-selected by `proofread-profile' instead."
-  :type '(choice (const :tag "Infer" nil) string)
-  :group 'proofread)
-
 (defcustom proofread-auto-check t
   "Non-nil means schedule automatic checks in `proofread-mode'.
 When nil, enabling the mode, buffer changes, and window activity do
@@ -169,19 +159,6 @@ prevents new backend requests from being sent."
   :type 'natnum
   :group 'proofread)
 
-(defcustom proofread-backend nil
-  "Legacy backend selected when `proofread-profile' is nil.
-The symbol `llm' uses `proofread-llm-provider'.  The symbol
-`languagetool' uses a local LanguageTool HTTP server.  A nil value
-disables legacy backend dispatch.
-
-This option is obsolete.  Configure named checker entries in
-`proofread-profiles' and select one with `proofread-profile' instead."
-  :type '(choice (const :tag "None" nil)
-                 (const :tag "Generic llm backend" llm)
-                 (const :tag "LanguageTool backend" languagetool))
-  :group 'proofread)
-
 (defcustom proofread-profiles nil
   "Named proofreading profiles.
 Each element maps a stable profile name to a profile property list.
@@ -206,18 +183,19 @@ A profile may contain:
 
 (defcustom proofread-profile nil
   "Selected proofreading profile.
-The value nil keeps the legacy `proofread-backend' and
-`proofread-language' settings active.  A symbol selects the matching
-entry from `proofread-profiles'.
+The value nil disables backend dispatch.  A non-nil symbol selects the
+matching entry from `proofread-profiles'.
 
 This option may be set buffer-locally, for example with
 `setq-local' or file/directory-local variables, when different
 buffers should use different profiles."
   :type '(choice
-          (const :tag "Use legacy backend settings" nil)
+          (const :tag "Disable backend dispatch" nil)
           symbol)
+  :package-version '(proofread . "0.3.0")
   :group 'proofread)
 
+;; Keep compiler-facing tombstones for configuration removed in 0.3.0.
 (make-obsolete-variable
  'proofread-backend
  "configure `proofread-profiles' and select one with `proofread-profile'"
@@ -284,11 +262,11 @@ request-ready chunks."
     (languagetool . proofread-languagetool))
   "Alist mapping built-in backend names to their library features.")
 
-(defconst proofread--legacy-profile-name 'legacy
-  "Profile name used for synthetic legacy backend settings.")
+(defconst proofread--ad-hoc-profile-name 'ad-hoc
+  "Profile name used for explicit low-level backend requests.")
 
-(defconst proofread--legacy-checker-name 'legacy
-  "Checker name used for synthetic legacy backend settings.")
+(defconst proofread--ad-hoc-checker-name 'ad-hoc
+  "Checker name used for explicit low-level backend requests.")
 
 (defconst proofread--profile-keys
   '( :language :display-language :checkers)
@@ -402,9 +380,6 @@ request-ready chunks."
 
 (defvar proofread--ignored-diagnostics (make-hash-table :test #'equal)
   "Session-local table of ignored proofread diagnostic keys.")
-
-(defvar proofread--legacy-dispatch-warning-issued-p nil
-  "Non-nil after warning about legacy dispatch this session.")
 
 (defvar-local proofread--diagnostics nil
   "Proofread diagnostics for the current buffer.")
@@ -781,42 +756,18 @@ hash table used to reject duplicate checker names inside the profile."
             (proofread--normalize-profile-checkers
              name checkers)))))
 
-(defun proofread--legacy-profile-checker ()
-  "Return the normalized checker selected by legacy options.
-Return nil when `proofread-backend' is nil.  Mark a returned checker
-so it cannot alias an explicitly named profile and checker."
-  (when proofread-backend
-    (unless (symbolp proofread-backend)
-      (error "Proofread backend must be nil or a symbol"))
-    (list :profile proofread--legacy-profile-name
-          :name proofread--legacy-checker-name
-          :checker-ordinal 0
-          :backend proofread-backend
-          :options nil
-          :legacy t)))
-
 (defun proofread--ad-hoc-checker (backend)
   "Return an internal checker for an explicit low-level BACKEND.
 Ad-hoc checkers are independent of profile selection and cannot alias
-synthetic legacy or explicit profile checkers."
+explicit profile checkers."
   (when backend
     (unless (symbolp backend)
       (error "Proofread backend must be nil or a symbol"))
-    (list :profile proofread--legacy-profile-name
-          :name proofread--legacy-checker-name
+    (list :profile proofread--ad-hoc-profile-name
+          :name proofread--ad-hoc-checker-name
           :backend backend
           :options nil
           :ad-hoc t)))
-
-(defun proofread--legacy-profile ()
-  "Return a normalized profile from legacy backend options."
-  (proofread--validate-language-option
-   proofread-language "proofread-language")
-  (let ((checker (proofread--legacy-profile-checker)))
-    (list :name proofread--legacy-profile-name
-          :language (proofread--snapshot-value proofread-language)
-          :display-language nil
-          :checkers (and checker (list checker)))))
 
 (defun proofread--current-profile ()
   "Return the normalized selected proofreading profile."
@@ -824,7 +775,7 @@ synthetic legacy or explicit profile checkers."
       (proofread--normalize-profile
        proofread-profile
        (proofread--profile-definition proofread-profile))
-    (proofread--legacy-profile)))
+    (proofread--normalize-profile nil nil)))
 
 (defun proofread--current-profile-language ()
   "Return the selected proofreading profile's language hint."
@@ -832,9 +783,8 @@ synthetic legacy or explicit profile checkers."
 
 (defun proofread--checker-discriminator (checker)
   "Return internal provenance properties for CHECKER."
-  (cond
-   ((plist-get checker :legacy) '( :legacy t))
-   ((plist-get checker :ad-hoc) '( :ad-hoc t))))
+  (when (plist-get checker :ad-hoc)
+    '( :ad-hoc t)))
 
 (defun proofread--checker-owner (checker)
   "Return the stable owner identity for CHECKER.
@@ -981,37 +931,22 @@ effective backend identity."
           ((null owner)
            (null (plist-get request :checker-identity)))
           (t
-           (let ((profile (proofread--current-profile)))
-             (if (null proofread-profile)
-                 (and (eq profile-name proofread--legacy-profile-name)
-                      (eq checker-name proofread--legacy-checker-name)
-                      (equal (plist-get request :language)
-                             (plist-get profile :language))
-                      (equal (plist-get request :display-language)
-                             (plist-get profile :display-language))
-                      (when-let* ((checker
-                                   (car (plist-get profile :checkers))))
-                        (and (equal owner
-                                    (proofread--checker-owner checker))
-                             (equal
-                              (plist-get request :checker-identity)
-                              (proofread--checker-identity checker)))))
-               (let ((checker
-                      (cl-find checker-name
-                               (plist-get profile :checkers)
-                               :key (lambda (candidate)
-                                      (plist-get candidate :name)))))
-                 (and (eq profile-name (plist-get profile :name))
-                      (equal (plist-get request :language)
-                             (plist-get profile :language))
-                      (equal (plist-get request :display-language)
-                             (plist-get profile :display-language))
-                      checker
-                      (equal owner
-                             (proofread--checker-owner checker))
-                      (equal (plist-get request :checker-identity)
-                             (proofread--checker-identity
-                              checker))))))))))
+           (let* ((profile (proofread--current-profile))
+                  (checker
+                   (cl-find checker-name
+                            (plist-get profile :checkers)
+                            :key (lambda (candidate)
+                                   (plist-get candidate :name)))))
+             (and (eq profile-name (plist-get profile :name))
+                  (equal (plist-get request :language)
+                         (plist-get profile :language))
+                  (equal (plist-get request :display-language)
+                         (plist-get profile :display-language))
+                  checker
+                  (equal owner
+                         (proofread--checker-owner checker))
+                  (equal (plist-get request :checker-identity)
+                         (proofread--checker-identity checker))))))))
     (error nil)))
 
 ;;;; State predicates
@@ -1081,17 +1016,6 @@ effective backend identity."
   'proofread-report-warning-without-window
   "0.2.0")
 
-(defun proofread--warn-about-legacy-dispatch ()
-  "Warn once per session about legacy configuration use."
-  (unless proofread--legacy-dispatch-warning-issued-p
-    (setq proofread--legacy-dispatch-warning-issued-p t)
-    (proofread-report-warning-without-window
-     (concat
-      "`proofread-backend' and `proofread-language' are obsolete; "
-      "configure `proofread-profiles' and select one with "
-      "`proofread-profile' instead")
-     "legacy configuration is obsolete; see *Warnings*")))
-
 (defun proofread--request-batch-error-counts (errors)
   "Return an alist counting backend error message strings in ERRORS."
   (let (counts)
@@ -1155,7 +1079,7 @@ effective backend identity."
   "Return a detached safe representation of checker OWNER."
   (when (proper-list-p owner)
     (proofread--request-log-copy-properties
-     owner '( :profile :checker-name :legacy :ad-hoc))))
+     owner '( :profile :checker-name :ad-hoc))))
 
 (defun proofread--request-log-safe-property-value (property value)
   "Return `(t . COPY)' when PROPERTY and VALUE are safe to log."
@@ -1171,7 +1095,7 @@ effective backend identity."
    ((and (memq property
                '( :type :status :final-status :profile :checker-name
                   :backend :major-mode :target-kind :kind :strategy
-                  :source :reason :phase :legacy :ad-hoc :partial))
+                  :source :reason :phase :ad-hoc :partial))
          (symbolp value))
     (cons t value))
    ((and (eq property :source) (stringp value))
@@ -1243,7 +1167,7 @@ Position values are frozen as integers; other values are detached."
     (let ((summary
            (proofread--request-log-copy-properties
             identity
-            '( :profile :checker-name :backend :legacy :ad-hoc))))
+            '( :profile :checker-name :backend :ad-hoc))))
       (when (and (proper-list-p identity)
                  (plist-member identity :backend-identity))
         (setq summary
@@ -2821,10 +2745,9 @@ owns the request.  Without CHECKER, create an ad-hoc low-level owner
 that is independent of profile selection.  IDENTITIES, when non-nil,
 contains precomputed identity and source-label snapshots for CHECKER."
   (let* ((checker (or checker
-                      (proofread--ad-hoc-checker
-                       (or backend proofread-backend))))
+                      (proofread--ad-hoc-checker backend)))
          (backend-name (or (plist-get checker :backend)
-                           backend proofread-backend))
+                           backend))
          (backend-identity
           (if identities
               (plist-get identities :backend-identity)
@@ -3012,9 +2935,9 @@ When MESSAGE is non-nil, include it as caller-readable error text."
           callback-value)))))
 
 (defun proofread--supported-backend-p (&optional backend)
-  "Return non-nil if BACKEND is a supported proofreading backend.
-When BACKEND is nil, check the selected `proofread-backend'."
-  (and (proofread--backend-descriptor (or backend proofread-backend))
+  "Return non-nil if non-nil BACKEND is a supported backend."
+  (and backend
+       (proofread--backend-descriptor backend)
        t))
 
 (defun proofread--request-relative-range-valid-p (request beg end)
@@ -3244,9 +3167,9 @@ The report is delivered asynchronously."
 
 (defun proofread--backend-check (request callback &optional backend)
   "Submit REQUEST to BACKEND and invoke CALLBACK asynchronously.
-When BACKEND is nil, use `proofread-backend'.  The return value is a
+When BACKEND is nil, use REQUEST's `:backend'.  The return value is a
 backend handle."
-  (let* ((backend (or backend proofread-backend))
+  (let* ((backend (or backend (plist-get request :backend)))
          (descriptor
           (if (and (consp proofread--backend-descriptor-snapshot)
                    (eq (car proofread--backend-descriptor-snapshot)
@@ -3278,8 +3201,8 @@ ERROR identifies the failure and DETAIL describes it."
 (defun proofread--dispatch-backend-request
     (request callback &optional backend)
   "Register and submit REQUEST to BACKEND, then invoke CALLBACK.
-When BACKEND is nil, use `proofread-backend'."
-  (let ((backend (or backend proofread-backend))
+When BACKEND is nil, use REQUEST's `:backend'."
+  (let ((backend (or backend (plist-get request :backend)))
         (buffer (plist-get request :buffer)))
     (when (buffer-live-p buffer)
       (with-current-buffer buffer
@@ -4266,23 +4189,21 @@ Do not scan unrelated requests."
    (t value)))
 
 (defun proofread--backend-identity (&optional backend)
-  "Return canonical identity for BACKEND.
-When BACKEND is nil, use the selected `proofread-backend'."
-  (let ((backend (or backend proofread-backend)))
-    (proofread--snapshot-value
-     (cond
-      ((proofread--backend-identity-p backend) backend)
-      ((null backend) nil)
-      (t
-       (when-let* ((descriptor
-                    (proofread--backend-descriptor backend))
-                   (identity (plist-get descriptor :identity)))
-         (let ((value (funcall identity)))
-           (unless (and (proofread--backend-identity-p value)
-                        (eq (plist-get value :backend) backend))
-             (error "Invalid identity for proofread backend %S"
-                    backend))
-           value)))))))
+  "Return canonical identity for BACKEND, or nil when it is nil."
+  (proofread--snapshot-value
+   (cond
+    ((proofread--backend-identity-p backend) backend)
+    ((null backend) nil)
+    (t
+     (when-let* ((descriptor
+                  (proofread--backend-descriptor backend))
+                 (identity (plist-get descriptor :identity)))
+       (let ((value (funcall identity)))
+         (unless (and (proofread--backend-identity-p value)
+                      (eq (plist-get value :backend) backend))
+           (error "Invalid identity for proofread backend %S"
+                  backend))
+         value))))))
 
 (defun proofread--chunk-text-hash (text)
   "Return a deterministic cache hash for chunk TEXT."
@@ -4304,8 +4225,7 @@ When BACKEND is nil, use the selected `proofread-backend'."
   "Return checker identity for cache key CHUNK and BACKEND."
   (or (plist-get chunk :checker-identity)
       (when-let* ((backend-name (or backend
-                                    (plist-get chunk :backend)
-                                    proofread-backend))
+                                    (plist-get chunk :backend)))
                   (checker
                    (proofread--ad-hoc-checker backend-name)))
         (if (plist-member chunk :backend-identity)
@@ -4326,7 +4246,8 @@ When BACKEND is nil, use the selected `proofread-backend'."
         :target-policy (plist-get chunk :target-policy)
         :target-kind (plist-get chunk :target-kind)
         :backend (or (plist-get chunk :backend-identity)
-                     (proofread--backend-identity backend))
+                     (proofread--backend-identity
+                      (or backend (plist-get chunk :backend))))
         :checker (proofread--cache-checker-identity chunk backend)
         :contract-version proofread--contract-version
         :context (proofread--context-cache-identity chunk)))
@@ -4520,15 +4441,13 @@ REQUEST-RANGE is the checked buffer range as a (BEG . END) pair."
 
 (defun proofread--diagnostic-owned-by-request-p (diagnostic request)
   "Return non-nil when REQUEST may replace DIAGNOSTIC.
-Diagnostics without checker provenance are legacy diagnostics.  They
-can be replaced by compatibility or ad-hoc requests, or by requests
-that also have no checker owner."
+Diagnostics without checker provenance can be replaced by ad-hoc
+requests or by requests that also have no checker owner."
   (let ((owner (plist-get request :checker-owner))
         (diagnostic-owner (plist-get diagnostic :checker-owner)))
     (or (equal diagnostic-owner owner)
         (and (null diagnostic-owner)
              (or (null owner)
-                 (plist-get owner :legacy)
                  (plist-get owner :ad-hoc))))))
 
 (defun proofread--diagnostics-replaced-by-request
@@ -4696,12 +4615,11 @@ CHUNKS, BACKEND, PROFILE, and IDENTITIES describe the work.  Return
 (defun proofread--dispatch-request-ready-chunks
     (chunks &optional backend checker profile)
   "Dispatch request-ready CHUNKS through BACKEND.
-When BACKEND is nil, use `proofread-backend'.  CHECKER and PROFILE,
-when non-nil, identify the selected profile checker.  Return
-dispatched requests."
+When BACKEND is nil, use CHECKER's backend.  CHECKER and PROFILE, when
+non-nil, identify the selected profile checker.  Return dispatched
+requests."
   (let* ((backend (or backend
-                      (plist-get checker :backend)
-                      proofread-backend))
+                      (plist-get checker :backend)))
          (checker (or checker (proofread--ad-hoc-checker backend))))
     (when (proofread--supported-backend-p backend)
       (when chunks
@@ -7680,8 +7598,6 @@ progress messages are inhibited."
          (normalized-ranges
           (proofread--normalize-accessible-ranges ranges))
          (profile (proofread--current-profile))
-         (legacy-profile-p
-          (null proofread-profile))
          (islands
           (proofread--target-islands-for-ranges
            normalized-ranges))
@@ -7694,8 +7610,6 @@ progress messages are inhibited."
                     :domain-end (plist-get island :domain-end)))
             islands)
            :test #'equal)))
-    (when (and legacy-profile-p (plist-get profile :checkers))
-      (proofread--warn-about-legacy-dispatch))
     (proofread--prune-diagnostics-outside-targets
      normalized-ranges domains)
     (proofread--prune-inactive-checker-diagnostics

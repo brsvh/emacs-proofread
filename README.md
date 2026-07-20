@@ -330,28 +330,30 @@ Do not mark arbitrary values of `proofread-profile` as safe. A profile may
 select a remote checker, and automatic checking may then send buffer contents to
 that provider.
 
-During compatibility with version 0.1 configurations, `nil` means that the
-obsolete single-backend settings remain active when configured; it does not
-unconditionally disable dispatch. To disable dispatch explicitly, select a named
-profile whose `:checkers` list is empty:
+Setting `proofread-profile` to `nil` disables backend dispatch. A named profile
+whose `:checkers` list is empty also disables dispatch and can serve as an
+explicitly selectable off state:
 
 ```elisp
 (add-to-list 'proofread-profiles '(disabled :checkers nil))
 (setq-local proofread-profile 'disabled)
 ```
 
-An explicit check with this profile removes profile-owned diagnostics from the
-checked range without dispatching backend requests. Diagnostics outside that
-range remain unchanged. This profile-owner retirement does not affect
-otherwise-valid ad-hoc diagnostics added through the low-level API.
+An explicit check while dispatch is disabled in either way removes profile-owned
+diagnostics from the checked range without dispatching backend requests.
+Diagnostics outside that range remain unchanged. This profile-owner retirement
+does not affect otherwise-valid ad-hoc diagnostics added through the low-level
+API.
 
-#### Migrating from version 0.1
+#### Migrating single-backend configurations from versions 0.1 and 0.2
 
-`proofread-backend` and `proofread-language` are obsolete in version 0.2. Move
+`proofread-backend` and `proofread-language` became obsolete in version 0.2 and
+are no longer read in version 0.3.0. An init file may still use `setq` to create
+or set either old variable, but its value has no effect on Proofread. Move
 backend selection into each checker's `:backend`, move the language hint into
-the profile's `:language`, and select that profile with `proofread-profile`. The
-old variables remain temporarily functional for compatibility when
-`proofread-profile` is `nil`, but new configurations should not set them.
+the profile's `:language`, and select that profile with `proofread-profile`. See
+the complete [minimal `llm` profile](#minimal-configuration-llm) above for a
+profile-and-checker configuration.
 
 `proofread-targets` controls which text is checked in each buffer:
 
@@ -535,7 +537,7 @@ Run `M-x customize-group RET proofread RET` to edit the core options:
 | `proofread-context-sentences-after`       | `1`     | Limit logical context sentences after a chunk                                     |
 | `proofread-max-concurrent-requests`       | `8`     | Limit active backend requests per buffer                                          |
 | `proofread-profiles`                      | `nil`   | Define named multi-backend profiles                                               |
-| `proofread-profile`                       | `nil`   | Select a named profile                                                            |
+| `proofread-profile`                       | `nil`   | Select a named profile; `nil` disables backend dispatch                           |
 | `proofread-llm-provider`                  | `nil`   | Default provider when an LLM checker omits `:provider`                            |
 | `proofread-llm-response-strategy`         | `auto`  | Default response strategy when an LLM checker omits `:response-strategy`          |
 | `proofread-llm-request-timeout`           | `120`   | Set the LLM watchdog and mode-local plz connect timeout; `nil` disables both      |

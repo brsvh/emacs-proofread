@@ -4,6 +4,23 @@ This file records notable user-visible changes to proofread and
 proofread-popup.  For detailed development history, see the Git log.
 
 
+* Changes in proofread 0.3.0
+
+** Incompatible changes
+
+---
+*** The legacy single-backend configuration has been removed.
+Proofread no longer reads the obsolete 'proofread-backend' and
+'proofread-language' variables.  Setting either variable has no effect on
+backend dispatch.  A nil 'proofread-profile' now disables backend dispatch, as
+does a named profile with an empty ':checkers' list.
+
+To migrate, define a named entry in 'proofread-profiles', move the language to
+the profile's ':language' property, represent each backend with a named checker
+whose ':backend' property selects it, and select the profile with
+'proofread-profile'.
+
+
 * Changes in proofread 0.2.0
 
 ** Configuration
