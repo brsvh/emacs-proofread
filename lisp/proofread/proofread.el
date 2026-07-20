@@ -1655,6 +1655,18 @@ ranges are discarded.  Overlapping or adjacent ranges are merged."
 
 ;;;; Target discovery
 
+(cl-defstruct
+    (proofread--selection-plan
+     (:constructor proofread--make-selection-plan
+                   (ranges domains islands)))
+  "One immutable-by-convention target selection snapshot.
+RANGES are normalized accessible half-open ranges.  DOMAINS are the
+complete target domains returned by discovery, and ISLANDS are their
+intersections with RANGES."
+  ranges
+  domains
+  islands)
+
 (defun proofread--effective-target-policy ()
   "Return the effective proofreading target policy for this buffer."
   (pcase proofread-targets
@@ -1778,12 +1790,13 @@ BUFFER-END is the end of the widened buffer."
                 state (cdr advanced)))))
     (nreverse containers)))
 
-(defun proofread--syntax-containers-for-ranges (ranges kind)
+(defun proofread--syntax-containers-in-normalized-ranges
+    (ranges kind)
   "Return full syntactic containers of KIND overlapping RANGES.
-KIND is either `comment' or `string'.  Selection is limited to the
-current restriction, but returned containers may extend beyond it."
-  (let ((ranges (proofread--normalize-accessible-ranges ranges))
-        containers)
+RANGES must be normalized inside the current restriction.  KIND is
+either `comment' or `string'.  Returned containers may extend beyond
+the restriction."
+  (let (containers)
     (proofread--with-widened-syntax
       (dolist (range ranges)
         (setq containers
@@ -1792,6 +1805,14 @@ current restriction, but returned containers may extend beyond it."
                 range (point-max) kind)
                containers))))
     (proofread--normalize-overlapping-ranges containers)))
+
+(defun proofread--syntax-containers-for-ranges (ranges kind)
+  "Return full syntactic containers of KIND overlapping RANGES.
+Accept raw RANGES and normalize them within the current restriction.
+KIND is either `comment' or `string'.  Returned containers may extend
+beyond the restriction."
+  (proofread--syntax-containers-in-normalized-ranges
+   (proofread--normalize-accessible-ranges ranges) kind))
 
 (defun proofread--horizontally-adjacent-ranges-p (left right)
   "Return non-nil if horizontal space separates LEFT and RIGHT."
@@ -1846,12 +1867,13 @@ MINIMUM and MAXIMUM bound the expansion."
           (setq expanded t))))
     (cons beg end)))
 
-(defun proofread--comment-domains-for-ranges (ranges)
-  "Return logical comment domains overlapping RANGES.
+(defun proofread--comment-domains-in-normalized-ranges (ranges)
+  "Return logical comment domains overlapping normalized RANGES.
 Consecutive line comments separated only by indentation are treated as
 one domain so sentence context can cross their source lines."
   (let ((comments
-         (proofread--syntax-containers-for-ranges ranges 'comment))
+         (proofread--syntax-containers-in-normalized-ranges
+          ranges 'comment))
         (expansion-size (proofread--comment-domain-expansion-size))
         domains)
     (when comments
@@ -1870,6 +1892,13 @@ one domain so sentence context can cross their source lines."
                           (+ (cdr comment) expansion-size)))
                     domains))))))
     (proofread--normalize-overlapping-ranges domains)))
+
+(defun proofread--comment-domains-for-ranges (ranges)
+  "Return logical comment domains overlapping raw RANGES.
+Consecutive line comments separated only by indentation form one
+domain so sentence context can cross their source lines."
+  (proofread--comment-domains-in-normalized-ranges
+   (proofread--normalize-accessible-ranges ranges)))
 
 (defun proofread--face-value-contains-p (value face)
   "Return non-nil if FACE is present recursively in face VALUE."
@@ -1968,10 +1997,11 @@ Search before POSITION."
     (when face-match
       (proofread--expand-range-over-doc-face string-range))))
 
-(defun proofread--docstring-domains-for-ranges (ranges)
-  "Return full docstring domains overlapping RANGES."
+(defun proofread--docstring-domains-in-normalized-ranges (ranges)
+  "Return full docstring domains overlapping normalized RANGES."
   (let ((strings
-         (proofread--syntax-containers-for-ranges ranges 'string))
+         (proofread--syntax-containers-in-normalized-ranges
+          ranges 'string))
         face-domains
         unmatched-strings
         domains)
@@ -2005,6 +2035,11 @@ Search before POSITION."
               (push domain domains))))))
     (proofread--normalize-ranges domains)))
 
+(defun proofread--docstring-domains-for-ranges (ranges)
+  "Return full docstring domains overlapping raw RANGES."
+  (proofread--docstring-domains-in-normalized-ranges
+   (proofread--normalize-accessible-ranges ranges)))
+
 (defun proofread--make-target-domain
     (range kind policy minimum maximum)
   "Return a target domain plist for RANGE and KIND under POLICY.
@@ -2017,17 +2052,17 @@ MINIMUM and MAXIMUM are the accessible buffer bounds."
             :domain-beg beg
             :domain-end end))))
 
-(defun proofread--target-domains-for-kind
+(defun proofread--target-domains-for-kind-in-normalized-ranges
     (ranges kind policy minimum maximum)
-  "Return target domains of KIND overlapping RANGES under POLICY.
-MINIMUM and MAXIMUM are the accessible buffer bounds."
+  "Return target domains of KIND in normalized RANGES under POLICY.
+MINIMUM and MAXIMUM are the snapshotted accessible buffer bounds."
   (let ((target-ranges
          (pcase kind
            ('text (and ranges (list (cons minimum maximum))))
            ('comment
-            (proofread--comment-domains-for-ranges ranges))
+            (proofread--comment-domains-in-normalized-ranges ranges))
            ('docstring
-            (proofread--docstring-domains-for-ranges ranges))
+            (proofread--docstring-domains-in-normalized-ranges ranges))
            (_ (error "Unsupported proofread target kind: %S" kind))))
         domains)
     (dolist (range target-ranges)
@@ -2037,31 +2072,36 @@ MINIMUM and MAXIMUM are the accessible buffer bounds."
         (push domain domains)))
     (nreverse domains)))
 
-(defun proofread--target-domains-for-ranges (ranges)
-  "Return complete proofreading target domains overlapping RANGES."
-  (let* ((minimum (point-min))
-         (maximum (point-max))
-         (ranges (proofread--normalize-accessible-ranges ranges))
-         (policy (proofread--effective-target-policy))
-         domains)
+(defun proofread--target-domains-for-kind
+    (ranges kind policy minimum maximum)
+  "Return target domains of KIND overlapping raw RANGES under POLICY.
+MINIMUM and MAXIMUM are the accessible buffer bounds."
+  (proofread--target-domains-for-kind-in-normalized-ranges
+   (proofread--normalize-accessible-ranges ranges)
+   kind policy minimum maximum))
+
+(defun proofread--target-domains-in-normalized-ranges
+    (ranges policy minimum maximum)
+  "Return target domains discovered from normalized RANGES.
+POLICY and accessible bounds MINIMUM and MAXIMUM belong to the same
+selection snapshot as RANGES."
+  (let (domains)
     (dolist (kind '( text comment docstring))
       (when (proofread--target-policy-includes-p policy kind)
         (setq domains
               (nconc domains
-                     (proofread--target-domains-for-kind
+                     (proofread--target-domains-for-kind-in-normalized-ranges
                       ranges kind policy minimum maximum)))))
     (sort domains
           (lambda (left right)
             (< (plist-get left :domain-beg)
                (plist-get right :domain-beg))))))
 
-(defun proofread--target-islands-for-ranges (ranges)
-  "Return selected target islands for accessible RANGES.
-Each island records its selected bounds and its complete target
-domain."
-  (let ((ranges (proofread--normalize-accessible-ranges ranges))
-        islands)
-    (dolist (domain (proofread--target-domains-for-ranges ranges))
+(defun proofread--target-islands-in-normalized-ranges
+    (ranges domains)
+  "Return intersections of normalized RANGES and complete DOMAINS."
+  (let (islands)
+    (dolist (domain domains)
       (let ((domain-beg (plist-get domain :domain-beg))
             (domain-end (plist-get domain :domain-end)))
         (dolist (range ranges)
@@ -2075,6 +2115,35 @@ domain."
           (lambda (left right)
             (< (plist-get left :beg)
                (plist-get right :beg))))))
+
+(defun proofread--selection-plan-for-ranges (ranges)
+  "Return a target selection plan for raw RANGES.
+Normalize and clip RANGES exactly once, snapshot the target policy and
+accessible bounds, retain complete discovery domains, and derive
+selected islands from those values."
+  (let* ((minimum (point-min))
+         (maximum (point-max))
+         (ranges (proofread--normalize-accessible-ranges ranges))
+         (policy (proofread--effective-target-policy))
+         (domains
+          (proofread--target-domains-in-normalized-ranges
+           ranges policy minimum maximum)))
+    (proofread--make-selection-plan
+     ranges domains
+     (proofread--target-islands-in-normalized-ranges
+      ranges domains))))
+
+(defun proofread--target-domains-for-ranges (ranges)
+  "Return complete proofreading target domains overlapping RANGES."
+  (proofread--selection-plan-domains
+   (proofread--selection-plan-for-ranges ranges)))
+
+(defun proofread--target-islands-for-ranges (ranges)
+  "Return selected target islands for accessible RANGES.
+Each island records its selected bounds and its complete target
+domain."
+  (proofread--selection-plan-islands
+   (proofread--selection-plan-for-ranges ranges)))
 
 (defun proofread--visible-window-ranges ()
   "Return raw visible ranges for windows showing this buffer."

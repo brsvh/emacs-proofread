@@ -11395,6 +11395,146 @@ This covers URLs, email, invisible text, faces, and properties."
 
 ;;;; Target selection tests
 
+(ert-deftest proofread-test-selection-plan-normalizes-raw-ranges ()
+  "Retain normalized ranges, complete domains, and selected islands."
+  (with-temp-buffer
+    (insert "XXabcdefghijYY")
+    (narrow-to-region 3 13)
+    (let* ((proofread-targets 'all)
+           (minimum (point-min))
+           (maximum (point-max))
+           (marker-beg (copy-marker (+ minimum 6)))
+           (marker-end (copy-marker (+ minimum 8)))
+           (raw-ranges
+            (list (cons marker-beg marker-end)
+                  (cons (+ minimum 4) minimum)
+                  (cons (- minimum 10) (1+ minimum))
+                  (cons maximum (+ maximum 20))
+                  (cons (+ minimum 5) (+ minimum 5))
+                  (cons nil (+ minimum 2))
+                  'invalid))
+           (expected-ranges
+            (list (cons minimum (+ minimum 4))
+                  (cons (+ minimum 6) (+ minimum 8))))
+           (plan (proofread--selection-plan-for-ranges raw-ranges))
+           (ranges (proofread--selection-plan-ranges plan))
+           (domains (proofread--selection-plan-domains plan))
+           (islands (proofread--selection-plan-islands plan))
+           (domain (car domains)))
+      (should (proofread--selection-plan-p plan))
+      (should (equal ranges expected-ranges))
+      (should (markerp (caar raw-ranges)))
+      (should
+       (equal (nth 1 raw-ranges)
+              (cons (+ minimum 4) minimum)))
+      (dolist (range ranges)
+        (should (integerp (car range)))
+        (should (integerp (cdr range))))
+      (should (= (length domains) 1))
+      (should (eq (plist-get domain :kind) 'text))
+      (should (eq (plist-get domain :target-policy) 'all))
+      (should (= (plist-get domain :domain-beg) minimum))
+      (should (= (plist-get domain :domain-end) maximum))
+      (should
+       (equal
+        (mapcar (lambda (island)
+                  (cons (plist-get island :beg)
+                        (plist-get island :end)))
+                islands)
+        expected-ranges))
+      (dolist (island islands)
+        (should (= (plist-get island :domain-beg) minimum))
+        (should (= (plist-get island :domain-end) maximum))
+        (should (eq (plist-get island :target-policy) 'all)))
+      (should
+       (equal (proofread--target-domains-for-ranges raw-ranges)
+              domains))
+      (should
+       (equal (proofread--target-islands-for-ranges raw-ranges)
+              islands)))))
+
+(ert-deftest proofread-test-selection-plan-normalizes-once ()
+  "Normalize accessible ranges and snapshot target policy once."
+  (with-temp-buffer
+    (emacs-lisp-mode)
+    (insert ";; Comment prose.\n"
+            "(defun sample ()\n"
+            "  \"Docstring prose.\")\n")
+    (setq-local proofread-targets 'comments-and-docstrings)
+    (goto-char (point-max))
+    (push-mark (point-min) t t)
+    (let ((normalizer
+           (symbol-function 'proofread--normalize-accessible-ranges))
+          (policy-function
+           (symbol-function 'proofread--effective-target-policy))
+          (normalization-count 0)
+          (policy-count 0)
+          (before-point (point))
+          (before-mark (mark t))
+          (before-mark-active mark-active))
+      (cl-letf
+          (((symbol-function 'proofread--normalize-accessible-ranges)
+            (lambda (ranges)
+              (setq normalization-count (1+ normalization-count))
+              (funcall normalizer ranges)))
+           ((symbol-function 'proofread--effective-target-policy)
+            (lambda ()
+              (setq policy-count (1+ policy-count))
+              (funcall policy-function))))
+        (let* ((plan
+                (proofread--selection-plan-for-ranges
+                 (list (cons (point-max) (point-min)))))
+               (domains (proofread--selection-plan-domains plan)))
+          (should (= normalization-count 1))
+          (should (= policy-count 1))
+          (should
+           (equal (proofread--selection-plan-ranges plan)
+                  (list (cons (point-min) (point-max)))))
+          (should
+           (equal (mapcar (lambda (domain)
+                            (plist-get domain :kind))
+                          domains)
+                  '( comment docstring)))
+          (dolist (domain domains)
+            (should
+             (eq (plist-get domain :target-policy)
+                 'comments-and-docstrings)))))
+      (should (= (point) before-point))
+      (should (= (mark t) before-mark))
+      (should (eq mark-active before-mark-active)))))
+
+(ert-deftest proofread-test-selection-plan-retains-discovered-domains
+    ()
+  "Keep discovery domains instead of rebuilding them from islands."
+  (with-temp-buffer
+    (text-mode)
+    (insert "abcd")
+    (let* ((token (list 'discovery-token))
+           (domain
+            (list :kind 'text
+                  :target-policy 'all
+                  :domain-beg (point-min)
+                  :domain-end (point-max)
+                  :token token))
+           arguments
+           plan)
+      (cl-letf
+          (((symbol-function
+             'proofread--target-domains-in-normalized-ranges)
+            (lambda (ranges policy minimum maximum)
+              (setq arguments
+                    (list ranges policy minimum maximum))
+              (list domain))))
+        (setq plan
+              (proofread--selection-plan-for-ranges '((2 . 4)))))
+      (should (equal arguments '(((2 . 4)) all 1 5)))
+      (should
+       (eq (car (proofread--selection-plan-domains plan)) domain))
+      (should
+       (eq (plist-get
+            (car (proofread--selection-plan-islands plan)) :token)
+           token)))))
+
 (ert-deftest proofread-test-targets-default-auto-and-buffer-local ()
   "`proofread-targets' defaults to automatic buffer-local selection."
   (should (custom-variable-p 'proofread-targets))
