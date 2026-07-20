@@ -2241,12 +2241,6 @@ and confirm it against the buffer's syntax state."
       (forward-char 1))
     (point)))
 
-(defun proofread--skip-sentence-separator-whitespace (limit)
-  "Move point past whitespace between sentences, not beyond LIMIT."
-  (while (and (< (point) limit)
-              (memq (char-after) '( ?\s ?\t ?\n ?\r)))
-    (forward-char 1)))
-
 (defun proofread--sentence-spans-in-paragraph (span)
   "Return sentence spans inside paragraph SPAN.
 The splitter is intentionally local and punctuation-based for Chinese
@@ -2269,7 +2263,7 @@ boundaries unless the preceding text ends with sentence punctuation."
                          span-beg span-end)
                     (push (cons span-beg span-end) spans))
                   (goto-char span-end)
-                  (proofread--skip-sentence-separator-whitespace end)
+                  (skip-chars-forward " \t\n\r" end)
                   (setq span-beg (point)))
               (forward-char 1)))
           (when (proofread--range-nonblank-p span-beg end)
@@ -2512,10 +2506,6 @@ boundaries unless the preceding text ends with sentence punctuation."
         (proofread--org-structural-line-p line)
         (proofread--org-block-content-line-p))))
 
-(defun proofread--line-end-after-newline ()
-  "Return the position after the current line's terminating newline."
-  (min (point-max) (1+ (line-end-position))))
-
 (defun proofread--context-search-beg (beg)
   "Return the nearest structural context boundary before BEG."
   (save-excursion
@@ -2530,7 +2520,9 @@ boundaries unless the preceding text ends with sentence punctuation."
         (while (and (not boundary) (> (point) limit))
           (forward-line -1)
           (when (proofread--context-stop-line-at-point-p)
-            (setq boundary (proofread--line-end-after-newline)))))
+            (setq boundary
+                  (min (point-max)
+                       (1+ (line-end-position)))))))
       (max limit (min beg (or boundary limit))))))
 
 (defun proofread--context-search-end (end)
@@ -2564,20 +2556,11 @@ boundaries unless the preceding text ends with sentence punctuation."
            spans)
         spans))))
 
-(defun proofread--take-spans (count spans)
-  "Return the first COUNT items from SPANS."
-  (let (taken)
-    (while (and spans (> count 0))
-      (push (car spans) taken)
-      (setq spans (cdr spans))
-      (setq count (1- count)))
-    (nreverse taken)))
-
 (defun proofread--context-selected-spans (spans direction count)
   "Return selected SPANS for DIRECTION using COUNT sentences."
   (if (eq direction 'before)
       (last spans count)
-    (proofread--take-spans count spans)))
+    (take count spans)))
 
 (defun proofread--context-spans-text (spans)
   "Return filtered context text for SPANS."
@@ -6209,15 +6192,6 @@ nil for a change to the default."
   "Fit proofread list WINDOW to its buffer."
   (fit-window-to-buffer window 15 8))
 
-(defun proofread--request-log-source-buffer (buffer)
-  "Return BUFFER as a live buffer, or signal `user-error'."
-  (let ((source (if (bufferp buffer)
-                    buffer
-                  (get-buffer buffer))))
-    (unless (buffer-live-p source)
-      (user-error "No such live buffer: %S" buffer))
-    source))
-
 (defun proofread--request-log-ensure-hook ()
   "Install the proofread request log hook."
   (add-hook 'proofread-request-log-hook
@@ -6511,7 +6485,9 @@ events."
                           proofread--request-log-list-source)
                      (current-buffer))
                  t)))
-  (let ((source (proofread--request-log-source-buffer buffer)))
+  (let ((source (get-buffer buffer)))
+    (unless (buffer-live-p source)
+      (user-error "No such live buffer: %S" buffer))
     (unless (with-current-buffer source proofread-mode)
       (user-error "Proofread mode is not enabled in %s" source))
     (proofread--request-log-enable-source source)

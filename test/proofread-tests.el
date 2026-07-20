@@ -2381,6 +2381,57 @@ range; no available backend"))))))
 
 ;;;; Chunk and context tests
 
+(ert-deftest
+    proofread-test-sentence-spans-handle-whitespace-and-edges ()
+  "Split sentences across separators and buffer boundaries."
+  (with-temp-buffer
+    (should-not
+     (proofread--sentence-spans-in-paragraph
+      (cons (point-min) (point-max))))
+    (insert "First.\t \r\nSecond")
+    (let ((spans
+           (proofread--sentence-spans-in-paragraph
+            (cons (point-min) (point-max)))))
+      (should (equal (proofread-test--span-texts spans)
+                     '( "First." "Second")))
+      (should (= (caar spans) (point-min)))
+      (should (= (cdr (car (last spans))) (point-max))))))
+
+(ert-deftest proofread-test-context-selected-spans-clamps-count ()
+  "Select no after-context spans for non-positive counts."
+  (let ((spans '((1 . 2) (2 . 3) (3 . 4))))
+    (should-not
+     (proofread--context-selected-spans spans 'after -1))
+    (should-not
+     (proofread--context-selected-spans spans 'after 0))
+    (should
+     (equal (proofread--context-selected-spans spans 'after 2)
+            '((1 . 2) (2 . 3))))
+    (should
+     (equal (proofread--context-selected-spans spans 'after 4)
+            spans))))
+
+(ert-deftest proofread-test-context-search-beg-handles-buffer-edges
+    ()
+  "Find context boundaries in empty and unterminated buffers."
+  (with-temp-buffer
+    (let ((proofread-context-size 100))
+      (should (= (proofread--context-search-beg (point-min))
+                 (point-min)))
+      (insert "Context.\n\nTarget")
+      (let ((target-beg (save-excursion
+                          (goto-char (point-min))
+                          (search-forward "Target")
+                          (match-beginning 0))))
+        (should (= (proofread--context-search-beg target-beg)
+                   target-beg))
+        (should (= (point-max) (+ target-beg (length "Target")))))
+      (erase-buffer)
+      (insert "   \nTarget")
+      (put-text-property 1 3 'field 'first)
+      (put-text-property 3 4 'field 'second)
+      (should (= (proofread--context-search-beg 5) 4)))))
+
 (ert-deftest proofread-test-chunk-spans-for-ranges-ordinary-paragraph
     ()
   "Sentence chunk spans record exact buffer boundaries."
@@ -10042,6 +10093,45 @@ This covers URLs, email, invisible text, faces, and properties."
           (should-not proofread--overlays))))))
 
 ;;;; Listing tests
+
+(ert-deftest
+    proofread-test-request-list-accepts-buffer-object-and-name ()
+  "Resolve a live request-list source from its object or name."
+  (let ((proofread--request-log-sources nil)
+        (proofread-request-log-hook nil)
+        (source
+         (generate-new-buffer " *proofread-request-source-input*"))
+        list-buffer)
+    (unwind-protect
+        (save-window-excursion
+          (with-current-buffer source
+            (setq-local proofread-auto-check nil)
+            (proofread-mode 1))
+          (setq list-buffer
+                (proofread-show-buffer-requests source))
+          (should
+           (eq (proofread-show-buffer-requests
+                (buffer-name source))
+               list-buffer))
+          (should
+           (eq (buffer-local-value
+                'proofread--request-log-list-source list-buffer)
+               source)))
+      (when (buffer-live-p list-buffer)
+        (kill-buffer list-buffer))
+      (when (buffer-live-p source)
+        (kill-buffer source)))))
+
+(ert-deftest proofread-test-request-list-rejects-dead-sources ()
+  "Reject dead source objects and nonexistent source names."
+  (let* ((source
+          (generate-new-buffer " *proofread-request-source-dead*"))
+         (name (buffer-name source)))
+    (kill-buffer source)
+    (should-error (proofread-show-buffer-requests source)
+                  :type 'user-error)
+    (should-error (proofread-show-buffer-requests name)
+                  :type 'user-error)))
 
 (ert-deftest proofread-test-negative-request-log-limit-is-safe ()
   "A negative direct request-log limit is clamped instead of looping."
