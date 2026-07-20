@@ -312,7 +312,7 @@ request-ready chunks."
   "Required keys for proofread backend request plists.")
 
 (defconst proofread--request-log-request-keys
-  '( :log-id :id :generation :buffer
+  '( :id :generation :buffer
      :beg :end :text
      :context-before :context-after
      :language :display-language
@@ -481,7 +481,7 @@ request-ready chunks."
   "Non-nil while reporting work rejected during cleanup.")
 
 (defvar-local proofread--pending-request-keys nil
-  "Map active and queued work keys to owning request log ids.")
+  "Map active and queued work keys to scheduled work records.")
 
 (defvar-local proofread--next-request-id 0
   "Next proofread backend request id for the current buffer.")
@@ -542,6 +542,10 @@ interrupting proofreading.")
 (defvar proofread--request-log-sequence 0
   "Session-local sequence for request log identifiers.")
 
+(defvar proofread--request-log-owner-ids
+  (make-hash-table :test #'eq :weakness 'key)
+  "Weak map from backend request payloads to scheduler log ids.")
+
 (defvar proofread--request-batch-sequence 0
   "Session-local sequence for request batch identifiers.")
 
@@ -589,6 +593,24 @@ interrupting proofreading.")
   value
   cancel
   cancelled)
+
+(cl-defstruct
+    (proofread--scheduled-work
+     (:constructor
+      proofread--make-scheduled-work (request cache-key log-id)))
+  "Core-owned mutable state for one immutable backend REQUEST.
+CACHE-KEY and LOG-ID belong to the scheduler and are never exposed to
+the backend.  The remaining fields track lifecycle state after the
+work is published."
+  request
+  cache-key
+  log-id
+  superseded
+  invalidated
+  cancelled
+  batch
+  batch-settled
+  handle)
 
 (cl-defstruct
     (proofread--checker-preparation
@@ -1086,20 +1108,20 @@ OMIT-SOURCE-LABEL is non-nil, skip the presentation-only operation."
     (car condition))
    (t 'error)))
 
-(defun proofread--make-request-batch (requests)
-  "Return shared lifecycle state for REQUESTS dispatched together."
+(defun proofread--make-request-batch (works)
+  "Return shared lifecycle state for WORKS dispatched together."
   (list :id (cl-incf proofread--request-batch-sequence)
-        :pending (length requests)
+        :pending (length works)
         :errors nil
         :buffer (current-buffer)
         :reported nil))
 
-(defun proofread--attach-request-batch (requests)
-  "Attach one shared request batch to REQUESTS and return it."
-  (when requests
-    (let ((batch (proofread--make-request-batch requests)))
-      (dolist (request requests)
-        (setf (plist-get (plist-get request :state) :batch) batch))
+(defun proofread--attach-request-batch (works)
+  "Attach one shared request batch to WORKS and return it."
+  (when works
+    (let ((batch (proofread--make-request-batch works)))
+      (dolist (work works)
+        (setf (proofread--scheduled-work-batch work) batch))
       batch)))
 
 (defun proofread--backend-error-message (result)
@@ -1173,12 +1195,11 @@ OMIT-SOURCE-LABEL is non-nil, skip the presentation-only operation."
                  (if (= (length errors) 1) "" "s")))))))
 
 (defun proofread--settle-request-batch
-    (request &optional result status)
-  "Settle REQUEST in its shared batch using RESULT and final STATUS."
-  (when-let* ((state (plist-get request :state))
-              (batch (plist-get state :batch)))
-    (unless (plist-get state :batch-settled)
-      (setf (plist-get state :batch-settled) t)
+    (work &optional result status)
+  "Settle WORK in its shared batch using RESULT and final STATUS."
+  (when-let* ((batch (proofread--scheduled-work-batch work)))
+    (unless (proofread--scheduled-work-batch-settled work)
+      (setf (proofread--scheduled-work-batch-settled work) t)
       (when (eq status 'error)
         (push (proofread--backend-error-message result)
               (plist-get batch :errors)))
@@ -1638,20 +1659,33 @@ original error value."
 
 ;;;; Diagnostic and range data
 
-(defun proofread--record-request-event (request type &rest properties)
-  "Record a lifecycle event of TYPE for REQUEST with PROPERTIES."
-  (let ((raw-event
-         (append
-          (list :type type
-                :time (current-time)
-                :log-id (plist-get request :log-id)
-                :request-id (plist-get request :id)
-                :buffer (plist-get request :buffer)
-                :beg (plist-get request :beg)
-                :end (plist-get request :end)
-                :request request)
-          properties))
-        event)
+(defun proofread--record-request-event (source type &rest properties)
+  "Record a request event of TYPE for SOURCE with PROPERTIES.
+SOURCE is normally a `proofread--scheduled-work' record.  Backends may
+record their own events with the immutable request payload they were
+given; its weak log-owner index supplies the scheduler-owned log id."
+  (let* ((work (and (proofread--scheduled-work-p source) source))
+         (request (if work
+                      (proofread--scheduled-work-request work)
+                    source))
+         (log-id
+          (if work
+              (proofread--scheduled-work-log-id work)
+            (and (hash-table-p proofread--request-log-owner-ids)
+                 (gethash request
+                          proofread--request-log-owner-ids))))
+         (raw-event
+          (append
+           (list :type type
+                 :time (current-time)
+                 :log-id log-id
+                 :request-id (plist-get request :id)
+                 :buffer (plist-get request :buffer)
+                 :beg (plist-get request :beg)
+                 :end (plist-get request :end)
+                 :request request)
+           properties))
+         event)
     (unwind-protect
         (progn
           (setq event
@@ -1659,11 +1693,13 @@ original error value."
           (proofread--run-request-log-hook event))
       (pcase type
         ('final-result
-         (proofread--settle-request-batch
-          request (plist-get raw-event :result)
-          (plist-get raw-event :status)))
+         (when work
+           (proofread--settle-request-batch
+            work (plist-get raw-event :result)
+            (plist-get raw-event :status))))
         ('cancelled
-         (proofread--settle-request-batch request))))
+         (when work
+           (proofread--settle-request-batch work)))))
     event))
 
 (defun proofread--make-diagnostic (&rest properties)
@@ -3115,18 +3151,20 @@ contains the checker and metadata snapshots to share across requests."
                      (_ (proofread--snapshot-value
                          (plist-get chunk key))))))
            proofread--backend-request-keys)))
-    (setq request
-          (plist-put request :log-id
-                     (cl-incf proofread--request-log-sequence)))
-    (setq request
-          (plist-put request :state
-                     (list :superseded nil
-                           :invalidated nil
-                           :cancelled nil
-                           :batch nil
-                           :batch-settled nil)))
-    (plist-put request :cache-key
-               (proofread--cache-key request backend-name))))
+    request))
+
+(defun proofread--make-request-work (request &optional backend)
+  "Return fresh scheduled work owning backend REQUEST.
+BACKEND, when non-nil, selects the identity used for the cache key."
+  (let ((work
+         (proofread--make-scheduled-work
+          request
+          (proofread--cache-key request backend)
+          (cl-incf proofread--request-log-sequence))))
+    (puthash request
+             (proofread--scheduled-work-log-id work)
+             proofread--request-log-owner-ids)
+    work))
 
 (defun proofread--backend-success-result (request diagnostics)
   "Return a successful backend result for REQUEST and DIAGNOSTICS."
@@ -3151,14 +3189,26 @@ When MESSAGE is non-nil, include it as caller-readable error text."
         (append result (list :message message))
       result)))
 
-(defun proofread--active-request-p (request)
-  "Return non-nil if REQUEST is active in the current buffer."
-  (let ((log-id (plist-get request :log-id))
-        active)
-    (dolist (candidate proofread--active-requests)
-      (when (equal log-id (plist-get candidate :log-id))
-        (setq active t)))
-    active))
+(defun proofread--scheduled-work-for-request (request)
+  "Return scheduled work owning backend REQUEST, or nil."
+  (when-let* ((buffer (plist-get request :buffer))
+              ((buffer-live-p buffer)))
+    (with-current-buffer buffer
+      (or (cl-find request proofread--active-requests
+                   :key #'proofread--scheduled-work-request
+                   :test #'eq)
+          (cl-find request proofread--claimed-requests
+                   :key #'proofread--scheduled-work-request
+                   :test #'eq)
+          (cl-find request proofread--request-queue
+                   :key (lambda (entry)
+                          (proofread--scheduled-work-request
+                           (plist-get entry :work)))
+                   :test #'eq)))))
+
+(defun proofread--active-request-p (work)
+  "Return non-nil if WORK is active in the current buffer."
+  (memq work proofread--active-requests))
 
 (defun proofread--active-request-limit ()
   "Return the current buffer's backend request concurrency limit."
@@ -3173,39 +3223,27 @@ When MESSAGE is non-nil, include it as caller-readable error text."
   "Return non-nil when another backend request may be sent."
   (> (proofread--active-request-slots) 0))
 
-(defun proofread--register-active-request (request)
-  "Register REQUEST as active in the current buffer."
+(defun proofread--register-active-request (work)
+  "Register WORK as active in the current buffer."
   (setq proofread--claimed-requests
-        (delq request proofread--claimed-requests))
-  (push request proofread--active-requests)
-  (puthash (proofread--request-work-key request)
-           (plist-get request :log-id)
+        (delq work proofread--claimed-requests))
+  (push work proofread--active-requests)
+  (puthash (proofread--request-work-key work)
+           work
            proofread--pending-request-keys)
-  request)
+  work)
 
-(defun proofread--record-active-request-handle (request request-handle)
-  "Record REQUEST-HANDLE for active REQUEST in the current buffer."
-  (let ((log-id (plist-get request :log-id))
-        retained)
-    (dolist (candidate proofread--active-requests)
-      (push
-       (if (equal log-id (plist-get candidate :log-id))
-           (plist-put (copy-sequence candidate)
-                      :handle request-handle)
-         candidate)
-       retained))
-    (setq proofread--active-requests (nreverse retained)))
+(defun proofread--record-active-request-handle (work request-handle)
+  "Record REQUEST-HANDLE on active WORK without replacing it."
+  (when (memq work proofread--active-requests)
+    (setf (proofread--scheduled-work-handle work) request-handle))
   request-handle)
 
-(defun proofread--remove-active-request (request)
-  "Remove REQUEST from active request state in the current buffer."
-  (let ((log-id (plist-get request :log-id))
-        retained)
-    (dolist (candidate proofread--active-requests)
-      (unless (equal log-id (plist-get candidate :log-id))
-        (push candidate retained)))
-    (setq proofread--active-requests (nreverse retained))
-    (proofread--forget-request-work request)))
+(defun proofread--remove-active-request (work)
+  "Remove WORK from active request state in the current buffer."
+  (setq proofread--active-requests
+        (delq work proofread--active-requests))
+  (proofread--forget-request-work work))
 
 (defun proofread--invoke-backend-callback (callback result)
   "Invoke CALLBACK with backend RESULT when CALLBACK is non-nil."
@@ -3217,17 +3255,18 @@ When MESSAGE is non-nil, include it as caller-readable error text."
   (run-at-time
    0 nil #'proofread--invoke-backend-callback callback result))
 
-(defun proofread--wrap-backend-callback (request callback)
-  "Return a wrapper for CALLBACK that cleans REQUEST state once."
+(defun proofread--wrap-backend-callback (work callback)
+  "Return a wrapper for CALLBACK that cleans WORK state once."
   (let (finished)
     (lambda (result)
       (unless finished
         (setq finished t)
-        (let ((buffer (plist-get request :buffer))
-              callback-value)
+        (let* ((request (proofread--scheduled-work-request work))
+               (buffer (plist-get request :buffer))
+               callback-value)
           (when (buffer-live-p buffer)
             (with-current-buffer buffer
-              (proofread--remove-active-request request)))
+              (proofread--remove-active-request work)))
           (unwind-protect
               (setq callback-value
                     (proofread--invoke-backend-callback
@@ -3501,24 +3540,25 @@ ERROR identifies the failure and DETAIL describes it."
     (plist-put result :phase 'submission)))
 
 (defun proofread--dispatch-backend-request
-    (request callback &optional backend)
-  "Register and submit REQUEST to BACKEND, then invoke CALLBACK.
-When BACKEND is nil, use REQUEST's `:backend'."
-  (let ((backend (or backend (plist-get request :backend)))
-        (buffer (plist-get request :buffer)))
+    (work callback &optional backend)
+  "Register and submit WORK to BACKEND, then invoke CALLBACK.
+When BACKEND is nil, use WORK's backend request `:backend'."
+  (let* ((request (proofread--scheduled-work-request work))
+         (backend (or backend (plist-get request :backend)))
+         (buffer (plist-get request :buffer)))
     (when (buffer-live-p buffer)
       (with-current-buffer buffer
-        (proofread--register-active-request request))
+        (proofread--register-active-request work))
       (proofread--record-request-event
-       request 'active-request
+       work 'active-request
        :backend backend)
-      (if (not (proofread--request-ready-to-submit-p request))
+      (if (not (proofread--request-ready-to-submit-p work))
           (progn
-            (proofread--retire-active-request request)
+            (proofread--retire-active-request work)
             proofread--stale-dispatch-result)
         (let* ((callback-state 'pending)
                (lifecycle-callback
-                (proofread--wrap-backend-callback request callback))
+                (proofread--wrap-backend-callback work callback))
                (wrapped-callback
                 (lambda (result)
                   (when (eq callback-state 'pending)
@@ -3580,121 +3620,123 @@ When BACKEND is nil, use REQUEST's `:backend'."
           (let* ((active
                   (and (buffer-live-p buffer)
                        (with-current-buffer buffer
-                         (proofread--active-request-p request))))
+                         (proofread--active-request-p work))))
                  (stale
                   (or (not (buffer-live-p buffer))
                       (and active
                            (not
                             (proofread--request-ready-to-submit-p
-                             request)))
+                             work)))
                       (and (not active)
                            (proofread--request-state-flag-p
-                            request :cancelled)))))
+                            work :cancelled)))))
             (cond
              (stale
               (proofread--retire-active-request
-               request request-handle)
+               work request-handle)
               proofread--stale-dispatch-result)
              (t
               (when handle
                 (when active
                   (with-current-buffer buffer
                     (proofread--record-active-request-handle
-                     request request-handle)))
+                     work request-handle)))
                 (proofread--record-request-event
-                 request 'backend-dispatched
+                 work 'backend-dispatched
                  :backend backend
                  :handle handle))
               handle))))))))
 
 ;;;; Request scheduling
 
-(defun proofread--request-lifecycle-current-p (request)
-  "Return non-nil when REQUEST may still change lifecycle state."
-  (let ((buffer (plist-get request :buffer)))
+(defun proofread--request-lifecycle-current-p (work)
+  "Return non-nil when WORK may still change lifecycle state."
+  (let* ((request (proofread--scheduled-work-request work))
+         (buffer (plist-get request :buffer)))
     (and (buffer-live-p buffer)
          (with-current-buffer buffer
            (and proofread-mode
                 (equal proofread--generation
                        (plist-get request :generation))
-                (proofread--latest-request-p request)
+                (proofread--latest-request-p work)
                 (not (proofread--request-state-flag-p
-                      request :cancelled))
-                (not (proofread--request-invalidated-p request)))))))
+                      work :cancelled))
+                (not (proofread--request-invalidated-p work)))))))
 
-(defun proofread--request-ready-to-submit-p (request)
-  "Return non-nil if REQUEST is fresh and lifecycle-current."
-  (and (proofread--request-lifecycle-current-p request)
+(defun proofread--request-ready-to-submit-p (work)
+  "Return non-nil if WORK is fresh and lifecycle-current."
+  (and (proofread--request-lifecycle-current-p work)
        (condition-case nil
-           (proofread--fresh-request-p request)
+           (proofread--fresh-request-p work)
          (error nil))
        ;; Freshness can invoke user predicates that mutate request
        ;; state.
-       (proofread--request-lifecycle-current-p request)))
+       (proofread--request-lifecycle-current-p work)))
 
 (defun proofread--retire-active-request
-    (request &optional request-handle reason)
-  "Remove active REQUEST and cancel optional core REQUEST-HANDLE.
+    (work &optional request-handle reason)
+  "Remove active WORK and cancel optional core REQUEST-HANDLE.
 Record REASON as the cancellation reason, defaulting to `stale'."
-  (let ((buffer (plist-get request :buffer)))
+  (let* ((request (proofread--scheduled-work-request work))
+         (buffer (plist-get request :buffer)))
     (when (buffer-live-p buffer)
       (with-current-buffer buffer
-        (proofread--invalidate-request request)
-        (proofread--remove-active-request request)))
+        (proofread--invalidate-request work)
+        (proofread--remove-active-request work)))
     (let ((proofread--inhibit-queue-dispatch buffer))
       (proofread--record-request-cancellation
-       request (or reason 'stale))
+       work (or reason 'stale))
       (proofread--cancel-request-handle request-handle))))
 
 (defun proofread--prune-stale-active-requests ()
   "Cancel active requests that no longer match this buffer."
   (let ((candidates proofread--active-requests)
         stale)
-    (dolist (request candidates)
-      (unless (proofread--request-ready-to-submit-p request)
-        (push request stale)))
+    (dolist (work candidates)
+      (unless (proofread--request-ready-to-submit-p work)
+        (push work stale)))
     ;; Freshness predicates can reenter request dispatch.  Remove only
     ;; candidates that are still active after all predicates return.
     (setq stale
           (cl-delete-if-not
-           (lambda (request)
-             (memq request proofread--active-requests))
+           (lambda (work)
+             (memq work proofread--active-requests))
            stale))
     (when stale
       (let ((table (make-hash-table :test #'eq)))
-        (dolist (request stale)
-          (puthash request t table)
-          (proofread--invalidate-request request))
+        (dolist (work stale)
+          (puthash work t table)
+          (proofread--invalidate-request work))
         (setq proofread--active-requests
-              (cl-delete-if (lambda (request) (gethash request table))
+              (cl-delete-if (lambda (work) (gethash work table))
                             proofread--active-requests)))
       (let ((proofread--inhibit-queue-dispatch (current-buffer)))
-        (dolist (request stale)
-          (proofread--record-request-cancellation request 'stale)
+        (dolist (work stale)
+          (proofread--record-request-cancellation work 'stale)
           (proofread--cancel-request-handle
-           (plist-get request :handle)))))
+           (proofread--scheduled-work-handle work)))))
     (nreverse stale)))
 
-(defun proofread--request-cache-status (request)
-  "Apply REQUEST's current cache entry and return its queue status.
-Return `cached' or `stale' when an entry settles REQUEST, and nil when
+(defun proofread--request-cache-status (work)
+  "Apply WORK's current cache entry and return its queue status.
+Return `cached' or `stale' when an entry settles WORK, and nil when
 there is no applicable entry."
-  (when-let* ((entry (proofread--cache-read-request request)))
-    (pcase (proofread--apply-cache-entry request entry)
+  (when-let* ((entry (proofread--cache-read-request work)))
+    (pcase (proofread--apply-cache-entry work entry)
       ('applied 'cached)
       ('stale 'stale))))
 
-(defun proofread--submit-request (request backend)
-  "Submit REQUEST through BACKEND when cache and concurrency permit.
+(defun proofread--submit-request (work backend)
+  "Submit WORK through BACKEND when cache and concurrency permit.
 Return one of the symbols `sent', `cached', `full', `stale', or
 `error'."
   (catch 'status
-    (unless (proofread--request-ready-to-submit-p request)
+    (unless (proofread--request-ready-to-submit-p work)
       (throw 'status 'stale))
-    (when-let* ((status (proofread--request-cache-status request)))
+    (when-let* ((status (proofread--request-cache-status work)))
       (throw 'status status))
     ;; Cache lifecycle hooks can enqueue a newer conflicting request.
-    (unless (proofread--request-lifecycle-current-p request)
+    (unless (proofread--request-lifecycle-current-p work)
       (throw 'status 'stale))
     (unless (proofread--request-slot-available-p)
       (if proofread--queue-dispatch-transaction
@@ -3702,21 +3744,25 @@ Return one of the symbols `sent', `cached', `full', `stale', or
             (setq proofread--queue-dispatch-pruned-active-p t)
             (proofread--prune-stale-active-requests))
         (proofread--prune-stale-active-requests))
-      (unless (proofread--request-lifecycle-current-p request)
+      (unless (proofread--request-lifecycle-current-p work)
         (throw 'status 'stale))
       ;; Pruning can run freshness, cancellation, and logging hooks while
       ;; this request is claimed and therefore absent from the queue index.
       ;; Consume a same-key cache write from those hooks before either
       ;; submitting the backend request or restoring the queue entry.
-      (when-let* ((status (proofread--request-cache-status request)))
+      (when-let* ((status (proofread--request-cache-status work)))
         (throw 'status status))
-      (unless (proofread--request-lifecycle-current-p request)
+      (unless (proofread--request-lifecycle-current-p work)
         (throw 'status 'stale))
       (unless (proofread--request-slot-available-p)
         (throw 'status 'full)))
     (let ((result
            (proofread--dispatch-backend-request
-            request #'proofread--handle-backend-result backend)))
+            work
+            (lambda (backend-result)
+              (proofread--handle-backend-result
+               work backend-result))
+            backend)))
       (cond
        ((eq result proofread--stale-dispatch-result) 'stale)
        (result 'sent)
@@ -3751,7 +3797,7 @@ Return one of the symbols `sent', `cached', `full', `stale', or
 
 (defun proofread--request-queue-entry-cache-key (entry)
   "Return the frozen cache key for queued request ENTRY."
-  (plist-get (plist-get entry :request) :cache-key))
+  (proofread--scheduled-work-cache-key (plist-get entry :work)))
 
 (defun proofread--index-request-queue-entry (entry)
   "Add queued ENTRY to cache-key and cache-wakeup indexes."
@@ -3819,32 +3865,32 @@ Return one of the symbols `sent', `cached', `full', `stale', or
     (setq proofread--request-queue-tail cell)
     (proofread--link-request-queue-entry entry cell previous)))
 
-(defun proofread--enqueue-requests (requests backend)
-  "Append REQUESTS for BACKEND without running lifecycle hooks."
-  (when (and requests (not (proofread--clearing-scheduled-work-p)))
+(defun proofread--enqueue-requests (works backend)
+  "Append WORKS for BACKEND without running lifecycle hooks."
+  (when (and works (not (proofread--clearing-scheduled-work-p)))
     (when (and proofread--request-queue
                (or (not (hash-table-p proofread--request-queue-links))
                    (= (hash-table-count proofread--request-queue-links)
                       0)))
       (proofread--rebuild-request-queue-bookkeeping))
-    (dolist (request requests)
+    (dolist (work works)
       (proofread--append-request-queue-entry
-       (list :request request
+       (list :work work
              :backend backend
              :queue-sequence
              (cl-incf proofread--next-request-queue-sequence)))
-      (puthash (proofread--request-work-key request)
-               (plist-get request :log-id)
+      (puthash (proofread--request-work-key work)
+               work
                proofread--pending-request-keys))
     (when proofread--queue-dispatch-active-p
       (setq proofread--queue-dispatch-requested-p t))
-    requests))
+    works))
 
-(defun proofread--reject-request-during-clear (request)
-  "Retire REQUEST while this buffer clears scheduled work."
-  (proofread--invalidate-request request)
-  (unless (proofread--request-state-flag-p request :cancelled)
-    (proofread--set-request-state-flag request :cancelled)
+(defun proofread--reject-request-during-clear (work)
+  "Retire WORK while this buffer clears scheduled work."
+  (proofread--invalidate-request work)
+  (unless (proofread--request-state-flag-p work :cancelled)
+    (proofread--set-request-state-flag work :cancelled)
     ;; Prevent an adversarial cancellation hook from recursively
     ;; generating an unbounded chain of cancellation events.  Nested
     ;; work is still marked terminal, but only the outer rejection is
@@ -3852,52 +3898,63 @@ Return one of the symbols `sent', `cached', `full', `stale', or
     (unless proofread--recording-clear-rejection-p
       (let ((proofread--recording-clear-rejection-p t))
         (proofread--record-request-event
-         request 'cancelled :reason 'cleared))))
+         work 'cancelled :reason 'cleared))))
   nil)
 
-(defun proofread--request-work-key (request)
-  "Return the identity of REQUEST's proofreading work."
-  (list (plist-get request :generation)
-        (plist-get request :checker-owner)
-        (proofread--position-integer (plist-get request :beg))
-        (proofread--position-integer (plist-get request :end))
-        (plist-get request :accessible-beg)
-        (plist-get request :accessible-end)
-        (plist-get request :cache-key)
-        (plist-get request :source-label)))
+(defun proofread--request-work-key (work)
+  "Return the identity of scheduled WORK."
+  (let ((request (proofread--scheduled-work-request work)))
+    (list (plist-get request :generation)
+          (plist-get request :checker-owner)
+          (proofread--position-integer (plist-get request :beg))
+          (proofread--position-integer (plist-get request :end))
+          (plist-get request :accessible-beg)
+          (plist-get request :accessible-end)
+          (proofread--scheduled-work-cache-key work)
+          (plist-get request :source-label))))
 
-(defun proofread--forget-request-work (request)
-  "Remove REQUEST's work key from pending state."
+(defun proofread--forget-request-work (work)
+  "Remove WORK's key from pending state."
   (when (hash-table-p proofread--pending-request-keys)
-    (let ((key (proofread--request-work-key request)))
-      (when (equal (gethash key proofread--pending-request-keys)
-                   (plist-get request :log-id))
+    (let ((key (proofread--request-work-key work)))
+      (when (eq (gethash key proofread--pending-request-keys)
+                work)
         (remhash key proofread--pending-request-keys)))))
 
-(defun proofread--request-work-pending-p (request)
-  "Return non-nil when REQUEST's work is already active or queued."
+(defun proofread--request-work-pending-p (work)
+  "Return non-nil when WORK's identity is already active or queued."
   (and (hash-table-p proofread--pending-request-keys)
-       (gethash (proofread--request-work-key request)
+       (gethash (proofread--request-work-key work)
                 proofread--pending-request-keys)))
 
-(defun proofread--request-state-flag-p (request property)
-  "Return non-nil when REQUEST lifecycle PROPERTY is set."
-  (plist-get (plist-get request :state) property))
+(defun proofread--request-state-flag-p (work property)
+  "Return non-nil when WORK lifecycle PROPERTY is set."
+  (pcase property
+    ( :superseded (proofread--scheduled-work-superseded work))
+    ( :invalidated (proofread--scheduled-work-invalidated work))
+    ( :cancelled (proofread--scheduled-work-cancelled work))
+    (_ (error "Unknown scheduled work state property %S" property))))
 
-(defun proofread--set-request-state-flag (request property)
-  "Set REQUEST lifecycle PROPERTY."
-  (when-let* ((state (plist-get request :state)))
-    (setf (plist-get state property) t)))
+(defun proofread--set-request-state-flag (work property)
+  "Set WORK lifecycle PROPERTY."
+  (pcase property
+    ( :superseded
+      (setf (proofread--scheduled-work-superseded work) t))
+    ( :invalidated
+      (setf (proofread--scheduled-work-invalidated work) t))
+    ( :cancelled
+      (setf (proofread--scheduled-work-cancelled work) t))
+    (_ (error "Unknown scheduled work state property %S" property))))
 
 (defun proofread--record-request-cancellation
-    (request &optional reason)
-  "Record one cancellation event for REQUEST, optionally with REASON."
-  (unless (proofread--request-state-flag-p request :cancelled)
-    (proofread--set-request-state-flag request :cancelled)
+    (work &optional reason)
+  "Record one cancellation event for WORK, optionally with REASON."
+  (unless (proofread--request-state-flag-p work :cancelled)
+    (proofread--set-request-state-flag work :cancelled)
     (if reason
         (proofread--record-request-event
-         request 'cancelled :reason reason)
-      (proofread--record-request-event request 'cancelled))))
+         work 'cancelled :reason reason)
+      (proofread--record-request-event work 'cancelled))))
 
 (defun proofread--request-range (request)
   "Return REQUEST's current integer range, or nil."
@@ -3908,21 +3965,26 @@ Return one of the symbols `sent', `cached', `full', `stale', or
       range)))
 
 (defun proofread--same-request-owner-p (left right)
-  "Return non-nil when LEFT and RIGHT belong to the same checker."
-  (equal (plist-get left :checker-owner)
-         (plist-get right :checker-owner)))
+  "Return non-nil when work LEFT and RIGHT belong to one checker."
+  (equal
+   (plist-get (proofread--scheduled-work-request left) :checker-owner)
+   (plist-get (proofread--scheduled-work-request right) :checker-owner)))
 
 (defun proofread--conflicting-request-table (requests candidates)
   "Return an eq table of CANDIDATES conflicting with REQUESTS."
   (let ((table (make-hash-table :test #'eq)))
-    (dolist (request requests)
-      (when-let* ((range (proofread--request-range request)))
+    (dolist (work requests)
+      (when-let* ((range
+                   (proofread--request-range
+                    (proofread--scheduled-work-request work))))
         (let (entries)
           (dolist (candidate candidates)
             (when (proofread--same-request-owner-p
-                   request candidate)
+                   work candidate)
               (when-let* ((candidate-range
-                           (proofread--request-range candidate)))
+                           (proofread--request-range
+                            (proofread--scheduled-work-request
+                             candidate))))
                 (push (cons candidate candidate-range)
                       entries))))
           (dolist (entry
@@ -3932,12 +3994,12 @@ Return one of the symbols `sent', `cached', `full', `stale', or
     table))
 
 (defun proofread--partition-pending-requests (predicate)
-  "Remove pending requests matching PREDICATE and group them by state.
-Call PREDICATE with each active, claimed, then queued request.  It
-must not mutate request lifecycle state or invoke user callbacks.
+  "Remove pending work matching PREDICATE and group it by state.
+Call PREDICATE with each active, claimed, then queued work record.  It
+must not mutate work lifecycle state or invoke user callbacks.
 Publish all retained state after every predicate call finishes while
-preserving request order and queued entry identity.  Return selected
-requests in a plist with the keys :active, :claimed, and :queued.
+preserving work order and queued entry identity.  Return selected work
+in a plist with the keys :active, :claimed, and :queued.
 
 This function updates `proofread--request-queue-tail', but it does not
 change request flags or pending-work identity, run lifecycle hooks,
@@ -3948,18 +4010,18 @@ cancel handles, or schedule work."
         retained-active
         retained-claimed
         retained-queue)
-    (dolist (request proofread--active-requests)
-      (if (funcall predicate request)
-          (push request selected-active)
-        (push request retained-active)))
-    (dolist (request proofread--claimed-requests)
-      (if (funcall predicate request)
-          (push request selected-claimed)
-        (push request retained-claimed)))
+    (dolist (work proofread--active-requests)
+      (if (funcall predicate work)
+          (push work selected-active)
+        (push work retained-active)))
+    (dolist (work proofread--claimed-requests)
+      (if (funcall predicate work)
+          (push work selected-claimed)
+        (push work retained-claimed)))
     (dolist (entry proofread--request-queue)
-      (let ((request (plist-get entry :request)))
-        (if (funcall predicate request)
-            (push request selected-queued)
+      (let ((work (plist-get entry :work)))
+        (if (funcall predicate work)
+            (push work selected-queued)
           (push entry retained-queue))))
     (setq selected-active (nreverse selected-active))
     (setq selected-claimed (nreverse selected-claimed))
@@ -3974,80 +4036,83 @@ cancel handles, or schedule work."
           :claimed selected-claimed
           :queued selected-queued)))
 
-(defun proofread--supersede-conflicting-requests (requests)
-  "Remove older work that conflicts with REQUESTS.
-Return the removed requests grouped by their previous lifecycle state.
+(defun proofread--supersede-conflicting-requests (works)
+  "Remove older work that conflicts with WORKS.
+Return removed work grouped by its previous lifecycle state.
 This function changes only internal state; it does not run lifecycle
 hooks or call backend cancellation functions."
-  (let* ((queued-requests
-          (mapcar (lambda (entry) (plist-get entry :request))
+  (let* ((queued-works
+          (mapcar (lambda (entry) (plist-get entry :work))
                   proofread--request-queue))
          (conflicts
           (proofread--conflicting-request-table
-           requests
+           works
            (append proofread--active-requests
                    proofread--claimed-requests
-                   queued-requests)))
+                   queued-works)))
          (superseded
           (proofread--partition-pending-requests
            (lambda (candidate)
              (gethash candidate conflicts)))))
-    (dolist (candidate
+    (dolist (work
              (append (plist-get superseded :active)
                      (plist-get superseded :claimed)
                      (plist-get superseded :queued)))
-      (proofread--set-request-state-flag candidate :superseded)
-      (proofread--forget-request-work candidate))
+      (proofread--set-request-state-flag work :superseded)
+      (proofread--forget-request-work work))
     superseded))
 
 (defun proofread--finish-superseded-requests (superseded)
   "Finish lifecycle handling for requests in SUPERSEDED."
   (let ((proofread--inhibit-queue-dispatch (current-buffer))
         (active (plist-get superseded :active)))
-    (dolist (request
+    (dolist (work
              (append active
                      (plist-get superseded :claimed)
                      (plist-get superseded :queued)))
-      (proofread--record-request-cancellation request 'superseded))
-    (dolist (request active)
-      (proofread--cancel-request-handle (plist-get request :handle))))
+      (proofread--record-request-cancellation work 'superseded))
+    (dolist (work active)
+      (proofread--cancel-request-handle
+       (proofread--scheduled-work-handle work))))
   superseded)
 
-(defun proofread--latest-request-p (request)
-  "Return non-nil when no newer request supersedes REQUEST."
-  (not (proofread--request-state-flag-p request :superseded)))
+(defun proofread--latest-request-p (work)
+  "Return non-nil when no newer request supersedes WORK."
+  (not (proofread--request-state-flag-p work :superseded)))
 
-(defun proofread--invalidate-request (request)
-  "Mark REQUEST stale because an edit may have shifted its positions."
-  (proofread--set-request-state-flag request :invalidated)
-  (proofread--forget-request-work request))
+(defun proofread--invalidate-request (work)
+  "Mark WORK stale because an edit may have shifted its positions."
+  (proofread--set-request-state-flag work :invalidated)
+  (proofread--forget-request-work work))
 
-(defun proofread--request-invalidated-p (request)
-  "Return non-nil when an edit made REQUEST's positions unsafe."
-  (proofread--request-state-flag-p request :invalidated))
+(defun proofread--request-invalidated-p (work)
+  "Return non-nil when an edit made WORK's positions unsafe."
+  (proofread--request-state-flag-p work :invalidated))
 
 (defun proofread--invalidate-position-shifted-requests (change-beg)
   "Invalidate pending requests that an edit at CHANGE-BEG may shift."
   (let* ((invalid
           (proofread--partition-pending-requests
-           (lambda (request)
-             (when-let* ((request-end
-                          (proofread--position-integer
-                           (plist-get request :end))))
-               (< change-beg request-end)))))
+           (lambda (work)
+             (let ((request
+                    (proofread--scheduled-work-request work)))
+               (when-let* ((request-end
+                            (proofread--position-integer
+                             (plist-get request :end))))
+                 (< change-beg request-end))))))
          (invalid-active (plist-get invalid :active))
          (invalid-requests
           (append invalid-active
                   (plist-get invalid :claimed)
                   (plist-get invalid :queued))))
-    (dolist (request invalid-requests)
-      (proofread--invalidate-request request))
+    (dolist (work invalid-requests)
+      (proofread--invalidate-request work))
     (let ((proofread--inhibit-queue-dispatch (current-buffer)))
-      (dolist (request invalid-requests)
-        (proofread--record-request-cancellation request 'stale))
-      (dolist (request invalid-active)
+      (dolist (work invalid-requests)
+        (proofread--record-request-cancellation work 'stale))
+      (dolist (work invalid-active)
         (proofread--cancel-request-handle
-         (plist-get request :handle))))
+         (proofread--scheduled-work-handle work))))
     (when (and invalid-active proofread--request-queue)
       (proofread--schedule-queue-dispatch))))
 
@@ -4080,7 +4145,7 @@ Return nil when ENTRY is no longer queued."
 (defun proofread--claim-request-queue-entry (entry)
   "Move queued ENTRY into claimed state and return it."
   (when (proofread--unlink-request-queue-entry entry)
-    (push (plist-get entry :request) proofread--claimed-requests)
+    (push (plist-get entry :work) proofread--claimed-requests)
     entry))
 
 (defun proofread--claim-request-queue-head ()
@@ -4090,13 +4155,13 @@ Return nil when ENTRY is no longer queued."
      (car proofread--request-queue))))
 
 (defun proofread--release-claimed-request
-    (request &optional forget-work)
-  "Remove REQUEST from claimed state.
+    (work &optional forget-work)
+  "Remove WORK from claimed state.
 When FORGET-WORK is non-nil, also release its pending-work identity."
   (setq proofread--claimed-requests
-        (delq request proofread--claimed-requests))
+        (delq work proofread--claimed-requests))
   (when forget-work
-    (proofread--forget-request-work request)))
+    (proofread--forget-request-work work)))
 
 (defun proofread--prepend-request-queue-entry
     (entry &optional suppress-cache-wakeup)
@@ -4157,18 +4222,18 @@ was already considered while ENTRY was claimed."
       (eq proofread--queue-dispatch-active-p
           proofread--queue-dispatch-transaction)))
 
-(defun proofread--claimed-request-restorable-p (request)
-  "Return non-nil when claimed REQUEST may safely return to the queue."
+(defun proofread--claimed-request-restorable-p (work)
+  "Return non-nil when claimed WORK may safely return to the queue."
   (and (proofread--queue-dispatch-transaction-current-p)
-       (memq request proofread--claimed-requests)
-       (proofread--request-lifecycle-current-p request)))
+       (memq work proofread--claimed-requests)
+       (proofread--request-lifecycle-current-p work)))
 
-(defun proofread--retire-unrestorable-claimed-request (request)
-  "Retire claimed REQUEST after a reentrant lifecycle change."
-  (proofread--release-claimed-request request t)
+(defun proofread--retire-unrestorable-claimed-request (work)
+  "Retire claimed WORK after a reentrant lifecycle change."
+  (proofread--release-claimed-request work t)
   (proofread--record-request-cancellation
-   request
-   (if (proofread--request-state-flag-p request :superseded)
+   work
+   (if (proofread--request-state-flag-p work :superseded)
        'superseded
      'stale)))
 
@@ -4177,16 +4242,16 @@ was already considered while ENTRY was claimed."
   (< (proofread--request-queue-entry-sequence left)
      (proofread--request-queue-entry-sequence right)))
 
-(defun proofread--cache-woken-request-status (request)
-  "Apply REQUEST's exact cache entry and return its queue status.
+(defun proofread--cache-woken-request-status (work)
+  "Apply WORK's exact cache entry and return its queue status.
 Return one of `cached', `miss', or `stale'.  This function never sends
-REQUEST to a backend."
+WORK to a backend."
   (catch 'status
-    (unless (proofread--request-ready-to-submit-p request)
+    (unless (proofread--request-ready-to-submit-p work)
       (throw 'status 'stale))
-    (unless (proofread--request-lifecycle-current-p request)
+    (unless (proofread--request-lifecycle-current-p work)
       (throw 'status 'stale))
-    (when-let* ((status (proofread--request-cache-status request)))
+    (when-let* ((status (proofread--request-cache-status work)))
       (throw 'status status))
     'miss))
 
@@ -4221,33 +4286,33 @@ Do not scan unrelated requests."
       ;; this exact entry or invalidated its cache wakeup.
       (when-let* ((claimed
                    (proofread--claim-current-cache-woken-entry entry))
-                  (request (plist-get claimed :request)))
+                  (work (plist-get claimed :work)))
         (setq claimed-count (1+ claimed-count))
         (unwind-protect
-            (pcase (proofread--cache-woken-request-status request)
+            (pcase (proofread--cache-woken-request-status work)
               ('cached
-               (proofread--release-claimed-request request t))
+               (proofread--release-claimed-request work t))
               ('stale
-               (proofread--release-claimed-request request t)
+               (proofread--release-claimed-request work t)
                (proofread--record-request-cancellation
-                request
+                work
                 (if (proofread--request-state-flag-p
-                     request :superseded)
+                     work :superseded)
                     'superseded
                   'stale)))
               ('miss
                ;; Cache eviction or a defensive text mismatch must not
                ;; promote this request ahead of unrelated FIFO work.
-               (if (proofread--claimed-request-restorable-p request)
+               (if (proofread--claimed-request-restorable-p work)
                    (progn
                      (proofread--insert-request-queue-entry entry t)
-                     (proofread--release-claimed-request request))
+                     (proofread--release-claimed-request work))
                  (proofread--retire-unrestorable-claimed-request
-                  request))))
-          (when (memq request proofread--claimed-requests)
-            (proofread--release-claimed-request request t)
+                  work))))
+          (when (memq work proofread--claimed-requests)
+            (proofread--release-claimed-request work t)
             (proofread--record-request-cancellation
-             request 'error)))))
+             work 'error)))))
     claimed-count))
 
 (defun proofread--drain-request-queue ()
@@ -4258,39 +4323,40 @@ Do not scan unrelated requests."
                 (proofread--queue-dispatch-transaction-current-p)
                 proofread--request-queue)
       (let* ((entry (proofread--claim-request-queue-head))
-             (request (plist-get entry :request))
+             (work (plist-get entry :work))
              (backend (plist-get entry :backend)))
         (unwind-protect
-            (pcase (proofread--submit-request request backend)
+            (pcase (proofread--submit-request work backend)
               ('sent
-               (proofread--release-claimed-request request)
-               (push request requests))
+               (proofread--release-claimed-request work)
+               (push (proofread--scheduled-work-request work)
+                     requests))
               ('full
                ;; The current cache state was already considered by
                ;; submission.  Keep unrelated work in strict FIFO order.
-               (if (proofread--claimed-request-restorable-p request)
+               (if (proofread--claimed-request-restorable-p work)
                    (progn
                      (proofread--prepend-request-queue-entry entry t)
-                     (proofread--release-claimed-request request))
+                     (proofread--release-claimed-request work))
                  (proofread--retire-unrestorable-claimed-request
-                  request))
+                  work))
                (setq full t))
               ((or 'cached 'error)
-               (proofread--release-claimed-request request t))
+               (proofread--release-claimed-request work t))
               ('stale
-               (proofread--release-claimed-request request t)
+               (proofread--release-claimed-request work t)
                (proofread--record-request-cancellation
-                request
+                work
                 (if (proofread--request-state-flag-p
-                     request :superseded)
+                     work :superseded)
                     'superseded
                   'stale))))
           ;; A malformed setting or unexpected predicate failure must
           ;; not strand a request between queue and active state.
-          (when (memq request proofread--claimed-requests)
-            (proofread--release-claimed-request request t)
+          (when (memq work proofread--claimed-requests)
+            (proofread--release-claimed-request work t)
             (proofread--record-request-cancellation
-             request 'error)))))
+             work 'error)))))
     (nreverse requests)))
 
 (defun proofread--dispatch-queued-requests ()
@@ -4417,15 +4483,16 @@ Do not scan unrelated requests."
              (proofread--backend-identity
               (plist-get request :backend)))))
 
-(defun proofread--fresh-request-p (request)
-  "Return non-nil if REQUEST still matches its originating buffer."
-  (let ((buffer (plist-get request :buffer)))
+(defun proofread--fresh-request-p (work)
+  "Return non-nil if WORK still matches its originating buffer."
+  (let* ((request (proofread--scheduled-work-request work))
+         (buffer (plist-get request :buffer)))
     (and (buffer-live-p buffer)
          (with-current-buffer buffer
            (and proofread-mode
                 (equal proofread--generation
                        (plist-get request :generation))
-                (not (proofread--request-invalidated-p request))
+                (not (proofread--request-invalidated-p work))
                 (let ((accessible-beg
                        (plist-get request :accessible-beg))
                       (accessible-end
@@ -4448,13 +4515,19 @@ Do not scan unrelated requests."
                        (proofread--request-context-matches-p
                         request domain))))))))
 
-(defun proofread--request-continuable-p (request)
-  "Return non-nil if REQUEST may submit another backend pass."
-  (let ((buffer (plist-get request :buffer)))
-    (and (buffer-live-p buffer)
-         (with-current-buffer buffer
-           (and (proofread--latest-request-p request)
-                (proofread--fresh-request-p request))))))
+(defun proofread--request-continuable-p (source)
+  "Return non-nil if SOURCE may submit another backend pass.
+SOURCE may be scheduled work or its backend-facing request payload."
+  (when-let* ((work
+               (if (proofread--scheduled-work-p source)
+                   source
+                 (proofread--scheduled-work-for-request source)))
+              (request (proofread--scheduled-work-request work))
+              (buffer (plist-get request :buffer))
+              ((buffer-live-p buffer)))
+    (with-current-buffer buffer
+      (and (proofread--latest-request-p work)
+           (proofread--fresh-request-p work)))))
 
 ;;;; Diagnostic cache
 
@@ -4699,40 +4772,43 @@ contain both snapshots."
           request diagnostics)
          request)))
 
-(defun proofread--cache-read-request (request)
-  "Return cache entry matching REQUEST in the current buffer."
-  (proofread--cache-read (plist-get request :cache-key)))
+(defun proofread--cache-read-request (work)
+  "Return cache entry matching WORK in the current buffer."
+  (proofread--cache-read
+   (proofread--scheduled-work-cache-key work)))
 
-(defun proofread--cache-write-request (request diagnostics)
-  "Write DIAGNOSTICS for REQUEST to the current buffer cache."
-  (proofread--cache-write
-   (plist-get request :cache-key)
-   (proofread--make-cache-entry request diagnostics)))
+(defun proofread--cache-write-request (work diagnostics)
+  "Write DIAGNOSTICS for WORK to the current buffer cache."
+  (let ((request (proofread--scheduled-work-request work)))
+    (proofread--cache-write
+     (proofread--scheduled-work-cache-key work)
+     (proofread--make-cache-entry request diagnostics))))
 
-(defun proofread--apply-cache-entry (request entry)
-  "Apply cached diagnostics from ENTRY for REQUEST when still valid."
-  (when (equal (plist-get entry :text)
-               (plist-get request :text))
-    (proofread--record-request-event
-     request 'cache-hit
-     :entry entry)
-    (let ((result
-           (list :status 'ok
-                 :source 'cache
-                 :request request
-                 :diagnostics
-                 (proofread--diagnostics-with-request-provenance
-                  request
-                  (proofread--diagnostics-to-absolute
-                   (plist-get entry :diagnostics)
-                   request)))))
+(defun proofread--apply-cache-entry (work entry)
+  "Apply cached diagnostics from ENTRY for WORK when still valid."
+  (let ((request (proofread--scheduled-work-request work)))
+    (when (equal (plist-get entry :text)
+                 (plist-get request :text))
       (proofread--record-request-event
-       request 'backend-result
-       :backend (plist-get request :backend)
-       :source 'cache
-       :entry entry
-       :result result)
-      (proofread--handle-backend-result result))))
+       work 'cache-hit
+       :entry entry)
+      (let ((result
+             (list :status 'ok
+                   :source 'cache
+                   :request request
+                   :diagnostics
+                   (proofread--diagnostics-with-request-provenance
+                    request
+                    (proofread--diagnostics-to-absolute
+                     (plist-get entry :diagnostics)
+                     request)))))
+        (proofread--record-request-event
+         work 'backend-result
+         :backend (plist-get request :backend)
+         :source 'cache
+         :entry entry
+         :result result)
+        (proofread--handle-backend-result work result)))))
 
 ;;;; Backend results
 
@@ -4852,16 +4928,16 @@ range."
    (proofread--backend-error-message result)
    "backend request failed; see *Warnings*"))
 
-(defun proofread--handle-backend-result (result)
-  "Handle backend RESULT and return an internal status symbol."
-  (let* ((request (plist-get result :request))
+(defun proofread--handle-backend-result (work result)
+  "Handle backend RESULT for WORK and return an internal status."
+  (let* ((request (proofread--scheduled-work-request work))
          (buffer (plist-get request :buffer))
          (status
           (pcase (plist-get result :status)
             ('ok
-             (if (and (proofread--fresh-request-p request)
+             (if (and (proofread--fresh-request-p work)
                       (with-current-buffer buffer
-                        (proofread--latest-request-p request)))
+                        (proofread--latest-request-p work)))
                  (with-current-buffer buffer
                    (let
                        ((diagnostics
@@ -4877,33 +4953,32 @@ range."
                                      'cache)
                                  (plist-get result :partial))
                        (proofread--cache-write-request
-                        request diagnostics)))
+                        work diagnostics)))
                    'applied)
                'stale))
             ('error
-             (if (and (proofread--fresh-request-p request)
+             (if (and (proofread--fresh-request-p work)
                       (with-current-buffer buffer
-                        (proofread--latest-request-p request)))
+                        (proofread--latest-request-p work)))
                  (progn
-                   (unless (plist-get
-                            (plist-get request :state) :batch)
+                   (unless (proofread--scheduled-work-batch work)
                      (proofread--report-backend-error result))
                    'error)
                'stale))
             (_ 'error))))
     (proofread--record-request-event
-     request 'final-result
+     work 'final-result
      :result result
      :status status)
     (when (buffer-live-p buffer)
       (with-current-buffer buffer
-        (proofread--forget-request-work request)))
+        (proofread--forget-request-work work)))
     status))
 
 (defun proofread--prepare-checker-request-work
     (chunks backend profile preparation)
   "Prepare unpublished request work from PREPARATION.
-CHUNKS, BACKEND, and PROFILE describe the work.  Return `(REQUEST .
+CHUNKS, BACKEND, and PROFILE describe the work.  Return `(WORK .
 CHUNK)' pairs after removing duplicate pending work."
   (let ((checker
          (proofread--checker-preparation-checker preparation))
@@ -4913,37 +4988,38 @@ CHUNK)' pairs after removing duplicate pending work."
       (let* ((request
               (proofread--make-backend-request
                chunk backend checker profile preparation))
-             (work-key (proofread--request-work-key request)))
-        (unless (or (proofread--request-work-pending-p request)
+             (work (proofread--make-request-work request backend))
+             (work-key (proofread--request-work-key work)))
+        (unless (or (proofread--request-work-pending-p work)
                     (gethash work-key new-work-keys))
           (puthash work-key t new-work-keys)
-          (push (cons request chunk) prepared))))
+          (push (cons work chunk) prepared))))
     (nreverse prepared)))
 
 (defun proofread--dispatch-prepared-checker-work (prepared backend)
   "Publish and dispatch PREPARED request work through BACKEND."
-  (let* ((requests (mapcar #'car prepared))
+  (let* ((works (mapcar #'car prepared))
          (superseded
-          (proofread--supersede-conflicting-requests requests)))
+          (proofread--supersede-conflicting-requests works)))
     ;; Publish the complete batch before lifecycle hooks or
     ;; cancellation callbacks can edit the buffer or enqueue more work.
     (let ((enqueued
-           (proofread--enqueue-requests requests backend)))
+           (proofread--enqueue-requests works backend)))
       (when enqueued
-        (proofread--attach-request-batch requests))
+        (proofread--attach-request-batch works))
       (let ((proofread--inhibit-queue-dispatch (current-buffer)))
         (proofread--finish-superseded-requests superseded)
         (if enqueued
             (dolist (work prepared)
-              (let ((request (car work)))
+              (let ((scheduled-work (car work)))
                 (proofread--record-request-event
-                 request 'chunk-request
+                 scheduled-work 'chunk-request
                  :chunk (cdr work))
                 (proofread--record-request-event
-                 request 'queued-request
+                 scheduled-work 'queued-request
                  :backend backend)))
-          (dolist (request requests)
-            (proofread--reject-request-during-clear request))))
+          (dolist (work works)
+            (proofread--reject-request-during-clear work))))
       (when enqueued
         (proofread--dispatch-queued-requests)))))
 
@@ -5100,15 +5176,15 @@ of later requests can continue."
 
 (defun proofread--cancel-active-requests ()
   "Cancel cancellable active backend requests for the current buffer."
-  (let ((requests proofread--active-requests)
+  (let ((works proofread--active-requests)
         (proofread--inhibit-queue-dispatch (current-buffer)))
     (setq proofread--active-requests nil)
-    (dolist (request requests)
-      (proofread--forget-request-work request))
-    (dolist (request requests)
-      (proofread--record-request-cancellation request)
+    (dolist (work works)
+      (proofread--forget-request-work work))
+    (dolist (work works)
+      (proofread--record-request-cancellation work)
       (proofread--cancel-request-handle
-       (plist-get request :handle)))))
+       (proofread--scheduled-work-handle work)))))
 
 (defun proofread--cancel-idle-timer ()
   "Cancel the current buffer's scheduled idle timer."
@@ -5142,9 +5218,9 @@ of later requests can continue."
 
 (defun proofread--clear-scheduled-work ()
   "Clear pending scheduled proofreading work in the current buffer."
-  (let ((requests
+  (let ((works
          (append proofread--claimed-requests
-                 (mapcar (lambda (entry) (plist-get entry :request))
+                 (mapcar (lambda (entry) (plist-get entry :work))
                          proofread--request-queue)))
         (proofread--inhibit-queue-dispatch (current-buffer))
         (proofread--clearing-scheduled-work (current-buffer)))
@@ -5153,9 +5229,9 @@ of later requests can continue."
     (setq proofread--request-queue nil)
     (setq proofread--request-queue-tail nil)
     (proofread--clear-request-queue-bookkeeping)
-    (dolist (request requests)
-      (proofread--forget-request-work request)
-      (proofread--record-request-cancellation request)))
+    (dolist (work works)
+      (proofread--forget-request-work work)
+      (proofread--record-request-cancellation work)))
   (when (hash-table-p proofread--pending-request-keys)
     (clrhash proofread--pending-request-keys))
   (proofread--cancel-idle-timer)
@@ -6181,7 +6257,6 @@ nil for a change to the default."
   "Return the request record key for EVENT."
   (let ((request (proofread--request-log-event-request event)))
     (or (plist-get event :log-id)
-        (plist-get request :log-id)
         (plist-get event :request-id)
         (plist-get request :id))))
 
@@ -6548,26 +6623,28 @@ nil for a change to the default."
 (defun proofread--request-log-seed-active-requests (source)
   "Record active requests already present in SOURCE."
   (with-current-buffer source
-    (dolist (request proofread--active-requests)
-      (proofread--request-log-record-event
-       (list :type 'active-request
-             :time (current-time)
-             :log-id (plist-get request :log-id)
-             :request-id (plist-get request :id)
-             :buffer source
-             :beg (plist-get request :beg)
-             :end (plist-get request :end)
-             :request request)))))
+    (dolist (work proofread--active-requests)
+      (let ((request (proofread--scheduled-work-request work)))
+        (proofread--request-log-record-event
+         (list :type 'active-request
+               :time (current-time)
+               :log-id (proofread--scheduled-work-log-id work)
+               :request-id (plist-get request :id)
+               :buffer source
+               :beg (plist-get request :beg)
+               :end (plist-get request :end)
+               :request request))))))
 
 (defun proofread--request-log-seed-queued-requests (source)
   "Record queued requests already present in SOURCE."
   (with-current-buffer source
     (dolist (entry proofread--request-queue)
-      (let ((request (plist-get entry :request)))
+      (let* ((work (plist-get entry :work))
+             (request (proofread--scheduled-work-request work)))
         (proofread--request-log-record-event
          (list :type 'queued-request
                :time (current-time)
-               :log-id (plist-get request :log-id)
+               :log-id (proofread--scheduled-work-log-id work)
                :request-id (plist-get request :id)
                :buffer source
                :beg (plist-get request :beg)
@@ -8314,6 +8391,7 @@ buffer."
     (proofread--request-log-disable-source source))
   (remove-hook 'proofread-request-log-hook
                #'proofread--request-log-record-event)
+  (clrhash proofread--request-log-owner-ids)
   (setq proofread--request-log-sources nil)
   (setq proofread--mode-buffers nil)
   (remove-variable-watcher

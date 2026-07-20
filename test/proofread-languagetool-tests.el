@@ -599,20 +599,24 @@ POINT-OFFSET is a zero-based offset or the symbol `end'."
                         (proofread-languagetool--identity))
                        (first-session
                         (proofread-languagetool--server-session-snapshot))
-                       (first-request
-                        (proofread--make-backend-request
-                         chunk 'languagetool))
+                       (first-work
+                        (proofread--make-request-work
+                         (proofread--make-backend-request
+                          chunk 'languagetool)
+                         'languagetool))
                        (diagnostic
                         '( :beg 1 :end 6 :text "Alpha"
                            :kind grammar :message "Cached"
                            :suggestions ("Beta")
                            :source languagetool)))
                   (proofread--cache-write-request
-                   first-request (list diagnostic))
+                   first-work (list diagnostic))
                   (should
                    (proofread--cache-read-request
-                    (proofread--make-backend-request
-                     chunk 'languagetool)))
+                    (proofread--make-request-work
+                     (proofread--make-backend-request
+                      chunk 'languagetool)
+                     'languagetool)))
                   (write-region second-content nil config nil 'silent)
                   (set-file-times config mtime)
                   (let* ((new-attributes (file-attributes config))
@@ -620,9 +624,11 @@ POINT-OFFSET is a zero-based offset or the symbol `end'."
                           (proofread-languagetool--identity))
                          (second-session
                           (proofread-languagetool--server-session-snapshot))
-                         (second-request
-                          (proofread--make-backend-request
-                           chunk 'languagetool)))
+                         (second-work
+                          (proofread--make-request-work
+                           (proofread--make-backend-request
+                            chunk 'languagetool)
+                           'languagetool)))
                     (should
                      (= size
                         (file-attribute-size new-attributes)))
@@ -636,10 +642,11 @@ POINT-OFFSET is a zero-based offset or the symbol `end'."
                      (proofread-languagetool--same-session-p
                       first-session second-session))
                     (should-not
-                     (equal (plist-get first-request :cache-key)
-                            (plist-get second-request :cache-key)))
+                     (equal
+                      (proofread--scheduled-work-cache-key first-work)
+                      (proofread--scheduled-work-cache-key second-work)))
                     (should-not
-                     (proofread--cache-read-request second-request))))))))
+                     (proofread--cache-read-request second-work))))))))
       (delete-directory directory t))))
 
 (ert-deftest
@@ -1758,17 +1765,20 @@ A stale timeout leaves readiness unchanged."
                      (list (cons (point-min) (point-max)))))))
                  (request
                   (proofread--make-backend-request
-                   chunk 'languagetool)))
+                   chunk 'languagetool))
+                 (work
+                  (proofread--make-request-work
+                   request 'languagetool)))
             (should
              (proofread--dispatch-backend-request
-              request
+              work
               (lambda (value) (setq result value))
               'languagetool))
-            (should (proofread--active-request-p request))
+            (should (proofread--active-request-p work))
             (proofread-languagetool-stop-server)
             (should (eq (plist-get result :error)
                         'languagetool-stopped))
-            (should-not (proofread--active-request-p request))
+            (should-not (proofread--active-request-p work))
             (should-not proofread--active-requests)
             (should-not proofread-languagetool--live-handles)
             (should-not proofread-languagetool--server-waiters)

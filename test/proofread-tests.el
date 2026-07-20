@@ -209,6 +209,22 @@ LANGUAGE is the language hint snapshotted for the chunks."
           (lambda ()
             (reverse callbacks)))))
 
+(defun proofread-test--work-request (work)
+  "Return WORK's immutable backend request payload."
+  (proofread--scheduled-work-request work))
+
+(defun proofread-test--queue-entry-work (entry)
+  "Return the scheduled work owned by queue ENTRY."
+  (plist-get entry :work))
+
+(defun proofread-test--make-request-work
+    (chunk &optional backend checker profile preparation)
+  "Return scheduled work for a backend request built from CHUNK."
+  (let ((request
+         (proofread--make-backend-request
+          chunk backend checker profile preparation)))
+    (proofread--make-request-work request backend)))
+
 (defun proofread-test--ordered-profiles (&optional checker-order)
   "Return a profile fixture with CHECKER-ORDER.
 CHECKER-ORDER defaults to first followed by second."
@@ -309,13 +325,13 @@ CHECKER-ORDER defaults to first followed by second."
 (defun proofread-test--scheduled-checker-names ()
   "Return checker names in all current scheduler states."
   (mapcar
-   (lambda (request)
-     (plist-get request :checker-name))
+   (lambda (work)
+     (plist-get (proofread-test--work-request work) :checker-name))
    (append
     proofread--active-requests
     proofread--claimed-requests
     (mapcar (lambda (entry)
-              (plist-get entry :request))
+              (proofread-test--queue-entry-work entry))
             proofread--request-queue))))
 
 (defun proofread-test--assert-queue-cache-index-consistent ()
@@ -376,17 +392,14 @@ CHECKER-ORDER defaults to first followed by second."
          (should (gethash entry queued)))
        proofread--cache-woken-queue-entries))))
 
-(defun proofread-test--assert-requests-settled (requests)
-  "Assert that REQUESTS and current scheduler state are settled."
-  (dolist (request requests)
-    (let ((state (plist-get request :state)))
-      (should (plist-get state :batch))
-      (should (plist-get state :batch-settled))))
+(defun proofread-test--assert-requests-settled (works)
+  "Assert that WORKS and current scheduler state are settled."
+  (dolist (work works)
+    (should (proofread--scheduled-work-batch work))
+    (should (proofread--scheduled-work-batch-settled work)))
   (dolist (batch
            (delete-dups
-            (mapcar (lambda (request)
-                      (plist-get (plist-get request :state) :batch))
-                    requests)))
+            (mapcar #'proofread--scheduled-work-batch works)))
     (should (zerop (plist-get batch :pending))))
   (should-not proofread--active-requests)
   (should-not proofread--claimed-requests)
@@ -516,30 +529,27 @@ CHECKER-ORDER defaults to first followed by second."
 
 (defun proofread-test--lifecycle-request
     (id beg end &optional handle)
-  "Return a minimal lifecycle request named ID from BEG to END.
+  "Return minimal scheduled work named ID from BEG to END.
 When HANDLE is non-nil, attach it as the backend handle."
-  (list :id id
-        :log-id id
-        :buffer (current-buffer)
-        :generation 1
-        :beg beg
-        :end end
-        :accessible-beg 1
-        :accessible-end 100
-        :cache-key id
-        :handle handle
-        :state (list :superseded nil
-                     :invalidated nil
-                     :cancelled nil
-                     :batch nil
-                     :batch-settled nil)))
+  (let ((work
+         (proofread--make-scheduled-work
+          (list :id id
+                :buffer (current-buffer)
+                :generation 1
+                :beg beg
+                :end end
+                :accessible-beg 1
+                :accessible-end 100)
+          id id)))
+    (setf (proofread--scheduled-work-handle work) handle)
+    work))
 
-(defun proofread-test--pending-request-table (requests)
-  "Return a pending-work table containing REQUESTS."
+(defun proofread-test--pending-request-table (works)
+  "Return a pending-work table containing WORKS."
   (let ((table (make-hash-table :test #'equal)))
-    (dolist (request requests)
-      (puthash (proofread--request-work-key request)
-               (plist-get request :log-id)
+    (dolist (work works)
+      (puthash (proofread--request-work-key work)
+               work
                table))
     table))
 
@@ -1009,16 +1019,23 @@ When PROFILE is nil, use the current profile."
 
 (ert-deftest proofread-test-conflicting-request-table-uses-eq-keys ()
   "Fold repeated conflicting candidate identities into an eq table."
-  (let* ((main (list :beg 4 :end 7))
-         (zero (list :beg 10 :end 10))
-         (overlap (list :beg 3 :end 5))
-         (contains (list :beg 2 :end 8))
-         (zero-right (list :beg 7 :end 7))
-         (zero-query-left (list :beg 9 :end 10))
-         (contained (list :beg 5 :end 6))
+  (let* ((main (proofread-test--lifecycle-request 'main 4 7))
+         (zero (proofread-test--lifecycle-request 'zero 10 10))
+         (overlap
+          (proofread-test--lifecycle-request 'overlap 3 5))
+         (contains
+          (proofread-test--lifecycle-request 'contains 2 8))
+         (zero-right
+          (proofread-test--lifecycle-request 'zero-right 7 7))
+         (zero-query-left
+          (proofread-test--lifecycle-request 'zero-query-left 9 10))
+         (contained
+          (proofread-test--lifecycle-request 'contained 5 6))
          (contained-copy (copy-sequence contained))
-         (adjacent-left (list :beg 1 :end 4))
-         (adjacent-right (list :beg 7 :end 9))
+         (adjacent-left
+          (proofread-test--lifecycle-request 'adjacent-left 1 4))
+         (adjacent-right
+          (proofread-test--lifecycle-request 'adjacent-right 7 9))
          (table
           (proofread--conflicting-request-table
            (list zero main)
@@ -1065,15 +1082,15 @@ When PROFILE is nil, use the current profile."
          (queued-last
           (proofread-test--lifecycle-request 'queued-last 10 11))
          (queued-first-entry
-          (list :request queued-first :backend 'first-backend))
+          (list :work queued-first :backend 'first-backend))
          (queued-retained-first-entry
-          (list :request queued-retained-first
+          (list :work queued-retained-first
                 :backend 'retained-first-backend))
          (queued-retained-last-entry
-          (list :request queued-retained-last
+          (list :work queued-retained-last
                 :backend 'retained-last-backend))
          (queued-last-entry
-          (list :request queued-last :backend 'last-backend))
+          (list :work queued-last :backend 'last-backend))
          (active-input
           (list active-first active-retained active-last))
          (claimed-input
@@ -1088,7 +1105,7 @@ When PROFILE is nil, use the current profile."
          (all-requests
           (append active-input claimed-input
                   (mapcar (lambda (entry)
-                            (plist-get entry :request))
+                            (plist-get entry :work))
                           queue-input)))
          (request-value-snapshot (copy-tree all-requests))
          (queue-value-snapshot (copy-tree queue-input))
@@ -1184,15 +1201,15 @@ When PROFILE is nil, use the current profile."
     (should (cl-every #'eq queue-input queue-snapshot))
     (should (equal all-requests request-value-snapshot))
     (should (equal queue-input queue-value-snapshot))
-    (dolist (request all-requests)
-      (should (equal (proofread--request-work-pending-p request)
-                     (plist-get request :log-id)))
+    (dolist (work all-requests)
+      (should (eq (proofread--request-work-pending-p work)
+                  work))
       (should-not
-       (proofread--request-state-flag-p request :superseded))
+       (proofread--request-state-flag-p work :superseded))
       (should-not
-       (proofread--request-state-flag-p request :invalidated))
+       (proofread--request-state-flag-p work :invalidated))
       (should-not
-       (proofread--request-state-flag-p request :cancelled)))
+       (proofread--request-state-flag-p work :cancelled)))
     (should-not events)
     (should-not cancelled-handles)))
 
@@ -2433,8 +2450,13 @@ range; no available backend"))))))
     (insert "Alpha")
     (setq-local proofread-auto-check nil)
     (proofread-mode 1)
-    (let ((proofread--request-queue '( manual-request))
-          timer-count)
+    (let* ((manual-work
+            (proofread-test--lifecycle-request
+             'manual-request 1 1))
+           (manual-entry
+            (list :work manual-work :backend 'manual-backend))
+           (proofread--request-queue (list manual-entry))
+           timer-count)
       (cl-letf (((symbol-function 'run-with-idle-timer)
                  (lambda (_seconds _repeat _function &rest _args)
                    (setq timer-count (1+ (or timer-count 0)))
@@ -2444,7 +2466,7 @@ range; no available backend"))))))
         (should-not proofread--pending-work)
         (should-not proofread--idle-timer)
         (should (equal proofread--request-queue
-                       '( manual-request)))))))
+                       (list manual-entry)))))))
 
 (ert-deftest
     proofread-test-auto-check-disabled-does-not-schedule-window-work
@@ -3959,16 +3981,24 @@ This covers URLs, email, invisible text, faces, and properties."
       (let* ((chunk
               (car (proofread-test--request-ready-chunks-for-ranges
                     (list (cons (point-min) (point-max))))))
-             (request (proofread-test--make-profile-request chunk))
+             (profile (proofread--current-profile))
+             (checker
+              (proofread-test--current-profile-checker profile))
+             (work
+              (proofread-test--make-request-work
+               chunk proofread-test--backend checker profile))
+             (request (proofread-test--work-request work))
              (diagnostic
               (proofread-test--diagnostic-for-range 1 5 "helo")))
         (should (eq (proofread--handle-backend-result
+                     work
                      (proofread--backend-success-result
                       request (list diagnostic)))
                     'applied))
         (should (= (length proofread--diagnostics) 1))
         (should (= (length proofread--overlays) 1))
         (should (eq (proofread--handle-backend-result
+                     work
                      (proofread--backend-success-result
                       request (list diagnostic)))
                     'applied))
@@ -3978,6 +4008,7 @@ This covers URLs, email, invisible text, faces, and properties."
                 (list diagnostic)))
         (should (= (length proofread--overlays) 1))
         (should (eq (proofread--handle-backend-result
+                     work
                      (proofread--backend-success-result request nil))
                     'applied))
         (should-not proofread--diagnostics)
@@ -3993,7 +4024,13 @@ This covers URLs, email, invisible text, faces, and properties."
       (let* ((chunk
               (car (proofread-test--request-ready-chunks-for-ranges
                     (list (cons (point-min) (point-max))))))
-             (request (proofread-test--make-profile-request chunk))
+             (profile (proofread--current-profile))
+             (checker
+              (proofread-test--current-profile-checker profile))
+             (work
+              (proofread-test--make-request-work
+               chunk proofread-test--backend checker profile))
+             (request (proofread-test--work-request work))
              (old (proofread-test--diagnostic-for-range 1 5 "helo"))
              (later-range
               (proofread-test--diagnostic-for-range 10 14 "wrld"))
@@ -4010,6 +4047,7 @@ This covers URLs, email, invisible text, faces, and properties."
              (created 0)
              (changed 0))
         (should (eq (proofread--handle-backend-result
+                     work
                      (proofread--backend-success-result request (list old)))
                     'applied))
         (proofread-clear-cache)
@@ -4019,7 +4057,7 @@ This covers URLs, email, invisible text, faces, and properties."
                    (lambda (diagnostic)
                      (setq created (1+ created))
                      (funcall original-create-overlay diagnostic))))
-          (should (eq (proofread--handle-backend-result partial)
+          (should (eq (proofread--handle-backend-result work partial)
                       'applied))
           (should
            (equal (proofread-test--diagnostics-without-provenance
@@ -4029,7 +4067,7 @@ This covers URLs, email, invisible text, faces, and properties."
           (should (= created 2))
           (should (= changed 1))
           (should (= (hash-table-count proofread--cache) 0))
-          (should (eq (proofread--handle-backend-result partial)
+          (should (eq (proofread--handle-backend-result work partial)
                       'applied))
           (should
            (equal (proofread-test--diagnostics-without-provenance
@@ -4085,14 +4123,19 @@ This covers URLs, email, invisible text, faces, and properties."
                 (let* ((chunks
                         (proofread-test--request-ready-chunks-for-ranges
                          (list (cons (point-min) (point-max)))))
-                       (cached-request
-                        (proofread-test--make-profile-request
-                         (car chunks)))
+                       (profile (proofread--current-profile))
+                       (checker
+                        (proofread-test--current-profile-checker
+                         profile))
+                       (cached-work
+                        (proofread-test--make-request-work
+                         (car chunks) proofread-test--backend checker
+                         profile))
                        (cached-diagnostic
                         (proofread-test--diagnostic-with-kind
                          1 6 "Alpha" 'spelling)))
                   (proofread--cache-write-request
-                   cached-request (list cached-diagnostic))
+                   cached-work (list cached-diagnostic))
                   (cl-letf (((symbol-function 'window-start)
                              (lambda (&optional _window) (point-min)))
                             ((symbol-function 'window-end)
@@ -4123,20 +4166,21 @@ This covers URLs, email, invisible text, faces, and properties."
            (chunk
             (car (proofread-test--request-ready-chunks-for-ranges
                   (list (cons (point-min) (point-max))))))
-           (request (proofread--make-backend-request
-                     chunk proofread-test--backend))
+           (work
+            (proofread-test--make-request-work
+             chunk proofread-test--backend))
            (diagnostic
             (proofread-test--diagnostic-for-range 1 6 "Alpha")))
-      (proofread--cache-write-request request (list diagnostic))
+      (proofread--cache-write-request work (list diagnostic))
       (let ((proofread-test--backend-identity-token "identity-b"))
         (should-not (proofread--cache-read-request
-                     (proofread--make-backend-request
+                     (proofread-test--make-request-work
                       chunk proofread-test--backend))))
       (let ((changed-chunk (plist-put (copy-sequence chunk)
                                       :text "Beta")))
         (should-not
          (proofread--cache-read-request
-          (proofread--make-backend-request
+          (proofread-test--make-request-work
            changed-chunk proofread-test--backend)))))))
 
 (ert-deftest proofread-test-stale-and-error-results-are-not-cached ()
@@ -4148,20 +4192,32 @@ This covers URLs, email, invisible text, faces, and properties."
       (let* ((chunk
               (car (proofread-test--request-ready-chunks-for-ranges
                     (list (cons (point-min) (point-max))))))
-             (request (proofread-test--make-profile-request chunk))
+             (profile (proofread--current-profile))
+             (checker
+              (proofread-test--current-profile-checker profile))
+             (work
+              (proofread-test--make-request-work
+               chunk proofread-test--backend checker profile))
+             (request (proofread-test--work-request work))
              (diagnostic
               (proofread-test--diagnostic-for-range 1 5 "helo")))
         (insert "!")
         (should (eq (proofread--handle-backend-result
+                     work
                      (proofread--backend-success-result
                       request (list diagnostic)))
                     'stale))
         (should (= (hash-table-count proofread--cache) 0))
-        (let ((fresh-request
-               (proofread-test--make-profile-request
-                (car (proofread-test--request-ready-chunks-for-ranges
-                      (list (cons (point-min) (point-max))))))))
+        (let* ((fresh-work
+                (proofread-test--make-request-work
+                 (car
+                  (proofread-test--request-ready-chunks-for-ranges
+                   (list (cons (point-min) (point-max)))))
+                 proofread-test--backend checker profile))
+               (fresh-request
+                (proofread-test--work-request fresh-work)))
           (should (eq (proofread--handle-backend-result
+                       fresh-work
                        (proofread--backend-error-result
                         fresh-request 'proofread-test-backend-failure
                         "Test backend failure"))
@@ -4176,14 +4232,15 @@ This covers URLs, email, invisible text, faces, and properties."
     (let* ((chunk
             (car (proofread-test--request-ready-chunks-for-ranges
                   (list (cons (point-min) (point-max))))))
-           (request (proofread--make-backend-request chunk))
+           (work (proofread-test--make-request-work chunk))
+           (request (proofread-test--work-request work))
            (diagnostic
             (proofread-test--diagnostic-for-range 1 5 "helo"))
            (entry (proofread--make-cache-entry request (list
                                                         diagnostic))))
       (delete-region 1 5)
       (insert "hello")
-      (should (eq (proofread--apply-cache-entry request entry)
+      (should (eq (proofread--apply-cache-entry work entry)
                   'stale))
       (should-not proofread--diagnostics)
       (should-not proofread--overlays))))
@@ -4497,37 +4554,44 @@ This covers URLs, email, invisible text, faces, and properties."
                 (list (cons (point-min) (point-max))) "en-US")))
              (profile (proofread--current-profile))
              (checker (car (plist-get profile :checkers)))
-             (profile-request
-              (proofread--make-backend-request
+             (profile-work
+              (proofread-test--make-request-work
                chunk proofread-test--backend checker profile))
+             (ad-hoc-work
+              (proofread-test--make-request-work
+               chunk proofread-test--backend))
+             (profile-request
+              (proofread-test--work-request profile-work))
              (ad-hoc-request
-              (proofread--make-backend-request
-               chunk proofread-test--backend)))
+              (proofread-test--work-request ad-hoc-work)))
         (should
          (equal (plist-get profile-request :checker-owner)
                 '( :profile ad-hoc :checker-name ad-hoc)))
         (should
          (equal (plist-get ad-hoc-request :checker-owner)
                 '( :profile ad-hoc :checker-name ad-hoc :ad-hoc t)))
-        (dolist (key '( :checker-owner :checker-identity :cache-key))
+        (dolist (key '( :checker-owner :checker-identity))
           (should-not
            (equal (plist-get profile-request key)
                   (plist-get ad-hoc-request key))))
+        (should-not
+         (equal (proofread--scheduled-work-cache-key profile-work)
+                (proofread--scheduled-work-cache-key ad-hoc-work)))
         (should
          (zerop
           (hash-table-count
            (proofread--conflicting-request-table
-            (list profile-request) (list ad-hoc-request)))))
+            (list profile-work) (list ad-hoc-work)))))
         (should
          (zerop
           (hash-table-count
            (proofread--conflicting-request-table
-            (list ad-hoc-request) (list profile-request)))))
-        (should (proofread--fresh-request-p profile-request))
-        (should (proofread--fresh-request-p ad-hoc-request))
+            (list ad-hoc-work) (list profile-work)))))
+        (should (proofread--fresh-request-p profile-work))
+        (should (proofread--fresh-request-p ad-hoc-work))
         (let ((proofread-profile nil))
-          (should-not (proofread--fresh-request-p profile-request))
-          (should (proofread--fresh-request-p ad-hoc-request)))))))
+          (should-not (proofread--fresh-request-p profile-work))
+          (should (proofread--fresh-request-p ad-hoc-work)))))))
 
 (ert-deftest proofread-test-invalid-profile-never-falls-back
     ()
@@ -4839,7 +4903,7 @@ This covers URLs, email, invisible text, faces, and properties."
                 (list (cons (point-min) (point-max))))))
              (original-descriptor
               (symbol-function 'proofread--backend-descriptor))
-             (requests
+             (works
               (cl-letf
                   (((symbol-function 'proofread--backend-descriptor)
                     (lambda (queried-backend)
@@ -4852,13 +4916,14 @@ This covers URLs, email, invisible text, faces, and properties."
                       (mapcar #'car prepared))))
                 (proofread--dispatch-request-ready-chunks
                  (list chunk) backend)))
-             (request (car requests))
+             (work (car works))
+             (request (proofread-test--work-request work))
              (checker-identity
               (plist-get request :checker-identity)))
         (should (= descriptor-calls 1))
         (should (= snapshot-calls 1))
         (should (= identity-calls 1))
-        (should (= (length requests) 1))
+        (should (= (length works) 1))
         (should (eq (plist-get request :checker-options) snapshot))
         (should (eq (plist-get checker-identity :options)
                     snapshot))))))
@@ -4960,16 +5025,18 @@ This covers URLs, email, invisible text, faces, and properties."
                         (funcall original-snapshot value))))
                   (proofread--prepare-profile-checker-dispatch
                    chunks profile checker))))
-             (requests (mapcar #'car
-                               (plist-get preparation :work)))
+             (works (mapcar #'car
+                            (plist-get preparation :work)))
+             (requests (mapcar #'proofread-test--work-request works))
              (backend-identity
               (plist-get (car requests) :backend-identity))
              (checker-identity
               (plist-get (car requests) :checker-identity))
              (cache-keys
-              (mapcar (lambda (request)
-                        (copy-tree (plist-get request :cache-key)))
-                      requests)))
+              (mapcar (lambda (work)
+                        (copy-tree
+                         (proofread--scheduled-work-cache-key work)))
+                      works)))
         (should (eq (plist-get preparation :status) 'prepared))
         (should (= (length requests) 2))
         (should (= descriptor-calls 1))
@@ -5008,10 +5075,10 @@ This covers URLs, email, invisible text, faces, and properties."
                            "identity"))
             (should (equal (plist-get request :source-label)
                            "test model"))))
-        (should (equal cache-keys
-                       (mapcar (lambda (request)
-                                 (plist-get request :cache-key))
-                               requests)))))))
+        (should
+         (equal
+          cache-keys
+          (mapcar #'proofread--scheduled-work-cache-key works)))))))
 
 (ert-deftest
     proofread-test-checker-preparation-snapshots-backend-identity-once
@@ -5088,16 +5155,18 @@ This covers URLs, email, invisible text, faces, and properties."
                       (funcall original-snapshot value))))
                 (proofread--prepare-profile-checker-dispatch
                  chunks profile checker)))
-             (requests
+             (works
               (mapcar #'car (plist-get preparation :work)))
+             (requests (mapcar #'proofread-test--work-request works))
              (backend-identity
               (plist-get (car requests) :backend-identity))
              (checker-identity
               (plist-get (car requests) :checker-identity))
              (cache-keys
-              (mapcar (lambda (request)
-                        (copy-tree (plist-get request :cache-key)))
-                      requests)))
+              (mapcar (lambda (work)
+                        (copy-tree
+                         (proofread--scheduled-work-cache-key work)))
+                      works)))
         (should (eq (plist-get preparation :status) 'prepared))
         (should (= (length requests) 2))
         (should (= descriptor-calls 1))
@@ -5118,10 +5187,10 @@ This covers URLs, email, invisible text, faces, and properties."
         (aset token 0 ?X)
         (should (equal (plist-get backend-identity :token)
                        "identity"))
-        (should (equal cache-keys
-                       (mapcar (lambda (request)
-                                 (plist-get request :cache-key))
-                               requests)))))))
+        (should
+         (equal
+          cache-keys
+          (mapcar #'proofread--scheduled-work-cache-key works)))))))
 
 (ert-deftest
     proofread-test-checker-preparation-keeps-captured-descriptor ()
@@ -5215,8 +5284,10 @@ This covers URLs, email, invisible text, faces, and properties."
                (old-preparation
                 (proofread--prepare-profile-checker-dispatch
                  chunks profile checker))
+               (old-work
+                (caar (plist-get old-preparation :work)))
                (old-request
-                (caar (plist-get old-preparation :work))))
+                (proofread-test--work-request old-work)))
           (should (eq (plist-get old-preparation :status) 'prepared))
           (should (equal (nreverse events)
                          '(old-snapshot old-identity old-source)))
@@ -5226,16 +5297,19 @@ This covers URLs, email, invisible text, faces, and properties."
           (let* ((new-preparation
                   (proofread--prepare-profile-checker-dispatch
                    chunks profile checker))
+                 (new-work
+                  (caar (plist-get new-preparation :work)))
                  (new-request
-                  (caar (plist-get new-preparation :work))))
+                  (proofread-test--work-request new-work)))
             (should (eq (plist-get new-preparation :status)
                         'prepared))
             (should (equal (nreverse events)
                            '(new-snapshot new-identity new-source)))
             (should (equal (plist-get new-request :source-label)
                            "new source"))
-            (should (equal (plist-get old-request :cache-key)
-                           (plist-get new-request :cache-key)))
+            (should
+             (equal (proofread--scheduled-work-cache-key old-work)
+                    (proofread--scheduled-work-cache-key new-work)))
             (let ((descriptor-calls 0)
                   (original-descriptor
                    (symbol-function 'proofread--backend-descriptor)))
@@ -5246,7 +5320,7 @@ This covers URLs, email, invisible text, faces, and properties."
                             (1+ descriptor-calls))
                       (funcall original-descriptor queried-backend))))
                 (should
-                 (equal (plist-get old-request :cache-key)
+                 (equal (proofread--scheduled-work-cache-key old-work)
                         (proofread--cache-key old-request backend))))
               (should (zerop descriptor-calls))))
           (setq events nil)
@@ -5259,7 +5333,7 @@ This covers URLs, email, invisible text, faces, and properties."
                     (setq descriptor-calls
                           (1+ descriptor-calls))
                     (funcall original-descriptor queried-backend))))
-              (should (proofread--fresh-request-p old-request)))
+              (should (proofread--fresh-request-p old-work)))
             (should (= descriptor-calls 1)))
           (should (equal (nreverse events)
                          '(new-snapshot new-identity)))
@@ -5268,7 +5342,7 @@ This covers URLs, email, invisible text, faces, and properties."
            (plist-get old-preparation :work) backend)
           (should (zerop old-checks))
           (should (= new-checks 1))
-          (should (proofread--active-request-p old-request))
+          (should (proofread--active-request-p old-work))
           (proofread--cancel-active-requests)
           (should-not old-cancels)
           (should (equal new-cancels '(new-handle))))))))
@@ -5487,26 +5561,31 @@ This covers URLs, email, invisible text, faces, and properties."
                  (push handle cancelled-handles)))
       (proofread-mode 1)
       (proofread-check-buffer)
-      (let ((old (car (funcall (plist-get recorder :requests)))))
+      (let ((old (car (funcall (plist-get recorder :requests))))
+            (old-work (car proofread--active-requests)))
         (should old)
+        (should (eq (proofread-test--work-request old-work) old))
         (should (equal (plist-get old :source-label) "old-model"))
         (setq label "new-model")
         (proofread-check-buffer)
         (let* ((requests (funcall (plist-get recorder :requests)))
                (callbacks (funcall (plist-get recorder :callbacks)))
-               (new (cadr requests)))
+               (new (cadr requests))
+               (new-work (car proofread--active-requests)))
           (should (= (length requests) 2))
+          (should (eq (proofread-test--work-request new-work) new))
           (should (equal (plist-get new :source-label) "new-model"))
-          (should (equal (plist-get old :cache-key)
-                         (plist-get new :cache-key)))
-          (should-not (equal (proofread--request-work-key old)
-                             (proofread--request-work-key new)))
           (should
-           (proofread--request-state-flag-p old :superseded))
+           (equal (proofread--scheduled-work-cache-key old-work)
+                  (proofread--scheduled-work-cache-key new-work)))
+          (should-not (equal (proofread--request-work-key old-work)
+                             (proofread--request-work-key new-work)))
+          (should
+           (proofread--request-state-flag-p old-work :superseded))
           (should (equal cancelled-handles
                          '(proofread-test-handle)))
-          (should-not (proofread--active-request-p old))
-          (should (proofread--active-request-p new))
+          (should-not (proofread--active-request-p old-work))
+          (should (proofread--active-request-p new-work))
           (should
            (eq
             (funcall
@@ -5621,8 +5700,11 @@ This covers URLs, email, invisible text, faces, and properties."
                   (push (apply #'format format-string args)
                         progress))))
             (proofread-check-buffer)
-            (let ((requests
-                   (funcall (plist-get recorder :requests))))
+            (let* ((requests
+                    (funcall (plist-get recorder :requests)))
+                   (works
+                    (mapcar #'proofread--scheduled-work-for-request
+                            requests)))
               (should (= require-calls 1))
               (proofread-test--assert-checker-dispatch-failure-event
                events 'backend-loading)
@@ -5639,7 +5721,7 @@ This covers URLs, email, invisible text, faces, and properties."
                 (proofread-test--complete-recorded-requests recorder)
                 (make-list (length requests) 'applied)))
               (proofread-test--assert-request-diagnostics requests)
-              (proofread-test--assert-requests-settled requests)
+              (proofread-test--assert-requests-settled works)
               (proofread-test--assert-one-checker-report reports))))))))
 
 (ert-deftest
@@ -5711,8 +5793,11 @@ This covers URLs, email, invisible text, faces, and properties."
                   (push (apply #'format format-string args)
                         progress))))
             (proofread-check-buffer)
-            (let ((requests
-                   (funcall (plist-get recorder :requests))))
+            (let* ((requests
+                    (funcall (plist-get recorder :requests)))
+                   (works
+                    (mapcar #'proofread--scheduled-work-for-request
+                            requests)))
               (should (= failed-snapshot-calls 1))
               (when (eq failure 'error)
                 (should (string-match-p (regexp-quote sentinel)
@@ -5736,7 +5821,7 @@ This covers URLs, email, invisible text, faces, and properties."
                 (proofread-test--complete-recorded-requests recorder)
                 (make-list (length requests) 'applied)))
               (proofread-test--assert-request-diagnostics requests)
-              (proofread-test--assert-requests-settled requests))))))))
+              (proofread-test--assert-requests-settled works))))))))
 
 (ert-deftest
     proofread-test-profile-checker-identity-error-isolates-checker ()
@@ -5791,8 +5876,11 @@ This covers URLs, email, invisible text, faces, and properties."
                   (push (apply #'format format-string args)
                         progress))))
             (proofread-check-buffer)
-            (let ((requests
-                   (funcall (plist-get recorder :requests))))
+            (let* ((requests
+                    (funcall (plist-get recorder :requests)))
+                   (works
+                    (mapcar #'proofread--scheduled-work-for-request
+                            requests)))
               (should (= failed-identity-calls 1))
               (proofread-test--assert-checker-dispatch-failure-event
                events 'checker-identity)
@@ -5809,7 +5897,7 @@ This covers URLs, email, invisible text, faces, and properties."
                 (proofread-test--complete-recorded-requests recorder)
                 (make-list (length requests) 'applied)))
               (proofread-test--assert-request-diagnostics requests)
-              (proofread-test--assert-requests-settled requests)
+              (proofread-test--assert-requests-settled works)
               (proofread-test--assert-one-checker-report reports))))))))
 
 (ert-deftest
@@ -5864,8 +5952,11 @@ This covers URLs, email, invisible text, faces, and properties."
                   (push (apply #'format format-string args)
                         progress))))
             (proofread-check-buffer)
-            (let ((requests
-                   (funcall (plist-get recorder :requests))))
+            (let* ((requests
+                    (funcall (plist-get recorder :requests)))
+                   (works
+                    (mapcar #'proofread--scheduled-work-for-request
+                            requests)))
               (should (= failed-construction-calls 1))
               (proofread-test--assert-checker-dispatch-failure-event
                events 'request-construction)
@@ -5882,7 +5973,7 @@ This covers URLs, email, invisible text, faces, and properties."
                 (proofread-test--complete-recorded-requests recorder)
                 (make-list (length requests) 'applied)))
               (proofread-test--assert-request-diagnostics requests)
-              (proofread-test--assert-requests-settled requests)
+              (proofread-test--assert-requests-settled works)
               (proofread-test--assert-one-checker-report reports))))))))
 
 (ert-deftest
@@ -5907,6 +5998,7 @@ This covers URLs, email, invisible text, faces, and properties."
                (recorder (proofread-test--make-backend-recorder))
                (recorder-function (plist-get recorder :function))
                all-requests
+               all-works
                events
                progress
                reports)
@@ -5918,6 +6010,8 @@ This covers URLs, email, invisible text, faces, and properties."
                 (((symbol-function 'proofread--backend-check)
                   (lambda (request callback &optional backend)
                     (push request all-requests)
+                    (push (proofread--scheduled-work-for-request request)
+                          all-works)
                     (if (eq (plist-get request :checker-name) 'failed)
                         (pcase failure-mode
                           ('signal
@@ -5935,6 +6029,7 @@ This covers URLs, email, invisible text, faces, and properties."
                           progress))))
               (proofread-check-buffer)
               (setq all-requests (nreverse all-requests))
+              (setq all-works (nreverse all-works))
               (let* ((requests
                       (funcall (plist-get recorder :requests)))
                      (failed-requests
@@ -5991,16 +6086,24 @@ This covers URLs, email, invisible text, faces, and properties."
                 (should-not
                  (memq 'failed
                        (proofread-test--scheduled-checker-names)))
-                (dolist (request failed-requests)
-                  (should-not (plist-get request :handle))
+                (dolist (work
+                         (cl-remove-if-not
+                          (lambda (candidate)
+                            (eq
+                             (plist-get
+                              (proofread-test--work-request candidate)
+                              :checker-name)
+                             'failed))
+                          all-works))
+                  (should-not (proofread--scheduled-work-handle work))
                   (should-not
-                   (proofread--request-work-pending-p request)))
+                   (proofread--request-work-pending-p work)))
                 (should
                  (equal
                   (proofread-test--complete-recorded-requests recorder)
                   (make-list (length requests) 'applied)))
                 (proofread-test--assert-request-diagnostics requests)
-                (proofread-test--assert-requests-settled all-requests)
+                (proofread-test--assert-requests-settled all-works)
                 (proofread-test--assert-one-batch-error-report
                  reports 2
                  (if (eq failure-mode 'signal)
@@ -6023,6 +6126,7 @@ This covers URLs, email, invisible text, faces, and properties."
            (recorder (proofread-test--make-backend-recorder))
            (recorder-function (plist-get recorder :function))
            all-requests
+           all-works
            events
            reports)
       (proofread-mode 1)
@@ -6033,6 +6137,8 @@ This covers URLs, email, invisible text, faces, and properties."
             (((symbol-function 'proofread--backend-check)
               (lambda (request callback &optional backend)
                 (push request all-requests)
+                (push (proofread--scheduled-work-for-request request)
+                      all-works)
                 (if (eq (plist-get request :checker-name) 'completed)
                     (progn
                       (funcall
@@ -6058,6 +6164,7 @@ This covers URLs, email, invisible text, faces, and properties."
                 (push (list detail summary) reports))))
           (proofread-check-buffer)
           (setq all-requests (nreverse all-requests))
+          (setq all-works (nreverse all-works))
           (let* ((later-requests
                   (funcall (plist-get recorder :requests)))
                  (completed-events
@@ -6081,7 +6188,7 @@ This covers URLs, email, invisible text, faces, and properties."
               (proofread-test--complete-recorded-requests recorder)
               '( applied applied)))
             (proofread-test--assert-request-diagnostics all-requests)
-            (proofread-test--assert-requests-settled all-requests)
+            (proofread-test--assert-requests-settled all-works)
             (should-not reports)))))))
 
 (ert-deftest
@@ -6096,6 +6203,7 @@ This covers URLs, email, invisible text, faces, and properties."
            (proofread-profiles
             (proofread-test--ordered-profiles '( only)))
            request
+           work
            events
            reports)
       (proofread-mode 1)
@@ -6106,6 +6214,9 @@ This covers URLs, email, invisible text, faces, and properties."
             (((symbol-function 'proofread--backend-check)
               (lambda (backend-request callback &optional _backend)
                 (setq request backend-request)
+                (setq work
+                      (proofread--scheduled-work-for-request
+                       backend-request))
                 (funcall
                  callback
                  (proofread--backend-success-result
@@ -6125,6 +6236,7 @@ This covers URLs, email, invisible text, faces, and properties."
                     "Simulated core callback failure"))))
         (should request)
         (should-not (plist-get request :handle))
+        (should-not (proofread--scheduled-work-handle work))
         (should-not reports)
         (should-not
          (cl-find-if
@@ -6134,7 +6246,7 @@ This covers URLs, email, invisible text, faces, and properties."
              (eq (plist-get (plist-get event :result) :phase)
                  'submission)))
           events))
-        (should-not (proofread--request-work-pending-p request))
+        (should-not (proofread--request-work-pending-p work))
         (should-not proofread--active-requests)
         (should-not proofread--claimed-requests)
         (should-not proofread--request-queue)
@@ -6167,14 +6279,15 @@ This covers URLs, email, invisible text, faces, and properties."
                (list (cons (point-min) (point-max))))))
         (proofread--dispatch-profile-request-ready-chunks
          chunks profile)
-        (let ((queued
-               (mapcar (lambda (entry)
-                         (plist-get entry :request))
-                       proofread--request-queue)))
+        (let* ((queued
+                (mapcar #'proofread-test--queue-entry-work
+                        proofread--request-queue))
+               (requests
+                (mapcar #'proofread-test--work-request queued)))
           (should (= (length queued) 2))
           (should (equal (mapcar (lambda (request)
                                    (plist-get request :checker-name))
-                                 queued)
+                                 requests)
                          '( first second)))
           (should-not (equal (proofread--request-work-key
                               (car queued))
@@ -6223,13 +6336,17 @@ This covers URLs, email, invisible text, faces, and properties."
           (let* ((old-first
                   (cl-find
                    'first proofread--active-requests
-                   :key (lambda (request)
-                          (plist-get request :checker-name))))
+                   :key (lambda (work)
+                          (plist-get
+                           (proofread-test--work-request work)
+                           :checker-name))))
                  (old-second
                   (cl-find
                    'second proofread--active-requests
-                   :key (lambda (request)
-                          (plist-get request :checker-name)))))
+                   :key (lambda (work)
+                          (plist-get
+                           (proofread-test--work-request work)
+                           :checker-name)))))
             (should old-first)
             (should old-second)
             (proofread--dispatch-request-ready-chunks
@@ -6237,11 +6354,13 @@ This covers URLs, email, invisible text, faces, and properties."
              first-checker profile)
             (let ((new-first
                    (cl-find-if
-                    (lambda (request)
-                      (and (eq (plist-get request :checker-name)
-                               'first)
-                           (equal (plist-get request :text)
-                                  "bcde")))
+                    (lambda (work)
+                      (let ((request
+                             (proofread-test--work-request work)))
+                        (and (eq (plist-get request :checker-name)
+                                 'first)
+                             (equal (plist-get request :text)
+                                    "bcde"))))
                     proofread--active-requests)))
               (should (proofread--request-state-flag-p
                        old-first :superseded))
@@ -6273,13 +6392,15 @@ This covers URLs, email, invisible text, faces, and properties."
               (car
                (proofread-test--request-ready-chunks-for-ranges
                 (list (cons (point-min) (point-max))))))
-             (request
-              (proofread--make-backend-request
+             (work
+              (proofread-test--make-request-work
                chunk proofread-test--backend checker profile))
+             (request (proofread-test--work-request work))
              (diagnostic
               (proofread-test--diagnostic-for-range
                1 5 "helo")))
         (should (eq (proofread--handle-backend-result
+                     work
                      (proofread--backend-success-result
                       request (list diagnostic)))
                     'applied))
@@ -6316,9 +6437,10 @@ This covers URLs, email, invisible text, faces, and properties."
               (car
                (proofread-test--request-ready-chunks-for-ranges
                 (list (cons (point-min) (point-max))))))
-             (request
-              (proofread--make-backend-request
+             (work
+              (proofread-test--make-request-work
                chunk proofread-test--backend checker profile))
+             (request (proofread-test--work-request work))
              (request-display-language
               (plist-get request :display-language))
              (diagnostic
@@ -6335,6 +6457,7 @@ This covers URLs, email, invisible text, faces, and properties."
                        "Simplified Chinese"))
         (should
          (eq (proofread--handle-backend-result
+              work
               (proofread--backend-success-result
                request (list diagnostic)))
              'applied))
@@ -6374,12 +6497,16 @@ This covers URLs, email, invisible text, faces, and properties."
               (car
                (proofread-test--request-ready-chunks-for-ranges
                 (list (cons (point-min) (point-max))))))
-             (first-request
-              (proofread--make-backend-request
+             (first-work
+              (proofread-test--make-request-work
                chunk proofread-test--backend first-checker profile))
-             (second-request
-              (proofread--make-backend-request
+             (second-work
+              (proofread-test--make-request-work
                chunk proofread-test--backend second-checker profile))
+             (first-request
+              (proofread-test--work-request first-work))
+             (second-request
+              (proofread-test--work-request second-work))
              (first-diagnostic
               (proofread-test--diagnostic-with-suggestions
                1 5 "helo" '( "hello")))
@@ -6387,10 +6514,12 @@ This covers URLs, email, invisible text, faces, and properties."
               (proofread-test--diagnostic-with-suggestions
                1 5 "helo" '( "hullo"))))
         (should (eq (proofread--handle-backend-result
+                     second-work
                      (proofread--backend-success-result
                       second-request (list second-diagnostic)))
                     'applied))
         (should (eq (proofread--handle-backend-result
+                     first-work
                      (proofread--backend-success-result
                       first-request (list first-diagnostic)))
                     'applied))
@@ -6404,6 +6533,7 @@ This covers URLs, email, invisible text, faces, and properties."
                         proofread--diagnostics)
                 '( second first)))
         (should (eq (proofread--handle-backend-result
+                     first-work
                      (proofread--backend-success-result
                       first-request nil))
                     'applied))
@@ -6925,11 +7055,12 @@ This covers URLs, email, invisible text, faces, and properties."
                   (car
                    (proofread-test--request-ready-chunks-for-ranges
                     (list (cons (point-min) (point-max))))))
-                 (request
-                  (proofread--make-backend-request
-                   chunk proofread-test--backend checker profile)))
+                 (work
+                  (proofread-test--make-request-work
+                   chunk proofread-test--backend checker profile))
+                 (request (proofread-test--work-request work)))
             (proofread--cache-write-request
-             request
+             work
              (list
               (proofread-test--ordered-checker-diagnostic request))))
           (cl-letf (((symbol-function 'proofread--backend-check)
@@ -6984,14 +7115,15 @@ This covers URLs, email, invisible text, faces, and properties."
               (car
                (proofread-test--request-ready-chunks-for-ranges
                 (list (cons (point-min) (point-max))))))
-             (request
-              (proofread--make-backend-request
+             (work
+              (proofread-test--make-request-work
                chunk proofread-test--backend checker profile))
+             (request (proofread-test--work-request work))
              (diagnostic
               (proofread-test--diagnostic-for-range
                1 5 "helo")))
-        (proofread--cache-write-request request (list diagnostic))
-        (let* ((entry (proofread--cache-read-request request))
+        (proofread--cache-write-request work (list diagnostic))
+        (let* ((entry (proofread--cache-read-request work))
                (cached (car (plist-get entry :diagnostics))))
           (should (equal (plist-get cached :language) "en-US"))
           (should (equal (plist-get cached :display-language)
@@ -6999,7 +7131,7 @@ This covers URLs, email, invisible text, faces, and properties."
           (should (= (plist-get cached :checker-ordinal) 0))
           (should (equal (plist-get cached :checker-owner)
                          (plist-get request :checker-owner)))
-          (should (eq (proofread--apply-cache-entry request entry)
+          (should (eq (proofread--apply-cache-entry work entry)
                       'applied))
           (let ((live (car proofread--diagnostics)))
             (should (equal (plist-get live :language) "en-US"))
@@ -7039,25 +7171,27 @@ This covers URLs, email, invisible text, faces, and properties."
               (car
                (proofread-test--request-ready-chunks-for-ranges
                 (list (cons (point-min) (point-max))))))
-             (old-request
-              (proofread--make-backend-request
+             (old-work
+              (proofread-test--make-request-work
                chunk proofread-test--backend checker profile))
              (diagnostic
               (proofread-test--diagnostic-for-range 1 5 "helo")))
-        (proofread--cache-write-request old-request (list diagnostic))
-        (let* ((entry (proofread--cache-read-request old-request))
+        (proofread--cache-write-request old-work (list diagnostic))
+        (let* ((entry (proofread--cache-read-request old-work))
                (cached (car (plist-get entry :diagnostics))))
           (should (equal (plist-get cached :source-label) "old-model"))
           (setq label "new-model")
-          (let ((new-request
-                 (proofread--make-backend-request
-                  chunk proofread-test--backend checker profile)))
+          (let* ((new-work
+                  (proofread-test--make-request-work
+                   chunk proofread-test--backend checker profile))
+                 (new-request
+                  (proofread-test--work-request new-work)))
             (should
-             (equal (plist-get old-request :cache-key)
-                    (plist-get new-request :cache-key)))
+             (equal (proofread--scheduled-work-cache-key old-work)
+                    (proofread--scheduled-work-cache-key new-work)))
             (should (equal (plist-get new-request :source-label)
                            "new-model"))
-            (should (eq (proofread--apply-cache-entry new-request entry)
+            (should (eq (proofread--apply-cache-entry new-work entry)
                         'applied))
             (let ((live (car proofread--diagnostics)))
               (should (equal (plist-get live :source-label)
@@ -7101,22 +7235,28 @@ This covers URLs, email, invisible text, faces, and properties."
               (car
                (proofread-test--request-ready-chunks-for-ranges
                 (list (cons (point-min) (point-max))))))
-             (first-request
-              (proofread--make-backend-request
+             (first-work
+              (proofread-test--make-request-work
                chunk proofread-test--backend (car checkers)
                profile))
-             (second-request
-              (proofread--make-backend-request
+             (second-work
+              (proofread-test--make-request-work
                chunk proofread-test--backend (cadr checkers)
                profile))
+             (first-request
+              (proofread-test--work-request first-work))
+             (second-request
+              (proofread-test--work-request second-work))
              (diagnostic
               (proofread-test--diagnostic-for-range
                1 5 "helo")))
         (should (eq (proofread--handle-backend-result
+                     first-work
                      (proofread--backend-partial-success-result
                       first-request (list diagnostic)))
                     'applied))
         (should (eq (proofread--handle-backend-result
+                     second-work
                      (proofread--backend-partial-success-result
                       second-request (list (copy-sequence diagnostic))))
                     'applied))
@@ -7157,20 +7297,22 @@ This covers URLs, email, invisible text, faces, and properties."
             (car
              (proofread-test--request-ready-chunks-for-ranges
               (list (cons (point-min) (point-max))))))
-           (strict-request
-            (proofread--make-backend-request
+           (strict-work
+            (proofread-test--make-request-work
              chunk proofread-test--backend strict profile))
-           (gentle-request
-            (proofread--make-backend-request
+           (gentle-work
+            (proofread-test--make-request-work
              chunk proofread-test--backend gentle profile))
-           (strict-relaxed-request
-            (proofread--make-backend-request
+           (strict-relaxed-work
+            (proofread-test--make-request-work
              chunk proofread-test--backend strict-relaxed profile)))
-      (should-not (equal (plist-get strict-request :cache-key)
-                         (plist-get gentle-request :cache-key)))
-      (should-not (equal (plist-get strict-request :cache-key)
-                         (plist-get strict-relaxed-request
-                                    :cache-key))))))
+      (should-not
+       (equal (proofread--scheduled-work-cache-key strict-work)
+              (proofread--scheduled-work-cache-key gentle-work)))
+      (should-not
+       (equal (proofread--scheduled-work-cache-key strict-work)
+              (proofread--scheduled-work-cache-key
+               strict-relaxed-work))))))
 
 (ert-deftest
     proofread-test-profile-cache-key-uses-backend-checker-identity ()
@@ -7222,19 +7364,21 @@ This covers URLs, email, invisible text, faces, and properties."
               (car
                (proofread-test--request-ready-chunks-for-ranges
                 (list (cons (point-min) (point-max))))))
-             (formal-a-request
-              (proofread--make-backend-request
+             (formal-a-work
+              (proofread-test--make-request-work
                chunk proofread-test--backend formal-a profile))
-             (formal-b-request
-              (proofread--make-backend-request
+             (formal-b-work
+              (proofread-test--make-request-work
                chunk proofread-test--backend formal-b profile))
-             (relaxed-request
-              (proofread--make-backend-request
+             (relaxed-work
+              (proofread-test--make-request-work
                chunk proofread-test--backend relaxed profile)))
-        (should (equal (plist-get formal-a-request :cache-key)
-                       (plist-get formal-b-request :cache-key)))
-        (should-not (equal (plist-get formal-a-request :cache-key)
-                           (plist-get relaxed-request :cache-key)))
+        (should
+         (equal (proofread--scheduled-work-cache-key formal-a-work)
+                (proofread--scheduled-work-cache-key formal-b-work)))
+        (should-not
+         (equal (proofread--scheduled-work-cache-key formal-a-work)
+                (proofread--scheduled-work-cache-key relaxed-work)))
         (should
          (cl-every
           (lambda (checker)
@@ -7244,7 +7388,7 @@ This covers URLs, email, invisible text, faces, and properties."
          (string-match-p
           (regexp-quote "secret-a")
           (prin1-to-string
-           (plist-get formal-a-request :cache-key))))))))
+           (proofread--scheduled-work-cache-key formal-a-work))))))))
 
 (ert-deftest proofread-test-cache-contract-v4-isolates-v3-namespace
     ()
@@ -7259,9 +7403,13 @@ This covers URLs, email, invisible text, faces, and properties."
                 (car
                  (proofread-test--request-ready-chunks-for-ranges
                   (list (cons (point-min) (point-max))))))
-               (request
-                (proofread-test--make-profile-request chunk))
-               (new-key (plist-get request :cache-key))
+               (profile (proofread--current-profile))
+               (checker
+                (proofread-test--current-profile-checker profile))
+               (work
+                (proofread-test--make-request-work
+                 chunk proofread-test--backend checker profile))
+               (new-key (proofread--scheduled-work-cache-key work))
                (v3-key (copy-tree new-key)))
           (setf (plist-get v3-key :contract-version) 3)
           (should (= proofread--contract-version 4))
@@ -7285,10 +7433,15 @@ This covers URLs, email, invisible text, faces, and properties."
                 (car
                  (proofread-test--request-ready-chunks-for-ranges
                   (list (cons (point-min) (point-max))))))
-               (request
-                (proofread-test--make-profile-request chunk)))
+               (profile (proofread--current-profile))
+               (checker
+                (proofread-test--current-profile-checker profile))
+               (work
+                (proofread-test--make-request-work
+                 chunk proofread-test--backend checker profile))
+               (request (proofread-test--work-request work)))
           (should (proofread--request-current-checker-p request))
-          (should (proofread--fresh-request-p request))
+          (should (proofread--fresh-request-p work))
           (dolist (field
                    '( :checker-name :checker-owner
                       :checker-options :checker-identity))
@@ -7299,8 +7452,11 @@ This covers URLs, email, invisible text, faces, and properties."
                 incomplete-request))
               (should-not
                (proofread--request-current-checker-p incomplete-request))
-              (should-not
-               (proofread--fresh-request-p incomplete-request)))))))))
+              (let ((incomplete-work
+                     (proofread--make-request-work
+                      incomplete-request proofread-test--backend)))
+                (should-not
+                 (proofread--fresh-request-p incomplete-work))))))))))
 
 (ert-deftest
     proofread-test-profile-checker-change-makes-request-stale
@@ -7325,10 +7481,10 @@ This covers URLs, email, invisible text, faces, and properties."
               (car
                (proofread-test--request-ready-chunks-for-ranges
                 (list (cons (point-min) (point-max))))))
-             (request
-              (proofread--make-backend-request
+             (work
+              (proofread-test--make-request-work
                chunk proofread-test--backend checker profile)))
-        (should (proofread--fresh-request-p request))
+        (should (proofread--fresh-request-p work))
         (let ((proofread-profiles
                `((multi
                   :language "fr"
@@ -7336,7 +7492,7 @@ This covers URLs, email, invisible text, faces, and properties."
                   (( :name strict
                      :backend ,proofread-test--backend
                      :options ( :tone formal)))))))
-          (should-not (proofread--fresh-request-p request)))
+          (should-not (proofread--fresh-request-p work)))
         (let ((proofread-profiles
                `((multi
                   :language "en-US"
@@ -7344,7 +7500,7 @@ This covers URLs, email, invisible text, faces, and properties."
                   (( :name strict
                      :backend ,proofread-test--backend
                      :options ( :tone relaxed)))))))
-          (should-not (proofread--fresh-request-p request)))))))
+          (should-not (proofread--fresh-request-p work)))))))
 
 (ert-deftest
     proofread-test-backend-options-snapshot-defines-cache-freshness ()
@@ -7386,9 +7542,10 @@ This covers URLs, email, invisible text, faces, and properties."
                 (car
                  (proofread-test--request-ready-chunks-for-ranges
                   (list (cons (point-min) (point-max))))))
-               (request
-                (proofread--make-backend-request
-                 chunk backend checker profile)))
+               (work
+                (proofread-test--make-request-work
+                 chunk backend checker profile))
+               (request (proofread-test--work-request work)))
           (should (equal (plist-get request :checker-options)
                          '( :tone "formal")))
           (aset raw-tone 0 ?X)
@@ -7406,17 +7563,18 @@ This covers URLs, email, invisible text, faces, and properties."
                          '( :tone "formal"
                             :volatile (second)))))))
           (should (proofread--request-current-checker-p request))
-          (should (proofread--fresh-request-p request))
+          (should (proofread--fresh-request-p work))
           (let* ((equivalent-profile (proofread--current-profile))
                  (equivalent-checker
                   (car (plist-get equivalent-profile :checkers)))
-                 (equivalent-request
-                  (proofread--make-backend-request
+                 (equivalent-work
+                  (proofread-test--make-request-work
                    chunk backend equivalent-checker
                    equivalent-profile)))
             (should
-             (equal (plist-get equivalent-request :cache-key)
-                    (plist-get request :cache-key))))
+             (equal (proofread--scheduled-work-cache-key
+                     equivalent-work)
+                    (proofread--scheduled-work-cache-key work))))
           (setq proofread-profiles
                 (list
                  (list
@@ -7427,16 +7585,16 @@ This covers URLs, email, invisible text, faces, and properties."
                          :backend backend
                          :options '( :tone "relaxed"))))))
           (should-not (proofread--request-current-checker-p request))
-          (should-not (proofread--fresh-request-p request))
+          (should-not (proofread--fresh-request-p work))
           (let* ((changed-profile (proofread--current-profile))
                  (changed-checker
                   (car (plist-get changed-profile :checkers)))
-                 (changed-request
-                  (proofread--make-backend-request
+                 (changed-work
+                  (proofread-test--make-request-work
                    chunk backend changed-checker changed-profile)))
             (should-not
-             (equal (plist-get changed-request :cache-key)
-                    (plist-get request :cache-key))))
+             (equal (proofread--scheduled-work-cache-key changed-work)
+                    (proofread--scheduled-work-cache-key work))))
           (should (> snapshot-calls 1)))))))
 
 (ert-deftest proofread-test-hash-option-snapshot-is-cache-stable ()
@@ -7465,23 +7623,25 @@ This covers URLs, email, invisible text, faces, and properties."
               (car
                (proofread-test--request-ready-chunks-for-ranges
                 (list (cons (point-min) (point-max))))))
-             (request
-              (proofread--make-backend-request
+             (work
+              (proofread-test--make-request-work
                chunk proofread-test--backend checker profile))
+             (request (proofread-test--work-request work))
              (current-profile (proofread--current-profile))
              (current-checker
               (car (plist-get current-profile :checkers)))
-             (equivalent
-              (proofread--make-backend-request
+             (equivalent-work
+              (proofread-test--make-request-work
                chunk proofread-test--backend current-checker
                current-profile)))
         (should (proofread--request-current-checker-p request))
-        (should (proofread--fresh-request-p request))
-        (should (equal (plist-get equivalent :cache-key)
-                       (plist-get request :cache-key)))
+        (should (proofread--fresh-request-p work))
+        (should
+         (equal (proofread--scheduled-work-cache-key equivalent-work)
+                (proofread--scheduled-work-cache-key work)))
         (aset key 0 ?X)
         (should-not (proofread--request-current-checker-p request))
-        (should-not (proofread--fresh-request-p request))))))
+        (should-not (proofread--fresh-request-p work))))))
 
 (ert-deftest
     proofread-test-profile-display-language-affects-cache-and-freshness
@@ -7506,15 +7666,16 @@ This covers URLs, email, invisible text, faces, and properties."
               (car
                (proofread-test--request-ready-chunks-for-ranges
                 (list (cons (point-min) (point-max))))))
-             (request
-              (proofread--make-backend-request
+             (work
+              (proofread-test--make-request-work
                chunk proofread-test--backend checker profile))
+             (request (proofread-test--work-request work))
              (diagnostic
               (proofread-test--diagnostic-for-range
                1 6 "Alpha")))
         (should (equal (plist-get request :display-language)
                        "English"))
-        (proofread--cache-write-request request (list diagnostic))
+        (proofread--cache-write-request work (list diagnostic))
         (let ((proofread-profiles
                `((multi
                   :language "en-US"
@@ -7522,24 +7683,26 @@ This covers URLs, email, invisible text, faces, and properties."
                   :checkers
                   (( :name strict
                      :backend ,proofread-test--backend))))))
-          (should-not (proofread--fresh-request-p request))
+          (should-not (proofread--fresh-request-p work))
           (let* ((changed-profile (proofread--current-profile))
                  (changed-checker
                   (car (plist-get changed-profile :checkers)))
-                 (changed-request
-                  (proofread--make-backend-request
+                 (changed-work
+                  (proofread-test--make-request-work
                    chunk proofread-test--backend changed-checker
-                   changed-profile)))
+                   changed-profile))
+                 (changed-request
+                  (proofread-test--work-request changed-work)))
             (should (equal (plist-get changed-request :language)
                            (plist-get request :language)))
             (should (equal
                      (plist-get changed-request :display-language)
                      "American English"))
             (should-not
-             (equal (plist-get changed-request :cache-key)
-                    (plist-get request :cache-key)))
+             (equal (proofread--scheduled-work-cache-key changed-work)
+                    (proofread--scheduled-work-cache-key work)))
             (should-not
-             (proofread--cache-read-request changed-request))))))))
+             (proofread--cache-read-request changed-work))))))))
 
 (ert-deftest
     proofread-test-profile-checkers-share-global-concurrency-limit
@@ -7569,12 +7732,12 @@ This covers URLs, email, invisible text, faces, and properties."
         (should (= (length proofread--request-queue) 1))
         (let ((owners
                (mapcar
-                (lambda (request)
-                  (plist-get request :checker-name))
+                (lambda (work)
+                  (plist-get (proofread-test--work-request work)
+                             :checker-name))
                 (append
                  proofread--active-requests
-                 (mapcar (lambda (entry)
-                           (plist-get entry :request))
+                 (mapcar #'proofread-test--queue-entry-work
                          proofread--request-queue)))))
           (should (equal (sort owners
                                (lambda (left right)
@@ -7624,14 +7787,14 @@ This covers URLs, email, invisible text, faces, and properties."
           (proofread-mode 1)
           (proofread-check-buffer)
           (should (= (length proofread--active-requests) 1))
-          (let ((request (car proofread--active-requests)))
+          (let ((work (car proofread--active-requests)))
             (proofread--clear-request-work)
             (should (= (length cancelled) 1))
             (should (eq (car cancelled) handle))
             (should (equal (prin1-to-string handle)
                            printed-handle))
             (should
-             (proofread--request-state-flag-p request :cancelled))
+             (proofread--request-state-flag-p work :cancelled))
             (proofread-test--assert-no-pending-request-work)
             (proofread--clear-request-work)
             (should (= (length cancelled) 1))))))))
@@ -7668,7 +7831,7 @@ This covers URLs, email, invisible text, faces, and properties."
           (proofread-mode 1)
           (proofread-check-buffer)
           (should (= (length proofread--active-requests) 1))
-          (let ((request (car proofread--active-requests)))
+          (let ((work (car proofread--active-requests)))
             (pcase transition
               ('unregister
                (proofread-unregister-backend backend))
@@ -7684,7 +7847,7 @@ This covers URLs, email, invisible text, faces, and properties."
             (should (eq (car old-cancelled) handle))
             (should-not new-cancelled)
             (should
-             (proofread--request-state-flag-p request :cancelled))
+             (proofread--request-state-flag-p work :cancelled))
             (proofread-test--assert-no-pending-request-work)))))))
 
 (ert-deftest
@@ -7728,7 +7891,7 @@ This covers URLs, email, invisible text, faces, and properties."
         (proofread-check-buffer)
         (should (= (length submitted) 3))
         (should (= (length proofread--active-requests) 3))
-        (let ((requests (copy-sequence proofread--active-requests)))
+        (let ((works (copy-sequence proofread--active-requests)))
           (cl-letf
               (((symbol-function
                  'proofread-report-warning-without-window)
@@ -7752,9 +7915,9 @@ This covers URLs, email, invisible text, faces, and properties."
               (should (= (length cancelled) cancel-count))
               (should (= (length reports) 1))))
           (should raised)
-          (dolist (request requests)
+          (dolist (work works)
             (should
-             (proofread--request-state-flag-p request :cancelled)))
+             (proofread--request-state-flag-p work :cancelled)))
           (proofread-test--assert-no-pending-request-work))))))
 
 (ert-deftest
@@ -7762,10 +7925,11 @@ This covers URLs, email, invisible text, faces, and properties."
   "Settle final and cancelled batches after hook reporting signals."
   (dolist (type '( final-result cancelled))
     (with-temp-buffer
-      (let* ((request
+      (let* ((work
               (proofread-test--lifecycle-request
                (if (eq type 'final-result) 501 502) 1 2))
-             (batch (proofread--attach-request-batch (list request)))
+             (request (proofread-test--work-request work))
+             (batch (proofread--attach-request-batch (list work)))
              (proofread-request-log-hook
               (list
                (lambda (_event)
@@ -7781,13 +7945,13 @@ This covers URLs, email, invisible text, faces, and properties."
            (pcase type
              ('final-result
               (proofread--record-request-event
-               request type
+               work type
                :result
                (proofread--backend-success-result request nil)
                :status 'applied))
              ('cancelled
               (proofread--record-request-event
-               request type :reason 'cleared)))))
+               work type :reason 'cleared)))))
         (should (= (length reports) 1))
         (should
          (equal (caar reports)
@@ -7795,8 +7959,7 @@ This covers URLs, email, invisible text, faces, and properties."
         (proofread-test--assert-secret-not-printed
          "Sensitive request hook failure" reports)
         (should (zerop (plist-get batch :pending)))
-        (should
-         (plist-get (plist-get request :state) :batch-settled))))))
+        (should (proofread--scheduled-work-batch-settled work))))))
 
 (ert-deftest proofread-test-core-timers-stay-core-owned ()
   "Cancel core timers directly and backend timers through their adapter."
@@ -7830,7 +7993,7 @@ This covers URLs, email, invisible text, faces, and properties."
         (proofread-mode 1)
         (proofread-check-buffer)
         (should (= (length proofread--active-requests) 1))
-        (let ((request (car proofread--active-requests)))
+        (let ((work (car proofread--active-requests)))
           (setq proofread--idle-timer core-idle-timer)
           (setq proofread--queue-dispatch-timer core-queue-timer)
           (cl-letf (((symbol-function 'timerp)
@@ -7857,7 +8020,7 @@ This covers URLs, email, invisible text, faces, and properties."
               1))
           (should-not (memq backend-timer directly-cancelled))
           (should
-           (proofread--request-state-flag-p request :cancelled))
+           (proofread--request-state-flag-p work :cancelled))
           (should-not proofread--idle-timer)
           (should-not proofread--queue-dispatch-timer)
           (proofread-test--assert-no-pending-request-work))))))
@@ -8047,11 +8210,14 @@ This covers URLs, email, invisible text, faces, and properties."
                     (funcall original-descriptor backend))))
               (proofread--make-backend-request
                chunk 'unknown-backend)))
+           (work (proofread--make-request-work
+                  request 'unknown-backend))
            result)
       (should (= descriptor-calls 1))
       (should
        (eq (plist-get request :checker-identity)
-           (plist-get (plist-get request :cache-key) :checker)))
+           (plist-get (proofread--scheduled-work-cache-key work)
+                      :checker)))
       (should-not (proofread--supported-backend-p 'unknown-backend))
       (should (proofread--backend-check
                request
@@ -8096,6 +8262,8 @@ This covers URLs, email, invisible text, faces, and properties."
                (request (proofread-test--make-profile-request chunk)))
           (dolist (key proofread--backend-request-keys)
             (should (plist-member request key)))
+          (dolist (key '( :cache-key :log-id :state :batch :handle))
+            (should-not (plist-member request key)))
           (should (integerp (plist-get request :id)))
           (should (eq (plist-get request :buffer) (current-buffer)))
           (should (= (plist-get request :beg) 4))
@@ -8139,21 +8307,23 @@ This covers URLs, email, invisible text, faces, and properties."
               (car (proofread-test--request-ready-chunks-for-ranges
                     (list (cons (point-min) (point-max))))))
              (request (proofread-test--make-profile-request chunk))
+             (work (proofread--make-request-work
+                    request proofread-test--backend))
              result
              active-at-callback)
         (should (proofread--dispatch-backend-request
-                 request
+                 work
                  (lambda (backend-result)
                    (setq result backend-result)
                    (with-current-buffer buffer
                      (setq active-at-callback
                            proofread--active-requests)))
                  proofread-test--backend))
-        (should (proofread--active-request-p request))
+        (should (proofread--active-request-p work))
         (should (proofread-test--wait-for (lambda () result)))
         (should (eq (plist-get result :status) 'ok))
         (should-not active-at-callback)
-        (should-not (proofread--active-request-p request))))))
+        (should-not (proofread--active-request-p work))))))
 
 (ert-deftest
     proofread-test-backend-error-preserves-buffer-and-clears-request
@@ -8170,25 +8340,27 @@ This covers URLs, email, invisible text, faces, and properties."
               (car (proofread-test--request-ready-chunks-for-ranges
                     (list (cons (point-min) (point-max))))))
              (request (proofread-test--make-profile-request chunk))
+             (work (proofread--make-request-work
+                    request proofread-test--backend))
              result
              active-at-callback)
         (should
          (proofread--dispatch-backend-request
-          request
+          work
           (lambda (backend-result)
             (setq result backend-result)
             (with-current-buffer buffer
               (setq active-at-callback
                     proofread--active-requests)))
           proofread-test--backend))
-        (should (proofread--active-request-p request))
+        (should (proofread--active-request-p work))
         (should
          (proofread-test--wait-for (lambda () result)))
         (should (eq (plist-get result :status) 'error))
         (should (equal (buffer-string) before-text))
         (should-not active-at-callback)
         (should-not
-         (proofread--active-request-p request))))))
+         (proofread--active-request-p work))))))
 
 (ert-deftest
     proofread-test-check-visible-range-dispatches-ready-chunks ()
@@ -8342,8 +8514,10 @@ This covers URLs, email, invisible text, faces, and properties."
                                                      :requests)))
                            (third-request (caddr all-requests))
                            (active-ids
-                            (mapcar (lambda (request)
-                                      (plist-get request :id))
+                            (mapcar (lambda (work)
+                                      (plist-get
+                                       (proofread-test--work-request work)
+                                       :id))
                                     proofread--active-requests)))
                       (should (= (length all-requests) 3))
                       (should (= (length proofread--active-requests)
@@ -8409,7 +8583,9 @@ This covers URLs, email, invisible text, faces, and properties."
               (list (cons (point-min) (point-max))))))
           (with-current-buffer first-buffer
             (should (= (length proofread--active-requests) 1))
-            (let ((request (car proofread--active-requests)))
+            (let ((request
+                   (proofread-test--work-request
+                    (car proofread--active-requests))))
               (should (eq (plist-get request :buffer) first-buffer))
               (should (eq (plist-get request :profile)
                           'first-profile))
@@ -8417,7 +8593,9 @@ This covers URLs, email, invisible text, faces, and properties."
                           'first-checker))))
           (with-current-buffer second-buffer
             (should (= (length proofread--active-requests) 1))
-            (let ((request (car proofread--active-requests)))
+            (let ((request
+                   (proofread-test--work-request
+                    (car proofread--active-requests))))
               (should (eq (plist-get request :buffer) second-buffer))
               (should (eq (plist-get request :profile)
                           'second-profile))
@@ -8437,7 +8615,8 @@ This covers URLs, email, invisible text, faces, and properties."
             (insert "helo world")
             (proofread-mode 1)
             (let (request
-                  callback)
+                  callback
+                  work)
               (proofread-test--with-profile
                 (cl-letf (((symbol-function 'window-start)
                            (lambda (&optional _window) (point-min)))
@@ -8452,7 +8631,10 @@ This covers URLs, email, invisible text, faces, and properties."
                              (setq callback backend-callback)
                              'proofread-test-handle)))
                   (proofread-check-visible-range)
-                  (should (proofread--active-request-p request))
+                  (setq work (car proofread--active-requests))
+                  (should (eq (proofread-test--work-request work)
+                              request))
+                  (should (proofread--active-request-p work))
                   (let ((diagnostic
                          (proofread-test--diagnostic-for-range
                           1 5 "helo")))
@@ -8470,7 +8652,7 @@ This covers URLs, email, invisible text, faces, and properties."
                     (should
                      (overlay-buffer (car proofread--overlays)))
                     (should-not (proofread--active-request-p
-                                 request)))))))
+                                 work)))))))
         (kill-buffer buffer)))))
 
 (ert-deftest proofread-test-live-range-does-not-mutate-backend-result
@@ -8484,12 +8666,14 @@ This covers URLs, email, invisible text, faces, and properties."
               (car (proofread-test--request-ready-chunks-for-ranges
                     (list (cons (point-min) (point-max))))))
              (request (proofread-test--make-profile-request chunk))
+             (work (proofread--make-request-work
+                    request proofread-test--backend))
              (diagnostic
               (proofread-test--diagnostic-for-range 1 5 "helo"))
              (result
               (proofread--backend-success-result
                request (list diagnostic))))
-        (should (eq (proofread--handle-backend-result result)
+        (should (eq (proofread--handle-backend-result work result)
                     'applied))
         (let ((live (car proofread--diagnostics)))
           (should-not (eq live diagnostic))
@@ -8518,6 +8702,8 @@ This covers URLs, email, invisible text, faces, and properties."
                   (list (cons (point-min) (point-max))))
                  "目标句。"))
                (request (proofread-test--make-profile-request chunk))
+               (work (proofread--make-request-work
+                      request proofread-test--backend))
                (diagnostic
                 (proofread-test--diagnostic-for-range
                  (plist-get request :beg)
@@ -8526,6 +8712,7 @@ This covers URLs, email, invisible text, faces, and properties."
           (should (equal (plist-get request :context-before) "前文。"))
           (should (equal (plist-get request :context-after) "后文。"))
           (should (eq (proofread--handle-backend-result
+                       work
                        (proofread--backend-success-result
                         request (list diagnostic)))
                       'applied))
@@ -8580,7 +8767,8 @@ This covers URLs, email, invisible text, faces, and properties."
             (insert "helo world")
             (proofread-mode 1)
             (let (request
-                  callback)
+                  callback
+                  work)
               (proofread-test--with-profile
                 (cl-letf (((symbol-function 'window-start)
                            (lambda (&optional _window) (point-min)))
@@ -8595,6 +8783,7 @@ This covers URLs, email, invisible text, faces, and properties."
                              (setq callback backend-callback)
                              'proofread-test-handle)))
                   (proofread-check-visible-range)
+                  (setq work (car proofread--active-requests))
                   (proofread-mode -1)
                   (should (eq (funcall
                                callback
@@ -8606,6 +8795,7 @@ This covers URLs, email, invisible text, faces, and properties."
                               'stale))
                   (should-not proofread--diagnostics)
                   (should-not proofread--overlays)
+                  (should-not (proofread--active-request-p work))
                   (should-not proofread--active-requests)))))
         (kill-buffer buffer)))))
 
@@ -8619,7 +8809,8 @@ This covers URLs, email, invisible text, faces, and properties."
             (insert "helo world")
             (proofread-mode 1)
             (let (request
-                  callback)
+                  callback
+                  work)
               (proofread-test--with-profile
                 (cl-letf (((symbol-function 'window-start)
                            (lambda (&optional _window) (point-min)))
@@ -8633,6 +8824,7 @@ This covers URLs, email, invisible text, faces, and properties."
                              (setq callback backend-callback)
                              'proofread-test-handle)))
                   (proofread-check-visible-range)
+                  (setq work (car proofread--active-requests))
                   (goto-char (point-max))
                   (insert "!")
                   (should (eq (funcall
@@ -8646,7 +8838,7 @@ This covers URLs, email, invisible text, faces, and properties."
                   (should-not proofread--diagnostics)
                   (should-not proofread--overlays)
                   (should-not (proofread--active-request-p
-                               request))))))
+                               work))))))
         (kill-buffer buffer)))))
 
 (ert-deftest proofread-test-text-mismatch-result-is-dropped ()
@@ -8659,7 +8851,8 @@ This covers URLs, email, invisible text, faces, and properties."
             (insert "helo world")
             (proofread-mode 1)
             (let (request
-                  callback)
+                  callback
+                  work)
               (proofread-test--with-profile
                 (cl-letf (((symbol-function 'window-start)
                            (lambda (&optional _window) (point-min)))
@@ -8673,6 +8866,7 @@ This covers URLs, email, invisible text, faces, and properties."
                              (setq callback backend-callback)
                              'proofread-test-handle)))
                   (proofread-check-visible-range)
+                  (setq work (car proofread--active-requests))
                   (delete-region 1 5)
                   (insert "hello")
                   (should (eq (funcall
@@ -8686,7 +8880,7 @@ This covers URLs, email, invisible text, faces, and properties."
                   (should-not proofread--diagnostics)
                   (should-not proofread--overlays)
                   (should-not (proofread--active-request-p
-                               request))))))
+                               work))))))
         (kill-buffer buffer)))))
 
 (ert-deftest proofread-test-backend-error-result-creates-no-overlays
@@ -8701,7 +8895,8 @@ This covers URLs, email, invisible text, faces, and properties."
             (proofread-mode 1)
             (let ((before-text (buffer-string))
                   request
-                  callback)
+                  callback
+                  work)
               (proofread-test--with-profile
                 (cl-letf (((symbol-function 'window-start)
                            (lambda (&optional _window) (point-min)))
@@ -8716,6 +8911,7 @@ This covers URLs, email, invisible text, faces, and properties."
                              (setq callback backend-callback)
                              'proofread-test-handle)))
                   (proofread-check-visible-range)
+                  (setq work (car proofread--active-requests))
                   (should (eq (funcall
                                callback
                                (proofread--backend-error-result
@@ -8726,7 +8922,7 @@ This covers URLs, email, invisible text, faces, and properties."
                   (should-not proofread--diagnostics)
                   (should-not proofread--overlays)
                   (should-not (proofread--active-request-p
-                               request))))))
+                               work))))))
         (kill-buffer buffer)))))
 
 (ert-deftest
@@ -8834,16 +9030,23 @@ This covers URLs, email, invisible text, faces, and properties."
                         (proofread-test--dispatch-profile-chunks
                          chunks))
                        4))
-            (let ((requests (funcall (plist-get recorder :requests)))
-                  (callbacks (funcall (plist-get recorder
-                                                 :callbacks))))
+            (let* ((requests
+                    (funcall (plist-get recorder :requests)))
+                   (works
+                    (mapcar #'proofread--scheduled-work-for-request
+                            requests))
+                   (callbacks
+                    (funcall (plist-get recorder :callbacks))))
               (should (= (length requests) 4))
-              (should (cl-every
-                       (lambda (request)
-                         (plist-get
-                          (plist-get request :state)
-                          :batch))
-                       requests))
+              (should (cl-every #'proofread--scheduled-work-p works))
+              (should
+               (cl-every #'proofread--scheduled-work-batch works))
+              (should
+               (cl-every
+                (lambda (work)
+                  (eq (proofread--scheduled-work-batch work)
+                      (proofread--scheduled-work-batch (car works))))
+                (cdr works)))
               (dotimes (index 4)
                 (funcall
                  (nth index callbacks)
@@ -8852,6 +9055,7 @@ This covers URLs, email, invisible text, faces, and properties."
                   'proofread-test-backend-invalid-diagnostics
                   (format "Failure kind %d" index)))
                 (should (= (length warnings) (if (= index 3) 1 0))))
+              (proofread-test--assert-requests-settled works)
               (let ((message (nth 1 (car warnings))))
                 (should (string-match-p "4 requests" message))
                 (should
@@ -8872,12 +9076,15 @@ This covers URLs, email, invisible text, faces, and properties."
                          (plist-get second-recorder :function)))
                 (proofread-test--dispatch-profile-chunks
                  (cl-subseq chunks 0 2))
-                (let ((requests
-                       (funcall
-                        (plist-get second-recorder :requests)))
-                      (callbacks
-                       (funcall (plist-get second-recorder
-                                           :callbacks))))
+                (let* ((requests
+                        (funcall
+                         (plist-get second-recorder :requests)))
+                       (works
+                        (mapcar #'proofread--scheduled-work-for-request
+                                requests))
+                       (callbacks
+                        (funcall (plist-get second-recorder
+                                            :callbacks))))
                   (funcall
                    (car callbacks)
                    (proofread--backend-error-result
@@ -8886,13 +9093,18 @@ This covers URLs, email, invisible text, faces, and properties."
                     "One failure"))
                   (should (= (length warnings) 1))
                   (proofread--retire-active-request
-                   (cadr requests) nil 'test-cancelled)
-                  (should (= (length warnings) 2)))))
-            (let ((direct
-                   (proofread-test--make-profile-request
-                    (car chunks))))
+                   (cadr works) nil 'test-cancelled)
+                  (should (= (length warnings) 2))
+                  (proofread-test--assert-requests-settled works))))
+            (let* ((direct
+                    (proofread-test--make-profile-request
+                     (car chunks)))
+                   (work
+                    (proofread--make-request-work
+                     direct proofread-test--backend)))
               (should
                (eq (proofread--handle-backend-result
+                    work
                     (proofread--backend-error-result
                      direct
                      'proofread-test-backend-failure
@@ -11913,6 +12125,8 @@ This covers URLs, email, invisible text, faces, and properties."
                 (car (proofread-test--request-ready-chunks-for-ranges
                       (list (cons (point-min) (point-max))))))
                (request (proofread-test--make-profile-request chunk))
+               (work (proofread--make-request-work
+                      request proofread-test--backend))
                (diagnostic
                 (proofread-test--diagnostic-with-kind
                  1 5 "helo" 'spelling))
@@ -11920,12 +12134,13 @@ This covers URLs, email, invisible text, faces, and properties."
                        request (list diagnostic))))
           (proofread--record-ignored-diagnostic diagnostic)
           (should (eq (proofread--handle-backend-result
+                       work
                        (proofread--backend-success-result
                         request (list diagnostic)))
                       'applied))
           (should-not proofread--diagnostics)
           (should-not proofread--overlays)
-          (should (eq (proofread--apply-cache-entry request entry)
+          (should (eq (proofread--apply-cache-entry work entry)
                       'applied))
           (should-not proofread--diagnostics)
           (should-not proofread--overlays))))))
@@ -12033,7 +12248,7 @@ This covers URLs, email, invisible text, faces, and properties."
              :buffer (current-buffer)
              :beg 1
              :end 1
-             :request (list :log-id 1 :id 1 :buffer
+             :request (list :id 1 :buffer
                             (current-buffer))))
       (should-not proofread--request-log-order)
       (should (= (hash-table-count proofread--request-log-records)
@@ -12051,8 +12266,7 @@ This covers URLs, email, invisible text, faces, and properties."
             (insert "aa helo\nbb")
             (proofread-mode 1)
             (let* ((request
-                    (list :log-id 9001
-                          :id 7
+                    (list :id 7
                           :buffer source
                           :beg 4
                           :end 8
@@ -12122,8 +12336,7 @@ This covers URLs, email, invisible text, faces, and properties."
                 (schedules 0)
                 refresh-function
                 refresh-arguments
-                (request (list :log-id 9002
-                               :id 8
+                (request (list :id 8
                                :buffer source
                                :beg 1
                                :end 5
@@ -12621,6 +12834,8 @@ This covers URLs, email, invisible text, faces, and properties."
             (generate-new-buffer
              " *proofread-request-secret-source*"))
            raw-request
+           raw-work
+           payload-snapshot
            raw-result
            callback
            events
@@ -12685,6 +12900,28 @@ This covers URLs, email, invisible text, faces, and properties."
                 (proofread-check-buffer)
                 (should raw-request)
                 (should callback)
+                (setq raw-work (car proofread--active-requests))
+                (should (proofread--scheduled-work-p raw-work))
+                (should
+                 (eq (proofread--scheduled-work-request raw-work)
+                     raw-request))
+                (should
+                 (equal (proofread--plist-keys
+                         raw-request "backend request")
+                        proofread--backend-request-keys))
+                (dolist (property
+                         '( :log-id :state :cache-key :handle
+                            :batch :batch-settled))
+                  (should-not (plist-member raw-request property)))
+                (should
+                 (eq (car proofread--active-requests) raw-work))
+                (should
+                 (proofread--scheduled-work-handle raw-work))
+                (should
+                 (= (gethash raw-request
+                             proofread--request-log-owner-ids)
+                    (proofread--scheduled-work-log-id raw-work)))
+                (setq payload-snapshot (copy-tree raw-request))
                 (should
                  (string-match-p
                   (regexp-quote sentinel)
@@ -12712,7 +12949,8 @@ This covers URLs, email, invisible text, faces, and properties."
                 (proofread--request-log-record-event
                  (list :type 'backend-dispatched
                        :time (current-time)
-                       :log-id (plist-get raw-request :log-id)
+                       :log-id
+                       (proofread--scheduled-work-log-id raw-work)
                        :request-id (plist-get raw-request :id)
                        :buffer source
                        :beg (plist-get raw-request :beg)
@@ -12742,6 +12980,9 @@ This covers URLs, email, invisible text, faces, and properties."
                  :backend backend
                  :result raw-result)
                 (should (eq (funcall callback raw-result) 'error))
+                (should (eq (plist-get raw-result :request)
+                            raw-request))
+                (should (equal raw-request payload-snapshot))
                 (should reports)))
             (setq events (nreverse events))
             (proofread-test--flush-request-log-refresh source)
@@ -12790,7 +13031,8 @@ This covers URLs, email, invisible text, faces, and properties."
                (plist-member backend-dispatched :handle))
               (should-not (plist-member record :handle))
               (dolist (property
-                       '( :checker-options :state :cache-key :handle))
+                       '( :checker-options :log-id :state :cache-key
+                          :handle :batch :batch-settled))
                 (should-not (plist-member safe-request property)))
               (should (eq (plist-get safe-request :profile) profile))
               (should
@@ -13415,8 +13657,10 @@ This covers URLs, email, invisible text, faces, and properties."
     (let* ((chunk
             (car (proofread-test--request-ready-chunks-for-ranges
                   (list (cons (point-min) (point-max))))))
-           (request (proofread--make-backend-request
-                     chunk proofread-test--backend))
+           (work
+            (proofread-test--make-request-work
+             chunk proofread-test--backend))
+           (request (proofread-test--work-request work))
            (beg (plist-get request :beg))
            (diagnostic
             (proofread-test--diagnostic-for-range
@@ -13424,6 +13668,7 @@ This covers URLs, email, invisible text, faces, and properties."
              (buffer-substring-no-properties beg (+ beg 7)))))
       (setq-local proofread-targets 'all)
       (should (eq (proofread--handle-backend-result
+                   work
                    (proofread--backend-success-result
                     request (list diagnostic)))
                   'stale))
@@ -13445,14 +13690,17 @@ This covers URLs, email, invisible text, faces, and properties."
              (chunk
               (car (proofread-test--request-ready-chunks-for-ranges
                     (list (cons (point-min) (point-max))))))
-             (request (proofread-test--make-profile-request chunk)))
+             (request (proofread-test--make-profile-request chunk))
+             (work
+              (proofread--make-request-work
+               request proofread-test--backend)))
         (goto-char (point-min))
         (search-forward "cursor_and_mark")
         (push-mark (line-end-position) t t)
         (let ((before-point (point))
               (before-mark (mark t))
               (before-mark-active mark-active))
-          (should (proofread--fresh-request-p request))
+          (should (proofread--fresh-request-p work))
           (should (= (point) before-point))
           (should (= (mark t) before-mark))
           (should (eq mark-active before-mark-active)))))))
@@ -13839,13 +14087,16 @@ This covers URLs, email, invisible text, faces, and properties."
               (car (proofread-test--request-ready-chunks-for-ranges
                     (list (cons (point-min) (point-max))))))
              (request (proofread-test--make-profile-request chunk))
+             (work
+              (proofread--make-request-work
+               request proofread-test--backend))
              (chars-tick (buffer-chars-modified-tick)))
         (add-text-properties
          (plist-get request :beg)
          (1+ (plist-get request :beg))
          '( proofread-test-ignore t))
         (should (= chars-tick (buffer-chars-modified-tick)))
-        (should-not (proofread--fresh-request-p request)))))
+        (should-not (proofread--fresh-request-p work)))))
   (with-temp-buffer
     (insert "Beta prose.")
     (setq-local proofread-auto-check nil)
@@ -13854,10 +14105,13 @@ This covers URLs, email, invisible text, faces, and properties."
       (let* ((chunk
               (car (proofread-test--request-ready-chunks-for-ranges
                     (list (cons (point-min) (point-max))))))
-             (request (proofread-test--make-profile-request chunk)))
+             (request (proofread-test--make-profile-request chunk))
+             (work
+              (proofread--make-request-work
+               request proofread-test--backend)))
         (setq-local proofread-ignored-properties
                     '( proofread-test-ignore))
-        (should (proofread--fresh-request-p request))))))
+        (should (proofread--fresh-request-p work))))))
 
 (ert-deftest
     proofread-test-docstring-predicates-isolate-errors-and-short-circuit
@@ -13952,7 +14206,7 @@ This covers URLs, email, invisible text, faces, and properties."
                     (car (proofread-test--dispatch-profile-chunks
                           (proofread-test--request-ready-chunks-for-ranges
                            (list (cons (point-min) (point-max)))))))
-                   (new-log-id (plist-get new-request :log-id)))
+                   (new-work (car proofread--active-requests)))
               (should-not (= old-generation
                              (plist-get new-request :generation)))
               (should (eq
@@ -13964,9 +14218,8 @@ This covers URLs, email, invisible text, faces, and properties."
                                 1 5 "helo"))))
                        'stale))
               (should (= (length proofread--active-requests) 1))
-              (should (= (plist-get (car proofread--active-requests)
-                                    :log-id)
-                         new-log-id))
+              (should (eq (proofread-test--work-request new-work)
+                          new-request))
               (should-not proofread--diagnostics))))))))
 
 ;;;; Backend lifecycle tests
@@ -13979,8 +14232,10 @@ This covers URLs, email, invisible text, faces, and properties."
     (let* ((chunk
             (car (proofread-test--request-ready-chunks-for-ranges
                   (list (cons (point-min) (point-max))))))
-           (request (proofread--make-backend-request
-                     chunk proofread-test--backend))
+           (work
+            (proofread-test--make-request-work
+             chunk proofread-test--backend))
+           (request (proofread-test--work-request work))
            captured-callback
            (calls 0))
       (cl-letf (((symbol-function 'proofread--backend-check)
@@ -13988,7 +14243,7 @@ This covers URLs, email, invisible text, faces, and properties."
                    (setq captured-callback callback)
                    'proofread-test-handle)))
         (proofread--dispatch-backend-request
-         request
+         work
          (lambda (_result)
            (setq calls (1+ calls)))
          proofread-test--backend)
@@ -14077,15 +14332,17 @@ This covers URLs, email, invisible text, faces, and properties."
     (let* ((chunk
             (car (proofread-test--request-ready-chunks-for-ranges
                   '((6 . 10)))))
-           (request (proofread--make-backend-request
-                     chunk proofread-test--backend)))
+           (work
+            (proofread-test--make-request-work
+             chunk proofread-test--backend))
+           (request (proofread-test--work-request work)))
       (goto-char (point-min))
       (insert "helo ")
       (should (equal
                (buffer-substring-no-properties
                 (plist-get request :beg) (plist-get request :end))
                (plist-get request :text)))
-      (should-not (proofread--fresh-request-p request)))))
+      (should-not (proofread--fresh-request-p work)))))
 
 (ert-deftest
     proofread-test-request-cache-key-is-frozen-at-construction ()
@@ -14099,12 +14356,16 @@ This covers URLs, email, invisible text, faces, and properties."
                 (car (proofread-test--request-ready-chunks-for-ranges
                       (list (cons (point-min) (point-max))))))
                (request (proofread-test--make-profile-request chunk))
-               (key (plist-get request :cache-key))
+               (work
+                (proofread--make-request-work
+                 request proofread-test--backend))
+               (key (proofread--scheduled-work-cache-key work))
                (diagnostic
                 (proofread-test--diagnostic-for-range 1 6 "Alpha")))
           (let ((proofread-test--backend-identity-token "identity-b"))
-            (proofread--cache-write-request request (list diagnostic))
-            (should (equal (plist-get request :cache-key) key))
+            (proofread--cache-write-request work (list diagnostic))
+            (should (equal (proofread--scheduled-work-cache-key work)
+                           key))
             (should (gethash key proofread--cache))))))))
 
 (ert-deftest proofread-test-backend-identity-is-snapshotted ()
@@ -14119,20 +14380,23 @@ This covers URLs, email, invisible text, faces, and properties."
                 (car (proofread-test--request-ready-chunks-for-ranges
                       (list (cons (point-min) (point-max))))))
                (request (proofread-test--make-profile-request chunk))
+               (work
+                (proofread--make-request-work
+                 request proofread-test--backend))
                (work-key-text
-                (prin1-to-string (proofread--request-work-key request))))
+                (prin1-to-string (proofread--request-work-key work))))
           (proofread--enqueue-requests
-           (list request) proofread-test--backend)
+           (list work) proofread-test--backend)
           (aset name 0 ?o)
           (should
            (equal (plist-get (plist-get request :backend-identity)
                              :token)
                   '( :name "alpha")))
           (should (equal (prin1-to-string
-                          (proofread--request-work-key request))
+                          (proofread--request-work-key work))
                          work-key-text))
-          (should (proofread--request-work-pending-p request))
-          (should-not (proofread--fresh-request-p request)))))))
+          (should (proofread--request-work-pending-p work))
+          (should-not (proofread--fresh-request-p work)))))))
 
 (ert-deftest
     proofread-test-backend-identity-change-makes-request-stale ()
@@ -14145,9 +14409,12 @@ This covers URLs, email, invisible text, faces, and properties."
         (let* ((chunk
                 (car (proofread-test--request-ready-chunks-for-ranges
                       (list (cons (point-min) (point-max))))))
-               (request (proofread-test--make-profile-request chunk)))
+               (request (proofread-test--make-profile-request chunk))
+               (work
+                (proofread--make-request-work
+                 request proofread-test--backend)))
           (let ((proofread-test--backend-identity-token "identity-b"))
-            (should-not (proofread--fresh-request-p request))))))))
+            (should-not (proofread--fresh-request-p work))))))))
 
 (ert-deftest proofread-test-context-edit-makes-request-stale ()
   "Editing request context invalidates a still-unchanged target."
@@ -14161,8 +14428,10 @@ This covers URLs, email, invisible text, faces, and properties."
            (chunk
             (car (proofread-test--request-ready-chunks-for-ranges
                   (list (cons beg end)))))
-           (request (proofread--make-backend-request
-                     chunk proofread-test--backend)))
+           (work
+            (proofread-test--make-request-work
+             chunk proofread-test--backend))
+           (request (proofread-test--work-request work)))
       (goto-char (point-min))
       (delete-char 1)
       (insert "X")
@@ -14170,7 +14439,7 @@ This covers URLs, email, invisible text, faces, and properties."
                (buffer-substring-no-properties
                 (plist-get request :beg) (plist-get request :end))
                (plist-get request :text)))
-      (should-not (proofread--fresh-request-p request)))))
+      (should-not (proofread--fresh-request-p work)))))
 
 (ert-deftest
     proofread-test-supersede-partitions-before-lifecycle-effects
@@ -14210,10 +14479,10 @@ This covers URLs, email, invisible text, faces, and properties."
            (replacement
             (proofread-test--lifecycle-request 108 10 20))
            (queued-selected-entry
-            (list :request queued-selected
+            (list :work queued-selected
                   :backend proofread-test--backend))
            (queued-retained-entry
-            (list :request queued-retained
+            (list :work queued-retained
                   :backend proofread-test--backend))
            (selected
             (list active-first active-last claimed-selected
@@ -14253,8 +14522,7 @@ This covers URLs, email, invisible text, faces, and properties."
                                   (list claimed-retained))
                            (equal
                             (mapcar
-                             (lambda (entry)
-                               (plist-get entry :request))
+                             #'proofread-test--queue-entry-work
                              proofread--request-queue)
                             (list queued-retained replacement))
                            (eq proofread--request-queue-tail
@@ -14373,7 +14641,7 @@ This covers URLs, email, invisible text, faces, and properties."
            (late
             (proofread-test--lifecycle-request 207 50 52))
            (queued-selected-entry
-            (list :request queued-selected
+            (list :work queued-selected
                   :backend proofread-test--backend))
            (selected
             (list active-first active-last claimed-selected
@@ -14459,8 +14727,7 @@ This covers URLs, email, invisible text, faces, and properties."
                                  active-last-handle))
                        (equal
                         (mapcar
-                         (lambda (entry)
-                           (plist-get entry :request))
+                         #'proofread-test--queue-entry-work
                          proofread--request-queue)
                         (list late))
                        (eq proofread--request-queue-tail
@@ -14500,10 +14767,14 @@ This covers URLs, email, invisible text, faces, and properties."
     (let* ((chunk
             (car (proofread-test--request-ready-chunks-for-ranges
                   (list (cons (point-min) (point-max))))))
-           (older (proofread--make-backend-request
-                   chunk proofread-test--backend))
-           (newer (proofread--make-backend-request
-                   chunk proofread-test--backend))
+           (older
+            (proofread-test--make-request-work
+             chunk proofread-test--backend))
+           (newer
+            (proofread-test--make-request-work
+             chunk proofread-test--backend))
+           (older-request (proofread-test--work-request older))
+           (newer-request (proofread-test--work-request newer))
            (old-diagnostic
             (proofread-test--diagnostic-with-suggestions
              1 5 "helo" '( "hullo")))
@@ -14514,12 +14785,14 @@ This covers URLs, email, invisible text, faces, and properties."
       (proofread--finish-superseded-requests
        (proofread--supersede-conflicting-requests (list newer)))
       (should (eq (proofread--handle-backend-result
+                   newer
                    (proofread--backend-success-result
-                    newer (list new-diagnostic)))
+                    newer-request (list new-diagnostic)))
                   'applied))
       (should (eq (proofread--handle-backend-result
+                   older
                    (proofread--backend-success-result
-                    older (list old-diagnostic)))
+                    older-request (list old-diagnostic)))
                   'stale))
       (should
        (equal (proofread-test--diagnostics-without-provenance
@@ -14543,18 +14816,22 @@ This covers URLs, email, invisible text, faces, and properties."
                 (proofread-test--request-ready-chunks-for-ranges
                  '((1 . 3) (4 . 6) (7 . 9) (10 . 12))))
                (unrelated-a
-                (proofread-test--make-profile-request
-                 (nth 0 chunks)))
+                (proofread--make-request-work
+                 (proofread-test--make-profile-request (nth 0 chunks))
+                 proofread-test--backend))
                (matching-a
-                (proofread-test--make-profile-request
-                 (nth 1 chunks)))
+                (proofread--make-request-work
+                 (proofread-test--make-profile-request (nth 1 chunks))
+                 proofread-test--backend))
                (unrelated-b
-                (proofread-test--make-profile-request
-                 (nth 2 chunks)))
+                (proofread--make-request-work
+                 (proofread-test--make-profile-request (nth 2 chunks))
+                 proofread-test--backend))
                (matching-b
-                (proofread-test--make-profile-request
-                 (nth 3 chunks)))
-               (requests
+                (proofread--make-request-work
+                 (proofread-test--make-profile-request (nth 3 chunks))
+                 proofread-test--backend))
+               (works
                 (list unrelated-a matching-a unrelated-b matching-b))
                entries
                (proofread-request-log-hook
@@ -14563,12 +14840,14 @@ This covers URLs, email, invisible text, faces, and properties."
                    (when (eq (plist-get event :type) 'cache-hit)
                      (push (plist-get event :log-id)
                            cache-hit-log-ids))))))
-          (should (equal (plist-get matching-a :cache-key)
-                         (plist-get matching-b :cache-key)))
-          (should-not (equal (plist-get matching-a :cache-key)
-                             (plist-get unrelated-a :cache-key)))
+          (should
+           (equal (proofread--scheduled-work-cache-key matching-a)
+                  (proofread--scheduled-work-cache-key matching-b)))
+          (should-not
+           (equal (proofread--scheduled-work-cache-key matching-a)
+                  (proofread--scheduled-work-cache-key unrelated-a)))
           (proofread--enqueue-requests
-           requests proofread-test--backend)
+           works proofread-test--backend)
           (setq entries (copy-sequence proofread--request-queue))
           (proofread-test--assert-queue-cache-index-consistent)
           (proofread--cache-write-request matching-a nil)
@@ -14595,8 +14874,8 @@ This covers URLs, email, invisible text, faces, and properties."
           (should (= reentrant-dispatches 2))
           (should
            (equal (nreverse cache-hit-log-ids)
-                  (list (plist-get matching-a :log-id)
-                        (plist-get matching-b :log-id))))
+                  (list (proofread--scheduled-work-log-id matching-a)
+                        (proofread--scheduled-work-log-id matching-b))))
           (should (= (length proofread--request-queue) 2))
           (should (eq (nth 0 proofread--request-queue)
                       (nth 0 entries)))
@@ -14622,14 +14901,17 @@ This covers URLs, email, invisible text, faces, and properties."
                 (proofread-test--request-ready-chunks-for-ranges
                  '((1 . 3) (4 . 6))))
                (request-a
-                (proofread-test--make-profile-request
-                 (nth 0 chunks)))
+                (proofread--make-request-work
+                 (proofread-test--make-profile-request (nth 0 chunks))
+                 proofread-test--backend))
                (request-b
-                (proofread-test--make-profile-request
-                 (nth 1 chunks)))
+                (proofread--make-request-work
+                 (proofread-test--make-profile-request (nth 1 chunks))
+                 proofread-test--backend))
                (newer-a
-                (proofread-test--make-profile-request
-                 (nth 0 chunks)))
+                (proofread--make-request-work
+                 (proofread-test--make-profile-request (nth 0 chunks))
+                 proofread-test--backend))
                (entry-b nil)
                superseded)
           (proofread--enqueue-requests
@@ -14645,7 +14927,7 @@ This covers URLs, email, invisible text, faces, and properties."
           (should (equal (plist-get superseded :queued)
                          (list request-a)))
           (should-not
-           (gethash (plist-get request-a :cache-key)
+           (gethash (proofread--scheduled-work-cache-key request-a)
                     proofread--request-queue-index))
           (should (eq (car proofread--request-queue) entry-b))
           (should-not (proofread--cache-wakeup-pending-p))
@@ -14660,7 +14942,7 @@ This covers URLs, email, invisible text, faces, and properties."
           (should-not (proofread--cache-wakeup-pending-p))
           (should (eq (car proofread--request-queue) entry-b))
           (should
-           (gethash (plist-get request-b :cache-key)
+           (gethash (proofread--scheduled-work-cache-key request-b)
                     proofread--request-queue-index))
           (proofread-test--assert-queue-cache-index-consistent)
 
@@ -14688,15 +14970,18 @@ This covers URLs, email, invisible text, faces, and properties."
                 (proofread-test--request-ready-chunks-for-ranges
                  '((1 . 3) (4 . 6) (7 . 9))))
                (unrelated
-                (proofread-test--make-profile-request
-                 (nth 0 chunks)))
+                (proofread--make-request-work
+                 (proofread-test--make-profile-request (nth 0 chunks))
+                 proofread-test--backend))
                (matching-a
-                (proofread-test--make-profile-request
-                 (nth 1 chunks)))
+                (proofread--make-request-work
+                 (proofread-test--make-profile-request (nth 1 chunks))
+                 proofread-test--backend))
                (matching-b
-                (proofread-test--make-profile-request
-                 (nth 2 chunks)))
-               (requests (list unrelated matching-a matching-b))
+                (proofread--make-request-work
+                 (proofread-test--make-profile-request (nth 2 chunks))
+                 proofread-test--backend))
+               (works (list unrelated matching-a matching-b))
                entries
                (proofread-request-log-hook
                 (list
@@ -14705,7 +14990,7 @@ This covers URLs, email, invisible text, faces, and properties."
                      (push (plist-get event :log-id)
                            cache-hit-log-ids))))))
           (proofread--enqueue-requests
-           requests proofread-test--backend)
+           works proofread-test--backend)
           (setq entries (copy-sequence proofread--request-queue))
           (proofread--cache-write-request matching-a nil)
           (add-hook
@@ -14728,7 +15013,9 @@ This covers URLs, email, invisible text, faces, and properties."
           (should cleared)
           (should (= insert-calls 0))
           (should (equal cache-hit-log-ids
-                         (list (plist-get matching-a :log-id))))
+                         (list
+                          (proofread--scheduled-work-log-id
+                           matching-a))))
           (should (= (length proofread--request-queue) 2))
           (should (eq (nth 0 proofread--request-queue)
                       (nth 0 entries)))
@@ -14757,11 +15044,13 @@ This covers URLs, email, invisible text, faces, and properties."
                 (proofread-test--request-ready-chunks-for-ranges
                  '((1 . 3) (4 . 6))))
                (unrelated
-                (proofread-test--make-profile-request
-                 (nth 0 chunks)))
+                (proofread--make-request-work
+                 (proofread-test--make-profile-request (nth 0 chunks))
+                 proofread-test--backend))
                (matching
-                (proofread-test--make-profile-request
-                 (nth 1 chunks)))
+                (proofread--make-request-work
+                 (proofread-test--make-profile-request (nth 1 chunks))
+                 proofread-test--backend))
                entries)
           (proofread--enqueue-requests
            (list unrelated matching) proofread-test--backend)
@@ -14809,11 +15098,13 @@ This covers URLs, email, invisible text, faces, and properties."
                 (proofread-test--request-ready-chunks-for-ranges
                  '((1 . 3) (4 . 6))))
                (waiting
-                (proofread-test--make-profile-request
-                 (nth 0 chunks)))
+                (proofread--make-request-work
+                 (proofread-test--make-profile-request (nth 0 chunks))
+                 proofread-test--backend))
                (active
-                (proofread-test--make-profile-request
-                 (nth 1 chunks)))
+                (proofread--make-request-work
+                 (proofread-test--make-profile-request (nth 1 chunks))
+                 proofread-test--backend))
                (proofread-request-log-hook
                 (list
                  (lambda (event)
@@ -14825,8 +15116,8 @@ This covers URLs, email, invisible text, faces, and properties."
            (list waiting) proofread-test--backend)
           (cl-letf
               (((symbol-function 'proofread--fresh-request-p)
-                (lambda (request)
-                  (when (and (eq request active)
+                (lambda (work)
+                  (when (and (eq work active)
                              (not cache-written))
                     (setq cache-written t)
                     (proofread--cache-write-request waiting nil))
@@ -14834,7 +15125,8 @@ This covers URLs, email, invisible text, faces, and properties."
             (should-not (proofread--dispatch-queued-requests)))
           (should cache-written)
           (should (equal cache-hit-log-ids
-                         (list (plist-get waiting :log-id))))
+                         (list
+                          (proofread--scheduled-work-log-id waiting))))
           (should-not (proofread--request-work-pending-p waiting))
           (should-not proofread--request-queue)
           (should-not proofread--claimed-requests)
@@ -14864,9 +15156,15 @@ This covers URLs, email, invisible text, faces, and properties."
              (first-request
               (proofread--make-backend-request
                chunk proofread-test--backend first profile))
+             (first-work
+              (proofread--make-request-work
+               first-request proofread-test--backend))
              (second-request
               (proofread--make-backend-request
                chunk proofread-test--backend second profile))
+             (second-work
+              (proofread--make-request-work
+               second-request proofread-test--backend))
              second-entry
              (proofread-request-log-hook
               (list
@@ -14875,21 +15173,22 @@ This covers URLs, email, invisible text, faces, and properties."
                    (push (plist-get (plist-get event :request)
                                     :checker-name)
                          cache-hit-checkers))))))
-        (should-not (equal (plist-get first-request :cache-key)
-                           (plist-get second-request :cache-key)))
+        (should-not
+         (equal (proofread--scheduled-work-cache-key first-work)
+                (proofread--scheduled-work-cache-key second-work)))
         ;; Put the unrelated checker first so ordinary FIFO dispatch
         ;; reaches the concurrency limit before the exact cache waiter.
         (proofread--enqueue-requests
-         (list second-request first-request)
+         (list second-work first-work)
          proofread-test--backend)
         (setq second-entry (car proofread--request-queue))
-        (proofread--cache-write-request first-request nil)
+        (proofread--cache-write-request first-work nil)
         (should-not (proofread--dispatch-queued-requests))
         (should (equal cache-hit-checkers '( first)))
         (should (= (length proofread--request-queue) 1))
         (should (eq (car proofread--request-queue) second-entry))
-        (should (proofread--request-work-pending-p second-request))
-        (should-not (proofread--request-work-pending-p first-request))
+        (should (proofread--request-work-pending-p second-work))
+        (should-not (proofread--request-work-pending-p first-work))
         (proofread-test--assert-queue-cache-index-consistent)))))
 
 (ert-deftest proofread-test-cache-queue-wakeup-honors-eviction ()
@@ -14907,11 +15206,13 @@ This covers URLs, email, invisible text, faces, and properties."
                 (proofread-test--request-ready-chunks-for-ranges
                  '((1 . 3) (4 . 6))))
                (request-a
-                (proofread-test--make-profile-request
-                 (nth 0 chunks)))
+                (proofread--make-request-work
+                 (proofread-test--make-profile-request (nth 0 chunks))
+                 proofread-test--backend))
                (request-b
-                (proofread-test--make-profile-request
-                 (nth 1 chunks)))
+                (proofread--make-request-work
+                 (proofread-test--make-profile-request (nth 1 chunks))
+                 proofread-test--backend))
                entry-a
                (proofread-request-log-hook
                 (list
@@ -14983,12 +15284,12 @@ This covers URLs, email, invisible text, faces, and properties."
                      (push request submitted)
                      (enqueue-result (cons request callback))
                      (vector 'proofread-test-handle
-                             (plist-get request :log-id)))))
+                             (plist-get request :id)))))
               (cl-letf
                   (((symbol-function 'proofread--submit-request)
-                    (lambda (request backend)
+                    (lambda (work backend)
                       (setq submit-attempts (1+ submit-attempts))
-                      (funcall original-submit request backend)))
+                      (funcall original-submit work backend)))
                    ((symbol-function
                      'proofread--request-current-checker-p)
                     (lambda (request)
@@ -15018,7 +15319,7 @@ This covers URLs, email, invisible text, faces, and properties."
                 (let* ((ordered (nreverse submitted))
                        (ids
                         (mapcar (lambda (request)
-                                  (plist-get request :log-id))
+                                  (plist-get request :id))
                                 ordered)))
                   (should (= (length (delete-dups
                                       (copy-sequence ids)))
@@ -15062,25 +15363,26 @@ This covers URLs, email, invisible text, faces, and properties."
     (proofread-mode 1)
     (let* ((chunks (proofread-test--request-ready-chunks-for-ranges
                     (list (cons (point-min) (point-max)))))
-           (requests
+           (works
             (mapcar (lambda (chunk)
-                      (proofread--make-backend-request
+                      (proofread-test--make-request-work
                        chunk proofread-test--backend))
                     chunks))
-           (invalidated (nth 0 requests))
-           (superseded (nth 1 requests))
-           (ready (nth 2 requests))
+           (invalidated (nth 0 works))
+           (superseded (nth 1 works))
+           (ready (nth 2 works))
+           (ready-request (proofread-test--work-request ready))
            dispatched)
-      (should (= (length requests) 3))
+      (should (= (length works) 3))
       (proofread--enqueue-requests
-       requests proofread-test--backend)
+       works proofread-test--backend)
       (proofread--invalidate-request invalidated)
       (proofread--set-request-state-flag superseded :superseded)
       (let ((proofread-max-concurrent-requests 0))
         (should-not (proofread--dispatch-queued-requests))
         (should (= (length proofread--request-queue) 1))
-        (should (eq (plist-get (car proofread--request-queue)
-                               :request)
+        (should (eq (proofread-test--queue-entry-work
+                     (car proofread--request-queue))
                     ready))
         (should-not (proofread--request-work-pending-p invalidated))
         (should-not (proofread--request-work-pending-p superseded))
@@ -15091,8 +15393,8 @@ This covers URLs, email, invisible text, faces, and properties."
                      (setq dispatched request)
                      'proofread-test-handle)))
           (should (equal (proofread--dispatch-queued-requests)
-                         (list ready)))))
-      (should (eq dispatched ready))
+                         (list ready-request)))))
+      (should (eq dispatched ready-request))
       (should-not proofread--request-queue)
       (should-not proofread--request-queue-tail)
       (should (proofread--active-request-p ready)))))
@@ -15107,11 +15409,13 @@ This covers URLs, email, invisible text, faces, and properties."
           callback)
       (proofread-mode 1)
       (let* ((chunk (proofread--make-request-ready-chunk 1 6))
-             (request (proofread--make-backend-request
-                       chunk proofread-test--backend))
-             (log-id (plist-get request :log-id)))
+             (work
+              (proofread-test--make-request-work
+               chunk proofread-test--backend))
+             (request (proofread-test--work-request work))
+             (log-id (proofread--scheduled-work-log-id work)))
         (proofread--enqueue-requests
-         (list request) proofread-test--backend)
+         (list work) proofread-test--backend)
         (cl-letf (((symbol-function 'proofread--fresh-request-p)
                    (lambda (_request)
                      (unless reentered
@@ -15119,10 +15423,9 @@ This covers URLs, email, invisible text, faces, and properties."
                        (proofread--dispatch-queued-requests))
                      t))
                   ((symbol-function 'proofread--backend-check)
-                   (lambda (backend-request backend-callback
-                                            &optional _backend)
-                     (push (plist-get backend-request :log-id)
-                           submitted-log-ids)
+                   (lambda (_backend-request backend-callback
+                                             &optional _backend)
+                     (push log-id submitted-log-ids)
                      (setq callback backend-callback)
                      (list :backend 'test :log-id log-id))))
           (should (equal (proofread--dispatch-queued-requests)
@@ -15132,9 +15435,9 @@ This covers URLs, email, invisible text, faces, and properties."
           (should-not proofread--claimed-requests)
           (should (= (length proofread--active-requests) 1))
           (should (equal
-                   (gethash (proofread--request-work-key request)
+                   (gethash (proofread--request-work-key work)
                             proofread--pending-request-keys)
-                   log-id))
+                   work))
           (funcall callback (proofread--backend-success-result
                              request nil))
           (should (equal submitted-log-ids (list log-id)))
@@ -15156,7 +15459,7 @@ This covers URLs, email, invisible text, faces, and properties."
       (proofread-mode 1)
       (let* ((chunk (proofread--make-request-ready-chunk 1 6))
              (old-request
-              (proofread--make-backend-request
+              (proofread-test--make-request-work
                chunk proofread-test--backend)))
         (proofread--enqueue-requests
          (list old-request) proofread-test--backend)
@@ -15169,7 +15472,7 @@ This covers URLs, email, invisible text, faces, and properties."
                   (proofread-mode -1)
                   (proofread-mode 1)
                   (setq new-request
-                        (proofread--make-backend-request
+                        (proofread-test--make-request-work
                          (proofread--make-request-ready-chunk 1 6)
                          proofread-test--backend))
                   (proofread--enqueue-requests
@@ -15181,8 +15484,8 @@ This covers URLs, email, invisible text, faces, and properties."
         (should (proofread--request-state-flag-p
                  old-request :cancelled))
         (should (= (length proofread--request-queue) 1))
-        (should (eq (plist-get (car proofread--request-queue)
-                               :request)
+        (should (eq (proofread-test--queue-entry-work
+                     (car proofread--request-queue))
                     new-request))
         (should (proofread--request-work-pending-p new-request))
         (should-not proofread--queue-dispatch-active-p)
@@ -15201,7 +15504,7 @@ This covers URLs, email, invisible text, faces, and properties."
       (proofread-mode 1)
       (let* ((chunk (proofread--make-request-ready-chunk 1 6))
              (request
-              (proofread--make-backend-request
+              (proofread-test--make-request-work
                chunk proofread-test--backend)))
         (proofread--enqueue-requests
          (list request) proofread-test--backend)
@@ -15233,8 +15536,9 @@ This covers URLs, email, invisible text, faces, and properties."
       (proofread-mode 1)
       (let* ((old-chunk (proofread--make-request-ready-chunk 1 5))
              (new-chunk (proofread--make-request-ready-chunk 2 6))
-             (old (proofread--make-backend-request
-                   old-chunk proofread-test--backend)))
+             (old
+              (proofread-test--make-request-work
+               old-chunk proofread-test--backend)))
         (proofread--enqueue-requests
          (list old) proofread-test--backend)
         (cl-letf (((symbol-function 'proofread--fresh-request-p)
@@ -15250,32 +15554,34 @@ This covers URLs, email, invisible text, faces, and properties."
                      (push request submitted)
                      (setq callback backend-callback)
                      (list :backend 'test
-                           :log-id (plist-get request :log-id)))))
+                           :request-id (plist-get request :id)))))
           (let ((dispatched (proofread--dispatch-queued-requests)))
             (should (= (length dispatched) 1))
             (should (eq (car dispatched) (car submitted))))
-          (let* ((new (car submitted))
-                 (new-log-id (plist-get new :log-id)))
-            (should-not (equal new-log-id (plist-get old :log-id)))
+          (let* ((new-request (car submitted))
+                 (new-work (car proofread--active-requests))
+                 (new-log-id
+                  (proofread--scheduled-work-log-id new-work)))
+            (should-not
+             (equal new-log-id
+                    (proofread--scheduled-work-log-id old)))
             (should (proofread--request-state-flag-p old :superseded))
             (should (proofread--request-state-flag-p old :cancelled))
             (should (= (length submitted) 1))
             (should-not proofread--request-queue)
             (should-not proofread--claimed-requests)
-            (should (equal
-                     (mapcar (lambda (request)
-                               (plist-get request :log-id))
-                             proofread--active-requests)
-                     (list new-log-id)))
+            (should (equal proofread--active-requests
+                           (list new-work)))
             (should (= (hash-table-count
                         proofread--pending-request-keys)
                        1))
             (should (equal
-                     (gethash (proofread--request-work-key new)
+                     (gethash (proofread--request-work-key new-work)
                               proofread--pending-request-keys)
-                     new-log-id))
+                     new-work))
             (funcall callback
-                     (proofread--backend-success-result new nil))
+                     (proofread--backend-success-result
+                      new-request nil))
             (should-not proofread--active-requests)
             (should (= (hash-table-count
                         proofread--pending-request-keys)
@@ -15291,7 +15597,7 @@ This covers URLs, email, invisible text, faces, and properties."
           (proofread-context-size 0)
           (proofread-max-concurrent-requests 1)
           nested
-          submitted-log-ids
+          submitted-requests
           callbacks)
       (proofread-mode 1)
       (let* ((victim-chunk (proofread--make-request-ready-chunk 1 4))
@@ -15299,13 +15605,15 @@ This covers URLs, email, invisible text, faces, and properties."
              (unrelated-chunk
               (proofread--make-request-ready-chunk 5 8))
              (victim
-              (proofread--make-backend-request
+              (proofread-test--make-request-work
                victim-chunk proofread-test--backend))
              (unrelated
-              (proofread--make-backend-request
+              (proofread-test--make-request-work
                unrelated-chunk proofread-test--backend))
-             (victim-log-id (plist-get victim :log-id))
-             (unrelated-log-id (plist-get unrelated :log-id))
+             (unrelated-request
+              (proofread-test--work-request unrelated))
+             (victim-log-id
+              (proofread--scheduled-work-log-id victim))
              (proofread-request-log-hook
               (list
                (lambda (event)
@@ -15315,7 +15623,8 @@ This covers URLs, email, invisible text, faces, and properties."
                                    victim-log-id))
                    (setq nested t)
                    (proofread--dispatch-queued-requests))))))
-        (setq victim (plist-put victim :handle 'victim-handle))
+        (setf (proofread--scheduled-work-handle victim)
+              'victim-handle)
         (proofread--register-active-request victim)
         (proofread--enqueue-requests
          (list unrelated) proofread-test--backend)
@@ -15323,31 +15632,38 @@ This covers URLs, email, invisible text, faces, and properties."
                    (lambda (_request) t))
                   ((symbol-function 'proofread--backend-check)
                    (lambda (request callback &optional _backend)
-                     (let ((log-id (plist-get request :log-id)))
-                       (push log-id submitted-log-ids)
-                       (push (cons log-id callback) callbacks)
-                       (list :backend 'test :log-id log-id)))))
+                     (push request submitted-requests)
+                     (push (cons request callback) callbacks)
+                     (list :backend 'test
+                           :request-id (plist-get request :id)))))
           (proofread--dispatch-request-ready-chunks
            (list new-chunk) proofread-test--backend)
-          (should (equal submitted-log-ids (list unrelated-log-id)))
+          (should (equal submitted-requests
+                         (list unrelated-request)))
           (should (proofread--request-state-flag-p victim
                                                    :superseded))
           (should (proofread--request-state-flag-p victim :cancelled))
           (should-not proofread--claimed-requests)
           (should (= (length proofread--request-queue) 1))
-          (let* ((new
-                  (plist-get (car proofread--request-queue) :request))
-                 (new-log-id (plist-get new :log-id)))
-            (funcall (cdr (assq unrelated-log-id callbacks))
-                     (proofread--backend-success-result unrelated
-                                                        nil))
-            (should (= (cl-count unrelated-log-id submitted-log-ids)
+          (let* ((new-work
+                  (proofread-test--queue-entry-work
+                   (car proofread--request-queue)))
+                 (new-request
+                  (proofread-test--work-request new-work)))
+            (funcall (cdr (assq unrelated-request callbacks))
+                     (proofread--backend-success-result
+                      unrelated-request nil))
+            (should (= (cl-count unrelated-request submitted-requests
+                                 :test #'eq)
                        1))
-            (should (= (cl-count new-log-id submitted-log-ids) 1))
+            (should (= (cl-count new-request submitted-requests
+                                 :test #'eq)
+                       1))
             (should-not proofread--request-queue)
             (should-not proofread--claimed-requests)
-            (funcall (cdr (assq new-log-id callbacks))
-                     (proofread--backend-success-result new nil))
+            (funcall (cdr (assq new-request callbacks))
+                     (proofread--backend-success-result
+                      new-request nil))
             (should-not proofread--active-requests)
             (should (= (hash-table-count
                         proofread--pending-request-keys)
@@ -15363,8 +15679,9 @@ This covers URLs, email, invisible text, faces, and properties."
           backend-calls)
       (proofread-mode 1)
       (let* ((chunk (proofread--make-request-ready-chunk 1 6))
-             (request (proofread--make-backend-request
-                       chunk proofread-test--backend)))
+             (request
+              (proofread-test--make-request-work
+               chunk proofread-test--backend)))
         (proofread--enqueue-requests
          (list request) proofread-test--backend)
         (cl-letf (((symbol-function 'proofread--fresh-request-p)
@@ -15400,9 +15717,10 @@ This covers URLs, email, invisible text, faces, and properties."
           backend-calls)
       (proofread-mode 1)
       (let* ((chunk (proofread--make-request-ready-chunk 1 6))
-             (request (proofread--make-backend-request
-                       chunk proofread-test--backend))
-             (log-id (plist-get request :log-id))
+             (request
+              (proofread-test--make-request-work
+               chunk proofread-test--backend))
+             (log-id (proofread--scheduled-work-log-id request))
              (proofread-request-log-hook
               (list
                (lambda (event)
@@ -15440,20 +15758,20 @@ This covers URLs, email, invisible text, faces, and properties."
     (insert "aaa bbb")
     (let ((proofread-auto-check nil)
           (proofread-max-concurrent-requests 1)
-          submitted-log-ids
+          submitted-requests
           cancelled-handles
           callback)
       (proofread-mode 1)
       (let* ((waiting-chunk (proofread--make-request-ready-chunk 1 4))
              (active-chunk (proofread--make-request-ready-chunk 5 8))
              (waiting
-              (proofread--make-backend-request
+              (proofread-test--make-request-work
                waiting-chunk proofread-test--backend))
              (active
-              (proofread--make-backend-request
+              (proofread-test--make-request-work
                active-chunk proofread-test--backend))
-             (waiting-log-id (plist-get waiting :log-id)))
-        (setq active (plist-put active :handle 'old-handle))
+             (waiting-request (proofread-test--work-request waiting)))
+        (setf (proofread--scheduled-work-handle active) 'old-handle)
         (proofread--register-active-request active)
         (proofread--enqueue-requests
          (list waiting) proofread-test--backend)
@@ -15462,11 +15780,10 @@ This covers URLs, email, invisible text, faces, and properties."
                   ((symbol-function 'proofread--backend-check)
                    (lambda (request backend-callback &optional
                                     _backend)
-                     (push (plist-get request :log-id)
-                           submitted-log-ids)
+                     (push request submitted-requests)
                      (setq callback backend-callback)
                      (list :backend 'test
-                           :log-id (plist-get request :log-id))))
+                           :request-id (plist-get request :id))))
                   ((symbol-function 'proofread--cancel-request-handle)
                    (lambda (handle)
                      (push handle cancelled-handles))))
@@ -15474,8 +15791,8 @@ This covers URLs, email, invisible text, faces, and properties."
           (delete-char 1)
           (insert "b")
           (should
-           (proofread-test--wait-for (lambda () submitted-log-ids)))
-          (should (equal submitted-log-ids (list waiting-log-id)))
+           (proofread-test--wait-for (lambda () submitted-requests)))
+          (should (equal submitted-requests (list waiting-request)))
           (should (equal cancelled-handles (list 'old-handle)))
           (should (proofread--request-invalidated-p active))
           (should (proofread--request-state-flag-p active :cancelled))
@@ -15488,9 +15805,10 @@ This covers URLs, email, invisible text, faces, and properties."
           (should (equal
                    (gethash (proofread--request-work-key waiting)
                             proofread--pending-request-keys)
-                   waiting-log-id))
+                   waiting))
           (funcall callback
-                   (proofread--backend-success-result waiting nil))
+                   (proofread--backend-success-result
+                    waiting-request nil))
           (should-not proofread--active-requests)
           (should (= (hash-table-count
                       proofread--pending-request-keys)
@@ -15505,38 +15823,40 @@ This covers URLs, email, invisible text, faces, and properties."
           (proofread-test--backend-identity-token "identity-a")
           (proofread-context-size 0)
           (proofread-max-concurrent-requests 1)
-          submitted-log-ids
+          submitted-requests
           cancelled-handles)
       (proofread-mode 1)
       (proofread-test--with-profile
         (let* ((chunks
                 (proofread-test--request-ready-chunks-for-ranges
                  '((1 . 4) (5 . 8))))
+               (active-request
+                (proofread-test--make-profile-request (nth 1 chunks)))
                (active
-                (proofread-test--make-profile-request
-                 (nth 1 chunks))))
-          (setq active (plist-put active :handle 'old-handle))
+                (proofread--make-request-work
+                 active-request proofread-test--backend)))
+          (setf (proofread--scheduled-work-handle active) 'old-handle)
           (proofread--register-active-request active)
           (setq proofread-test--backend-identity-token "identity-b")
-          (let* ((waiting
-                  (proofread-test--make-profile-request
-                   (car chunks)))
-                 (waiting-log-id (plist-get waiting :log-id)))
+          (let* ((waiting-request
+                  (proofread-test--make-profile-request (car chunks)))
+                 (waiting
+                  (proofread--make-request-work
+                   waiting-request proofread-test--backend)))
             (proofread--enqueue-requests
              (list waiting) proofread-test--backend)
             (cl-letf (((symbol-function 'proofread--backend-check)
                        (lambda (request _callback &optional _backend)
-                         (push (plist-get request :log-id)
-                               submitted-log-ids)
+                         (push request submitted-requests)
                          (list :backend 'test
-                               :log-id (plist-get request :log-id))))
+                               :request-id (plist-get request :id))))
                       ((symbol-function
                         'proofread--cancel-request-handle)
                        (lambda (handle)
                          (push handle cancelled-handles))))
               (should (equal (proofread--dispatch-queued-requests)
-                             (list waiting))))
-            (should (equal submitted-log-ids (list waiting-log-id)))
+                             (list waiting-request))))
+            (should (equal submitted-requests (list waiting-request)))
             (should (equal cancelled-handles (list 'old-handle)))
             (should (proofread--request-invalidated-p active))
             (should (proofread--request-state-flag-p active
@@ -15556,7 +15876,7 @@ This covers URLs, email, invisible text, faces, and properties."
           (proofread-context-sentences-after 1)
           (proofread-context-size 200)
           (proofread-max-concurrent-requests 1)
-          submitted-log-ids
+          submitted-requests
           cancelled-handles)
       (proofread-mode 1)
       (proofread-test--with-profile
@@ -15566,21 +15886,25 @@ This covers URLs, email, invisible text, faces, and properties."
                (active-chunk
                 (car (proofread-test--request-ready-chunks-for-ranges
                       '((6 . 10)))))
-               (waiting
+               (waiting-request
                 (proofread-test--make-profile-request waiting-chunk))
-               (active
+               (waiting
+                (proofread--make-request-work
+                 waiting-request proofread-test--backend))
+               (active-request
                 (proofread-test--make-profile-request active-chunk))
-               (waiting-log-id (plist-get waiting :log-id)))
-          (setq active (plist-put active :handle 'old-handle))
+               (active
+                (proofread--make-request-work
+                 active-request proofread-test--backend)))
+          (setf (proofread--scheduled-work-handle active) 'old-handle)
           (proofread--register-active-request active)
           (proofread--enqueue-requests
            (list waiting) proofread-test--backend)
           (cl-letf (((symbol-function 'proofread--backend-check)
                      (lambda (request _callback &optional _backend)
-                       (push (plist-get request :log-id)
-                             submitted-log-ids)
+                       (push request submitted-requests)
                        (list :backend 'test
-                             :log-id (plist-get request :log-id))))
+                             :request-id (plist-get request :id))))
                     ((symbol-function
                       'proofread--cancel-request-handle)
                      (lambda (handle)
@@ -15591,8 +15915,8 @@ This covers URLs, email, invisible text, faces, and properties."
             (should-not (proofread--request-invalidated-p active))
             (should (timerp proofread--queue-dispatch-timer))
             (should
-             (proofread-test--wait-for (lambda () submitted-log-ids)))
-            (should (equal submitted-log-ids (list waiting-log-id)))
+             (proofread-test--wait-for (lambda () submitted-requests)))
+            (should (equal submitted-requests (list waiting-request)))
             (should (equal cancelled-handles (list 'old-handle)))
             (should (proofread--request-invalidated-p active))
             (should (proofread--request-state-flag-p active
@@ -15617,21 +15941,22 @@ This covers URLs, email, invisible text, faces, and properties."
                 submitted-log-ids)
             (with-current-buffer other
               (let* ((chunk (proofread--make-request-ready-chunk 1 6))
-                     (request
-                      (proofread--make-backend-request
+                     (work
+                      (proofread-test--make-request-work
                        chunk proofread-test--backend))
-                     (log-id (plist-get request :log-id)))
+                     (request (proofread-test--work-request work))
+                     (log-id
+                      (proofread--scheduled-work-log-id work)))
                 (proofread--enqueue-requests
-                 (list request) proofread-test--backend)
+                 (list work) proofread-test--backend)
                 (cl-letf (((symbol-function
                             'proofread--fresh-request-p)
                            (lambda (_request) t))
                           ((symbol-function 'proofread--backend-check)
-                           (lambda (backend-request _callback
-                                                    &optional
-                                                    _backend)
-                             (push (plist-get backend-request :log-id)
-                                   submitted-log-ids)
+                           (lambda (_backend-request _callback
+                                                     &optional
+                                                     _backend)
+                             (push log-id submitted-log-ids)
                              (list :backend 'test :log-id log-id))))
                   (should (equal (proofread--dispatch-queued-requests)
                                  (list request))))
@@ -15651,8 +15976,9 @@ This covers URLs, email, invisible text, faces, and properties."
     (let ((proofread-auto-check nil))
       (proofread-mode 1)
       (let* ((chunk (proofread--make-request-ready-chunk 1 6))
-             (request (proofread--make-backend-request
-                       chunk proofread-test--backend)))
+             (request
+              (proofread-test--make-request-work
+               chunk proofread-test--backend)))
         (proofread--enqueue-requests
          (list request) proofread-test--backend)
         (cl-letf (((symbol-function 'proofread--submit-request)
@@ -15677,7 +16003,7 @@ This covers URLs, email, invisible text, faces, and properties."
       (proofread-mode 1)
       (let* ((chunk (proofread--make-request-ready-chunk 1 6))
              (request
-              (proofread--make-backend-request
+              (proofread-test--make-request-work
                chunk proofread-test--backend)))
         (proofread--enqueue-requests
          (list request) proofread-test--backend)
@@ -15704,9 +16030,10 @@ This covers URLs, email, invisible text, faces, and properties."
       (proofread-mode 1)
       (let* ((old-chunk (proofread--make-request-ready-chunk 1 5))
              (new-chunk (proofread--make-request-ready-chunk 2 6))
-             (old (proofread--make-backend-request
-                   old-chunk proofread-test--backend))
-             (old-log-id (plist-get old :log-id)))
+             (old
+              (proofread-test--make-request-work
+               old-chunk proofread-test--backend))
+             (old-log-id (proofread--scheduled-work-log-id old)))
         (proofread--enqueue-requests
          (list old) proofread-test--backend)
         (let ((proofread-request-log-hook
@@ -15751,10 +16078,11 @@ This covers URLs, email, invisible text, faces, and properties."
       (proofread-mode 1)
       (let* ((old-chunk (proofread--make-request-ready-chunk 1 5))
              (new-chunk (proofread--make-request-ready-chunk 2 6))
-             (old (proofread--make-backend-request
-                   old-chunk proofread-test--backend))
-             (old-log-id (plist-get old :log-id)))
-        (setq old (plist-put old :handle 'old-handle))
+             (old
+              (proofread-test--make-request-work
+               old-chunk proofread-test--backend))
+             (old-log-id (proofread--scheduled-work-log-id old)))
+        (setf (proofread--scheduled-work-handle old) 'old-handle)
         (proofread--register-active-request old)
         (let ((proofread-request-log-hook
                (list
@@ -15797,10 +16125,11 @@ This covers URLs, email, invisible text, faces, and properties."
           (let* ((old-chunks
                   (proofread-test--request-ready-chunks-for-ranges
                    (list (cons (point-min) (point-max)))))
-                 (old
+                 (old-request
                   (car (proofread-test--dispatch-profile-chunks
-                        old-chunks))))
-            (should old)
+                        old-chunks)))
+                 (old (car proofread--active-requests)))
+            (should old-request)
             (goto-char 2)
             (insert "x")
             (delete-region 2 3)
@@ -15810,10 +16139,11 @@ This covers URLs, email, invisible text, faces, and properties."
             (let* ((new-chunks
                     (proofread-test--request-ready-chunks-for-ranges
                      (list (cons (point-min) (point-max)))))
-                   (new
+                   (new-request
                     (car (proofread-test--dispatch-profile-chunks
-                          new-chunks))))
-              (should new)
+                          new-chunks)))
+                   (new (car proofread--active-requests)))
+              (should new-request)
               (should (equal (proofread--request-work-key old)
                              (proofread--request-work-key new)))
               (should (= (length backend-requests) 2))
@@ -15831,12 +16161,12 @@ This covers URLs, email, invisible text, faces, and properties."
             (car (proofread-test--request-ready-chunks-for-ranges
                   (list (cons (point-min) (point-max))))))
            (full-request
-            (proofread--make-backend-request
+            (proofread-test--make-request-work
              full-chunk proofread-test--backend))
            narrowed-request)
       (narrow-to-region 2 6)
       (setq narrowed-request
-            (proofread--make-backend-request
+            (proofread-test--make-request-work
              (car (proofread-test--request-ready-chunks-for-ranges
                    (list (cons (point-min) (point-max)))))
              proofread-test--backend))
@@ -15866,7 +16196,9 @@ This covers URLs, email, invisible text, faces, and properties."
                 (car (proofread-test--request-ready-chunks-for-ranges
                       '((5 . 8)))))
                (preview
-                (proofread-test--make-profile-request first)))
+                (proofread--make-request-work
+                 (proofread-test--make-profile-request first)
+                 proofread-test--backend)))
           (should (equal (plist-get first :text) "aaa"))
           (should (equal (plist-get second :text) "aaa"))
           (proofread--cache-write-request preview nil)
@@ -15899,17 +16231,23 @@ This covers URLs, email, invisible text, faces, and properties."
       (proofread-mode 1)
       (proofread-test--with-profile
         (let* ((active
-                (proofread-test--make-profile-request
-                 (car (proofread-test--request-ready-chunks-for-ranges
-                       '((1 . 3))))))
+                (proofread--make-request-work
+                 (proofread-test--make-profile-request
+                  (car (proofread-test--request-ready-chunks-for-ranges
+                        '((1 . 3)))))
+                 proofread-test--backend))
                (waiting
-                (proofread-test--make-profile-request
-                 (car (proofread-test--request-ready-chunks-for-ranges
-                       '((4 . 6))))))
+                (proofread--make-request-work
+                 (proofread-test--make-profile-request
+                  (car (proofread-test--request-ready-chunks-for-ranges
+                        '((4 . 6)))))
+                 proofread-test--backend))
                (cached
-                (proofread-test--make-profile-request
-                 (car (proofread-test--request-ready-chunks-for-ranges
-                       '((7 . 9)))))))
+                (proofread--make-request-work
+                 (proofread-test--make-profile-request
+                  (car (proofread-test--request-ready-chunks-for-ranges
+                        '((7 . 9)))))
+                 proofread-test--backend)))
           (proofread--register-active-request active)
           (proofread--cache-write-request cached nil)
           (proofread--enqueue-requests
@@ -15956,22 +16294,26 @@ This covers URLs, email, invisible text, faces, and properties."
                  (newer-chunk
                   (car (proofread-test--request-ready-chunks-for-ranges
                         '((2 . 6)))))
-                 (older
+                 (older-request
                   (car (proofread-test--dispatch-profile-chunks
                         (list older-chunk))))
-                 (newer
+                 (older (car proofread--active-requests))
+                 (newer-request
                   (car (proofread-test--dispatch-profile-chunks
-                        (list newer-chunk)))))
-            (should older)
-            (should newer)
+                        (list newer-chunk))))
+                 (newer (car proofread--active-requests)))
+            (should older-request)
+            (should newer-request)
             (should (= (length backend-requests) 2))
             (should (= (length cancelled-handles) 1))
             (should (proofread--request-state-flag-p older
                                                      :superseded))
             (should-not (proofread--active-request-p older))
             (should (proofread--active-request-p newer))
-            (should (equal (mapcar (lambda (request)
-                                     (plist-get request :text))
+            (should (equal (mapcar (lambda (work)
+                                     (plist-get
+                                      (proofread-test--work-request work)
+                                      :text))
                                    proofread--active-requests)
                            '( "bcde")))
             (should-not proofread--request-queue)
@@ -16008,15 +16350,21 @@ This covers URLs, email, invisible text, faces, and properties."
                   (car (proofread-test--request-ready-chunks-for-ranges
                         '((5 . 8)))))
                  (cached-preview
-                  (proofread-test--make-profile-request cached-chunk))
-                 (unrelated
+                  (proofread--make-request-work
+                   (proofread-test--make-profile-request cached-chunk)
+                   proofread-test--backend))
+                 (unrelated-request
                   (proofread-test--make-profile-request
-                   unrelated-chunk)))
+                   unrelated-chunk))
+                 (unrelated
+                  (proofread--make-request-work
+                   unrelated-request proofread-test--backend)))
             (proofread--cache-write-request cached-preview nil)
-            (let ((older
-                   (car (proofread-test--dispatch-profile-chunks
-                         (list older-chunk)))))
-              (should older)
+            (let* ((older-request
+                    (car (proofread-test--dispatch-profile-chunks
+                          (list older-chunk))))
+                   (older (car proofread--active-requests)))
+              (should older-request)
               (proofread--enqueue-requests
                (list unrelated) proofread-test--backend)
               (should (= (length proofread--request-queue) 1))
@@ -16024,7 +16372,7 @@ This covers URLs, email, invisible text, faces, and properties."
                (equal
                 (proofread-test--dispatch-profile-chunks
                  (list cached-chunk))
-                (list unrelated)))
+                (list unrelated-request)))
               (should (proofread--request-state-flag-p
                        older :superseded))
               (should (= (length cancelled-handles) 1))
@@ -16044,38 +16392,40 @@ This covers URLs, email, invisible text, faces, and properties."
     (let ((proofread-auto-check nil)
           (proofread-context-size 0)
           (proofread-max-concurrent-requests 1)
-          submitted-log-ids)
+          submitted-request-ids)
       (proofread-mode 1)
       (let* ((chunks
               (proofread-test--request-ready-chunks-for-ranges
                (list (cons (point-min) (point-max)))))
-             (requests
+             (works
               (mapcar (lambda (chunk)
-                        (proofread--make-backend-request
+                        (proofread-test--make-request-work
                          chunk proofread-test--backend))
                       chunks))
-             (expected-log-ids
-              (mapcar (lambda (request)
-                        (plist-get request :log-id))
-                      requests)))
-        (should (= (length requests) 3))
+             (expected-request-ids
+              (mapcar (lambda (work)
+                        (plist-get (proofread-test--work-request work)
+                                   :id))
+                      works)))
+        (should (= (length works) 3))
         (proofread--enqueue-requests
-         requests proofread-test--backend)
+         works proofread-test--backend)
         (cl-letf (((symbol-function 'proofread--backend-check)
                    (lambda (request callback &optional _backend)
-                     (push (plist-get request :log-id)
-                           submitted-log-ids)
+                     (push (plist-get request :id)
+                           submitted-request-ids)
                      (funcall callback
                               (proofread--backend-success-result
                                request nil))
                      (list :backend 'test
                            :request-id (plist-get request :id)))))
           (proofread--dispatch-queued-requests))
-        (setq submitted-log-ids (nreverse submitted-log-ids))
-        (should (equal submitted-log-ids expected-log-ids))
+        (setq submitted-request-ids
+              (nreverse submitted-request-ids))
+        (should (equal submitted-request-ids expected-request-ids))
         (should (= (length (delete-dups (copy-sequence
-                                         submitted-log-ids)))
-                   (length requests)))
+                                         submitted-request-ids)))
+                   (length works)))
         (should-not proofread--active-requests)
         (should-not proofread--request-queue)
         (should-not proofread--request-queue-tail)
@@ -16104,12 +16454,22 @@ This covers URLs, email, invisible text, faces, and properties."
                       '((4 . 7)))))
                    (left-request
                     (proofread-test--make-profile-request left-chunk))
+                   (left-work
+                    (proofread--make-request-work
+                     left-request proofread-test--backend))
                    (right-request
                     (proofread-test--make-profile-request right-chunk))
+                   (right-work
+                    (proofread--make-request-work
+                     right-request proofread-test--backend))
                    (producer-request
                     (if (eq producer 'left)
                         left-request
                       right-request))
+                   (producer-work
+                    (if (eq producer 'left)
+                        left-work
+                      right-work))
                    (boundary-diagnostic
                     (proofread--make-diagnostic
                      :beg 4 :end 4 :text "" :kind 'grammar
@@ -16123,12 +16483,16 @@ This covers URLs, email, invisible text, faces, and properties."
                 (let ((request (if (eq side 'left)
                                    left-request
                                  right-request))
+                      (work (if (eq side 'left)
+                                left-work
+                              right-work))
                       (diagnostics
                        (if (eq side producer)
                            (list boundary-diagnostic)
                          (list neighbor-diagnostic))))
                   (should
                    (eq (proofread--handle-backend-result
+                        work
                         (proofread--backend-success-result
                          request diagnostics))
                        'applied))))
@@ -16157,6 +16521,7 @@ This covers URLs, email, invisible text, faces, and properties."
                          live-neighbor))
                 (should
                  (eq (proofread--handle-backend-result
+                      producer-work
                       (proofread--backend-success-result
                        producer-request nil))
                      'applied))
