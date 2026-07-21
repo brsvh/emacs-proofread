@@ -37,6 +37,7 @@
 (require 'button)
 (require 'cl-lib)
 (require 'eldoc)
+(require 'flymake)
 (require 'lisp-mode)
 (require 'pp)
 (require 'pulse)
@@ -265,6 +266,20 @@ request-ready chunks."
   '((t :inherit font-lock-comment-face))
   "Face for Proofread diagnostic messages in the echo area."
   :group 'proofread)
+
+;;;; Flymake diagnostic type
+
+(defconst proofread--flymake-diagnostic-type 'proofread-diagnostic
+  "Flymake diagnostic type used for Proofread diagnostics.")
+
+(put proofread--flymake-diagnostic-type
+     'flymake-category 'flymake-warning)
+(put proofread--flymake-diagnostic-type
+     'flymake-overlay-control '((face . proofread-face)))
+(put proofread--flymake-diagnostic-type
+     'flymake-type-name "proofread")
+(put proofread--flymake-diagnostic-type
+     'severity (warning-numeric-level :warning))
 
 ;;;; Internal constants
 
@@ -6046,6 +6061,64 @@ whitespace inside each field to single spaces."
         (if message-face
             (propertize (fallback) 'face message-face)
           (fallback))))))
+
+;;;; Flymake conversion
+
+(cl-defstruct
+    (proofread--flymake-data
+     (:constructor
+      proofread--make-flymake-data
+      (diagnostic range anchor-edge)))
+  "Proofread data attached to one Flymake diagnostic.
+DIAGNOSTIC is the original Proofread plist.  RANGE is its exact logical
+range at conversion time.  ANCHOR-EDGE is nil for a nonempty range,
+`:beg' or `:end' for a single-character zero-width anchor, and `:empty'
+when an empty buffer cannot provide such an anchor."
+  diagnostic
+  range
+  anchor-edge)
+
+(defun proofread--flymake-anchor-region (range)
+  "Return Flymake anchor data for logical RANGE in the current buffer.
+The result is `(BEG END ANCHOR-EDGE)'.  A nonempty range is unchanged.
+A zero-width range uses one displayable character where possible."
+  (let ((beg (car range))
+        (end (cdr range)))
+    (cond
+     ((< beg end) (list beg end nil))
+     ((< beg (point-max)) (list beg (1+ beg) :beg))
+     ((> beg (point-min)) (list (1- beg) beg :end))
+     (t (list beg end :empty)))))
+
+(defun proofread--diagnostic-to-flymake (diagnostic)
+  "Convert Proofread DIAGNOSTIC for the current buffer to Flymake.
+Return nil when DIAGNOSTIC has no valid range in the widened buffer."
+  (save-restriction
+    (widen)
+    (when-let* ((range (proofread--diagnostic-range diagnostic))
+                ((proofread--range-contains-p
+                  (cons (point-min) (point-max)) range)))
+      (pcase-let ((`(,beg ,end ,anchor-edge)
+                   (proofread--flymake-anchor-region range)))
+        (flymake-make-diagnostic
+         (current-buffer)
+         beg
+         end
+         proofread--flymake-diagnostic-type
+         (proofread-format-diagnostic-message
+          diagnostic :separator "; " :single-line t)
+         (proofread--make-flymake-data
+          diagnostic range anchor-edge))))))
+
+(defun proofread--flymake-to-diagnostic (flymake-diagnostic)
+  "Return the Proofread diagnostic wrapped by FLYMAKE-DIAGNOSTIC.
+Return nil unless its custom type and data wrapper both belong to
+Proofread."
+  (when (eq (flymake-diagnostic-type flymake-diagnostic)
+            proofread--flymake-diagnostic-type)
+    (when-let* ((data (flymake-diagnostic-data flymake-diagnostic))
+                ((proofread--flymake-data-p data)))
+      (proofread--flymake-data-diagnostic data))))
 
 (defun proofread--navigation-entry< (a b)
   "Return non-nil when navigation entry A should sort before B."

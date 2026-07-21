@@ -1644,6 +1644,167 @@ When PROFILE is nil, use the current profile."
         (should
          (cl-every #'eq (cdr affected) expected-diagnostics))))))
 
+;;;; Flymake conversion tests
+
+(ert-deftest proofread-test-flymake-conversion-preserves-data ()
+  "Preserve Proofread data in a source-aware Flymake diagnostic."
+  (with-temp-buffer
+    (insert "hello")
+    (let* ((owner (list :profile 'test :checker-name 'grammar))
+           (suggestions (list "hello" "hullo"))
+           (diagnostic
+            (proofread--make-diagnostic
+             :beg 2
+             :end 6
+             :text "ello"
+             :kind 'spelling
+             :message "Possible misspelling"
+             :suggestions suggestions
+             :source 'raw-backend))
+           (diagnostic
+            (plist-put diagnostic :source-label "grammar-checker"))
+           (diagnostic
+            (plist-put diagnostic :checker-owner owner))
+           (original (copy-tree diagnostic))
+           (constructor
+            (symbol-function 'flymake-make-diagnostic))
+           (calls 0)
+           flymake-diagnostic)
+      (cl-letf (((symbol-function 'flymake-make-diagnostic)
+                 (lambda (&rest arguments)
+                   (setq calls (1+ calls))
+                   (apply constructor arguments))))
+        (setq flymake-diagnostic
+              (proofread--diagnostic-to-flymake diagnostic)))
+      (should (= calls 1))
+      (should (eq (flymake-diagnostic-buffer flymake-diagnostic)
+                  (current-buffer)))
+      (should (= (flymake-diagnostic-beg flymake-diagnostic) 2))
+      (should (= (flymake-diagnostic-end flymake-diagnostic) 6))
+      (should (eq (flymake-diagnostic-type flymake-diagnostic)
+                  proofread--flymake-diagnostic-type))
+      (should
+       (equal (flymake-diagnostic-text flymake-diagnostic)
+              "grammar-checker: Possible misspelling"))
+      (let* ((data
+              (flymake-diagnostic-data flymake-diagnostic))
+             (unwrapped
+              (proofread--flymake-to-diagnostic
+               flymake-diagnostic)))
+        (should (proofread--flymake-data-p data))
+        (should (equal (proofread--flymake-data-range data)
+                       (cons 2 6)))
+        (should-not
+         (proofread--flymake-data-anchor-edge data))
+        (should (eq unwrapped diagnostic))
+        (should (eq (plist-get unwrapped :checker-owner) owner))
+        (should (eq (plist-get unwrapped :suggestions) suggestions))
+        (should
+         (equal (plist-get unwrapped :suggestions)
+                '("hello" "hullo")))
+        (should-not
+         (proofread--flymake-to-diagnostic
+          (flymake-make-diagnostic
+           (current-buffer) 2 6 :warning "Other" data)))
+        (should-not
+         (proofread--flymake-to-diagnostic
+          (flymake-make-diagnostic
+           (current-buffer) 2 6
+           proofread--flymake-diagnostic-type
+           "Other" diagnostic))))
+      (should (equal diagnostic original))
+      (should
+       (eq (get proofread--flymake-diagnostic-type
+                'flymake-category)
+           'flymake-warning))
+      (should
+       (equal (get proofread--flymake-diagnostic-type
+                   'flymake-type-name)
+              "proofread"))
+      (should
+       (= (get proofread--flymake-diagnostic-type 'severity)
+          (warning-numeric-level :warning)))
+      (should
+       (eq (alist-get
+            'face
+            (get proofread--flymake-diagnostic-type
+                 'flymake-overlay-control))
+           'proofread-face)))))
+
+(ert-deftest proofread-test-flymake-zero-width-anchors ()
+  "Anchor zero-width diagnostics to characters in a nonempty buffer."
+  (with-temp-buffer
+    (insert "abc")
+    (set-buffer-modified-p nil)
+    (narrow-to-region 2 3)
+    (dolist (case '((1 1 2 :beg)
+                    (2 2 3 :beg)
+                    (4 3 4 :end)))
+      (pcase-let* ((`(,position ,expected-beg ,expected-end ,edge)
+                    case)
+                   (diagnostic
+                    (proofread--make-diagnostic
+                     :beg position
+                     :end position
+                     :text ""
+                     :kind 'style
+                     :message "Insert text"
+                     :suggestions '("x")
+                     :source 'test))
+                   (original (copy-tree diagnostic))
+                   (flymake-diagnostic
+                    (proofread--diagnostic-to-flymake diagnostic))
+                   (data
+                    (flymake-diagnostic-data flymake-diagnostic)))
+        (should (= (flymake-diagnostic-beg flymake-diagnostic)
+                   expected-beg))
+        (should (= (flymake-diagnostic-end flymake-diagnostic)
+                   expected-end))
+        (should (= (- expected-end expected-beg) 1))
+        (should (equal (proofread--flymake-data-range data)
+                       (cons position position)))
+        (should (eq (proofread--flymake-data-anchor-edge data)
+                    edge))
+        (should (eq (proofread--flymake-to-diagnostic
+                     flymake-diagnostic)
+                    diagnostic))
+        (should (equal (proofread-diagnostic-range diagnostic)
+                       (cons position position)))
+        (should (equal diagnostic original))))
+    (should (= (point-min) 2))
+    (should (= (point-max) 3))
+    (save-restriction
+      (widen)
+      (should (equal (buffer-string) "abc")))
+    (should-not (buffer-modified-p))))
+
+(ert-deftest proofread-test-flymake-empty-buffer-anchor ()
+  "Keep the only valid zero-width anchor in an empty buffer."
+  (with-temp-buffer
+    (let* ((diagnostic
+            (proofread--make-diagnostic
+             :beg 1
+             :end 1
+             :text ""
+             :kind 'style
+             :message "Insert text"
+             :suggestions '("x")
+             :source 'test))
+           (flymake-diagnostic
+            (proofread--diagnostic-to-flymake diagnostic))
+           (data (flymake-diagnostic-data flymake-diagnostic)))
+      (should (= (flymake-diagnostic-beg flymake-diagnostic) 1))
+      (should (= (flymake-diagnostic-end flymake-diagnostic) 1))
+      (should (equal (proofread--flymake-data-range data)
+                     (cons 1 1)))
+      (should (eq (proofread--flymake-data-anchor-edge data)
+                  :empty))
+      (should (eq (proofread--flymake-to-diagnostic
+                   flymake-diagnostic)
+                  diagnostic))
+      (should (equal (buffer-string) ""))
+      (should-not (buffer-modified-p)))))
+
 ;;;; Overlay and mode tests
 
 (ert-deftest proofread-test-face-defaults-avoid-fixed-colors ()
