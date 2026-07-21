@@ -685,11 +685,11 @@ buffer generation and request queue.")
 (defvar proofread--generation-sequence 0
   "Sequence used to distinguish successive proofread buffer states.")
 
-(defvar-local proofread--pending-invalidated-overlays nil
-  "Proofread overlays captured before the current buffer change.")
-
 (defvar-local proofread--pending-invalidated-diagnostics nil
   "Proofread diagnostics captured before the current buffer change.")
+
+(defvar-local proofread--pending-diagnostic-ranges nil
+  "Live diagnostic ranges captured before the current buffer change.")
 
 (defvar-local proofread--cache nil
   "Proofread cache for the current buffer.")
@@ -724,11 +724,8 @@ interrupting proofreading.")
 (defvar proofread--mode-buffers nil
   "Live buffers where `proofread-mode' has installed local hooks.")
 
-(defvar proofread--inhibit-overlay-invalidation nil
-  "Buffer whose correction edits must preserve proofread overlays.")
-
-(defvar proofread--deferred-correction-overlays nil
-  "Overlays invalidated while applying an atomic correction.")
+(defvar proofread--inhibit-diagnostic-invalidation nil
+  "Buffer whose correction edits defer diagnostic invalidation.")
 
 (defvar proofread--deferred-correction-diagnostics nil
   "Diagnostics invalidated while applying an atomic correction.")
@@ -1329,9 +1326,9 @@ OMIT-SOURCE-LABEL is non-nil, skip the presentation-only operation."
   "Return non-nil when the current buffer is clearing scheduled work."
   (eq proofread--clearing-scheduled-work (current-buffer)))
 
-(defun proofread--overlay-invalidation-inhibited-p ()
+(defun proofread--diagnostic-invalidation-inhibited-p ()
   "Return non-nil if this buffer owns correction-time inhibition."
-  (eq proofread--inhibit-overlay-invalidation (current-buffer)))
+  (eq proofread--inhibit-diagnostic-invalidation (current-buffer)))
 
 ;;;; Request batches and reporting
 
@@ -5061,12 +5058,13 @@ contain both snapshots."
       (cons beg end))))
 
 (defun proofread--diagnostic-replaced-by-request-p
-    (diagnostic request request-range)
+    (diagnostic request request-range live-ranges)
   "Return non-nil if DIAGNOSTIC is replaced by REQUEST.
-REQUEST-RANGE is the checked buffer range as a (BEG . END) pair."
+REQUEST-RANGE is the checked buffer range as a (BEG . END) pair.
+LIVE-RANGES maps current diagnostic identities to live ranges."
   (let
       ((diagnostic-range
-        (proofread--diagnostic-live-range diagnostic))
+        (gethash diagnostic live-ranges))
        (owner-range
         (proofread--diagnostic-request-range diagnostic)))
     (and (proofread--diagnostic-owned-by-request-p diagnostic request)
@@ -5092,11 +5090,12 @@ requests or by requests that also have no checker owner."
 (defun proofread--diagnostics-replaced-by-request
     (request request-range)
   "Return diagnostics replaced by REQUEST over REQUEST-RANGE."
-  (cl-remove-if-not
-   (lambda (diagnostic)
-     (proofread--diagnostic-replaced-by-request-p
-      diagnostic request request-range))
-   proofread--diagnostics))
+  (let ((live-ranges (proofread--flymake-live-range-table)))
+    (cl-remove-if-not
+     (lambda (diagnostic)
+       (proofread--diagnostic-replaced-by-request-p
+        diagnostic request request-range live-ranges))
+     proofread--diagnostics)))
 
 (defun proofread--record-diagnostic-request-ranges
     (diagnostics request-range)
@@ -5110,9 +5109,9 @@ requests or by requests that also have no checker owner."
 (defun proofread--commit-diagnostic-state (region mutate-function)
   "Commit one diagnostic state change made by MUTATE-FUNCTION.
 REGION is the logical range directly affected by the change, or nil.
-MUTATE-FUNCTION must update the core model and legacy overlays without
-notifying observers.  It returns the diagnostics whose removal or
-addition changed the model, or nil when the model did not change.
+MUTATE-FUNCTION must update the core model without notifying
+observers.  It returns diagnostics whose identity, range, removal, or
+addition changed the published state, or nil when nothing changed.
 
 After a change, expand REGION with every still-valid Flymake display
 anchor of the changed diagnostics, publish the complete surviving
@@ -5174,11 +5173,7 @@ range."
          request-range
          (lambda ()
            (when replaced
-             (proofread--invalidate-affected-diagnostics
-              (delq nil
-                    (mapcar #'proofread--overlay-for-diagnostic
-                            replaced))
-              replaced t))
+             (proofread--remove-diagnostics replaced))
            (let ((added
                   (proofread--add-backend-diagnostics
                    diagnostics request-range)))
@@ -5693,35 +5688,28 @@ of later requests can continue."
     (setq proofread--pending-work t)
     (proofread--schedule-idle-timer)))
 
-(defun proofread--edit-affected-state (beg end)
-  "Return state affected by editing from BEG through END.
-The car of the result contains overlays in tracked order.  The cdr
-contains diagnostics in diagnostic order.  Preserve the identity of
-every collected object."
-  (let ((edit (cons beg end)))
-    (cons
-     (cl-remove-if-not
-      (lambda (overlay)
-        (let ((range (cons (overlay-start overlay)
-                           (overlay-end overlay))))
-          (proofread--range-affected-by-edit-p range edit)))
-      proofread--overlays)
-     (cl-remove-if-not
-      (lambda (diagnostic)
-        (when-let* ((range
-                     (proofread--diagnostic-live-range diagnostic)))
-          (proofread--range-affected-by-edit-p range edit)))
-      proofread--diagnostics))))
+(defun proofread--edit-affected-diagnostics
+    (beg end &optional range-snapshot)
+  "Return diagnostic identities affected by editing BEG through END.
+RANGE-SNAPSHOT defaults to a strict snapshot of current Flymake live
+ranges.  Preserve diagnostic model order and identity."
+  (let ((edit (cons beg end))
+        (range-snapshot
+         (or range-snapshot
+             (proofread--snapshot-live-diagnostic-ranges)))
+        diagnostics)
+    (dolist (entry range-snapshot)
+      (when (proofread--range-affected-by-edit-p
+             (cdr entry) edit)
+        (push (car entry) diagnostics)))
+    (nreverse diagnostics)))
 
 (defun proofread--defer-correction-invalidation (beg end)
   "Remember diagnostics affected by a correction-time change.
 BEG and END delimit the changed text."
-  (proofread--prune-overlays)
-  (let ((affected-state (proofread--edit-affected-state beg end)))
-    (dolist (overlay (car affected-state))
-      (cl-pushnew overlay proofread--deferred-correction-overlays
-                  :test #'eq))
-    (dolist (diagnostic (cdr affected-state))
+  (let ((diagnostics
+         (proofread--edit-affected-diagnostics beg end)))
+    (dolist (diagnostic diagnostics)
       (cl-pushnew diagnostic
                   proofread--deferred-correction-diagnostics
                   :test #'eq))))
@@ -5729,29 +5717,42 @@ BEG and END delimit the changed text."
 (defun proofread--before-change (beg end)
   "Capture diagnostics affected by a change from BEG to END."
   (proofread--invalidate-position-shifted-requests beg)
-  (if (proofread--overlay-invalidation-inhibited-p)
+  (if (proofread--diagnostic-invalidation-inhibited-p)
       (proofread--defer-correction-invalidation beg end)
-    (proofread--prune-overlays)
-    (let ((affected-state (proofread--edit-affected-state beg end)))
-      (setq proofread--pending-invalidated-overlays
-            (car affected-state))
+    (let ((range-snapshot
+           (proofread--snapshot-live-diagnostic-ranges)))
+      (setq proofread--pending-diagnostic-ranges range-snapshot)
       (setq proofread--pending-invalidated-diagnostics
-            (cdr affected-state)))))
+            (proofread--edit-affected-diagnostics
+             beg end range-snapshot)))))
 
-(defun proofread--after-change (_beg _end _length)
-  "Invalidate changed diagnostics and schedule proofreading."
-  (unless (proofread--overlay-invalidation-inhibited-p)
-    (let ((changed (or proofread--pending-invalidated-overlays
-                       proofread--pending-invalidated-diagnostics)))
-      (proofread--invalidate-affected-diagnostics
-       proofread--pending-invalidated-overlays
-       proofread--pending-invalidated-diagnostics
-       t)
-      (setq proofread--pending-invalidated-overlays nil)
+(defun proofread--after-change (beg end _length)
+  "Invalidate diagnostics changed between BEG and END and schedule work."
+  (unless (proofread--diagnostic-invalidation-inhibited-p)
+    (let ((invalidated proofread--pending-invalidated-diagnostics)
+          (range-snapshot proofread--pending-diagnostic-ranges))
+      ;; Clear outer edit state before reporting or running hooks, so
+      ;; a reentrant edit owns an independent pending snapshot.
       (setq proofread--pending-invalidated-diagnostics nil)
-      (proofread--synchronize-live-diagnostic-ranges)
-      (when changed
-        (proofread--run-diagnostics-changed-hook))))
+      (setq proofread--pending-diagnostic-ranges nil)
+      (let* ((moved
+              (proofread--diagnostics-with-changed-live-ranges
+               range-snapshot))
+             (changed
+              (cl-delete-duplicates
+               (append invalidated moved) :test #'eq)))
+        (when changed
+          (proofread--commit-diagnostic-state
+           (cons beg end)
+           (lambda ()
+             (let ((removed
+                    (proofread--remove-diagnostics invalidated)))
+               (append
+                removed
+                (cl-remove-if-not
+                 (lambda (diagnostic)
+                   (memq diagnostic proofread--diagnostics))
+                 moved)))))))))
   (proofread--mark-pending-work)
   ;; An edit outside an active target can still stale its saved
   ;; context.  Revisit queued work so such an active request cannot
@@ -6149,14 +6150,17 @@ A zero-width range uses one displayable character where possible."
      (t (list beg end :empty)))))
 
 (defun proofread--diagnostic-to-flymake
-    (diagnostic &optional model-orders presentation-message)
+    (diagnostic &optional model-orders presentation-message
+                logical-range)
   "Convert Proofread DIAGNOSTIC for the current buffer to Flymake.
 Return nil when DIAGNOSTIC has no valid range in the widened buffer.
 MODEL-ORDERS records the core order of its raw members.  When non-nil,
-PRESENTATION-MESSAGE overrides its normal Flymake message."
+PRESENTATION-MESSAGE overrides its normal Flymake message.
+LOGICAL-RANGE overrides DIAGNOSTIC's stored range."
   (save-restriction
     (widen)
-    (when-let* ((range (proofread--diagnostic-range diagnostic))
+    (when-let* ((range (or logical-range
+                           (proofread--diagnostic-range diagnostic)))
                 ((proofread--range-contains-p
                   (cons (point-min) (point-max)) range)))
       (pcase-let ((`(,beg ,end ,anchor-edge)
@@ -6249,12 +6253,6 @@ raw diagnostic in MODEL-ORDERS."
                     (cons (point-min) (point-max)) range))
           range)))))
 
-(defun proofread--flymake-data-represents-p (data diagnostic)
-  "Return non-nil when DATA represents raw DIAGNOSTIC."
-  (memq diagnostic
-        (proofread--diagnostic-members
-         (proofread--flymake-data-diagnostic data))))
-
 (defun proofread--flymake-data-current-member-orders
     (data model-orders)
   "Return current raw member and model-order pairs from DATA.
@@ -6292,24 +6290,94 @@ When non-nil, MODEL-ORDERS is the current diagnostic order table."
         (push flymake-diagnostic diagnostics)))
     (nreverse diagnostics)))
 
-(defun proofread--flymake-live-range-for-diagnostic (diagnostic)
-  "Return DIAGNOSTIC's range from a current owned Flymake object."
+(defun proofread--flymake-live-range-table ()
+  "Return an `eq' table of current raw diagnostics and live ranges.
+Only diagnostics published by Proofread's Flymake bridge and still in
+the core model are included.  Preserve the empty-buffer zero-width
+case that Flymake cannot represent with an overlay."
   (save-restriction
     (widen)
-    (let* ((model-orders (proofread--diagnostic-model-orders))
-           (member
-            (cl-find-if
-             (lambda (candidate)
-               (gethash candidate model-orders))
-             (proofread--diagnostic-members diagnostic))))
-      (when member
-        (cl-loop
-         for flymake-diagnostic
-         in (proofread--owned-flymake-diagnostics nil model-orders)
-         for data = (proofread--owned-flymake-data
-                     flymake-diagnostic model-orders)
-         when (proofread--flymake-data-represents-p data member)
-         return (proofread--flymake-live-range-from-data data))))))
+    (let ((model-orders (proofread--diagnostic-model-orders))
+          (ranges (make-hash-table :test #'eq)))
+      (dolist (flymake-diagnostic
+               (proofread--owned-flymake-diagnostics
+                nil model-orders))
+        (let* ((data
+                (proofread--owned-flymake-data
+                 flymake-diagnostic model-orders))
+               (range
+                (proofread--flymake-live-range-from-data data)))
+          (when range
+            (dolist (member-order
+                     (proofread--flymake-data-current-member-orders
+                      data model-orders))
+              (puthash (car member-order) range ranges)))))
+      (when (and proofread--flymake-report-function
+                 (= (point-min) (point-max)))
+        (dolist (diagnostic proofread--diagnostics)
+          (when-let* ((range (proofread--diagnostic-range diagnostic))
+                      ((= (car range) (cdr range)))
+                      ((= (car range) (point-min))))
+            (puthash diagnostic range ranges))))
+      ranges)))
+
+(defun proofread--current-diagnostic-live-range
+    (diagnostic &optional live-ranges)
+  "Return DIAGNOSTIC's strict current live range, or nil.
+LIVE-RANGES is an optional table from
+`proofread--flymake-live-range-table'.  Aggregate diagnostics use the
+first current raw member.  Never fall back to stale stored positions."
+  (let ((live-ranges
+         (or live-ranges (proofread--flymake-live-range-table))))
+    (cl-loop for member in (proofread--diagnostic-members diagnostic)
+             for range = (gethash member live-ranges)
+             when range return range)))
+
+(defun proofread--flymake-live-range-for-diagnostic (diagnostic)
+  "Return DIAGNOSTIC's range from a current owned Flymake object."
+  (proofread--current-diagnostic-live-range diagnostic))
+
+(defun proofread--snapshot-live-diagnostic-ranges ()
+  "Return current raw diagnostic identities paired with live ranges."
+  (let ((live-ranges (proofread--flymake-live-range-table))
+        snapshot)
+    (dolist (diagnostic proofread--diagnostics)
+      (when-let* ((range (gethash diagnostic live-ranges)))
+        (push (cons diagnostic
+                    (cons (car range) (cdr range)))
+              snapshot)))
+    (nreverse snapshot)))
+
+(defun proofread--diagnostics-with-changed-live-ranges
+    (snapshot &optional live-ranges)
+  "Return current diagnostics whose ranges differ from SNAPSHOT.
+SNAPSHOT must have the form returned by
+`proofread--snapshot-live-diagnostic-ranges'.  LIVE-RANGES is an
+optional current strict live-range table."
+  (let ((current
+         (or live-ranges (proofread--flymake-live-range-table)))
+        changed)
+    (dolist (entry snapshot)
+      (when-let* ((range (gethash (car entry) current)))
+        (unless (equal range (cdr entry))
+          (push (car entry) changed))))
+    (nreverse changed)))
+
+(defun proofread--diagnostics-live-region
+    (diagnostics &optional live-ranges)
+  "Return a bounding live region for DIAGNOSTICS, or nil.
+LIVE-RANGES is an optional strict live-range table."
+  (let ((live-ranges
+         (or live-ranges (proofread--flymake-live-range-table)))
+        ranges)
+    (dolist (diagnostic diagnostics)
+      (when-let* ((range
+                   (proofread--current-diagnostic-live-range
+                    diagnostic live-ranges)))
+        (push range ranges)))
+    (when ranges
+      (cons (apply #'min (mapcar #'car ranges))
+            (apply #'max (mapcar #'cdr ranges))))))
 
 (defun proofread--flymake-presentation-range (range)
   "Return the Flymake presentation range for logical RANGE.
@@ -6323,21 +6391,28 @@ Return nil unless RANGE is valid in the widened current buffer."
                    (proofread--flymake-anchor-region range)))
         (cons beg end)))))
 
-(defun proofread--flymake-diagnostics-snapshot (&optional region)
+(defun proofread--flymake-diagnostics-snapshot
+    (&optional region fallback-ranges)
   "Return Flymake diagnostics for the current Proofread snapshot.
 When REGION is non-nil, return only diagnostics whose converted
 display anchors overlap it.  In an empty buffer, retain every
-converted diagnostic because no nonempty display anchor is possible."
+converted diagnostic because no nonempty display anchor is possible.
+FALLBACK-RANGES is an optional `eq' table used when a current model
+diagnostic temporarily has no Flymake live range."
   (save-restriction
     (widen)
     (let ((empty-buffer-p (= (point-min) (point-max)))
           (model-orders (make-hash-table :test #'eq))
+          (live-ranges (proofread--flymake-live-range-table))
           (index 0)
           entries)
       (dolist (diagnostic proofread--diagnostics)
         (puthash diagnostic index model-orders)
         (when-let* ((logical-range
-                     (proofread--diagnostic-range diagnostic))
+                     (or (gethash diagnostic live-ranges)
+                         (and fallback-ranges
+                              (gethash diagnostic fallback-ranges))
+                         (proofread--diagnostic-range diagnostic)))
                     (presentation-range
                      (proofread--flymake-presentation-range
                       logical-range))
@@ -6396,7 +6471,8 @@ converted diagnostic because no nonempty display anchor is possible."
                  (gethash member model-orders))
                (proofread--diagnostic-members diagnostic))
               (and order
-                   (format "%s [%d/%d]" message order count)))))
+                   (format "%s [%d/%d]" message order count))
+              range)))
          entries)))))
 
 (defun proofread--flymake-publication-region
@@ -6407,7 +6483,8 @@ presentation anchors of CHANGED-DIAGNOSTICS.  Fall back to the full
 widened buffer when no valid affected range remains."
   (save-restriction
     (widen)
-    (let (ranges)
+    (let ((live-ranges (proofread--flymake-live-range-table))
+          ranges)
       (when-let* ((beg (proofread--position-integer (car-safe region)))
                   (end (proofread--position-integer (cdr-safe region)))
                   (presentation
@@ -6416,7 +6493,10 @@ widened buffer when no valid affected range remains."
         (push presentation ranges))
       (dolist (diagnostic changed-diagnostics)
         (when-let* ((logical-range
-                     (proofread-diagnostic-range diagnostic))
+                     (or
+                      (proofread--current-diagnostic-live-range
+                       diagnostic live-ranges)
+                      (proofread--diagnostic-range diagnostic)))
                     (presentation
                      (proofread--flymake-presentation-range
                       logical-range)))
@@ -6436,15 +6516,23 @@ widened buffer when no valid affected range remains."
     (error nil)))
 
 (defun proofread--report-flymake-snapshot
-    (report-function &optional region)
+    (report-function &optional region fallback-ranges)
   "Publish the current snapshot through REPORT-FUNCTION.
 When REGION is non-nil, publish a regional replacement.  Convert a
 failed snapshot to an empty replacement, but let reporting errors
-propagate to the caller."
+propagate to the caller.  FALLBACK-RANGES follows the contract of
+`proofread--flymake-diagnostics-snapshot'."
   (let (conversion-error)
     (let ((diagnostics
            (condition-case error-data
-               (proofread--flymake-diagnostics-snapshot region)
+               (cond
+                (fallback-ranges
+                 (proofread--flymake-diagnostics-snapshot
+                  region fallback-ranges))
+                (region
+                 (proofread--flymake-diagnostics-snapshot region))
+                (t
+                 (proofread--flymake-diagnostics-snapshot)))
              (error
               (setq conversion-error error-data)
               nil))))
@@ -6640,56 +6728,41 @@ restriction."
   "Return non-nil when DIAGNOSTIC matches ignore KEY."
   (equal (proofread--diagnostic-ignore-key diagnostic) key))
 
-(defun proofread--diagnostics-matching-ignore-key (key)
-  "Return current buffer diagnostics matching ignore KEY."
+(defun proofread--diagnostics-matching-ignore-keys (keys)
+  "Return current buffer diagnostics matching one of ignore KEYS."
   (let (diagnostics)
     (dolist (diagnostic proofread--diagnostics)
-      (when (proofread--diagnostic-matches-ignore-key-p
-             diagnostic key)
+      (when (cl-some
+             (lambda (key)
+               (proofread--diagnostic-matches-ignore-key-p
+                diagnostic key))
+             keys)
         (push diagnostic diagnostics)))
     (nreverse diagnostics)))
 
-(defun proofread--delete-overlays-matching-ignore-key (key)
-  "Delete proofread-owned overlays matching ignore KEY."
-  (proofread--prune-overlays)
-  (dolist (overlay proofread--overlays)
-    (let ((diagnostic (overlay-get overlay 'proofread-diagnostic)))
-      (when (and diagnostic
-                 (proofread--diagnostic-matches-ignore-key-p
-                  diagnostic key))
-        (proofread--delete-overlay overlay))))
-  (proofread--prune-overlays))
-
-(defun proofread--remove-local-diagnostics-matching-ignore-key (key)
-  "Remove this buffer's diagnostics and overlays matching KEY."
+(defun proofread--remove-local-diagnostics-matching-ignore-keys (keys)
+  "Remove this buffer's diagnostics matching ignore KEYS in one commit."
   (let ((diagnostics
-         (proofread--diagnostics-matching-ignore-key key)))
-    (proofread--delete-overlays-matching-ignore-key key)
-    (proofread--remove-diagnostics diagnostics)
-    (when (and proofread--current-diagnostic
-               (cl-some
-                (lambda (diagnostic)
-                  (proofread--diagnostic-matches-ignore-key-p
-                   diagnostic key))
-                (proofread--diagnostic-members
-                 proofread--current-diagnostic)))
-      (setq proofread--current-diagnostic nil))
+         (proofread--diagnostics-matching-ignore-keys keys)))
     (when diagnostics
-      (proofread--run-diagnostics-changed-hook))
-    diagnostics))
+      (let ((region
+             (proofread--diagnostics-live-region diagnostics)))
+        (proofread--commit-diagnostic-state
+         region
+         (lambda ()
+           (proofread--remove-diagnostics diagnostics)))))))
 
-(defun proofread--remove-diagnostics-matching-ignore-key (key)
-  "Remove diagnostics matching ignore KEY from all Proofread buffers."
+(defun proofread--remove-diagnostics-matching-ignore-keys (keys)
+  "Remove diagnostics matching ignore KEYS from all Proofread buffers."
   (let (removed)
     (proofread--prune-mode-buffers)
-    (dolist (buffer proofread--mode-buffers)
-      (with-current-buffer buffer
-        (setq
-         removed
-         (nconc
-          removed
-          (proofread--remove-local-diagnostics-matching-ignore-key
-           key)))))
+    (dolist (buffer (copy-sequence proofread--mode-buffers))
+      (when (proofread--live-mode-buffer-p buffer)
+        (let ((local-removed
+               (with-current-buffer buffer
+                 (proofread--remove-local-diagnostics-matching-ignore-keys
+                  keys))))
+          (setq removed (nconc removed local-removed)))))
     removed))
 
 (defun proofread--next-diagnostic-after (position)
@@ -8012,21 +8085,22 @@ When RESET is non-nil, move from the beginning of the buffer."
 
 (defun proofread--validate-suggestion-application (diagnostic)
   "Validate DIAGNOSTIC for application and return its range."
-  (let* ((range (proofread--diagnostic-live-range diagnostic))
-         (beg (car range))
-         (end (cdr range))
-         (text (plist-get diagnostic :text)))
+  (let ((range
+         (proofread--current-diagnostic-live-range diagnostic))
+        (text (plist-get diagnostic :text)))
     (unless range
       (user-error "Proofread diagnostic is stale"))
-    (unless (and (proofread--range-valid-p range)
-                 (proofread--range-contains-p
-                  (cons (point-min) (point-max)) range))
-      (user-error "Invalid proofread diagnostic range"))
-    (unless (stringp text)
-      (user-error "Invalid proofread diagnostic text"))
-    (unless (equal (buffer-substring-no-properties beg end) text)
-      (user-error "Proofread diagnostic text no longer matches"))
-    range))
+    (let ((beg (car range))
+          (end (cdr range)))
+      (unless (and (proofread--range-valid-p range)
+                   (proofread--range-contains-p
+                    (cons (point-min) (point-max)) range))
+        (user-error "Invalid proofread diagnostic range"))
+      (unless (stringp text)
+        (user-error "Invalid proofread diagnostic text"))
+      (unless (equal (buffer-substring-no-properties beg end) text)
+        (user-error "Proofread diagnostic text no longer matches"))
+      range)))
 
 (defun proofread--diagnostic-correction-container (diagnostic range)
   "Return syntax-container metadata for DIAGNOSTIC at RANGE.
@@ -8086,36 +8160,37 @@ length change."
            "Proofread suggestion would alter a source delimiter"))))))
 
 (defun proofread--remove-diagnostics (diagnostics)
-  "Remove DIAGNOSTICS from current buffer proofread state."
-  (let ((removed (make-hash-table :test #'eq)))
+  "Remove identities in DIAGNOSTICS from current buffer state.
+Return the identities actually removed, in their model order.  Legacy
+overlay cleanup remains encapsulated here until the overlay adapter is
+deleted."
+  (let ((remove-set (make-hash-table :test #'eq))
+        removed
+        retained)
     (dolist (diagnostic diagnostics)
-      (puthash diagnostic t removed)
+      (puthash diagnostic t remove-set))
+    (dolist (diagnostic proofread--diagnostics)
+      (if (gethash diagnostic remove-set)
+          (push diagnostic removed)
+        (push diagnostic retained)))
+    (setq removed (nreverse removed))
+    (setq proofread--diagnostics (nreverse retained))
+    (dolist (diagnostic removed)
+      (when-let* ((overlay
+                   (proofread--overlay-for-diagnostic diagnostic)))
+        (proofread--delete-overlay overlay))
       (when (hash-table-p proofread--diagnostic-overlays)
         (remhash diagnostic proofread--diagnostic-overlays))
       (when (hash-table-p proofread--diagnostic-request-ranges)
         (remhash diagnostic proofread--diagnostic-request-ranges)))
-    (setq proofread--diagnostics
-          (cl-delete-if (lambda (diagnostic)
-                          (gethash diagnostic removed))
-                        proofread--diagnostics))))
-
-(defun proofread--invalidate-affected-diagnostics
-    (overlays diagnostics &optional inhibit-notification)
-  "Invalidate OVERLAYS and DIAGNOSTICS after a text change.
-When INHIBIT-NOTIFICATION is non-nil, defer the diagnostics change
-hook."
-  (dolist (overlay overlays)
-    (proofread--delete-overlay overlay))
-  (proofread--remove-diagnostics diagnostics)
-  (when (and proofread--current-diagnostic
-             (cl-some (lambda (diagnostic)
-                        (memq diagnostic diagnostics))
-                      (proofread--diagnostic-members
-                       proofread--current-diagnostic)))
-    (setq proofread--current-diagnostic nil))
-  (proofread--prune-overlays)
-  (unless inhibit-notification
-    (proofread--run-diagnostics-changed-hook)))
+    (when (and proofread--current-diagnostic
+               (cl-some (lambda (diagnostic)
+                          (memq diagnostic removed))
+                        (proofread--diagnostic-members
+                         proofread--current-diagnostic)))
+      (setq proofread--current-diagnostic nil))
+    (proofread--prune-overlays)
+    removed))
 
 (defun proofread--synchronize-live-diagnostic-ranges ()
   "Synchronize stored diagnostic ranges with their live overlays."
@@ -8138,19 +8213,23 @@ hook."
             (setf (plist-get diagnostic :end) end)))))
     (setq proofread--overlays (nreverse overlays))))
 
-(defun proofread--mode-buffer-character-ticks ()
-  "Return modification ticks for live Proofread buffers."
+(defun proofread--mode-buffer-change-state ()
+  "Return character ticks and live ranges for Proofread buffers."
   (proofread--prune-mode-buffers)
   (mapcar (lambda (buffer)
-            (cons buffer
-                  (with-current-buffer buffer
-                    (buffer-chars-modified-tick))))
+            (with-current-buffer buffer
+              (list buffer
+                    (buffer-chars-modified-tick)
+                    (proofread--snapshot-live-diagnostic-ranges))))
           proofread--mode-buffers))
 
-(defun proofread--diagnostic-text-current-p (diagnostic)
-  "Return non-nil when DIAGNOSTIC still identifies its recorded text."
-  (when-let* ((range (or (proofread--diagnostic-live-range diagnostic)
-                         (proofread--diagnostic-range diagnostic)))
+(defun proofread--diagnostic-text-current-p
+    (diagnostic &optional live-ranges)
+  "Return non-nil when DIAGNOSTIC still identifies its recorded text.
+LIVE-RANGES is an optional strict live-range table."
+  (when-let* ((range
+               (proofread--current-diagnostic-live-range
+                diagnostic live-ranges))
               (beg (car range))
               (end (cdr range)))
     (and (proofread--range-valid-p range)
@@ -8160,16 +8239,17 @@ hook."
                 (plist-get diagnostic :text)))))
 
 (defun proofread--repair-correction-time-buffer-changes
-    (ticks source &optional repair-source)
-  "Repair proofread state changed since TICKS while correcting SOURCE.
+    (states source)
+  "Repair Proofread buffers in STATES changed while correcting SOURCE.
 Modification hooks suppress recursively triggered hooks, even in
 another buffer.  Revalidate every proofread buffer whose character
-tick changed.  When REPAIR-SOURCE is nil, preserve SOURCE state after
-an atomic rollback."
-  (dolist (entry ticks)
-    (let ((buffer (car entry))
-          (tick (cdr entry)))
-      (when (and (or repair-source (not (eq buffer source)))
+tick changed.  SOURCE is committed separately by the correction
+transaction and is never repaired here."
+  (dolist (state states)
+    (let ((buffer (nth 0 state))
+          (tick (nth 1 state))
+          (range-snapshot (nth 2 state)))
+      (when (and (not (eq buffer source))
                  (buffer-live-p buffer)
                  (with-current-buffer buffer
                    (and proofread-mode
@@ -8180,20 +8260,32 @@ an atomic rollback."
           (proofread--clear-request-work)
           (save-restriction
             (widen)
-            (let ((stale
-                   (cl-delete-if
-                    #'proofread--diagnostic-text-current-p
-                    (copy-sequence proofread--diagnostics))))
-              (when stale
-                (proofread--invalidate-affected-diagnostics
-                 (delq nil
-                       (mapcar
-                        #'proofread--overlay-for-diagnostic
-                        stale))
-                 stale t)
-                (proofread--synchronize-live-diagnostic-ranges)
-                (unless (eq buffer source)
-                  (proofread--run-diagnostics-changed-hook)))))
+            (let* ((live-ranges
+                    (proofread--flymake-live-range-table))
+                   (stale
+                    (cl-remove-if
+                     (lambda (diagnostic)
+                       (proofread--diagnostic-text-current-p
+                        diagnostic live-ranges))
+                     proofread--diagnostics))
+                   (moved
+                    (proofread--diagnostics-with-changed-live-ranges
+                     range-snapshot live-ranges))
+                   (changed
+                    (cl-delete-duplicates
+                     (append stale moved) :test #'eq)))
+              (when changed
+                (proofread--commit-diagnostic-state
+                 (cons (point-min) (point-max))
+                 (lambda ()
+                   (let ((removed
+                          (proofread--remove-diagnostics stale)))
+                     (append
+                      removed
+                      (cl-remove-if-not
+                       (lambda (diagnostic)
+                         (memq diagnostic proofread--diagnostics))
+                       moved))))))))
           (proofread--mark-pending-work))))))
 
 (defun proofread--prepare-diagnostic-corrections (diagnostics)
@@ -8218,41 +8310,54 @@ ranges."
             (push (cons diagnostic suggestion) corrections)))))
     (nreverse corrections)))
 
-(defun proofread--corrections-affected-state
+(defun proofread--corrections-affected-diagnostics
     (corrections &optional correction-ranges)
-  "Return overlays and diagnostics affected by CORRECTIONS.
-The return value is a cons cell whose car contains overlays and whose
-cdr contains diagnostics.  When CORRECTION-RANGES is non-nil, use
-the validated live ranges instead of the diagnostics' stored ranges."
-  (let* ((ranges
+  "Return diagnostic identities affected by CORRECTIONS.
+When CORRECTION-RANGES is non-nil, use those validated live ranges."
+  (let* ((live-ranges (proofread--flymake-live-range-table))
+         (ranges
           (or correction-ranges
               (mapcar
                (lambda (correction)
-                 (proofread--diagnostic-range (car correction)))
+                 (proofread--current-diagnostic-live-range
+                  (car correction) live-ranges))
                corrections)))
          (entries
           (delq nil
                 (mapcar
                  (lambda (diagnostic)
-                   (when-let* ((range
-                                (proofread--diagnostic-range
-                                 diagnostic)))
+                   (when-let* ((range (gethash diagnostic live-ranges)))
                      (cons diagnostic range)))
                  proofread--diagnostics)))
-         (affected (make-hash-table :test #'eq))
-         overlays
          diagnostics)
     (dolist (entry
              (proofread--range-conflicting-entries ranges entries))
-      (puthash (car entry) t affected)
       (push (car entry) diagnostics))
-    (proofread--prune-overlays)
-    (dolist (overlay proofread--overlays)
-      (when (gethash
-             (overlay-get overlay 'proofread-diagnostic)
-             affected)
-        (push overlay overlays)))
-    (cons overlays diagnostics)))
+    diagnostics))
+
+(defun proofread--restore-flymake-after-correction-rollback
+    (range-snapshot)
+  "Restore diagnostics lost from Flymake after a correction rollback.
+RANGE-SNAPSHOT is the pre-edit live-range snapshot.  Buffer text and
+the core model have already been rolled back.  Report the unchanged
+snapshot only when an owned Flymake diagnostic disappeared; do not run
+the diagnostic change hook because no logical state changed."
+  (when proofread--flymake-report-function
+    (let ((live-ranges (proofread--flymake-live-range-table))
+          (fallback-ranges (make-hash-table :test #'eq)))
+      (dolist (entry range-snapshot)
+        (puthash (car entry) (cdr entry) fallback-ranges))
+      (when (cl-some
+             (lambda (entry)
+               (and (memq (car entry) proofread--diagnostics)
+                    (not (gethash (car entry) live-ranges))))
+             range-snapshot)
+        (condition-case error-data
+            (proofread--report-flymake-snapshot
+             proofread--flymake-report-function nil fallback-ranges)
+          (error
+           (proofread--report-flymake-warning
+            "rollback report" error-data)))))))
 
 (defun proofread--run-correction-transaction
     (corrections &optional preserve-excursion)
@@ -8281,79 +8386,122 @@ point, mark, and mark activation before notifying diagnostics hooks."
                    (proofread--diagnostic-correction-container
                     diagnostic range))))))
            corrections))
-         (affected-state
-          (proofread--corrections-affected-state
+         (correction-ranges
+          (mapcar (lambda (validated-correction)
+                    (nth 1 validated-correction))
+                  validated-corrections))
+         (correction-region
+          (cons (apply #'min (mapcar #'car correction-ranges))
+                (apply #'max (mapcar #'cdr correction-ranges))))
+         (affected-diagnostics
+          (proofread--corrections-affected-diagnostics
            corrections
-           (mapcar (lambda (validated-correction)
-                     (nth 1 validated-correction))
-                   validated-corrections)))
-         (affected-overlays (car affected-state))
-         (affected-diagnostics (cdr affected-state))
-         (buffer-ticks (proofread--mode-buffer-character-ticks))
-         (source (current-buffer)))
+           correction-ranges))
+         (buffer-states (proofread--mode-buffer-change-state))
+         (source (current-buffer))
+         (source-state
+          (cl-find source buffer-states :key #'car :test #'eq))
+         (source-range-snapshot
+          (or (nth 2 source-state)
+              (proofread--snapshot-live-diagnostic-ranges)))
+         deferred-diagnostics
+         edits-completed-p
+         repairs-completed-p)
     (cl-labels
-        ((run-transaction
+        ((apply-edits
            ()
-           (undo-boundary)
-           (let ((proofread--inhibit-overlay-invalidation
+           (let ((proofread--inhibit-diagnostic-invalidation
                   (current-buffer))
-                 (proofread--deferred-correction-overlays nil)
-                 (proofread--deferred-correction-diagnostics nil)
-                 correction-committed)
-             (unwind-protect
-                 (progn
-                   (atomic-change-group
-                     (dolist (validated-correction
-                              (reverse validated-corrections))
-                       (let* ((correction
-                               (car validated-correction))
-                              (diagnostic (car correction))
-                              (suggestion (cdr correction))
-                              (range (nth 1 validated-correction))
-                              (beg (car range))
-                              (end (cdr range))
-                              (container-state
-                               (nth 2 validated-correction))
-                              (container
-                               (if container-state
-                                   (cdr container-state)
-                                 (proofread--diagnostic-correction-container
-                                  diagnostic
-                                  range))))
-                         (if preserve-excursion
-                             (progn
-                               (goto-char beg)
-                               (delete-region beg end))
-                           (delete-region beg end)
-                           (goto-char beg))
-                         (insert suggestion)
-                         (proofread--validate-correction-container
-                          container beg (point)
-                          (- (length suggestion) (- end beg))))))
-                   (setq correction-committed t)
-                   (proofread--invalidate-affected-diagnostics
-                    (cl-delete-duplicates
-                     (append proofread--deferred-correction-overlays
-                             affected-overlays)
-                     :test #'eq)
-                    (cl-delete-duplicates
-                     (append
-                      proofread--deferred-correction-diagnostics
-                      affected-diagnostics)
-                     :test #'eq)
-                    t)
-                   (proofread--synchronize-live-diagnostic-ranges))
-               (proofread--repair-correction-time-buffer-changes
-                buffer-ticks source correction-committed)))
-           (unless preserve-excursion
-             (proofread--run-diagnostics-changed-hook))
-           (undo-boundary)))
-      (if preserve-excursion
-          (save-mark-and-excursion
-            (run-transaction))
-        (run-transaction)))
-    (when preserve-excursion
-      (proofread--run-diagnostics-changed-hook))))
+                 (proofread--deferred-correction-diagnostics nil))
+             (atomic-change-group
+               (dolist (validated-correction
+                        (reverse validated-corrections))
+                 (let* ((correction (car validated-correction))
+                        (diagnostic (car correction))
+                        (suggestion (cdr correction))
+                        (range (nth 1 validated-correction))
+                        (beg (car range))
+                        (end (cdr range))
+                        (container-state
+                         (nth 2 validated-correction))
+                        (container
+                         (if container-state
+                             (cdr container-state)
+                           (proofread--diagnostic-correction-container
+                            diagnostic range))))
+                   (if preserve-excursion
+                       (progn
+                         (goto-char beg)
+                         (delete-region beg end))
+                     (delete-region beg end)
+                     (goto-char beg))
+                   (insert suggestion)
+                   (proofread--validate-correction-container
+                    container beg (point)
+                    (- (length suggestion) (- end beg))))))
+             (setq deferred-diagnostics
+                   (copy-sequence
+                    proofread--deferred-correction-diagnostics))))
+         (commit-source
+           ()
+           (proofread--clear-request-work)
+           (save-restriction
+             (widen)
+             (let* ((live-ranges
+                     (proofread--flymake-live-range-table))
+                    (stale
+                     (cl-remove-if
+                      (lambda (diagnostic)
+                        (proofread--diagnostic-text-current-p
+                         diagnostic live-ranges))
+                      proofread--diagnostics))
+                    (moved
+                     (proofread--diagnostics-with-changed-live-ranges
+                      source-range-snapshot live-ranges))
+                    (invalidated
+                     (cl-delete-duplicates
+                      (append affected-diagnostics
+                              deferred-diagnostics
+                              stale)
+                      :test #'eq))
+                    (changed
+                     (cl-delete-duplicates
+                      (append invalidated moved) :test #'eq)))
+               (when changed
+                 (proofread--commit-diagnostic-state
+                  correction-region
+                  (lambda ()
+                    (let ((removed
+                           (proofread--remove-diagnostics
+                            invalidated)))
+                      (append
+                       removed
+                       (cl-remove-if-not
+                        (lambda (diagnostic)
+                          (memq diagnostic proofread--diagnostics))
+                        moved))))))))
+           (proofread--mark-pending-work)))
+      (undo-boundary)
+      (unwind-protect
+          (progn
+            (if preserve-excursion
+                (save-mark-and-excursion
+                  (apply-edits)
+                  (undo-boundary))
+              (apply-edits))
+            (setq edits-completed-p t)
+            (commit-source)
+            (proofread--repair-correction-time-buffer-changes
+             buffer-states source)
+            (setq repairs-completed-p t))
+        (unless repairs-completed-p
+          (unless edits-completed-p
+            (proofread--restore-flymake-after-correction-rollback
+             source-range-snapshot))
+          (proofread--repair-correction-time-buffer-changes
+           buffer-states source)))
+      (unless preserve-excursion
+        (undo-boundary)))))
 
 (defun proofread--apply-suggestion-to-diagnostic
     (diagnostic suggestion)
@@ -8507,19 +8655,39 @@ DIAGNOSTICS must be in navigation order.  Return `applied'."
       (push overlay proofread--overlays)
       overlay)))
 
-(defun proofread--clear-diagnostics ()
-  "Clear this buffer's proofread diagnostics and overlays."
+(defun proofread--clear-transitional-diagnostic-state ()
+  "Clear legacy display and lookup state in the current buffer."
   (dolist (overlay (proofread--current-buffer-overlays))
     (delete-overlay overlay))
   (setq proofread--overlays nil)
-  (setq proofread--diagnostics nil)
   (when (hash-table-p proofread--diagnostic-overlays)
     (clrhash proofread--diagnostic-overlays))
   (when (hash-table-p proofread--diagnostic-request-ranges)
     (clrhash proofread--diagnostic-request-ranges))
-  (setq proofread--current-diagnostic nil)
-  (force-window-update (current-buffer))
-  (proofread--run-diagnostics-changed-hook))
+  (setq proofread--current-diagnostic nil))
+
+(defun proofread--clear-diagnostics ()
+  "Clear this buffer's diagnostic model in one commit."
+  (save-restriction
+    (widen)
+    (let ((region (cons (point-min) (point-max)))
+          (diagnostics (copy-sequence proofread--diagnostics)))
+      (when diagnostics
+        (proofread--commit-diagnostic-state
+         region
+         (lambda ()
+           (let ((removed
+                  (proofread--remove-diagnostics diagnostics)))
+             ;; Clear every transitional adapter object before report
+             ;; and hook callbacks can install fresh diagnostics.
+             (proofread--clear-transitional-diagnostic-state)
+             (when removed
+               (force-window-update (current-buffer)))
+             removed))))
+      ;; Keep teardown compatible with orphaned legacy overlays while
+      ;; preserving clear as a no-op for diagnostic observers.
+      (unless diagnostics
+        (proofread--clear-transitional-diagnostic-state)))))
 
 ;;;; Mode lifecycle
 
@@ -8552,8 +8720,8 @@ DIAGNOSTICS must be in navigation order.  Return `applied'."
   (setq-local proofread--cache-order nil)
   (setq-local proofread--pending-work nil)
   (setq-local proofread--idle-timer nil)
-  (setq-local proofread--pending-invalidated-overlays nil)
-  (setq-local proofread--pending-invalidated-diagnostics nil))
+  (setq-local proofread--pending-invalidated-diagnostics nil)
+  (setq-local proofread--pending-diagnostic-ranges nil))
 
 (defun proofread--clear-buffer-state ()
   "Clear proofread-owned state for the current buffer."
@@ -8574,8 +8742,8 @@ DIAGNOSTICS must be in navigation order.  Return `applied'."
   (setq proofread--diagnostic-request-ranges nil)
   (setq proofread--eldoc-mode-owned-p nil)
   (setq proofread--echo-area-refresh-pending-p nil)
-  (setq proofread--pending-invalidated-overlays nil)
-  (setq proofread--pending-invalidated-diagnostics nil))
+  (setq proofread--pending-invalidated-diagnostics nil)
+  (setq proofread--pending-diagnostic-ranges nil))
 
 (defun proofread--flymake-mode-changed ()
   "Disable Proofread when its required Flymake layer is disabled."
@@ -8687,9 +8855,10 @@ all other Flymake backends active."
 
 (defun proofread--checked-diagnostic-entries (ranges)
   "Return diagnostics conflicting with RANGES, sorted by position."
-  (let (entries)
+  (let ((live-ranges (proofread--flymake-live-range-table))
+        entries)
     (dolist (diagnostic proofread--diagnostics)
-      (when-let* ((range (proofread--diagnostic-range diagnostic)))
+      (when-let* ((range (gethash diagnostic live-ranges)))
         (when (proofread--range-conflicts-any-p range ranges)
           (push (cons diagnostic range) entries))))
     (sort entries
@@ -8735,12 +8904,7 @@ from the profile-owner requirement."
          (cons (apply #'min (mapcar #'car ranges))
                (apply #'max (mapcar #'cdr ranges))))
        (lambda ()
-         (proofread--invalidate-affected-diagnostics
-          (delq nil
-                (mapcar #'proofread--overlay-for-diagnostic
-                        diagnostics))
-          diagnostics t)
-         diagnostics)))))
+         (proofread--remove-diagnostics diagnostics))))))
 
 (defun proofread--prepare-forced-check (force-feedback)
   "Retire pending automatic work when FORCE-FEEDBACK is non-nil."
@@ -9145,7 +9309,6 @@ When the diagnostic has multiple suggestions, choose one using
 provide the selection interface."
   (interactive)
   (proofread--require-mode)
-  (proofread--synchronize-live-diagnostic-ranges)
   (let ((diagnostic (proofread-diagnostic-at-point)))
     (unless diagnostic
       (user-error "No proofread diagnostic at point"))
@@ -9167,7 +9330,6 @@ provide the selection interface."
 (defun proofread--correct-ranges (ranges scope)
   "Correct diagnostics contained in RANGES described by SCOPE."
   (proofread--require-mode)
-  (proofread--synchronize-live-diagnostic-ranges)
   (let ((diagnostics (proofread--diagnostics-in-ranges ranges)))
     (unless diagnostics
       (user-error "No proofread diagnostics in %s" scope))
@@ -9209,9 +9371,13 @@ buffer."
   (let ((diagnostic (proofread-diagnostic-at-point)))
     (unless diagnostic
       (user-error "No proofread diagnostic at point"))
-    (dolist (member (proofread--diagnostic-members diagnostic))
-      (proofread--remove-diagnostics-matching-ignore-key
-       (proofread--record-ignored-diagnostic member)))
+    (let (keys)
+      (dolist (member (proofread--diagnostic-members diagnostic))
+        (cl-pushnew
+         (proofread--record-ignored-diagnostic member)
+         keys :test #'equal))
+      (proofread--remove-diagnostics-matching-ignore-keys
+       (nreverse keys)))
     (message "proofread: ignored diagnostic")
     'ignored))
 

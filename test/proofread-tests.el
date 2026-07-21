@@ -1632,8 +1632,8 @@ When PROFILE is nil, use the current profile."
     (should-not cancelled-handles)))
 
 (ert-deftest
-    proofread-test-edit-affected-state-preserves-edit-boundaries ()
-  "Collect edit-affected state in source order without copying it."
+    proofread-test-edit-affected-diagnostics-preserve-boundaries ()
+  "Collect edit-affected identities in source order without copying."
   (with-temp-buffer
     (insert "abcdefghijk")
     (proofread-mode 1)
@@ -1655,34 +1655,21 @@ When PROFILE is nil, use the current profile."
            (diagnostics
             (list left interior interior-copy zero right covered
                   end-zero after))
-           (overlays
-            (proofread-test--install-diagnostics diagnostics))
-           (interior-overlay (nth 1 overlays))
-           (interior-copy-overlay (nth 2 overlays))
-           (zero-overlay (nth 3 overlays))
-           (covered-overlay (nth 5 overlays))
-           (end-zero-overlay (nth 6 overlays)))
+           (_overlays
+            (proofread-test--install-diagnostics diagnostics)))
       (should (equal interior interior-copy))
       (should-not (eq interior interior-copy))
-      (let ((affected (proofread--edit-affected-state 3 3))
-            (expected-overlays
-             (list zero-overlay
-                   interior-copy-overlay
-                   interior-overlay))
+      (let ((affected
+             (proofread--edit-affected-diagnostics 3 3))
             (expected-diagnostics (list interior interior-copy zero)))
-        (should (equal (car affected) expected-overlays))
-        (should (cl-every #'eq (car affected) expected-overlays))
-        (should (equal (cdr affected) expected-diagnostics))
-        (should (cl-every #'eq (cdr affected) expected-diagnostics)))
-      (let ((affected (proofread--edit-affected-state 6 9))
-            (expected-overlays
-             (list end-zero-overlay covered-overlay))
+        (should (equal affected expected-diagnostics))
+        (should (cl-every #'eq affected expected-diagnostics)))
+      (let ((affected
+             (proofread--edit-affected-diagnostics 6 9))
             (expected-diagnostics (list covered end-zero)))
-        (should (equal (car affected) expected-overlays))
-        (should (cl-every #'eq (car affected) expected-overlays))
-        (should (equal (cdr affected) expected-diagnostics))
+        (should (equal affected expected-diagnostics))
         (should
-         (cl-every #'eq (cdr affected) expected-diagnostics))))))
+         (cl-every #'eq affected expected-diagnostics))))))
 
 ;;;; Flymake conversion tests
 
@@ -2494,6 +2481,149 @@ When PROFILE is nil, use the current profile."
       (should (= hook-count 1))
       (should (equal (reverse events) '(report hook))))))
 
+(ert-deftest proofread-test-edit-commit-republishes-boundary-range ()
+  "Republish a moved Flymake range before notifying edit observers."
+  (with-temp-buffer
+    (insert "helo")
+    (let ((proofread-auto-check nil)
+          (diagnostic
+           (proofread-test--diagnostic-for-range 1 5 "helo"))
+          (report-count 0)
+          (hook-count 0)
+          events
+          hook-range
+          hook-flymake-range)
+      (proofread-mode 1)
+      (proofread-test--install-diagnostics (list diagnostic))
+      (let ((original-report-function
+             proofread--flymake-report-function))
+        (setq proofread--flymake-report-function
+              (lambda (&rest arguments)
+                (setq report-count (1+ report-count))
+                (push 'report events)
+                (apply original-report-function arguments))))
+      (add-hook
+       'proofread-diagnostics-changed-hook
+       (lambda ()
+         (setq hook-count (1+ hook-count))
+         (setq hook-range
+               (proofread-diagnostic-range diagnostic))
+         (when-let* ((flymake-diagnostic
+                      (car (proofread--owned-flymake-diagnostics))))
+           (setq hook-flymake-range
+                 (cons
+                  (flymake-diagnostic-beg flymake-diagnostic)
+                  (flymake-diagnostic-end flymake-diagnostic))))
+         (push 'hook events))
+       nil t)
+      (goto-char (point-min))
+      (insert "x")
+      (should (= report-count 1))
+      (should (= hook-count 1))
+      (should (equal (reverse events) '(report hook)))
+      (should (equal hook-range '(2 . 6)))
+      (should (equal hook-flymake-range '(2 . 6)))
+      (should (equal (proofread--diagnostic-range diagnostic)
+                     '(1 . 5)))
+      (should-not (proofread-diagnostic-at-point 1))
+      (should (eq (proofread-diagnostic-at-point 2) diagnostic))
+      ;; Insertion at the half-open end stays outside and changes no
+      ;; published diagnostic state.
+      (goto-char 6)
+      (insert "q")
+      (should (= report-count 1))
+      (should (= hook-count 1))
+      (should (equal (proofread-diagnostic-range diagnostic)
+                     '(2 . 6))))))
+
+(ert-deftest proofread-test-ignore-aggregate-commits-once-per-buffer ()
+  "Remove all aggregate ignore keys in one buffer commit."
+  (with-temp-buffer
+    (insert "helo")
+    (let ((proofread-auto-check nil)
+          (proofread--ignored-diagnostics
+           (make-hash-table :test #'equal))
+          (first
+           (plist-put
+            (proofread-test--diagnostic-for-range 1 5 "helo")
+            :source 'first-ignore-source))
+          (second
+           (plist-put
+            (proofread-test--diagnostic-for-range 1 5 "helo")
+            :source 'second-ignore-source))
+          (report-count 0)
+          (hook-count 0))
+      (proofread-mode 1)
+      (proofread-test--install-diagnostics (list first second))
+      (let ((original-report-function
+             proofread--flymake-report-function))
+        (setq proofread--flymake-report-function
+              (lambda (&rest arguments)
+                (setq report-count (1+ report-count))
+                (apply original-report-function arguments))))
+      (add-hook 'proofread-diagnostics-changed-hook
+                (lambda ()
+                  (setq hook-count (1+ hook-count)))
+                nil t)
+      (goto-char 2)
+      (should
+       (= (length
+           (proofread--diagnostic-members
+            (proofread-diagnostic-at-point)))
+          2))
+      (should (eq (proofread-ignore) 'ignored))
+      (should (= report-count 1))
+      (should (= hook-count 1))
+      (should-not proofread--diagnostics)
+      (should (= (hash-table-count proofread--ignored-diagnostics) 2)))))
+
+(ert-deftest proofread-test-narrowed-clear-is-one-backend-local-commit
+    ()
+  "Clear widely once, preserve foreign diagnostics, and skip a no-op."
+  (with-temp-buffer
+    (insert "abcdefgh")
+    (let ((proofread-auto-check nil)
+          (diagnostic
+           (proofread-test--diagnostic-for-range 1 4 "abc"))
+          (report-count 0)
+          (hook-count 0))
+      (setq-local flymake-diagnostic-functions
+                  (list #'proofread-test--flymake-foreign-backend))
+      (proofread-mode 1)
+      (proofread-test--install-diagnostics (list diagnostic))
+      (let ((foreign-before
+             (cl-find-if
+              (lambda (flymake-diagnostic)
+                (eq (flymake-diagnostic-backend flymake-diagnostic)
+                    #'proofread-test--flymake-foreign-backend))
+              (flymake-diagnostics)))
+            (original-report-function
+             proofread--flymake-report-function))
+        (should foreign-before)
+        (setq proofread--flymake-report-function
+              (lambda (&rest arguments)
+                (setq report-count (1+ report-count))
+                (apply original-report-function arguments)))
+        (add-hook 'proofread-diagnostics-changed-hook
+                  (lambda ()
+                    (setq hook-count (1+ hook-count)))
+                  nil t)
+        (narrow-to-region 5 9)
+        (proofread-clear)
+        (should (= report-count 1))
+        (should (= hook-count 1))
+        (should-not proofread--diagnostics)
+        (should
+         (eq foreign-before
+             (cl-find-if
+              (lambda (flymake-diagnostic)
+                (eq (flymake-diagnostic-backend flymake-diagnostic)
+                    #'proofread-test--flymake-foreign-backend))
+              (flymake-diagnostics))))
+        (proofread-clear)
+        (should (= report-count 1))
+        (should (= hook-count 1))))))
+
 ;;;; Overlay and mode tests
 
 (ert-deftest proofread-test-face-defaults-avoid-fixed-colors ()
@@ -2572,8 +2702,7 @@ When PROFILE is nil, use the current profile."
               overlay 'proofread-diagnostic-insertion-ordinal))
            overlays)
           '( 0 1)))
-        (proofread--invalidate-affected-diagnostics
-         (list (car overlays)) (list first))
+        (proofread--remove-diagnostics (list first))
         (proofread-clear)
         (setq proofread--diagnostics (list third))
         (let ((overlay (proofread--create-overlay third)))
@@ -2606,7 +2735,9 @@ When PROFILE is nil, use the current profile."
     (insert "hello world")
     (proofread-mode 1)
     (let* ((diagnostic (proofread-test--diagnostic))
-           (proofread-overlay (proofread--create-overlay diagnostic))
+           (proofread-overlay
+            (car (proofread-test--install-diagnostics
+                  (list diagnostic))))
            (foreign-overlay (make-overlay 1 6)))
       (overlay-put foreign-overlay 'category 'foreign-overlay)
       (goto-char 3)
@@ -2616,7 +2747,7 @@ When PROFILE is nil, use the current profile."
       (should-not proofread--diagnostics))))
 
 (ert-deftest proofread-test-before-change-paths-select-same-state ()
-  "Select the same objects for ordinary and deferred invalidation."
+  "Select the same identities for ordinary and deferred invalidation."
   (with-temp-buffer
     (insert "abcdef")
     (proofread-mode 1)
@@ -2629,27 +2760,19 @@ When PROFILE is nil, use the current profile."
       (should-not (eq first same))
       (proofread-test--install-diagnostics (list first same outside))
       (proofread--before-change 3 3)
-      (let ((ordinary-overlays
-             (copy-sequence proofread--pending-invalidated-overlays))
-            (ordinary-diagnostics
+      (let ((ordinary-diagnostics
              (copy-sequence
               proofread--pending-invalidated-diagnostics)))
-        (setq proofread--pending-invalidated-overlays nil)
         (setq proofread--pending-invalidated-diagnostics nil)
-        (let ((proofread--inhibit-overlay-invalidation
+        (setq proofread--pending-diagnostic-ranges nil)
+        (let ((proofread--inhibit-diagnostic-invalidation
                (current-buffer))
-              (proofread--deferred-correction-overlays nil)
               (proofread--deferred-correction-diagnostics nil))
           (proofread--before-change 3 3)
           (proofread--before-change 3 3)
-          (should (= (length proofread--deferred-correction-overlays)
-                     (length ordinary-overlays)))
           (should (= (length
                       proofread--deferred-correction-diagnostics)
                      (length ordinary-diagnostics)))
-          (dolist (overlay ordinary-overlays)
-            (should (memq overlay
-                          proofread--deferred-correction-overlays)))
           (dolist (diagnostic ordinary-diagnostics)
             (should
              (memq diagnostic
@@ -3651,7 +3774,7 @@ range; no available backend"))))))
         (let ((first-timer proofread--idle-timer))
           (proofread-mode 1)
           (let ((second-timer proofread--idle-timer))
-            (should (= (length timers) 3))
+            (should (= (length timers) 2))
             (should (equal cancelled (cdr timers)))
             (should-not (eq second-timer first-timer))
             (should (eq second-timer (car timers)))
@@ -11532,7 +11655,7 @@ This covers URLs, email, invisible text, faces, and properties."
 
 (ert-deftest proofread-test-live-range-does-not-mutate-backend-result
     ()
-  "Keep backend results immutable when overlays move."
+  "Keep stored diagnostics and backend results immutable after edits."
   (with-temp-buffer
     (insert "helo")
     (proofread-mode 1)
@@ -11554,6 +11677,8 @@ This covers URLs, email, invisible text, faces, and properties."
           (goto-char (point-min))
           (insert "x")
           (should (equal (proofread--diagnostic-range live)
+                         '( 1 . 5)))
+          (should (equal (proofread-diagnostic-range live)
                          '( 2 . 6)))
           (should
            (equal (proofread--diagnostic-range diagnostic)
@@ -12898,8 +13023,8 @@ This covers URLs, email, invisible text, faces, and properties."
         (should (= (point-max) maximum))))))
 
 (ert-deftest
-    proofread-test-diagnostic-at-point-skips-removed-overlay ()
-  "Ignore a live orphan overlay removed from diagnostic state."
+    proofread-test-diagnostic-at-point-follows-identity-removal ()
+  "Ignore a diagnostic removed by identity from the core model."
   (with-temp-buffer
     (insert "abcdefghij")
     (let ((proofread-auto-check nil)
@@ -12912,7 +13037,7 @@ This covers URLs, email, invisible text, faces, and properties."
       (let ((stale-overlay
              (proofread--overlay-for-diagnostic stale)))
         (proofread--remove-diagnostics (list stale))
-        (should (overlay-buffer stale-overlay))
+        (should-not (overlay-buffer stale-overlay))
         (should-not (gethash stale proofread--diagnostic-overlays))
         (should (eq (proofread-diagnostic-at-point 4) live))))))
 
@@ -12987,21 +13112,15 @@ This covers URLs, email, invisible text, faces, and properties."
       (proofread-mode 1)
       (proofread-test--install-diagnostics
        (list first second third))
-      (proofread--invalidate-affected-diagnostics
-       (list (proofread--overlay-for-diagnostic second))
-       (list second))
+      (proofread--remove-diagnostics (list second))
       (should
        (equal
         (proofread--diagnostic-members
          (proofread-diagnostic-at-point 2))
         (list first third)))
-      (proofread--invalidate-affected-diagnostics
-       (list (proofread--overlay-for-diagnostic first))
-       (list first))
+      (proofread--remove-diagnostics (list first))
       (should (eq (proofread-diagnostic-at-point 2) third))
-      (proofread--invalidate-affected-diagnostics
-       (list (proofread--overlay-for-diagnostic third))
-       (list third))
+      (proofread--remove-diagnostics (list third))
       (should-not (proofread-diagnostic-at-point 2)))))
 
 (ert-deftest
@@ -13571,6 +13690,46 @@ This covers URLs, email, invisible text, faces, and properties."
       (proofread-clear)
       (should (= calls 1))
       (should-not (proofread-diagnostic-at-point 4)))))
+
+(ert-deftest proofread-test-clear-preserves-reentrant-diagnostics ()
+  "Preserve diagnostic state installed by the clear notification."
+  (with-temp-buffer
+    (insert "abcdefghij")
+    (proofread-mode 1)
+    (let ((old
+           (proofread-test--diagnostic-for-range 1 4 "abc"))
+          (replacement
+           (proofread-test--diagnostic-for-range 5 8 "efg"))
+          (reentered-p nil)
+          (report-count 0)
+          (hook-count 0))
+      (proofread-test--install-diagnostics (list old))
+      (let ((original-report-function
+             proofread--flymake-report-function))
+        (setq proofread--flymake-report-function
+              (lambda (&rest arguments)
+                (setq report-count (1+ report-count))
+                (apply original-report-function arguments))))
+      (add-hook
+       'proofread-diagnostics-changed-hook
+       (lambda ()
+         (setq hook-count (1+ hook-count))
+         (unless reentered-p
+           (setq reentered-p t)
+           (proofread--apply-backend-diagnostics
+            (list replacement) '(5 . 8))))
+       nil t)
+      (proofread-clear)
+      (should (= report-count 2))
+      (should (= hook-count 2))
+      (should (= (length proofread--diagnostics) 1))
+      (let ((installed (car proofread--diagnostics)))
+        (should (equal installed replacement))
+        (should (overlay-buffer
+                 (proofread--overlay-for-diagnostic installed)))
+        (should (gethash installed
+                         proofread--diagnostic-request-ranges))
+        (should (eq (proofread-diagnostic-at-point 6) installed))))))
 
 (ert-deftest
     proofread-test-diagnostics-hook-error-does-not-break-correction ()
@@ -14294,9 +14453,8 @@ This covers URLs, email, invisible text, faces, and properties."
       (should (equal (buffer-substring-no-properties 6 10) "wrld")))))
 
 (ert-deftest
-    proofread-test-corrections-affected-state-preserves-adapter-order
-    ()
-  "Keep correction affected-state ordering around the shared scan."
+    proofread-test-corrections-affected-identities-preserve-order ()
+  "Keep affected diagnostic ordering around the correction scan."
   (with-temp-buffer
     (insert "abcdefghijkl")
     (proofread-mode 1)
@@ -14317,25 +14475,16 @@ This covers URLs, email, invisible text, faces, and properties."
            (diagnostics
             (list right-adjacent zero-right contains zero-correction
                   overlap main left-adjacent))
-           (installed-overlays
+           (_installed-overlays
             (proofread-test--install-diagnostics diagnostics))
-           (expected-overlays
-            (list (nth 1 installed-overlays)
-                  (nth 2 installed-overlays)
-                  (nth 3 installed-overlays)
-                  (nth 4 installed-overlays)
-                  (nth 5 installed-overlays)))
            (expected-diagnostics
             (list zero-correction zero-right main overlap contains))
-           (affected-state
-            (proofread--corrections-affected-state
+           (affected-diagnostics
+            (proofread--corrections-affected-diagnostics
              (list (cons zero-correction "X")
                    (cons main "Y")))))
-      (should (equal (car affected-state) expected-overlays))
-      (should (cl-every #'eq (car affected-state)
-                        expected-overlays))
-      (should (equal (cdr affected-state) expected-diagnostics))
-      (should (cl-every #'eq (cdr affected-state)
+      (should (equal affected-diagnostics expected-diagnostics))
+      (should (cl-every #'eq affected-diagnostics
                         expected-diagnostics)))))
 
 (ert-deftest proofread-test-correct-buffer-prefers-navigation-order ()
@@ -14440,7 +14589,7 @@ This covers URLs, email, invisible text, faces, and properties."
 
 (ert-deftest
     proofread-test-correction-uses-revalidated-range-for-state ()
-  "Use the validated live range when stored state misses an edit."
+  "Use live ranges when a failed edit hook leaves stored state stale."
   (with-temp-buffer
     (insert "ahelo")
     (proofread-mode 1)
@@ -14469,8 +14618,10 @@ This covers URLs, email, invisible text, faces, and properties."
               "hello")))
         (should (eq (proofread-correct-at-point) 'applied)))
       (should (equal (buffer-string) "aqhello"))
-      (should (equal proofread--diagnostics (list survivor)))
-      (should (proofread--overlay-for-diagnostic survivor)))))
+      ;; The zero-width diagnostic moved to the correction boundary
+      ;; even though its stored plist stayed at the old position.
+      (should-not proofread--diagnostics)
+      (should-not (proofread--overlay-for-diagnostic survivor)))))
 
 (ert-deftest
     proofread-test-correction-rejects-source-delimiter-suggestions ()
@@ -14576,18 +14727,44 @@ This covers URLs, email, invisible text, faces, and properties."
            (diagnostics (list first second))
            (overlays
             (proofread-test--install-diagnostics diagnostics))
+           (original-report-function
+            proofread--flymake-report-function)
+           (report-count 0)
            (calls 0))
+      ;; Make the published positions differ from the immutable stored
+      ;; plist positions before exercising rollback restoration.
+      (goto-char (point-min))
+      (insert "x")
+      (setq proofread--flymake-report-function
+            (lambda (&rest arguments)
+              (setq report-count (1+ report-count))
+              (apply original-report-function arguments)))
       (add-hook 'proofread-diagnostics-changed-hook
                 (lambda ()
                   (setq calls (1+ calls)))
                 nil t)
-      (goto-char 5)
+      (goto-char 6)
       (should-error (proofread-correct-buffer) :type 'user-error)
-      (should (equal (buffer-string) "\"helo wrld\""))
+      (should (equal (buffer-string) "x\"helo wrld\""))
       (should (equal proofread--diagnostics diagnostics))
       (should (cl-every #'overlay-buffer overlays))
+      ;; Flymake diagnostics use evaporating overlays.  The failed edit
+      ;; can remove those overlays even though the atomic change group
+      ;; restores the text, so Proofread republishes the unchanged
+      ;; snapshot without notifying model observers.
+      (should (= report-count 1))
       (should (= calls 0))
-      (should (= (point) 5)))))
+      (let ((published
+             (proofread-test--flymake-proofread-diagnostics)))
+        (should (= (length published) 2))
+        (should (cl-every
+                 (lambda (diagnostic)
+                   (memq diagnostic published))
+                 diagnostics)))
+      (should
+       (equal (mapcar #'proofread-diagnostic-range diagnostics)
+              '((3 . 7) (8 . 12))))
+      (should (= (point) 6)))))
 
 (ert-deftest
     proofread-test-narrowed-correction-uses-full-source-container ()
@@ -14751,6 +14928,9 @@ This covers URLs, email, invisible text, faces, and properties."
     (insert "helo wrld")
     (proofread-mode 1)
     (let ((calls 0)
+          (reports 0)
+          events
+          hook-flymake
           (first
            (proofread-test--diagnostic-with-suggestions
             1 5 "helo" '( "hello")))
@@ -14758,12 +14938,25 @@ This covers URLs, email, invisible text, faces, and properties."
            (proofread-test--diagnostic-with-suggestions
             6 10 "wrld" '( "world"))))
       (proofread-test--install-diagnostics (list first second))
+      (let ((original-report-function
+             proofread--flymake-report-function))
+        (setq proofread--flymake-report-function
+              (lambda (&rest arguments)
+                (setq reports (1+ reports))
+                (push 'report events)
+                (apply original-report-function arguments))))
       (add-hook 'proofread-diagnostics-changed-hook
                 (lambda ()
-                  (setq calls (1+ calls)))
+                  (setq calls (1+ calls))
+                  (setq hook-flymake
+                        (proofread-test--flymake-proofread-diagnostics))
+                  (push 'hook events))
                 nil t)
       (proofread-correct-buffer)
-      (should (= calls 1)))))
+      (should (= reports 1))
+      (should (= calls 1))
+      (should (equal (reverse events) '(report hook)))
+      (should-not hook-flymake))))
 
 (ert-deftest proofread-test-apply-no-suggestion-reports-unavailable ()
   "Report missing suggestions without editing."
@@ -14799,8 +14992,8 @@ This covers URLs, email, invisible text, faces, and properties."
       (should-error (proofread-correct-at-point) :type 'user-error)
       (should (equal (buffer-string) "helo")))))
 
-(ert-deftest proofread-test-apply-stale-overlay-rejected ()
-  "Reject diagnostics without live owned overlays."
+(ert-deftest proofread-test-apply-ignores-legacy-overlay-liveness ()
+  "Use Flymake publication rather than a legacy overlay for correction."
   (with-temp-buffer
     (insert "helo")
     (proofread-mode 1)
@@ -14815,6 +15008,21 @@ This covers URLs, email, invisible text, faces, and properties."
             (car (proofread-test--install-diagnostics
                   (list diagnostic)))))
       (delete-overlay overlay)
+      (goto-char 2)
+      (should (eq (proofread-correct-at-point) 'applied))
+      (should (equal (buffer-string) "hello")))))
+
+(ert-deftest proofread-test-apply-unpublished-diagnostic-rejected ()
+  "Reject a model identity no longer published by the Flymake bridge."
+  (with-temp-buffer
+    (insert "helo")
+    (proofread-mode 1)
+    (let ((diagnostic
+           (proofread-test--diagnostic-with-suggestions
+            1 5 "helo" '( "hello"))))
+      (proofread-test--install-diagnostics (list diagnostic))
+      (funcall proofread--flymake-report-function
+               nil :region (cons (point-min) (point-max)))
       (goto-char 2)
       (should-error (proofread-correct-at-point) :type 'user-error)
       (should (equal (buffer-string) "helo")))))
@@ -21082,7 +21290,9 @@ This covers URLs, email, invisible text, faces, and properties."
           (should-not
            (proofread-test--dispatch-profile-chunks
             (list first second)))
-          (should (= calls 1))
+          ;; The cache publication and its reentrant source edit are
+          ;; separate diagnostic commits.
+          (should (= calls 2))
           (should (equal (buffer-string) "aaa aaa aaa"))
           (should (proofread--request-queue-empty-p))
           (should (= (hash-table-count
@@ -21129,7 +21339,9 @@ This covers URLs, email, invisible text, faces, and properties."
                         (delete-char -1)))
                     nil t)
           (should-not (proofread--dispatch-queued-requests))
-          (should (= calls 1))
+          ;; Cache publication plus the hook's insertion and deletion
+          ;; each publish one coherent diagnostic state.
+          (should (= calls 3))
           (should (proofread--request-queue-empty-p))
           (should (proofread--request-invalidated-p waiting))
           (should-not (proofread--request-work-pending-p waiting))
