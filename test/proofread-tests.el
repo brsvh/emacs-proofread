@@ -14460,8 +14460,8 @@ This covers URLs, email, invisible text, faces, and properties."
           (setq list-a (proofread-show-buffer-requests source-a))
           (setq list-b (proofread-show-buffer-requests source-b))
           (should (= (length proofread--request-log-sources) 2))
-          (should (memq #'proofread--request-log-record-event
-                        proofread-request-log-hook))
+          (should-not (memq #'proofread--request-log-record-event
+                            proofread-request-log-hook))
           (kill-buffer source-a)
           (should-not (buffer-live-p list-a))
           (should (buffer-live-p list-b))
@@ -14471,8 +14471,8 @@ This covers URLs, email, invisible text, faces, and properties."
             (should proofread--request-log-enabled)
             (should (equal proofread--request-log-list-buffers
                            (list list-b))))
-          (should (memq #'proofread--request-log-record-event
-                        proofread-request-log-hook))
+          (should-not (memq #'proofread--request-log-record-event
+                            proofread-request-log-hook))
           (kill-buffer list-b)
           (with-current-buffer source-b
             (should-not proofread--request-log-enabled)
@@ -14486,7 +14486,7 @@ This covers URLs, email, invisible text, faces, and properties."
 
 (ert-deftest
     proofread-test-source-kill-closes-associated-list-buffers ()
-  "Killing a source closes its lists and releases request-log hooks."
+  "Killing a source closes its lists and releases monitor state."
   (save-window-excursion
     (let ((source (generate-new-buffer
                    " *proofread-list-source-kill*"))
@@ -14505,8 +14505,8 @@ This covers URLs, email, invisible text, faces, and properties."
             (proofread-show-buffer-requests source)
             (should (get-buffer diagnostics-name))
             (should (get-buffer requests-name))
-            (should (memq #'proofread--request-log-record-event
-                          proofread-request-log-hook))
+            (should-not (memq #'proofread--request-log-record-event
+                              proofread-request-log-hook))
             (kill-buffer source)
             (should-not (get-buffer diagnostics-name))
             (should-not (get-buffer requests-name))
@@ -14670,22 +14670,28 @@ This covers URLs, email, invisible text, faces, and properties."
            'proofread-test-api-key "secret-text-property"))
          (request-details
           (proofread--request-log-backend-request-details
-           (list :backend 'languagetool
-                 :method "POST"
-                 :url url
-                 :parameters parameters)))
+           (proofread--request-log-safe-event
+            (list :type 'backend-request
+                  :backend 'languagetool
+                  :method "POST"
+                  :url url
+                  :parameters parameters))))
          (opaque-details
           (proofread--request-log-backend-request-details
-           '( :backend languagetool
-              :method "POST"
-              :parameters (("language" . "en-US")
-                           ("text" . "helo")))))
+           (proofread--request-log-safe-event
+            '( :type backend-request
+               :backend languagetool
+               :method "POST"
+               :parameters (("language" . "en-US")
+                            ("text" . "helo"))))))
          (response-details
           (proofread--request-log-backend-response-details
-           (list :backend 'languagetool
-                 :url url
-                 :http-status 200
-                 :response "{\"matches\":[]}"))))
+           (proofread--request-log-safe-event
+            (list :type 'backend-response
+                  :backend 'languagetool
+                  :url url
+                  :http-status 200
+                  :response "{\"matches\":[]}")))))
     (should (equal (plist-get request-details :method) "POST"))
     (should
      (equal (plist-get request-details :url)
@@ -15214,6 +15220,475 @@ This covers URLs, email, invisible text, faces, and properties."
               :request safe-request
               :result
               (list :status 'ok :request safe-request)))))))
+
+(ert-deftest
+    proofread-test-request-log-sanitizes-normal-events-once ()
+  "Sanitize one normal event once across recording, hooks, and reads."
+  (let ((proofread--request-log-sources nil)
+        (proofread-request-log-hook nil)
+        (original-sanitizer
+         (symbol-function 'proofread--request-log-safe-event)))
+    (with-temp-buffer
+      (let* ((source (current-buffer))
+             (request
+              (list :id 71
+                    :buffer source
+                    :beg 1
+                    :end 5
+                    :text "helo"))
+             (sanitizations 0)
+             first-events
+             second-events)
+        (setq proofread--request-log-enabled t)
+        (setq proofread-request-log-hook
+              (list
+               (lambda (event)
+                 (push event first-events))
+               (lambda (event)
+                 (push event second-events))))
+        (cl-letf
+            (((symbol-function 'proofread--request-log-safe-event)
+              (lambda (event)
+                (setq sanitizations (1+ sanitizations))
+                (funcall original-sanitizer event))))
+          (proofread--record-request-event
+           request 'backend-request
+           :backend proofread-test--backend
+           :method "POST")
+          (should (= sanitizations 1))
+          (should (= (length first-events) 1))
+          (should (= (length second-events) 1))
+          (let ((records (proofread--request-log-record-list source)))
+            (should (= (length records) 1))
+            (should
+             (eq (plist-get (car (plist-get (car records) :events))
+                            :type)
+                 'backend-request)))
+          (should
+           (proofread--request-log-lookup-record source 71))
+          (should (= sanitizations 1)))))))
+
+(ert-deftest
+    proofread-test-request-log-recorder-error-does-not-block-hooks ()
+  "Continue public hooks after the internal recorder fails."
+  (with-temp-buffer
+    (let* ((sentinel
+            "PROOFREAD-TEST-RECORDER-ERROR-MUST-NOT-APPEAR")
+           (request
+            (list :id 72
+                  :buffer (current-buffer)
+                  :beg 1
+                  :end 5
+                  :text "helo"))
+           observed
+           reports
+           (proofread-request-log-hook
+            (list (lambda (event)
+                    (setq observed event)))))
+      (cl-letf
+          (((symbol-function
+             'proofread--request-log-record-canonical-event)
+            (lambda (_event)
+              (error "%s" sentinel)))
+           ((symbol-function
+             'proofread-report-warning-without-window)
+            (lambda (detail summary)
+              (push (list detail summary) reports))))
+        (should
+         (proofread--record-request-event
+          request 'backend-request :method "POST")))
+      (should (eq (plist-get observed :type) 'backend-request))
+      (should
+       (equal reports
+              '(( "Proofread request log recorder error (error)"
+                  "request log recorder failed; see *Warnings*"))))
+      (proofread-test--assert-secret-not-printed sentinel observed)
+      (proofread-test--assert-secret-not-printed sentinel reports))))
+
+(ert-deftest
+    proofread-test-request-log-updates-history-without-rescanning ()
+  "Sanitize each appended event once and expose histories in order."
+  (let ((original-sanitizer
+         (symbol-function 'proofread--request-log-safe-event)))
+    (with-temp-buffer
+      (let* ((source (current-buffer))
+             (request
+              (list :id 88
+                    :buffer source
+                    :beg 1
+                    :end 5
+                    :text "helo"))
+             (result
+              (list :status 'ok
+                    :request request
+                    :diagnostics nil))
+             (specific-events
+              (list
+               (list :type 'chunk-request :chunk request)
+               (list :type 'backend-request :pass 1)
+               (list :type 'backend-request :pass 2)
+               (list :type 'backend-response :pass 1)
+               (list :type 'backend-response :pass 2)
+               (list :type 'backend-result :result result)
+               (list :type 'final-result
+                     :status 'applied
+                     :result result)))
+             (expected-types
+              '( chunk-request backend-request backend-request
+                 backend-response backend-response backend-result
+                 final-result))
+             (sanitizations 0)
+             (index 0))
+        (setq proofread--request-log-enabled t)
+        (cl-letf
+            (((symbol-function 'proofread--request-log-safe-event)
+              (lambda (event)
+                (setq sanitizations (1+ sanitizations))
+                (funcall original-sanitizer event))))
+          (dolist (specific specific-events)
+            (setq index (1+ index))
+            (proofread--request-log-record-event
+             (append
+              (list :time (list 1 index 0 0)
+                    :log-id 88
+                    :request-id 88
+                    :buffer source
+                    :beg 1
+                    :end 5
+                    :request request)
+              specific)))
+          (should (= sanitizations (length specific-events)))
+          (let* ((records
+                  (proofread--request-log-record-list source))
+                 (record (car records)))
+            (should (= (length records) 1))
+            (should
+             (equal
+              (mapcar (lambda (event)
+                        (plist-get event :type))
+                      (plist-get record :events))
+              expected-types))
+            (should
+             (equal
+              (mapcar (lambda (event)
+                        (plist-get event :pass))
+                      (plist-get record :backend-requests))
+              '(1 2)))
+            (should
+             (equal
+              (mapcar (lambda (event)
+                        (plist-get event :pass))
+                      (plist-get record :backend-responses))
+              '(1 2)))
+            (should (= (length (plist-get record :backend-results))
+                       1)))
+          (should
+           (proofread--request-log-lookup-record source 88))
+          (should (= sanitizations (length specific-events))))))))
+
+(ert-deftest proofread-test-request-log-isolates-hook-mutations ()
+  "Give every request-log hook a detached event snapshot."
+  (with-temp-buffer
+    (let* ((source (current-buffer))
+           (request-text (copy-sequence "helo"))
+           (request
+            (list :id 99
+                  :buffer source
+                  :beg 1
+                  :end 5
+                  :text request-text))
+           (suggestion (copy-sequence "hello"))
+           (diagnostic
+            (list :beg 1
+                  :end 5
+                  :text request-text
+                  :kind 'spelling
+                  :message "Possible misspelling"
+                  :suggestions (list suggestion)))
+           (result
+            (list :status 'ok
+                  :request request
+                  :diagnostics (list diagnostic)))
+           mutator-event
+           observer-event)
+      (setq proofread--request-log-enabled t)
+      (setq proofread-request-log-hook
+            (list
+             (lambda (event)
+               (setq mutator-event event)
+               (let* ((hook-request (plist-get event :request))
+                      (hook-result (plist-get event :result))
+                      (result-request
+                       (plist-get hook-result :request))
+                      (hook-diagnostic
+                       (car (plist-get hook-result :diagnostics))))
+                 (aset (plist-get hook-request :text) 0 ?X)
+                 (aset (plist-get result-request :text) 0 ?X)
+                 (setcar (plist-get hook-diagnostic :suggestions)
+                         "changed")
+                 (setf (plist-get hook-result :status) 'error)
+                 (setf (plist-get event :status) 'poisoned)))
+             (lambda (event)
+               (setq observer-event event))))
+      (proofread--record-request-event
+       request 'backend-result
+       :status 'waiting
+       :backend proofread-test--backend
+       :result result)
+      (should mutator-event)
+      (should observer-event)
+      (should-not (eq mutator-event observer-event))
+      (should-not
+       (eq (plist-get (plist-get mutator-event :request) :text)
+           (plist-get (plist-get observer-event :request) :text)))
+      (should (eq (plist-get observer-event :status) 'waiting))
+      (should
+       (equal (plist-get (plist-get observer-event :request) :text)
+              "helo"))
+      (let* ((observer-result (plist-get observer-event :result))
+             (observer-diagnostic
+              (car (plist-get observer-result :diagnostics))))
+        (should (eq (plist-get observer-result :status) 'ok))
+        (should
+         (equal (plist-get observer-diagnostic :suggestions)
+                '("hello"))))
+      (should (equal request-text "helo"))
+      (should (eq (plist-get result :status) 'ok))
+      (should (equal (plist-get diagnostic :suggestions)
+                     '("hello")))
+      (aset (plist-get (plist-get observer-event :request) :text)
+            1 ?Y)
+      (setf (plist-get observer-event :status) 'observer-poisoned)
+      (let* ((record
+              (car (proofread--request-log-record-list source)))
+             (stored-event (car (plist-get record :events)))
+             (stored-result
+              (car (plist-get record :backend-results)))
+             (stored-diagnostic
+              (car (plist-get stored-result :diagnostics))))
+        (should (eq (plist-get record :status) 'parsed))
+        (should (eq (plist-get stored-event :status) 'waiting))
+        (should (eq (plist-get stored-result :status) 'ok))
+        (should
+         (equal (plist-get (plist-get record :request) :text)
+                "helo"))
+        (should
+         (equal (plist-get stored-diagnostic :suggestions)
+                '("hello")))))))
+
+(ert-deftest
+    proofread-test-request-log-snapshots-mutable-producer-events ()
+  "Snapshot mutable producer data before publishing or recording it."
+  (with-temp-buffer
+    (let* ((source (current-buffer))
+           (raw-text (copy-sequence "helo"))
+           (raw-message (copy-sequence "Possible misspelling"))
+           (raw-suggestion (copy-sequence "hello"))
+           (request
+            (list :id 404
+                  :buffer source
+                  :beg 1
+                  :end 5
+                  :text raw-text))
+           (diagnostic
+            (list :beg 1
+                  :end 5
+                  :text raw-text
+                  :kind 'spelling
+                  :message raw-message
+                  :suggestions (list raw-suggestion)))
+           (result
+            (list :status 'ok
+                  :request request
+                  :diagnostics (list diagnostic)))
+           observed-event
+           returned-event)
+      (setq proofread--request-log-enabled t)
+      (setq proofread-request-log-hook
+            (list (lambda (event)
+                    (setq observed-event event))))
+      (setq returned-event
+            (proofread--record-request-event
+             request 'final-result
+             :status 'applied
+             :result result))
+      (should observed-event)
+      (should-not
+       (eq raw-text
+           (plist-get (plist-get returned-event :request) :text)))
+      (should-not
+       (eq (plist-get (plist-get returned-event :request) :text)
+           (plist-get (plist-get observed-event :request) :text)))
+      (aset raw-text 0 ?X)
+      (aset raw-message 0 ?X)
+      (aset raw-suggestion 0 ?X)
+      (setf (plist-get result :status) 'error)
+      (aset (plist-get (plist-get returned-event :request) :text)
+            1 ?Y)
+      (setf (plist-get returned-event :status) 'returned-poisoned)
+      (should (eq (plist-get observed-event :status) 'applied))
+      (should
+       (equal (plist-get (plist-get observed-event :request) :text)
+              "helo"))
+      (let* ((record
+              (car (proofread--request-log-record-list source)))
+             (stored-result (plist-get record :final-result))
+             (stored-diagnostic
+              (car (plist-get stored-result :diagnostics))))
+        (should (eq (plist-get record :status) 'applied))
+        (should (eq (plist-get stored-result :status) 'ok))
+        (should
+         (equal (plist-get (plist-get record :request) :text)
+                "helo"))
+        (should
+         (equal (plist-get stored-diagnostic :message)
+                "Possible misspelling"))
+        (should
+         (equal (plist-get stored-diagnostic :suggestions)
+                '("hello")))))))
+
+(ert-deftest
+    proofread-test-request-log-direct-recorder-sanitizes-untrusted-events
+    ()
+  "Bound and redact an untrusted event passed directly to the recorder."
+  (with-temp-buffer
+    (let* ((source (current-buffer))
+           (sentinel
+            "PROOFREAD-TEST-DIRECT-RECORDER-SECRET-MUST-NOT-APPEAR")
+           (provider (vector 'provider :secret sentinel))
+           (long-error-text
+            (concat sentinel (make-string 100000 ?x)))
+           (request
+            (list :id 505
+                  :buffer source
+                  :beg 1
+                  :end 5
+                  :text "helo"
+                  :checker-options (list :provider provider)
+                  :provider provider))
+           safe-event
+           record)
+      (setq proofread--request-log-enabled t)
+      (setq safe-event
+            (proofread--request-log-record-event
+             (list :type 'backend-response
+                   :time '(1 2 3 4)
+                   :log-id 505
+                   :request-id 505
+                   :buffer source
+                   :beg 1
+                   :end 5
+                   :request request
+                   :error (list 'file-error long-error-text provider)
+                   :message long-error-text
+                   :handle provider
+                   :opaque provider)))
+      (setq record
+            (car (proofread--request-log-record-list source)))
+      (should (eq (plist-get safe-event :error) 'file-error))
+      (should
+       (equal (plist-get safe-event :message)
+              "Backend request failed"))
+      (dolist (property '( :checker-options :provider :handle :opaque))
+        (should-not (plist-member safe-event property)))
+      (dolist (value (list safe-event record))
+        (proofread-test--assert-secret-not-printed sentinel value))
+      (should (< (length (prin1-to-string safe-event)) 1024))
+      (should (< (length (prin1-to-string record)) 4096))
+      (should (eq (plist-get record :status) 'returned))
+      (let ((response
+             (car (plist-get record :backend-responses))))
+        (should (eq (plist-get response :error) 'file-error))
+        (should
+         (equal (plist-get response :message)
+                "Backend request failed"))))))
+
+(ert-deftest proofread-test-request-log-public-reads-are-detached ()
+  "Return detached records from list and lookup read boundaries."
+  (with-temp-buffer
+    (let* ((source (current-buffer))
+           (request
+            (list :id 606
+                  :buffer source
+                  :beg 1
+                  :end 5
+                  :text (copy-sequence "helo")))
+           (diagnostic
+            (list :beg 1
+                  :end 5
+                  :text "helo"
+                  :kind 'spelling
+                  :message "Possible misspelling"
+                  :suggestions (list (copy-sequence "hello"))))
+           (result
+            (list :status 'ok
+                  :request request
+                  :diagnostics (list diagnostic))))
+      (setq proofread--request-log-enabled t)
+      (proofread--request-log-record-event
+       (list :type 'backend-result
+             :time '(1 2 3 4)
+             :log-id 606
+             :request-id 606
+             :buffer source
+             :beg 1
+             :end 5
+             :request request
+             :result result))
+      (let* ((first-list
+              (car (proofread--request-log-record-list source)))
+             (first-lookup
+              (proofread--request-log-lookup-record source 606))
+             (list-request (plist-get first-list :request))
+             (lookup-request (plist-get first-lookup :request))
+             (list-event (car (plist-get first-list :events)))
+             (lookup-event (car (plist-get first-lookup :events)))
+             (list-result
+              (car (plist-get first-list :backend-results)))
+             (lookup-result
+              (car (plist-get first-lookup :backend-results)))
+             (list-diagnostic
+              (car (plist-get list-result :diagnostics)))
+             (lookup-diagnostic
+              (car (plist-get lookup-result :diagnostics))))
+        (should-not (eq first-list first-lookup))
+        (should-not (eq list-request lookup-request))
+        (should-not
+         (eq (plist-get list-request :text)
+             (plist-get lookup-request :text)))
+        (should-not
+         (eq (car (plist-get list-diagnostic :suggestions))
+             (car (plist-get lookup-diagnostic :suggestions))))
+        (setf (plist-get first-list :status) 'list-poisoned)
+        (setf (plist-get list-event :type) 'list-poisoned)
+        (aset (plist-get list-request :text) 0 ?X)
+        (aset (car (plist-get list-diagnostic :suggestions)) 0 ?X)
+        (should (eq (plist-get first-lookup :status) 'parsed))
+        (should (eq (plist-get lookup-event :type) 'backend-result))
+        (should (equal (plist-get lookup-request :text) "helo"))
+        (should
+         (equal (plist-get lookup-diagnostic :suggestions)
+                '("hello")))
+        (setf (plist-get first-lookup :status) 'lookup-poisoned)
+        (setf (plist-get lookup-event :type) 'lookup-poisoned)
+        (aset (plist-get lookup-request :text) 0 ?Y)
+        (aset (car (plist-get lookup-diagnostic :suggestions)) 0 ?Y)
+        (let* ((second-list
+                (car (proofread--request-log-record-list source)))
+               (second-request (plist-get second-list :request))
+               (second-event
+                (car (plist-get second-list :events)))
+               (second-result
+                (car (plist-get second-list :backend-results)))
+               (second-diagnostic
+                (car (plist-get second-result :diagnostics))))
+          (should (eq (plist-get second-list :status) 'parsed))
+          (should (eq (plist-get second-event :type)
+                      'backend-result))
+          (should (equal (plist-get second-request :text) "helo"))
+          (should
+           (equal (plist-get second-diagnostic :suggestions)
+                  '("hello"))))))))
 
 (ert-deftest proofread-test-request-monitor-redacts-opaque-values ()
   "Exclude opaque backend values from every request-monitor surface."

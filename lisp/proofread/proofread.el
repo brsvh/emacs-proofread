@@ -516,6 +516,10 @@ specification has the form (PROPERTY SANITIZER).  Object sanitizers
 also receive the safe fields collected so far; every sanitizer returns
 `(t . SAFE-VALUE)' or nil.")
 
+(defconst proofread--request-log-history-properties
+  '( :events :backend-requests :backend-responses :backend-results)
+  "Record properties stored internally in newest-first order.")
+
 (defconst proofread--overlay-category 'proofread-overlay
   "Overlay category used for proofread-owned overlays.")
 
@@ -687,10 +691,11 @@ buffer generation and request queue.")
 
 (defvar proofread-request-log-hook nil
   "Abnormal hook run with proofread request lifecycle events.
-Each function receives one detached, safe plist argument.  Raw checker
-options, provider objects, backend handles, and other opaque
-backend-local values are omitted.  Consumers should treat the event as
-read-only and must not signal errors that interrupt proofreading.")
+Each function receives its own detached, safe plist argument.  Raw
+checker options, provider objects, backend handles, and other opaque
+backend-local values are omitted.  Mutating an event cannot affect
+other consumers or recorded state.  Consumers must not signal errors
+that interrupt proofreading.")
 
 (defvar-local proofread-diagnostics-changed-hook nil
   "Hook run after displayed diagnostics change in the current buffer.
@@ -1471,21 +1476,6 @@ OMIT-SOURCE-LABEL is non-nil, skip the presentation-only operation."
                              :property-sanitizers))))
       (funcall sanitizer value))))
 
-(defun proofread--request-log-copy-properties
-    (source properties &optional target)
-  "Copy safe PROPERTIES from SOURCE into TARGET.
-Position values are frozen as integers; other values are detached."
-  (let ((copy target))
-    (when (proper-list-p source)
-      (dolist (property properties)
-        (when (plist-member source property)
-          (when-let* ((safe-value
-                       (proofread--request-log-safe-property-value
-                        property (plist-get source property))))
-            (setq copy
-                  (plist-put copy property (cdr safe-value)))))))
-    copy))
-
 (defun proofread--request-log-identity-fingerprint (identity)
   "Return a detached fingerprint for IDENTITY, or nil."
   (when identity
@@ -1791,15 +1781,28 @@ Position values are frozen as integers; other values are detached."
                   (plist-put safe property (cdr safe-value))))))
       safe)))
 
+(defun proofread--request-log-copy-safe-value (value)
+  "Return a recursive detached copy of safe request-log VALUE."
+  (cond
+   ((stringp value) (substring-no-properties value))
+   ((consp value)
+    (cons (proofread--request-log-copy-safe-value (car value))
+          (proofread--request-log-copy-safe-value (cdr value))))
+   ((bufferp value) value)
+   ((vectorp value)
+    (apply #'vector
+           (mapcar #'proofread--request-log-copy-safe-value value)))
+   (t value)))
+
 (defun proofread--run-request-log-hook (event)
-  "Run request-log hooks for safe EVENT without disrupting proofreading."
-  (setq event (proofread--request-log-safe-event event))
+  "Run request-log hooks with copies of canonical safe EVENT."
   (when proofread-request-log-hook
     (run-hook-wrapped
      'proofread-request-log-hook
      (lambda (function event)
        (condition-case err
-           (funcall function event)
+           (funcall function
+                    (proofread--request-log-copy-safe-value event))
          (error
           (proofread-report-warning-without-window
            (format "Proofread request log hook error (%S)"
@@ -1808,6 +1811,19 @@ Position values are frozen as integers; other values are detached."
        nil)
      event))
   event)
+
+(defun proofread--publish-request-log-event (raw-event)
+  "Record and publish one safe projection of RAW-EVENT."
+  (let ((event (proofread--request-log-safe-event raw-event)))
+    (condition-case err
+        (proofread--request-log-record-canonical-event event)
+      (error
+       (proofread-report-warning-without-window
+        (format "Proofread request log recorder error (%S)"
+                (proofread--condition-kind err))
+        "request log recorder failed; see *Warnings*")))
+    (proofread--run-request-log-hook event)
+    (proofread--request-log-copy-safe-value event)))
 
 (defun proofread--checker-dispatch-phase-label (phase)
   "Return a caller-readable label for checker dispatch PHASE."
@@ -1850,7 +1866,7 @@ original error value."
             (plist-get failure :message))
            320 nil nil "..."))
          (event
-          (proofread--request-log-safe-event
+          (proofread--publish-request-log-event
            (append
             (list :type 'checker-dispatch-failed
                   :time (current-time)
@@ -1858,7 +1874,6 @@ original error value."
                   :buffer (current-buffer)
                   :status 'error)
             failure))))
-    (proofread--run-request-log-hook event)
     (proofread-report-warning-without-window
      message
      (format "checker %S failed; see *Warnings*"
@@ -1923,8 +1938,7 @@ given; its weak log-owner index supplies the scheduler-owned log id."
     (unwind-protect
         (progn
           (setq event
-                (proofread--request-log-safe-event raw-event))
-          (proofread--run-request-log-hook event))
+                (proofread--publish-request-log-event raw-event)))
       (pcase type
         ('final-result
          (when work
@@ -6601,10 +6615,10 @@ nil for a change to the default."
         (plist-get event :request-id)
         (plist-get request :id))))
 
-(defun proofread--request-log-plist-append (plist property value)
-  "Return PLIST with VALUE appended to list PROPERTY."
+(defun proofread--request-log-plist-push (plist property value)
+  "Return PLIST with VALUE prepended to list PROPERTY."
   (plist-put plist property
-             (append (plist-get plist property) (list value))))
+             (cons value (plist-get plist property))))
 
 (defun proofread--request-log-record-status (type event)
   "Return the request status implied by event TYPE and EVENT."
@@ -6639,8 +6653,7 @@ nil for a change to the default."
     record))
 
 (defun proofread--request-log-apply-event (record event)
-  "Return RECORD updated with request lifecycle EVENT."
-  (setq event (proofread--request-log-safe-event event))
+  "Return RECORD updated with canonical request lifecycle EVENT."
   (let* ((type (plist-get event :type))
          (time (plist-get event :time))
          (request (proofread--request-log-event-request event))
@@ -6651,7 +6664,7 @@ nil for a change to the default."
       (setq record (plist-put record :created-at time)))
     (setq record (plist-put record :updated-at time))
     (setq record
-          (proofread--request-log-plist-append
+          (proofread--request-log-plist-push
            record :events event))
     (when status
       (setq record (plist-put record :status status)))
@@ -6662,15 +6675,15 @@ nil for a change to the default."
                         (plist-get event :chunk))))
       ('backend-request
        (setq record
-             (proofread--request-log-plist-append
+             (proofread--request-log-plist-push
               record :backend-requests event)))
       ('backend-response
        (setq record
-             (proofread--request-log-plist-append
+             (proofread--request-log-plist-push
               record :backend-responses event)))
       ('backend-result
        (setq record
-             (proofread--request-log-plist-append
+             (proofread--request-log-plist-push
               record :backend-results (plist-get event :result))))
       ('cache-hit
        (setq record (plist-put record :cache-entry
@@ -6689,69 +6702,16 @@ nil for a change to the default."
                           (plist-get event property))))))
     record))
 
-(defun proofread--request-log-safe-record (record)
-  "Return a detached safe representation of request RECORD."
+(defun proofread--request-log-copy-record (record)
+  "Return a detached public copy of canonical request RECORD."
   (when (proper-list-p record)
-    (let ((safe
-           (proofread--request-log-copy-properties
-            record
-            '( :key :source-buffer :log-id :request-id :buffer
-               :beg :end :created-at :updated-at :status
-               :profile :checker-name :backend :phase
-               :final-status))))
-      (when (plist-member record :error)
-        (setq safe
-              (plist-put safe :error
-                         (proofread--condition-kind
-                          (plist-get record :error)))))
-      (when (plist-member record :message)
-        (setq safe (plist-put safe :message
-                              "Backend request failed")))
-      (when (plist-member record :request)
-        (setq safe
-              (plist-put safe :request
-                         (proofread--request-log-safe-request
-                          (plist-get record :request)))))
-      (when (plist-member record :chunk)
-        (setq safe
-              (plist-put safe :chunk
-                         (proofread--request-log-safe-chunk
-                          (plist-get record :chunk)))))
-      (when (proper-list-p (plist-get record :events))
-        (setq safe
-              (plist-put
-               safe :events
-               (mapcar #'proofread--request-log-safe-event
-                       (plist-get record :events)))))
-      (when (proper-list-p (plist-get record :backend-requests))
-        (setq safe
-              (plist-put
-               safe :backend-requests
-               (mapcar #'proofread--request-log-safe-event
-                       (plist-get record :backend-requests)))))
-      (when (proper-list-p (plist-get record :backend-responses))
-        (setq safe
-              (plist-put
-               safe :backend-responses
-               (mapcar #'proofread--request-log-safe-event
-                       (plist-get record :backend-responses)))))
-      (when (proper-list-p (plist-get record :backend-results))
-        (setq safe
-              (plist-put
-               safe :backend-results
-               (mapcar #'proofread--request-log-safe-result
-                       (plist-get record :backend-results)))))
-      (when (plist-member record :final-result)
-        (setq safe
-              (plist-put safe :final-result
-                         (proofread--request-log-safe-result
-                          (plist-get record :final-result)))))
-      (when (plist-member record :cache-entry)
-        (setq safe
-              (plist-put safe :cache-entry
-                         (proofread--request-log-safe-cache-entry
-                          (plist-get record :cache-entry)))))
-      safe)))
+    (let ((copy (proofread--request-log-copy-safe-value record)))
+      (dolist (property proofread--request-log-history-properties)
+        (when (plist-member copy property)
+          (setq copy
+                (plist-put copy property
+                           (nreverse (plist-get copy property))))))
+      copy)))
 
 (defun proofread--request-log-source-enabled-p (source)
   "Return non-nil when SOURCE records proofread request events."
@@ -6759,9 +6719,8 @@ nil for a change to the default."
        (with-current-buffer source
          proofread--request-log-enabled)))
 
-(defun proofread--request-log-record-event (event)
-  "Record a proofread request EVENT when its buffer is monitored."
-  (setq event (proofread--request-log-safe-event event))
+(defun proofread--request-log-record-canonical-event (event)
+  "Record canonical EVENT when its source buffer is monitored."
   (let ((source (plist-get event :buffer))
         (key (proofread--request-log-event-key event)))
     (when (and key (proofread--request-log-source-enabled-p source))
@@ -6771,8 +6730,7 @@ nil for a change to the default."
                            (list :key key
                                  :source-buffer source))))
           (setq record
-                (proofread--request-log-safe-record
-                 (proofread--request-log-apply-event record event)))
+                (proofread--request-log-apply-event record event))
           (puthash key record records)
           (unless (member key proofread--request-log-order)
             (setq proofread--request-log-order
@@ -6782,25 +6740,34 @@ nil for a change to the default."
               (remhash (pop proofread--request-log-order) records))))
         (proofread--schedule-request-log-refresh)))))
 
+(defun proofread--request-log-record-event (raw-event)
+  "Safely record RAW-EVENT when its source buffer is monitored."
+  (let ((event (proofread--request-log-safe-event raw-event)))
+    (proofread--request-log-record-canonical-event event)
+    (proofread--request-log-copy-safe-value event)))
+
 (defun proofread--request-log-record-list (&optional source)
   "Return proofread request records for SOURCE or the current buffer."
   (with-current-buffer (or source (current-buffer))
-    (sort
-     (hash-table-values (proofread--request-log-ensure-records))
-     (lambda (a b)
-       (< (or (plist-get a :log-id)
-              (plist-get a :request-id)
-              0)
-          (or (plist-get b :log-id)
-              (plist-get b :request-id)
-              0))))))
+    (mapcar
+     #'proofread--request-log-copy-record
+     (sort
+      (hash-table-values (proofread--request-log-ensure-records))
+      (lambda (a b)
+        (< (or (plist-get a :log-id)
+               (plist-get a :request-id)
+               0)
+           (or (plist-get b :log-id)
+               (plist-get b :request-id)
+               0)))))))
 
 (defun proofread--request-log-lookup-record (source key)
   "Return request record KEY from SOURCE."
   (when (buffer-live-p source)
     (with-current-buffer source
       (and (hash-table-p proofread--request-log-records)
-           (gethash key proofread--request-log-records)))))
+           (proofread--request-log-copy-record
+            (gethash key proofread--request-log-records))))))
 
 (defun proofread--request-log-source-range-valid-p (source beg end)
   "Return non-nil when BEG to END is valid in SOURCE."
@@ -6956,11 +6923,6 @@ nil for a change to the default."
   "Fit proofread list WINDOW to its buffer."
   (fit-window-to-buffer window 15 8))
 
-(defun proofread--request-log-ensure-hook ()
-  "Install the proofread request log hook."
-  (add-hook 'proofread-request-log-hook
-            #'proofread--request-log-record-event))
-
 (defun proofread--request-log-seed-active-requests (source)
   "Record active requests already present in SOURCE."
   (with-current-buffer source
@@ -7020,7 +6982,6 @@ nil for a change to the default."
       (proofread--request-log-ensure-records)
       (proofread--install-source-list-cleanup))
     (cl-pushnew source proofread--request-log-sources)
-    (proofread--request-log-ensure-hook)
     (when newly-enabled
       (proofread--request-log-seed-active-requests source)
       (proofread--request-log-seed-queued-requests source))))
@@ -7040,10 +7001,7 @@ nil for a change to the default."
       (proofread--uninstall-source-list-cleanup-if-unused)))
   (setq proofread--request-log-sources
         (delq source proofread--request-log-sources))
-  (proofread--prune-request-log-sources)
-  (unless proofread--request-log-sources
-    (remove-hook 'proofread-request-log-hook
-                 #'proofread--request-log-record-event)))
+  (proofread--prune-request-log-sources))
 
 (defun proofread--request-log-list-buffer-p (buffer source)
   "Return non-nil when BUFFER is a live request list for SOURCE."
@@ -7130,11 +7088,7 @@ nil for a change to the default."
            (current-buffer)))))
 
 (defun proofread--request-log-backend-request-details (event)
-  "Return printable backend request details for EVENT."
-  (unless (plist-get event :type)
-    (setq event
-          (plist-put (copy-sequence event) :type 'backend-request)))
-  (setq event (proofread--request-log-safe-event event))
+  "Return printable backend request details from canonical EVENT."
   (list :backend (plist-get event :backend)
         :method (plist-get event :method)
         :url (plist-get event :url)
@@ -7148,11 +7102,7 @@ nil for a change to the default."
         (plist-get event :reported-diagnostics)))
 
 (defun proofread--request-log-backend-response-details (event)
-  "Return printable backend response details for EVENT."
-  (unless (plist-get event :type)
-    (setq event
-          (plist-put (copy-sequence event) :type 'backend-response)))
-  (setq event (proofread--request-log-safe-event event))
+  "Return printable backend response details from canonical EVENT."
   (list :backend (plist-get event :backend)
         :url (plist-get event :url)
         :http-status (plist-get event :http-status)
@@ -7163,8 +7113,7 @@ nil for a change to the default."
 
 (defun proofread--request-log-record-summary (record)
   "Return a summary plist for RECORD."
-  (let* ((record (proofread--request-log-safe-record record))
-         (request (plist-get record :request))
+  (let* ((request (plist-get record :request))
          (line-column
           (proofread--request-log-record-line-column record)))
     (list :log-id (plist-get record :log-id)
@@ -7199,7 +7148,6 @@ nil for a change to the default."
 
 (defun proofread--request-log-show-record (record)
   "Display detailed proofread request information for RECORD."
-  (setq record (proofread--request-log-safe-record record))
   (let ((buffer
          (get-buffer-create
           (proofread--request-log-request-buffer-name record))))
@@ -8715,8 +8663,6 @@ buffer."
         (kill-buffer buffer))))
   (dolist (source (copy-sequence proofread--request-log-sources))
     (proofread--request-log-disable-source source))
-  (remove-hook 'proofread-request-log-hook
-               #'proofread--request-log-record-event)
   (clrhash proofread--request-log-owner-ids)
   (setq proofread--request-log-sources nil)
   (setq proofread--mode-buffers nil)
