@@ -4283,6 +4283,106 @@ This covers URLs, email, invisible text, faces, and properties."
                    (plist-get diagnostic :end)))
     (should (equal absolute diagnostic))))
 
+(ert-deftest
+    proofread-test-result-paths-add-request-provenance-once ()
+  "Annotate network, partial, and cached diagnostics exactly once."
+  (let (path-counts)
+    (dolist (path '( network partial cache))
+      (with-temp-buffer
+        (insert "helo")
+        (let ((proofread-auto-check nil)
+              (proofread-cache-max-entries 10))
+          (proofread-mode 1)
+          (proofread-test--with-profile
+            (let* ((chunk
+                    (car
+                     (proofread-test--request-ready-chunks-for-ranges
+                      '((1 . 5)))))
+                   (work
+                    (proofread--make-request-work
+                     (proofread-test--make-profile-request chunk)))
+                   (request (proofread-test--work-request work))
+                   (diagnostic
+                    (proofread-test--diagnostic-for-range 1 5 "helo"))
+                   (entry
+                    (when (eq path 'cache)
+                      (proofread--make-cache-entry
+                       request (list diagnostic))))
+                   (original
+                    (symbol-function
+                     'proofread--diagnostics-with-request-provenance))
+                   (provenance-calls 0))
+              (cl-letf
+                  (((symbol-function
+                     'proofread--diagnostics-with-request-provenance)
+                    (lambda (candidate-request diagnostics)
+                      (setq provenance-calls (1+ provenance-calls))
+                      (funcall original candidate-request diagnostics))))
+                (should
+                 (eq
+                  (pcase path
+                    ('network
+                     (proofread--handle-backend-result
+                      work
+                      (proofread--backend-success-result
+                       request (list diagnostic))))
+                    ('partial
+                     (proofread--handle-backend-result
+                      work
+                      (proofread--backend-partial-success-result
+                       request (list diagnostic))))
+                    ('cache
+                     (proofread--apply-cache-entry work entry)))
+                  'applied)))
+              (push (cons path provenance-calls) path-counts))))))
+    (should
+     (equal (nreverse path-counts)
+            '((network . 1) (partial . 1) (cache . 1))))))
+
+(ert-deftest
+    proofread-test-cache-snapshots-backend-diagnostics-before-hooks ()
+  "Snapshot backend diagnostics before diagnostic hooks can mutate them."
+  (with-temp-buffer
+    (insert "helo")
+    (let ((proofread-auto-check nil))
+      (proofread-mode 1)
+      (proofread-test--with-profile
+        (let* ((chunk
+                (car
+                 (proofread-test--request-ready-chunks-for-ranges
+                  '((1 . 5)))))
+               (work
+                (proofread--make-request-work
+                 (proofread-test--make-profile-request chunk)))
+               (request (proofread-test--work-request work))
+               (diagnostic
+                (proofread-test--diagnostic-for-range 1 5 "helo")))
+          (setq-local
+           proofread-diagnostics-changed-hook
+           (list
+            (lambda ()
+              (setf (plist-get diagnostic :message)
+                    "mutated after apply"))))
+          (should
+           (eq
+            (proofread--handle-backend-result
+             work
+             (proofread--backend-success-result
+              request (list diagnostic)))
+            'applied))
+          (should
+           (equal (plist-get diagnostic :message)
+                  "mutated after apply"))
+          (should
+           (equal
+            (plist-get
+             (car
+              (plist-get
+               (proofread--cache-read-request work)
+               :diagnostics))
+             :message)
+            "Possible misspelling")))))))
+
 (ert-deftest proofread-test-cache-hit-skips-backend-dispatch ()
   "Reuse cached diagnostics for unchanged visible text."
   (save-window-excursion
@@ -8881,9 +8981,9 @@ This covers URLs, email, invisible text, faces, and properties."
                    (list expected expected)))))
 
 (ert-deftest
-    proofread-test-profile-cache-hit-preserves-diagnostic-provenance
+    proofread-test-profile-cache-entry-is-provider-neutral
     ()
-  "Keep checker provenance when diagnostics are served from cache."
+  "Cache relative payloads and add current request provenance on use."
   (with-temp-buffer
     (insert "helo")
     (let ((proofread-profile 'multi)
@@ -8906,20 +9006,40 @@ This covers URLs, email, invisible text, faces, and properties."
                chunk proofread-test--backend checker profile))
              (request (proofread-test--work-request work))
              (diagnostic
-              (proofread-test--diagnostic-for-range
-               1 5 "helo")))
-        (proofread--cache-write-request work (list diagnostic))
+              (append
+               (proofread-test--diagnostic-for-range
+                1 5 "helo")
+               '( :backend-extra kept))))
+        (should
+         (eq
+          (proofread--handle-backend-result
+           work
+           (proofread--backend-success-result
+            request (list diagnostic)))
+          'applied))
         (let* ((entry (proofread--cache-read-request work))
                (cached (car (plist-get entry :diagnostics))))
-          (should (equal (plist-get cached :language) "en-US"))
-          (should (equal (plist-get cached :display-language)
-                         "English"))
-          (should (= (plist-get cached :checker-ordinal) 0))
-          (should (equal (plist-get cached :checker-owner)
-                         (plist-get request :checker-owner)))
-          (should (eq (proofread--apply-cache-entry work entry)
-                      'applied))
+          (should
+           (equal
+            (cl-loop for (key _value) on entry by #'cddr
+                     collect key)
+            '( :text :diagnostics)))
+          (should (equal (plist-get entry :text) "helo"))
+          (should (eq (plist-get cached :source) 'test))
+          (should (eq (plist-get cached :backend-extra) 'kept))
+          (should
+           (equal cached
+                  (proofread--diagnostic-to-relative
+                   diagnostic request)))
+          (dolist (key proofread-test--diagnostic-provenance-keys)
+            (should-not (plist-member cached key)))
+          (let ((saved-entry (copy-tree entry)))
+            (should (eq (proofread--apply-cache-entry work entry)
+                        'applied))
+            (should (equal entry saved-entry)))
           (let ((live (car proofread--diagnostics)))
+            (should (eq (plist-get live :source) 'test))
+            (should (eq (plist-get live :backend-extra) 'kept))
             (should (equal (plist-get live :language) "en-US"))
             (should (equal (plist-get live :display-language)
                            "English"))
@@ -8960,12 +9080,20 @@ This covers URLs, email, invisible text, faces, and properties."
              (old-work
               (proofread-test--make-request-work
                chunk proofread-test--backend checker profile))
+             (old-request
+              (proofread-test--work-request old-work))
              (diagnostic
-              (proofread-test--diagnostic-for-range 1 5 "helo")))
+              (append
+               (proofread--diagnostic-with-request-provenance
+                old-request
+                (proofread-test--diagnostic-for-range 1 5 "helo"))
+               '( :backend-extra kept))))
         (proofread--cache-write-request old-work (list diagnostic))
         (let* ((entry (proofread--cache-read-request old-work))
                (cached (car (plist-get entry :diagnostics))))
-          (should (equal (plist-get cached :source-label) "old-model"))
+          (dolist (key proofread-test--diagnostic-provenance-keys)
+            (should-not (plist-member cached key)))
+          (should (eq (plist-get cached :backend-extra) 'kept))
           (setq label "new-model")
           (let* ((new-work
                   (proofread-test--make-request-work
@@ -8983,6 +9111,7 @@ This covers URLs, email, invisible text, faces, and properties."
               (should (equal (plist-get live :source-label)
                              "new-model"))
               (should (eq (plist-get live :source) 'test))
+              (should (eq (plist-get live :backend-extra) 'kept))
               (should
                (equal
                 (proofread-diagnostic-message-entries live)
@@ -9176,9 +9305,9 @@ This covers URLs, email, invisible text, faces, and properties."
           (prin1-to-string
            (proofread--scheduled-work-cache-key formal-a-work))))))))
 
-(ert-deftest proofread-test-cache-contract-v4-isolates-v3-namespace
+(ert-deftest proofread-test-cache-contract-v5-isolates-v4-namespace
     ()
-  "Keep pre-snapshot checker cache entries out of the namespace."
+  "Keep provenance-bearing cache entries out of the namespace."
   (with-temp-buffer
     (insert "Alpha")
     (let ((proofread-auto-check nil)
@@ -9196,15 +9325,15 @@ This covers URLs, email, invisible text, faces, and properties."
                 (proofread-test--make-request-work
                  chunk proofread-test--backend checker profile))
                (new-key (proofread--scheduled-work-cache-key work))
-               (v3-key (copy-tree new-key)))
-          (setf (plist-get v3-key :contract-version) 3)
-          (should (= proofread--contract-version 4))
-          (should (= (plist-get new-key :contract-version) 4))
-          (should (= (plist-get v3-key :contract-version) 3))
+               (v4-key (copy-tree new-key)))
+          (setf (plist-get v4-key :contract-version) 4)
+          (should (= proofread--contract-version 5))
+          (should (= (plist-get new-key :contract-version) 5))
+          (should (= (plist-get v4-key :contract-version) 4))
           (should (plist-member new-key :checker))
           (should (plist-member new-key :display-language))
-          (should (proofread--cache-write v3-key 'old-value))
-          (should (eq (proofread--cache-read v3-key) 'old-value))
+          (should (proofread--cache-write v4-key 'old-value))
+          (should (eq (proofread--cache-read v4-key) 'old-value))
           (should-not (proofread--cache-read new-key)))))))
 
 (ert-deftest proofread-test-request-requires-current-checker-provenance ()

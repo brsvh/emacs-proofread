@@ -295,7 +295,13 @@ request-ready chunks."
   '( :beg :end :text :kind :message :suggestions :source :target-kind)
   "Required keys for proofread diagnostic plists.")
 
-(defconst proofread--contract-version 4
+(defconst proofread--diagnostic-provenance-keys
+  '( :language :display-language
+     :profile :checker-name :checker-ordinal :checker-owner
+     :source-label)
+  "Request properties added to live proofread diagnostics.")
+
+(defconst proofread--contract-version 5
   "Version of the internal diagnostic cache-key contract.")
 
 (defconst proofread--backend-request-keys
@@ -1748,10 +1754,7 @@ The returned plist contains the keys in `proofread--diagnostic-keys'."
     (request diagnostic)
   "Return DIAGNOSTIC annotated with provenance from REQUEST."
   (let ((diagnostic (copy-sequence diagnostic)))
-    (dolist (key '( :language :display-language
-                    :profile :checker-name
-                    :checker-ordinal :checker-owner
-                    :source-label))
+    (dolist (key proofread--diagnostic-provenance-keys)
       (setq diagnostic
             (plist-put
              diagnostic key
@@ -4752,10 +4755,15 @@ contain both snapshots."
     (setq absolute (plist-put absolute :end (+ base end)))
     absolute))
 
-(defun proofread--diagnostics-to-relative (diagnostics request)
-  "Return DIAGNOSTICS converted to chunk-relative ranges for REQUEST."
+(defun proofread--diagnostics-to-cache-payload (diagnostics request)
+  "Return provider-neutral relative DIAGNOSTICS for REQUEST."
   (mapcar (lambda (diagnostic)
-            (proofread--diagnostic-to-relative diagnostic request))
+            (let ((payload
+                   (proofread--diagnostic-to-relative
+                    diagnostic request)))
+              (dolist (key proofread--diagnostic-provenance-keys)
+                (cl-remf payload key))
+              payload))
           diagnostics))
 
 (defun proofread--diagnostics-to-absolute (diagnostics request)
@@ -4765,13 +4773,10 @@ contain both snapshots."
           diagnostics))
 
 (defun proofread--make-cache-entry (request diagnostics)
-  "Return cache entry for REQUEST and accepted DIAGNOSTICS."
+  "Return a provider-neutral cache entry for REQUEST and DIAGNOSTICS."
   (list :text (plist-get request :text)
         :diagnostics
-        (proofread--diagnostics-to-relative
-         (proofread--diagnostics-with-request-provenance
-          request diagnostics)
-         request)))
+        (proofread--diagnostics-to-cache-payload diagnostics request)))
 
 (defun proofread--cache-read-request (work)
   "Return cache entry matching WORK in the current buffer."
@@ -4798,11 +4803,9 @@ contain both snapshots."
                    :source 'cache
                    :request request
                    :diagnostics
-                   (proofread--diagnostics-with-request-provenance
-                    request
-                    (proofread--diagnostics-to-absolute
-                     (plist-get entry :diagnostics)
-                     request)))))
+                   (proofread--diagnostics-to-absolute
+                    (plist-get entry :diagnostics)
+                    request))))
         (proofread--record-request-event
          work 'backend-result
          :backend (plist-get request :backend)
@@ -4942,21 +4945,28 @@ range."
             ('ok
              (if continuable-p
                  (with-current-buffer buffer
-                   (let
-                       ((diagnostics
-                         (proofread--diagnostics-with-request-provenance
-                          request
-                          (plist-get result :diagnostics))))
+                   (let* ((backend-diagnostics
+                           (plist-get result :diagnostics))
+                          (cacheable-p
+                           (not
+                            (or (eq (plist-get result :source)
+                                    'cache)
+                                (plist-get result :partial))))
+                          (cache-diagnostics
+                           (and cacheable-p
+                                (mapcar #'copy-sequence
+                                        backend-diagnostics)))
+                          (diagnostics
+                           (proofread--diagnostics-with-request-provenance
+                            request backend-diagnostics)))
                      (if (plist-get result :partial)
                          (proofread--merge-backend-diagnostics
                           request diagnostics)
                        (proofread--replace-backend-diagnostics
                         request diagnostics))
-                     (unless (or (eq (plist-get result :source)
-                                     'cache)
-                                 (plist-get result :partial))
+                     (when cacheable-p
                        (proofread--cache-write-request
-                        work diagnostics)))
+                        work cache-diagnostics)))
                    'applied)
                'stale))
             ('error
