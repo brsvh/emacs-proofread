@@ -3994,33 +3994,40 @@ When SUPPRESS-CACHE-WAKEUP is non-nil, forward it to the cache index."
                 ((proofread--range-valid-p range)))
       range)))
 
-(defun proofread--same-request-owner-p (left right)
-  "Return non-nil when work LEFT and RIGHT belong to one checker."
-  (equal
-   (plist-get (proofread--scheduled-work-request left) :checker-owner)
-   (plist-get (proofread--scheduled-work-request right) :checker-owner)))
-
 (defun proofread--conflicting-request-table (requests candidates)
-  "Return an eq table of CANDIDATES conflicting with REQUESTS."
-  (let ((table (make-hash-table :test #'eq)))
+  "Return an eq table of CANDIDATES conflicting with REQUESTS.
+Group valid ranges by checker owner and run at most one interval
+conflict sweep for each owner represented in REQUESTS."
+  ;; Each bucket is (RANGES . CANDIDATE-ENTRIES).
+  (let ((buckets (make-hash-table :test #'equal))
+        (table (make-hash-table :test #'eq)))
     (dolist (work requests)
-      (when-let* ((range
-                   (proofread--request-range
-                    (proofread--scheduled-work-request work))))
-        (let (entries)
-          (dolist (candidate candidates)
-            (when (proofread--same-request-owner-p
-                   work candidate)
-              (when-let* ((candidate-range
-                           (proofread--request-range
-                            (proofread--scheduled-work-request
-                             candidate))))
-                (push (cons candidate candidate-range)
-                      entries))))
-          (dolist (entry
-                   (proofread--range-conflicting-entries
-                    (list range) entries))
-            (puthash (car entry) t table)))))
+      (let* ((request (proofread--scheduled-work-request work))
+             (range (proofread--request-range request)))
+        (when range
+          (let* ((owner (plist-get request :checker-owner))
+                 (bucket (gethash owner buckets)))
+            (unless bucket
+              (setq bucket (cons nil nil))
+              (puthash owner bucket buckets))
+            (push range (car bucket))))))
+    (unless (zerop (hash-table-count buckets))
+      (dolist (candidate candidates)
+        (let* ((request
+                (proofread--scheduled-work-request candidate))
+               (owner (plist-get request :checker-owner))
+               (bucket (gethash owner buckets)))
+          (when bucket
+            (when-let* ((range (proofread--request-range request)))
+              (push (cons candidate range) (cdr bucket)))))))
+    (maphash
+     (lambda (_owner bucket)
+       (when (cdr bucket)
+         (dolist (entry
+                  (proofread--range-conflicting-entries
+                   (car bucket) (cdr bucket)))
+           (puthash (car entry) t table))))
+     buckets)
     table))
 
 (defun proofread--partition-pending-requests (predicate)

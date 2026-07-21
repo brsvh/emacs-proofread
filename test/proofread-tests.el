@@ -554,6 +554,46 @@ When HANDLE is non-nil, attach it as the backend handle."
     (setf (proofread--scheduled-work-handle work) handle)
     work))
 
+(defun proofread-test--owned-lifecycle-request
+    (id owner beg end)
+  "Return minimal scheduled work named ID for OWNER from BEG to END."
+  (let ((work (proofread-test--lifecycle-request id beg end)))
+    (setf (proofread--scheduled-work-request work)
+          (plist-put (proofread-test--work-request work)
+                     :checker-owner owner))
+    work))
+
+(defun proofread-test--reference-conflicting-request-candidates
+    (requests candidates)
+  "Return conflicting CANDIDATES in input order for REQUESTS.
+Implement the original per-request scan as a semantic reference for
+the owner-bucketed conflict detector."
+  (let ((table (make-hash-table :test #'eq)))
+    (dolist (work requests)
+      (when-let* ((range
+                   (proofread--request-range
+                    (proofread-test--work-request work))))
+        (let (entries)
+          (dolist (candidate candidates)
+            (when (equal
+                   (plist-get (proofread-test--work-request work)
+                              :checker-owner)
+                   (plist-get (proofread-test--work-request candidate)
+                              :checker-owner))
+              (when-let* ((candidate-range
+                           (proofread--request-range
+                            (proofread-test--work-request
+                             candidate))))
+                (push (cons candidate candidate-range) entries))))
+          (dolist (entry
+                   (proofread--range-conflicting-entries
+                    (list range) entries))
+            (puthash (car entry) t table)))))
+    (cl-remove-if-not
+     (lambda (candidate)
+       (gethash candidate table))
+     candidates)))
+
 (defun proofread-test--pending-request-table (works)
   "Return a pending-work table containing WORKS."
   (let ((table (make-hash-table :test #'equal)))
@@ -1060,6 +1100,224 @@ When PROFILE is nil, use the current profile."
     (should-not (gethash adjacent-left table))
     (should-not (gethash adjacent-right table))
     (should (= (hash-table-count table) 6))))
+
+(ert-deftest
+    proofread-test-conflicting-request-owner-buckets-match-reference
+    ()
+  "Match the per-request conflict scan across owner bucket cases."
+  (let* ((first-owner
+          '( :profile multi :checker-name first))
+         (first-owner-copy (copy-tree first-owner))
+         (second-owner
+          '( :profile multi :checker-name second))
+         (second-owner-copy (copy-tree second-owner))
+         (other-owner
+          '( :profile multi :checker-name other))
+         (bulk-owner
+          '( :profile bulk :checker-name primary))
+         (bulk-owner-copy (copy-tree bulk-owner))
+         (bulk-other-owner
+          '( :profile bulk :checker-name other))
+         (bulk-request-specs
+          (cl-loop
+           for index downfrom 127 to 0
+           for beg = (+ 1 (* index 4))
+           collect
+           (list (+ 1000 index) bulk-owner beg (+ beg 2))))
+         (bulk-candidate-specs
+          (cl-loop
+           for index downfrom 127 to 0
+           for beg = (+ 1 (* index 4))
+           append
+           (list
+            (list (+ 3000 index) bulk-owner
+                  (+ beg 2) (+ beg 4))
+            (list (+ 2000 index) bulk-owner-copy
+                  (1+ beg) (+ beg 3))
+            (list (+ 4000 index) bulk-other-owner
+                  beg (+ beg 2)))))
+         (cases
+          (list
+           (list
+            :name 'multiple-owners
+            :request-specs
+            (list
+             (list 'a-late first-owner-copy 40 50)
+             (list 'b-zero second-owner 60 60)
+             (list 'a-first first-owner 10 20)
+             (list 'b-range second-owner-copy 20 30)
+             (list 'nil-range nil 90 100)
+             (list 'invalid-new first-owner 55 54))
+            :candidate-specs
+            (list
+             (list 'b-left-boundary-zero second-owner 20 20)
+             (list 'cross-owner other-owner 10 20)
+             (list 'a-second-overlap first-owner-copy 45 46)
+             (list 'nil-overlap nil 95 96)
+             (list 'a-adjacent first-owner 20 25)
+             (list 'b-zero-equal second-owner-copy 60 60)
+             (list 'a-first-overlap first-owner 15 18)
+             (list 'b-adjacent second-owner 30 35)
+             (list 'a-first-overlap first-owner-copy 15 18)
+             (list 'b-cross-owner-only first-owner 25 28)
+             (list 'a-right-boundary-zero first-owner 50 50)
+             (list 'a-right-adjacent first-owner 50 55)
+             (list 'invalid-candidate first-owner 45 44))
+            :expected-ids
+            '( b-left-boundary-zero a-second-overlap nil-overlap
+               b-zero-equal a-first-overlap a-first-overlap
+               a-right-boundary-zero)
+            :equal-candidate-id 'a-first-overlap)
+           (list
+            :name 'zero-width-boundaries
+            :request-specs
+            (list
+             (list 'zero first-owner 10 10)
+             (list 'middle first-owner-copy 20 30)
+             (list 'late first-owner 40 50))
+            :candidate-specs
+            (list
+             (list 'right-nonempty-boundary first-owner-copy 10 15)
+             (list 'other-owner-zero second-owner 10 10)
+             (list 'adjacent-left first-owner 15 20)
+             (list 'right-zero-boundary first-owner 30 30)
+             (list 'same-zero first-owner-copy 10 10)
+             (list 'inside-zero first-owner 25 25)
+             (list 'adjacent-right first-owner 30 35)
+             (list 'left-nonempty-boundary first-owner 5 10)
+             (list 'left-zero-boundary first-owner-copy 20 20)
+             (list 'separate-zero first-owner 19 19)
+             (list 'far-right-zero first-owner 50 50)
+             (list 'far-right-adjacent first-owner 50 55))
+            :expected-ids
+            '( right-nonempty-boundary right-zero-boundary
+               same-zero inside-zero left-nonempty-boundary
+               left-zero-boundary far-right-zero))
+           (list
+            :name 'no-valid-request-range
+            :request-specs
+            (list
+             (list 'invalid-first first-owner 8 7)
+             (list 'invalid-second second-owner 4 3))
+            :candidate-specs
+            (list
+             (list 'unexamined-first first-owner 1 9)
+             (list 'unexamined-second second-owner 2 6))
+            :expected-ids nil
+            :expected-candidate-range-calls 0)
+           (list
+            :name 'large-chunk-set
+            :request-specs bulk-request-specs
+            :candidate-specs bulk-candidate-specs
+            :expected-ids
+            (cl-loop
+             for index downfrom 127 to 0
+             collect (+ 2000 index))))))
+    (dolist (case cases)
+      (let* ((requests
+              (mapcar
+               (lambda (spec)
+                 (pcase-let ((`(,id ,owner ,beg ,end) spec))
+                   (proofread-test--owned-lifecycle-request
+                    id owner beg end)))
+               (plist-get case :request-specs)))
+             (candidates
+              (mapcar
+               (lambda (spec)
+                 (pcase-let ((`(,id ,owner ,beg ,end) spec))
+                   (proofread-test--owned-lifecycle-request
+                    id owner beg end)))
+               (plist-get case :candidate-specs)))
+             (original-requests (copy-sequence requests))
+             (original-candidates (copy-sequence candidates))
+             (candidate-requests
+              (mapcar #'proofread-test--work-request candidates))
+             (reference
+              (proofread-test--reference-conflicting-request-candidates
+               requests candidates))
+             (actual-observation
+              (let ((candidate-range-calls 0)
+                    (original-request-range
+                     (symbol-function 'proofread--request-range))
+                    table)
+                (setq table
+                      (cl-letf
+                          (((symbol-function
+                             'proofread--request-range)
+                            (lambda (request)
+                              (when (memq request candidate-requests)
+                                (setq candidate-range-calls
+                                      (1+ candidate-range-calls)))
+                              (funcall original-request-range
+                                       request))))
+                        (proofread--conflicting-request-table
+                         requests candidates)))
+                (list table candidate-range-calls)))
+             (table (car actual-observation))
+             (candidate-range-calls (cadr actual-observation))
+             (actual
+              (cl-remove-if-not
+               (lambda (candidate)
+                 (gethash candidate table))
+               candidates))
+             (expected-ids (plist-get case :expected-ids)))
+        (should (eq (hash-table-test table) #'eq))
+        (when (plist-member case :expected-candidate-range-calls)
+          (should
+           (= candidate-range-calls
+              (plist-get case :expected-candidate-range-calls))))
+        (should
+         (= (hash-table-count table)
+            (length
+             (cl-delete-duplicates
+              (copy-sequence reference) :test #'eq))))
+        (should
+         (equal
+          (mapcar
+           (lambda (candidate)
+             (plist-get (proofread-test--work-request candidate)
+                        :id))
+           reference)
+          expected-ids))
+        (should
+         (equal
+          (mapcar
+           (lambda (candidate)
+             (plist-get (proofread-test--work-request candidate)
+                        :id))
+           actual)
+          expected-ids))
+        (should (= (length actual) (length reference)))
+        (cl-mapc
+         (lambda (actual-candidate reference-candidate)
+           (should (eq actual-candidate reference-candidate)))
+         actual reference)
+        (cl-mapc
+         (lambda (actual-request original-request)
+           (should (eq actual-request original-request)))
+         requests original-requests)
+        (cl-mapc
+         (lambda (actual-candidate original-candidate)
+           (should (eq actual-candidate original-candidate)))
+         candidates original-candidates)
+        (when-let* ((equal-id
+                     (plist-get case :equal-candidate-id))
+                    (equal-candidates
+                     (cl-remove-if-not
+                      (lambda (candidate)
+                        (eq
+                         (plist-get
+                          (proofread-test--work-request candidate)
+                          :id)
+                         equal-id))
+                      actual)))
+          (should (= (length equal-candidates) 2))
+          (should (equal (car equal-candidates)
+                         (cadr equal-candidates)))
+          (should-not (eq (car equal-candidates)
+                          (cadr equal-candidates)))
+          (should (gethash (car equal-candidates) table))
+          (should (gethash (cadr equal-candidates) table)))))))
 
 (ert-deftest
     proofread-test-partition-pending-requests-preserves-state
