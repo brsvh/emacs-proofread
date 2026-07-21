@@ -1050,14 +1050,6 @@ OMIT-SOURCE-LABEL is non-nil, skip the presentation-only operation."
    (proofread--checker-with-options-snapshot checker descriptor)
    descriptor omit-source-label))
 
-(defun proofread--current-profile-supported-checkers (profile)
-  "Return PROFILE checkers whose backends are registered."
-  (cl-remove-if-not
-   (lambda (checker)
-     (proofread--supported-backend-p
-      (plist-get checker :backend)))
-   (plist-get profile :checkers)))
-
 (defun proofread--request-current-checker-p (request)
   "Return non-nil when REQUEST's checker is still current."
   (condition-case nil
@@ -5017,43 +5009,6 @@ after removing duplicate pending work."
        work 'queued-request
        :backend (proofread--scheduled-work-backend work)))))
 
-(defun proofread--dispatch-prepared-checker-work (prepared)
-  "Publish and dispatch PREPARED request work."
-  (let* ((works (mapcar #'car prepared))
-         (superseded
-          (proofread--supersede-conflicting-requests works)))
-    ;; Publish the complete batch before lifecycle hooks or
-    ;; cancellation callbacks can edit the buffer or enqueue more work.
-    (let ((enqueued
-           (proofread--enqueue-requests works)))
-      (when enqueued
-        (proofread--attach-request-batch works))
-      (let ((proofread--inhibit-queue-dispatch (current-buffer)))
-        (proofread--finish-superseded-requests superseded)
-        (if enqueued
-            (proofread--record-prepared-work-publication prepared)
-          (dolist (work works)
-            (proofread--reject-request-during-clear work))))
-      (when enqueued
-        (proofread--dispatch-queued-requests)))))
-
-(defun proofread--dispatch-request-ready-chunks
-    (chunks &optional backend checker profile)
-  "Dispatch request-ready CHUNKS through BACKEND.
-When CHECKER is non-nil, its backend is canonical and BACKEND is
-ignored.  CHECKER and PROFILE identify the selected profile checker.
-Return dispatched requests."
-  (let* ((checker (or checker (proofread--ad-hoc-checker backend)))
-         (backend (plist-get checker :backend))
-         (descriptor (proofread--backend-descriptor backend)))
-    (when descriptor
-      (when chunks
-        (let ((preparation
-               (proofread--prepare-checker checker descriptor)))
-          (proofread--dispatch-prepared-checker-work
-           (proofread--prepare-checker-request-work
-            chunks profile preparation)))))))
-
 (defun proofread--prepare-profile-checker-dispatch
     (chunks profile checker)
   "Prepare CHUNKS for CHECKER in PROFILE and return isolated state.
@@ -5332,16 +5287,6 @@ The result contains `:requests', `:supported-count', and `:failures'."
                   buffer generation queue-state))
         (with-current-buffer buffer
           (proofread--schedule-queue-dispatch))))))
-
-(defun proofread--dispatch-profile-request-ready-chunks
-    (chunks profile)
-  "Dispatch CHUNKS for every supported checker in PROFILE.
-Return requests sent to backends.  Preparation failures are reported
-per checker without preventing later checkers from running."
-  (plist-get
-   (proofread--dispatch-profile-request-ready-chunks-result
-    chunks profile)
-   :requests))
 
 ;;;; Cancellation and automatic checks
 
