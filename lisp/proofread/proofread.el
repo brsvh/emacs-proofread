@@ -4533,9 +4533,10 @@ SOURCE may be scheduled work or its backend-facing request payload."
               (request (proofread--scheduled-work-request work))
               (buffer (plist-get request :buffer))
               ((buffer-live-p buffer)))
-    (with-current-buffer buffer
-      (and (proofread--latest-request-p work)
-           (proofread--fresh-request-p work)))))
+    ;; Freshness predicates may reenter dispatch and supersede WORK.
+    (and (proofread--fresh-request-p work)
+         (with-current-buffer buffer
+           (proofread--latest-request-p work)))))
 
 ;;;; Diagnostic cache
 
@@ -4940,12 +4941,14 @@ range."
   "Handle backend RESULT for WORK and return an internal status."
   (let* ((request (proofread--scheduled-work-request work))
          (buffer (plist-get request :buffer))
+         (result-status (plist-get result :status))
+         (continuable-p
+          (and (memq result-status '( ok error))
+               (proofread--request-continuable-p work)))
          (status
-          (pcase (plist-get result :status)
+          (pcase result-status
             ('ok
-             (if (and (proofread--fresh-request-p work)
-                      (with-current-buffer buffer
-                        (proofread--latest-request-p work)))
+             (if continuable-p
                  (with-current-buffer buffer
                    (let
                        ((diagnostics
@@ -4965,9 +4968,7 @@ range."
                    'applied)
                'stale))
             ('error
-             (if (and (proofread--fresh-request-p work)
-                      (with-current-buffer buffer
-                        (proofread--latest-request-p work)))
+             (if continuable-p
                  (progn
                    (unless (proofread--scheduled-work-batch work)
                      (proofread--report-backend-error result))

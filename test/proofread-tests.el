@@ -4381,6 +4381,230 @@ This covers URLs, email, invisible text, faces, and properties."
         (should-not proofread--diagnostics)
         (should-not proofread--overlays)))))
 
+(ert-deftest proofread-test-result-handler-shares-continuable-decision
+    ()
+  "Compute one continuable decision for every valid result status."
+  (dolist (case
+           '((ok t applied 1)
+             (ok nil stale 0)
+             (error t error 0)
+             (error nil stale 0)))
+    (pcase-let
+        ((`(,result-status ,continuable ,expected-status
+                           ,expected-diagnostic-count)
+          case))
+      (with-temp-buffer
+        (insert "helo")
+        (let ((proofread-auto-check nil)
+              (proofread-cache-max-entries 0)
+              final-events
+              (continuable-calls 0)
+              (report-calls 0))
+          (proofread-mode 1)
+          (proofread-test--with-profile
+            (let* ((chunk
+                    (car
+                     (proofread-test--request-ready-chunks-for-ranges
+                      '((1 . 5)))))
+                   (work
+                    (proofread--make-request-work
+                     (proofread-test--make-profile-request chunk)))
+                   (request (proofread-test--work-request work))
+                   (diagnostic
+                    (proofread-test--diagnostic-for-range
+                     1 5 "helo"))
+                   (result
+                    (pcase result-status
+                      ('ok
+                       (proofread--backend-success-result
+                        request (list diagnostic)))
+                      ('error
+                       (proofread--backend-error-result
+                        request 'proofread-test-backend-failure
+                        "Test backend failure"))))
+                   (proofread-request-log-hook
+                    (list
+                     (lambda (event)
+                       (when (eq (plist-get event :type)
+                                 'final-result)
+                         (push event final-events))))))
+              (cl-letf
+                  (((symbol-function
+                     'proofread--request-continuable-p)
+                    (lambda (candidate)
+                      (should (eq candidate work))
+                      (setq continuable-calls
+                            (1+ continuable-calls))
+                      continuable))
+                   ((symbol-function 'proofread--fresh-request-p)
+                    (lambda (_candidate)
+                      (ert-fail
+                       "Result handler bypassed continuable predicate")))
+                   ((symbol-function 'proofread--latest-request-p)
+                    (lambda (_candidate)
+                      (ert-fail
+                       "Result handler bypassed continuable predicate")))
+                   ((symbol-function 'proofread--report-backend-error)
+                    (lambda (_result)
+                      (setq report-calls (1+ report-calls)))))
+                (should
+                 (eq (proofread--handle-backend-result work result)
+                     expected-status)))
+              (should (= continuable-calls 1))
+              (should
+               (= report-calls
+                  (if (and (eq result-status 'error)
+                           continuable)
+                      1
+                    0)))
+              (should
+               (= (length proofread--diagnostics)
+                  expected-diagnostic-count))
+              (should (= (length final-events) 1))
+              (should (eq (plist-get (car final-events) :status)
+                          expected-status))
+              (should
+               (eq (plist-get
+                    (plist-get (car final-events) :result)
+                    :status)
+                   result-status)))))))))
+
+(ert-deftest
+    proofread-test-malformed-result-skips-continuable-predicates ()
+  "Do not run freshness or user predicates for a malformed status."
+  (with-temp-buffer
+    (emacs-lisp-mode)
+    (insert "(setq proofread-test-value \"Custom prose.\")\n")
+    (let ((proofread-auto-check nil)
+          (proofread-cache-max-entries 0)
+          (proofread-targets 'docstrings)
+          final-events
+          (continuable-calls 0)
+          (freshness-calls 0)
+          (user-predicate-calls 0))
+      (setq-local
+       proofread-docstring-predicate-functions
+       (list
+        (lambda (_beg _end)
+          (setq user-predicate-calls
+                (1+ user-predicate-calls))
+          t)))
+      (proofread-mode 1)
+      (proofread-test--with-profile
+        (let* ((chunk
+                (car
+                 (proofread-test--request-ready-chunks-for-ranges
+                  (list (cons (point-min) (point-max))))))
+               (work
+                (proofread--make-request-work
+                 (proofread-test--make-profile-request chunk)))
+               (request (proofread-test--work-request work))
+               (result
+                (list :status 'malformed :request request))
+               (original-continuable
+                (symbol-function 'proofread--request-continuable-p))
+               (original-fresh
+                (symbol-function 'proofread--fresh-request-p))
+               (proofread-request-log-hook
+                (list
+                 (lambda (event)
+                   (when (eq (plist-get event :type) 'final-result)
+                     (push event final-events))))))
+          (should chunk)
+          (should (> user-predicate-calls 0))
+          (setq user-predicate-calls 0)
+          (cl-letf
+              (((symbol-function 'proofread--request-continuable-p)
+                (lambda (candidate)
+                  (setq continuable-calls
+                        (1+ continuable-calls))
+                  (funcall original-continuable candidate)))
+               ((symbol-function 'proofread--fresh-request-p)
+                (lambda (candidate)
+                  (setq freshness-calls (1+ freshness-calls))
+                  (funcall original-fresh candidate))))
+            (should (eq (proofread--handle-backend-result
+                         work result)
+                        'error)))
+          (should (zerop continuable-calls))
+          (should (zerop freshness-calls))
+          (should (zerop user-predicate-calls))
+          (should (= (length final-events) 1))
+          (should (eq (plist-get (car final-events) :status)
+                      'error))
+          (should
+           (eq (plist-get
+                (plist-get (car final-events) :result) :status)
+               'malformed)))))))
+
+(ert-deftest
+    proofread-test-result-continuable-predicate-rechecks-after-reentry
+    ()
+  "Recheck latest ownership after freshness publishes newer work."
+  (with-temp-buffer
+    (insert "helo")
+    (let ((proofread-auto-check nil)
+          (proofread-cache-max-entries 0)
+          final-events
+          (freshness-calls 0))
+      (proofread-mode 1)
+      (proofread-test--with-profile
+        (let* ((chunk
+                (car
+                 (proofread-test--request-ready-chunks-for-ranges
+                  '((1 . 5)))))
+               (old-work
+                (proofread--make-request-work
+                 (proofread-test--make-profile-request chunk)))
+               (new-work
+                (proofread--make-request-work
+                 (proofread-test--make-profile-request chunk)))
+               (old-request (proofread-test--work-request old-work))
+               (diagnostic
+                (proofread-test--diagnostic-for-range 1 5 "helo"))
+               (proofread-request-log-hook
+                (list
+                 (lambda (event)
+                   (when (and
+                          (eq (plist-get event :type) 'final-result)
+                          (equal
+                           (plist-get event :log-id)
+                           (proofread--scheduled-work-log-id old-work)))
+                     (push event final-events))))))
+          (proofread--register-active-request old-work)
+          (cl-letf
+              (((symbol-function 'proofread--fresh-request-p)
+                (lambda (candidate)
+                  (should (eq candidate old-work))
+                  (setq freshness-calls (1+ freshness-calls))
+                  (unless (proofread--request-state-flag-p
+                           old-work :superseded)
+                    (let ((superseded
+                           (proofread--supersede-conflicting-requests
+                            (list new-work))))
+                      (should
+                       (equal (plist-get superseded :active)
+                              (list old-work)))
+                      (proofread--enqueue-requests (list new-work))))
+                  t)))
+            (should
+             (eq (proofread--handle-backend-result
+                  old-work
+                  (proofread--backend-success-result
+                   old-request (list diagnostic)))
+                 'stale)))
+          (should (= freshness-calls 1))
+          (should (proofread--request-state-flag-p
+                   old-work :superseded))
+          (should-not proofread--diagnostics)
+          (should-not proofread--overlays)
+          (should (= (length final-events) 1))
+          (should (eq (plist-get (car final-events) :status)
+                      'stale))
+          (should (eq (proofread--request-work-pending-p new-work)
+                      new-work))
+          (proofread--clear-scheduled-work))))))
+
 (ert-deftest
     proofread-test-partial-backend-result-merges-without-caching ()
   "Merge unique partial results without writing them to the cache."
