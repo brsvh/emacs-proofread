@@ -37,7 +37,14 @@ SUGGESTIONS, MESSAGE, and SOURCE supply the optional field values."
 (defun proofread-popup-test--install-diagnostics (diagnostics)
   "Install DIAGNOSTICS and return their proofread overlays."
   (setq proofread--diagnostics diagnostics)
-  (mapcar #'proofread--create-overlay diagnostics))
+  (let ((overlays
+         (mapcar #'proofread--create-overlay diagnostics)))
+    (when (and proofread-mode
+               flymake-mode
+               (memq #'proofread--flymake-backend
+                     flymake-diagnostic-functions))
+      (flymake-start))
+    overlays))
 
 (defun proofread-popup-test--diagnostic-with-checker
     (diagnostic checker)
@@ -1026,15 +1033,15 @@ SUGGESTIONS, MESSAGE, and SOURCE supply the optional field values."
 	(switch-to-buffer (current-buffer))
 	(insert "aa helo zz")
 	(proofread-mode 1)
-	(let* ((diagnostic
-		(proofread-popup-test--diagnostic 4 8 "helo"))
-               (overlay
-		(car
-                 (proofread-popup-test--install-diagnostics
-                  (list diagnostic)))))
+	(let ((diagnostic
+	       (proofread-popup-test--diagnostic 4 8 "helo")))
+          (proofread-popup-test--install-diagnostics
+           (list diagnostic))
           (goto-char 6)
           (proofread-popup--update)
-          (move-overlay overlay 5 9)
+          (goto-char (point-min))
+          (insert "x")
+          (goto-char 7)
           (proofread-popup--update)
           (should (= (length proofread-popup-test--shows) 2))
           (should

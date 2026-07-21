@@ -136,14 +136,28 @@
 
 (defun proofread-test--flymake-proofread-diagnostics ()
   "Return current Proofread diagnostics published through Flymake."
-  (delq nil
-        (mapcar #'proofread--flymake-to-diagnostic
-                (flymake-diagnostics))))
+  (apply
+   #'append
+   (mapcar
+    (lambda (flymake-diagnostic)
+      (when-let* ((diagnostic
+                   (proofread--flymake-to-diagnostic
+                    flymake-diagnostic)))
+        (copy-sequence
+         (proofread--diagnostic-members diagnostic))))
+    (flymake-diagnostics))))
 
 (defun proofread-test--install-diagnostics (diagnostics)
   "Install DIAGNOSTICS and return their proofread overlays."
   (setq proofread--diagnostics diagnostics)
-  (mapcar #'proofread--create-overlay diagnostics))
+  (let ((overlays
+         (mapcar #'proofread--create-overlay diagnostics)))
+    (when (and proofread-mode
+               flymake-mode
+               (memq #'proofread--flymake-backend
+                     flymake-diagnostic-functions))
+      (flymake-start))
+    overlays))
 
 (defconst proofread-test--diagnostic-provenance-keys
   '( :language :display-language :profile :checker-name
@@ -2311,8 +2325,15 @@ When PROFILE is nil, use the current profile."
             (should (equal (reverse events) '(report hook)))
             (should (plist-get (cdr report-arguments) :region))
             (let ((reported
-                   (mapcar #'proofread--flymake-to-diagnostic
-                           (car report-arguments))))
+                   (apply
+                    #'append
+                    (mapcar
+                     (lambda (flymake-diagnostic)
+                       (copy-sequence
+                        (proofread--diagnostic-members
+                         (proofread--flymake-to-diagnostic
+                          flymake-diagnostic))))
+                     (car report-arguments)))))
               (should
                (equal
                 (mapcar (lambda (live-diagnostic)
@@ -12078,6 +12099,7 @@ This covers URLs, email, invisible text, faces, and properties."
                   same-start-short first))
       (mapc #'proofread--create-overlay
             (list same-start-long last same-start-short first))
+      (flymake-start)
       (should (equal (mapcar #'proofread--diagnostic-range
                              (proofread--navigation-diagnostics))
                      '((2 . 5) (4 . 6) (4 . 9) (8 . 10)))))))
@@ -12094,6 +12116,7 @@ This covers URLs, email, invisible text, faces, and properties."
            (invalid (proofread-test--diagnostic-for-range 12 11 "")))
       (setq proofread--diagnostics (list third invalid first second))
       (mapc #'proofread--create-overlay (list third first second))
+      (flymake-start)
       (should (eq (proofread--next-diagnostic-after 1) first))
       (should (eq (proofread--next-diagnostic-after 3) second))
       (should (eq (proofread--next-diagnostic-after 6) third))
@@ -12646,7 +12669,7 @@ This covers URLs, email, invisible text, faces, and properties."
 
 (ert-deftest
     proofread-test-diagnostic-at-point-live-range-work-is-local ()
-  "Bound live-range work by local rather than total diagnostics."
+  "Use only position-scoped Flymake queries for point lookup."
   (let (call-counts)
     (dolist (remote-count '( 20 200))
       (with-temp-buffer
@@ -12668,27 +12691,25 @@ This covers URLs, email, invisible text, faces, and properties."
                   (proofread-test--diagnostic-with-checker
                    (proofread-test--diagnostic-for-range 1 2 "x")
                    'second))
-                 (local-diagnostics (list first second))
-                 (live-range-calls nil)
-                 (original-live-range
-                  (symbol-function
-                   'proofread--diagnostic-live-range)))
+                 (original-query
+                  (symbol-function 'flymake-diagnostics))
+                 queries)
             (proofread-test--install-diagnostics
              (append (nreverse remote-diagnostics)
-                     local-diagnostics))
+                     (list first second)))
             (cl-letf
-                (((symbol-function 'proofread--diagnostic-live-range)
-                  (lambda (diagnostic)
-                    (push diagnostic live-range-calls)
-                    (funcall original-live-range diagnostic))))
+                (((symbol-function 'flymake-diagnostics)
+                  (lambda (&optional beg end)
+                    (unless beg
+                      (ert-fail
+                       "Point lookup made a buffer-wide Flymake query"))
+                    (push (list beg end) queries)
+                    (funcall original-query beg end))))
               (should
                (proofread--aggregate-diagnostic-p
                 (proofread-diagnostic-at-point 1))))
-            (dolist (diagnostic live-range-calls)
-              (should (memq diagnostic local-diagnostics)))
-            (should (<= (length live-range-calls)
-                        (* 2 (length local-diagnostics))))
-            (push (length live-range-calls) call-counts)))))
+            (should (equal queries '((1 nil))))
+            (push (length queries) call-counts)))))
     (should (= (length call-counts) 2))
     (should (apply #'= call-counts))))
 
@@ -12716,29 +12737,165 @@ This covers URLs, email, invisible text, faces, and properties."
       (proofread-test--install-diagnostics (list zero earlier))
       (should (eq (proofread-diagnostic-at-point 3) earlier)))))
 
-(ert-deftest proofread-test-diagnostic-at-point-uses-moved-range ()
-  "Aggregate diagnostics using their moved overlay ranges."
+(ert-deftest proofread-test-flymake-backed-range-and-point-follow-edit
+    ()
+  "Read moved ranges and stable aggregates from Flymake diagnostics."
   (with-temp-buffer
-    (insert "helo")
+    (insert "xhelo")
     (let ((proofread-auto-check nil)
           (first
            (proofread-test--diagnostic-with-checker
-            (proofread-test--diagnostic-for-range 1 5 "helo")
-            'first))
+            (proofread-test--diagnostic-for-range 2 6 "helo")
+            'same))
           (second
            (proofread-test--diagnostic-with-checker
-            (proofread-test--diagnostic-for-range 1 5 "helo")
-            'second)))
+            (proofread-test--diagnostic-for-range 2 6 "helo")
+            'same)))
       (proofread-mode 1)
-      (proofread-test--install-diagnostics (list first second))
+      (setq first (plist-put first :checker-ordinal 0))
+      (setq second (plist-put second :checker-ordinal 0))
+      (setq proofread--diagnostics (list first second))
+      (flymake-start)
+      (should-not (proofread--current-buffer-overlays))
+      (should (= (length (proofread--owned-flymake-diagnostics)) 1))
+      (goto-char (point-min))
+      (insert "y")
+      (should (equal (proofread--diagnostic-range first) '(2 . 6)))
+      (should (equal (proofread-diagnostic-range first) '(3 . 7)))
+      (should-not (proofread-diagnostic-at-point 2))
+      (let ((diagnostic (proofread-diagnostic-at-point 3)))
+        (should (equal (proofread-diagnostic-range diagnostic)
+                       '( 3 . 7)))
+        (should (equal (proofread--diagnostic-members diagnostic)
+                       (list first second))))
+      ;; Preserve Proofread's half-open insertion semantics at both
+      ;; endpoints: insertions at either boundary remain outside.
+      (goto-char 3)
+      (insert "z")
+      (should (equal (proofread-diagnostic-range first) '(4 . 8)))
+      (should-not (proofread-diagnostic-at-point 3))
+      (goto-char 8)
+      (insert "q")
+      (should (equal (proofread-diagnostic-range first) '(4 . 8)))
+      (should-not (proofread-diagnostic-at-point 8)))))
+
+(ert-deftest proofread-test-flymake-backed-point-recovers-zero-width
+    ()
+  "Recover both zero-width Flymake anchor directions after edits."
+  (with-temp-buffer
+    (insert "abcd")
+    (let ((proofread-auto-check nil)
+          (beg-anchor
+           (proofread-test--diagnostic-for-range 2 2 ""))
+          (end-anchor
+           (proofread-test--diagnostic-for-range 5 5 "")))
+      (setf (plist-get end-anchor :message) "End anchor")
+      (proofread-mode 1)
+      (setq proofread--diagnostics (list beg-anchor end-anchor))
+      (flymake-start)
+      (should-not (proofread--current-buffer-overlays))
+      (should (eq (proofread-diagnostic-at-point 2) beg-anchor))
+      (should-not (proofread-diagnostic-at-point 3))
+      (should-not (proofread-diagnostic-at-point 4))
+      (should (eq (proofread-diagnostic-at-point 5) end-anchor))
       (goto-char (point-min))
       (insert "x")
-      (should-not (proofread-diagnostic-at-point 1))
-      (let ((diagnostic (proofread-diagnostic-at-point 2)))
-        (should (equal (proofread-diagnostic-range diagnostic)
-                       '( 2 . 6)))
-        (should (equal (proofread--diagnostic-members diagnostic)
-                       (list first second)))))))
+      (should (equal (proofread-diagnostic-range beg-anchor)
+                     '(3 . 3)))
+      (should (equal (proofread-diagnostic-range end-anchor)
+                     '(6 . 6)))
+      (should (eq (proofread-diagnostic-at-point 3) beg-anchor))
+      (should (eq (proofread-diagnostic-at-point 6) end-anchor)))))
+
+(ert-deftest proofread-test-flymake-backed-empty-buffer-fallback ()
+  "Preserve point lookup where Flymake cannot display an empty anchor."
+  (with-temp-buffer
+    (let ((proofread-auto-check nil)
+          (diagnostic
+           (proofread-test--diagnostic-for-range 1 1 "")))
+      (proofread-mode 1)
+      (setq proofread--diagnostics (list diagnostic))
+      (flymake-start)
+      (should-not (flymake-diagnostics))
+      (should (eq (proofread-diagnostic-at-point) diagnostic))
+      (should (equal (proofread--navigation-diagnostics)
+                     (list diagnostic)))
+      (should (equal (proofread-diagnostic-range diagnostic)
+                     '(1 . 1))))))
+
+(ert-deftest proofread-test-flymake-backed-queries-exclude-lookalike
+    ()
+  "Exclude a foreign backend even when its type and data look owned."
+  (with-temp-buffer
+    (insert "helo")
+    (let* ((proofread-auto-check nil)
+           (diagnostic
+            (proofread-test--diagnostic-for-range 1 5 "helo"))
+           (foreign-backend
+            (lambda (report-function &rest _arguments)
+              (funcall
+               report-function
+               (list
+                (proofread--diagnostic-to-flymake
+                 diagnostic '(0)))))))
+      (proofread-mode 1)
+      (add-hook 'flymake-diagnostic-functions
+                foreign-backend t t)
+      (setq proofread--diagnostics (list diagnostic))
+      (flymake-start)
+      (should (= (length (flymake-diagnostics)) 2))
+      (should (= (length (proofread--owned-flymake-diagnostics)) 1))
+      (should (eq (proofread-diagnostic-at-point 2) diagnostic))
+      (should (equal (proofread--navigation-diagnostics)
+                     (list diagnostic))))))
+
+(ert-deftest proofread-test-flymake-backed-queries-require-data-tag ()
+  "Reject a bridge diagnostic without Proofread's data wrapper."
+  (with-temp-buffer
+    (insert "helo")
+    (let ((proofread-auto-check nil)
+          (diagnostic
+           (proofread-test--diagnostic-for-range 1 5 "helo")))
+      (proofread-mode 1)
+      (setq proofread--diagnostics (list diagnostic))
+      (cl-letf
+          (((symbol-function 'proofread--flymake-diagnostics-snapshot)
+            (lambda (&optional _region)
+              (list
+               (flymake-make-diagnostic
+                (current-buffer) 1 5
+                proofread--flymake-diagnostic-type
+                "Invalid wrapper" '(not-proofread-data))))))
+        (flymake-start))
+      (should (= (length (flymake-diagnostics)) 1))
+      (should-not (proofread--owned-flymake-diagnostics))
+      (should-not (proofread-diagnostic-at-point 2))
+      (should-not (proofread--navigation-diagnostics)))))
+
+(ert-deftest proofread-test-flymake-backed-queries-preserve-narrowing
+    ()
+  "Query Flymake ranges widely without changing narrowing semantics."
+  (with-temp-buffer
+    (insert "abcdefgh")
+    (let ((proofread-auto-check nil)
+          (hidden
+           (proofread-test--diagnostic-for-range 1 4 "abc"))
+          (visible
+           (proofread-test--diagnostic-for-range 5 8 "efg")))
+      (proofread-mode 1)
+      (setq proofread--diagnostics (list hidden visible))
+      (flymake-start)
+      (narrow-to-region 5 9)
+      (let ((minimum (point-min))
+            (maximum (point-max)))
+        (should (equal (proofread-diagnostic-range hidden) '(1 . 4)))
+        (should (eq (proofread-diagnostic-at-point 2) hidden))
+        (should (equal (proofread--navigation-diagnostics)
+                       (list hidden visible)))
+        (should (equal (proofread--navigation-diagnostics t)
+                       (list visible)))
+        (should (= (point-min) minimum))
+        (should (= (point-max) maximum))))))
 
 (ert-deftest
     proofread-test-diagnostic-at-point-skips-removed-overlay ()
@@ -13027,24 +13184,25 @@ This covers URLs, email, invisible text, faces, and properties."
     "Proofread: helo")))
 
 (ert-deftest
-    proofread-test-public-diagnostic-at-point-requires-overlay ()
-  "Return only live displayed diagnostics from the public lookup."
+    proofread-test-public-diagnostic-at-point-requires-publication ()
+  "Return only diagnostics currently published by the bridge."
   (with-temp-buffer
     (insert "abcdefghij")
     (proofread-mode 1)
-    (let* ((diagnostic
-            (proofread-test--diagnostic-for-range 3 6 "cde"))
-           overlay)
+    (let ((diagnostic
+           (proofread-test--diagnostic-for-range 3 6 "cde")))
       (setq proofread--diagnostics (list diagnostic))
       (should-not (proofread-diagnostic-at-point 4))
-      (setq overlay (proofread--create-overlay diagnostic))
+      (flymake-start)
       (should (eq (proofread-diagnostic-at-point 4) diagnostic))
-      (delete-overlay overlay)
+      (funcall proofread--flymake-report-function
+               nil :region (cons (point-min) (point-max)))
       (should-not (proofread-diagnostic-at-point 4)))))
 
 (ert-deftest
-    proofread-test-public-diagnostic-at-point-skips-stale-overlap ()
-  "The public lookup skips an earlier stale overlapping diagnostic."
+    proofread-test-public-diagnostic-at-point-skips-unpublished-overlap
+    ()
+  "The public lookup skips an earlier unreported model diagnostic."
   (with-temp-buffer
     (insert "abcdefghij")
     (proofread-mode 1)
@@ -13052,8 +13210,9 @@ This covers URLs, email, invisible text, faces, and properties."
            (proofread-test--diagnostic-for-range 2 8 "bcdefg"))
           (live
            (proofread-test--diagnostic-for-range 3 6 "cde")))
+      (setq proofread--diagnostics (list live))
+      (flymake-start)
       (setq proofread--diagnostics (list stale live))
-      (proofread--create-overlay live)
       (should (eq (proofread-diagnostic-at-point 4) live)))))
 
 (ert-deftest proofread-test-eldoc-provider-formats-diagnostic-at-point

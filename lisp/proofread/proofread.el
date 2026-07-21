@@ -5863,9 +5863,9 @@ BEG and END delimit the changed text."
 
 (defun proofread-diagnostic-range (diagnostic)
   "Return DIAGNOSTIC's current well-formed range, or nil.
-Prefer the range tracked by a live proofread overlay in the current
-buffer; otherwise return the diagnostic's stored range."
-  (or (proofread--diagnostic-live-range diagnostic)
+Prefer the range tracked by a current Flymake diagnostic in the
+current buffer; otherwise return the diagnostic's stored range."
+  (or (proofread--flymake-live-range-for-diagnostic diagnostic)
       (proofread--diagnostic-range diagnostic)))
 
 (defun proofread-diagnostic-message (diagnostic)
@@ -6119,15 +6119,22 @@ whitespace inside each field to single spaces."
     (proofread--flymake-data
      (:constructor
       proofread--make-flymake-data
-      (diagnostic range anchor-edge)))
+      (diagnostic range anchor-edge live-beg-marker live-end-marker
+                  model-orders)))
   "Proofread data attached to one Flymake diagnostic.
 DIAGNOSTIC is the original Proofread plist.  RANGE is its exact logical
 range at conversion time.  ANCHOR-EDGE is nil for a nonempty range,
 `:beg' or `:end' for a single-character zero-width anchor, and `:empty'
-when an empty buffer cannot provide such an anchor."
+when an empty buffer cannot provide such an anchor.  LIVE-BEG-MARKER
+and LIVE-END-MARKER track its logical live anchor without consulting
+Flymake's private overlay.  MODEL-ORDERS records the stable positions
+of DIAGNOSTIC's raw members in the core model."
   diagnostic
   range
-  anchor-edge)
+  anchor-edge
+  live-beg-marker
+  live-end-marker
+  model-orders)
 
 (defun proofread--flymake-anchor-region (range)
   "Return Flymake anchor data for logical RANGE in the current buffer.
@@ -6141,9 +6148,12 @@ A zero-width range uses one displayable character where possible."
      ((> beg (point-min)) (list (1- beg) beg :end))
      (t (list beg end :empty)))))
 
-(defun proofread--diagnostic-to-flymake (diagnostic)
+(defun proofread--diagnostic-to-flymake
+    (diagnostic &optional model-orders presentation-message)
   "Convert Proofread DIAGNOSTIC for the current buffer to Flymake.
-Return nil when DIAGNOSTIC has no valid range in the widened buffer."
+Return nil when DIAGNOSTIC has no valid range in the widened buffer.
+MODEL-ORDERS records the core order of its raw members.  When non-nil,
+PRESENTATION-MESSAGE overrides its normal Flymake message."
   (save-restriction
     (widen)
     (when-let* ((range (proofread--diagnostic-range diagnostic))
@@ -6156,10 +6166,20 @@ Return nil when DIAGNOSTIC has no valid range in the widened buffer."
          beg
          end
          proofread--flymake-diagnostic-type
-         (proofread-format-diagnostic-message
-          diagnostic :separator "; " :single-line t)
+         (or presentation-message
+             (proofread-format-diagnostic-message
+              diagnostic :separator "; " :single-line t))
          (proofread--make-flymake-data
-          diagnostic range anchor-edge))))))
+          diagnostic
+          range
+          anchor-edge
+          ;; Keep insertions at either logical boundary outside the
+          ;; diagnostic, matching Proofread's range contract.  The
+          ;; diagnostic commit republishes Flymake's annotation at
+          ;; the resulting live range.
+          (copy-marker beg t)
+          (copy-marker end)
+          model-orders))))))
 
 (defun proofread--flymake-to-diagnostic (flymake-diagnostic)
   "Return the Proofread diagnostic wrapped by FLYMAKE-DIAGNOSTIC.
@@ -6170,6 +6190,126 @@ Proofread."
     (when-let* ((data (flymake-diagnostic-data flymake-diagnostic))
                 ((proofread--flymake-data-p data)))
       (proofread--flymake-data-diagnostic data))))
+
+(defun proofread--diagnostic-model-orders ()
+  "Return an `eq' table mapping current diagnostics to model order."
+  (let ((orders (make-hash-table :test #'eq))
+        (index 0))
+    (dolist (diagnostic proofread--diagnostics)
+      (puthash diagnostic index orders)
+      (setq index (1+ index)))
+    orders))
+
+(defun proofread--owned-flymake-data
+    (flymake-diagnostic model-orders)
+  "Return owned data from FLYMAKE-DIAGNOSTIC, or nil.
+An owned diagnostic must come from the current buffer's named bridge,
+carry Proofread's custom type and data tag, and represent at least one
+raw diagnostic in MODEL-ORDERS."
+  (when (and (eq (flymake-diagnostic-backend flymake-diagnostic)
+                 #'proofread--flymake-backend)
+             (eq (flymake-diagnostic-buffer flymake-diagnostic)
+                 (current-buffer))
+             (eq (flymake-diagnostic-type flymake-diagnostic)
+                 proofread--flymake-diagnostic-type))
+    (when-let* ((data (flymake-diagnostic-data flymake-diagnostic))
+                ((proofread--flymake-data-p data))
+                (diagnostic
+                 (proofread--flymake-data-diagnostic data))
+                ((cl-some
+                  (lambda (member)
+                    (gethash member model-orders))
+                  (proofread--diagnostic-members diagnostic))))
+      data)))
+
+(defun proofread--flymake-live-range-from-data (data)
+  "Return the current logical range represented by Flymake DATA."
+  (let ((beg-marker
+         (proofread--flymake-data-live-beg-marker data))
+        (end-marker
+         (proofread--flymake-data-live-end-marker data)))
+    (when (and (markerp beg-marker)
+               (markerp end-marker)
+               (eq (marker-buffer beg-marker) (current-buffer))
+               (eq (marker-buffer end-marker) (current-buffer)))
+      (let* ((anchor-beg (marker-position beg-marker))
+             (anchor-end (marker-position end-marker))
+             (edge (proofread--flymake-data-anchor-edge data))
+             (range
+              (pcase edge
+                (:beg (cons anchor-beg anchor-beg))
+                (:end (cons anchor-end anchor-end))
+                (:empty
+                 (let ((original
+                        (proofread--flymake-data-range data)))
+                   (cons (car original) (cdr original))))
+                (_ (cons anchor-beg anchor-end)))))
+        (when (and (proofread--range-valid-p range)
+                   (proofread--range-contains-p
+                    (cons (point-min) (point-max)) range))
+          range)))))
+
+(defun proofread--flymake-data-represents-p (data diagnostic)
+  "Return non-nil when DATA represents raw DIAGNOSTIC."
+  (memq diagnostic
+        (proofread--diagnostic-members
+         (proofread--flymake-data-diagnostic data))))
+
+(defun proofread--flymake-data-current-member-orders
+    (data model-orders)
+  "Return current raw member and model-order pairs from DATA.
+MODEL-ORDERS maps current diagnostic identities to their model order."
+  (let ((members
+         (proofread--diagnostic-members
+          (proofread--flymake-data-diagnostic data)))
+        (snapshot-orders
+         (proofread--flymake-data-model-orders data))
+        pairs)
+    (while members
+      (let ((member (pop members))
+            (snapshot-order (pop snapshot-orders)))
+        (when-let* ((model-order (gethash member model-orders)))
+          (push (cons member (or snapshot-order model-order))
+                pairs))))
+    (nreverse pairs)))
+
+(defun proofread--owned-flymake-diagnostics
+    (&optional position model-orders)
+  "Return current owned Flymake diagnostics, optionally at POSITION.
+When non-nil, MODEL-ORDERS is the current diagnostic order table."
+  (let ((model-orders
+         (or model-orders (proofread--diagnostic-model-orders)))
+        (seen (make-hash-table :test #'eq))
+        diagnostics)
+    (dolist (flymake-diagnostic
+             (if position
+                 (flymake-diagnostics position)
+               (flymake-diagnostics)))
+      (when (and (not (gethash flymake-diagnostic seen))
+                 (proofread--owned-flymake-data
+                  flymake-diagnostic model-orders))
+        (puthash flymake-diagnostic t seen)
+        (push flymake-diagnostic diagnostics)))
+    (nreverse diagnostics)))
+
+(defun proofread--flymake-live-range-for-diagnostic (diagnostic)
+  "Return DIAGNOSTIC's range from a current owned Flymake object."
+  (save-restriction
+    (widen)
+    (let* ((model-orders (proofread--diagnostic-model-orders))
+           (member
+            (cl-find-if
+             (lambda (candidate)
+               (gethash candidate model-orders))
+             (proofread--diagnostic-members diagnostic))))
+      (when member
+        (cl-loop
+         for flymake-diagnostic
+         in (proofread--owned-flymake-diagnostics nil model-orders)
+         for data = (proofread--owned-flymake-data
+                     flymake-diagnostic model-orders)
+         when (proofread--flymake-data-represents-p data member)
+         return (proofread--flymake-live-range-from-data data))))))
 
 (defun proofread--flymake-presentation-range (range)
   "Return the Flymake presentation range for logical RANGE.
@@ -6191,8 +6331,11 @@ converted diagnostic because no nonempty display anchor is possible."
   (save-restriction
     (widen)
     (let ((empty-buffer-p (= (point-min) (point-max)))
-          snapshot)
+          (model-orders (make-hash-table :test #'eq))
+          (index 0)
+          entries)
       (dolist (diagnostic proofread--diagnostics)
+        (puthash diagnostic index model-orders)
         (when-let* ((logical-range
                      (proofread--diagnostic-range diagnostic))
                     (presentation-range
@@ -6201,11 +6344,60 @@ converted diagnostic because no nonempty display anchor is possible."
                     ((or (null region)
                          empty-buffer-p
                          (proofread--range-overlaps-p
-                          presentation-range region)))
-                    (flymake-diagnostic
-                     (proofread--diagnostic-to-flymake diagnostic)))
-          (push flymake-diagnostic snapshot)))
-      (nreverse snapshot))))
+                          presentation-range region))))
+          (push (list diagnostic
+                      (car logical-range)
+                      (cdr logical-range)
+                      index)
+                entries))
+        (setq index (1+ index)))
+      (setq entries
+            (proofread--aggregate-navigation-entries
+             (sort entries #'proofread--navigation-entry<)))
+      (let ((presentation-counts (make-hash-table :test #'equal))
+            (presentation-orders (make-hash-table :test #'equal)))
+        ;; Flymake's equality ignores diagnostic data.  Distinct
+        ;; Proofread UI groups can therefore collide when they have
+        ;; the same anchor and rendered message.  Count those groups
+        ;; before conversion so every group remains queryable.
+        (dolist (entry entries)
+          (let* ((diagnostic (car entry))
+                 (range (cons (nth 1 entry) (nth 2 entry)))
+                 (anchor
+                  (proofread--flymake-presentation-range range))
+                 (message
+                  (proofread-format-diagnostic-message
+                   diagnostic :separator "; " :single-line t))
+                 (key (list anchor message)))
+            (puthash key
+                     (1+ (gethash key presentation-counts 0))
+                     presentation-counts)))
+        (mapcar
+         (lambda (entry)
+           (let* ((diagnostic (car entry))
+                  (range (cons (nth 1 entry) (nth 2 entry)))
+                  (anchor
+                   (proofread--flymake-presentation-range range))
+                  (message
+                   (proofread-format-diagnostic-message
+                    diagnostic :separator "; " :single-line t))
+                  (key (list anchor message))
+                  (count (gethash key presentation-counts))
+                  (order
+                   (when (> count 1)
+                     (let ((next
+                            (1+ (gethash key presentation-orders 0))))
+                       (puthash key next presentation-orders)
+                       next))))
+             (proofread--diagnostic-to-flymake
+              diagnostic
+              (mapcar
+               (lambda (member)
+                 (gethash member model-orders))
+               (proofread--diagnostic-members diagnostic))
+              (and order
+                   (format "%s [%d/%d]" message order count)))))
+         entries)))))
 
 (defun proofread--flymake-publication-region
     (region changed-diagnostics)
@@ -6308,17 +6500,36 @@ This named function is the sole Flymake backend used by Proofread."
   "Return sorted entries for live raw diagnostics in the current buffer.
 When ACCESSIBLE-ONLY is non-nil, omit ranges outside the current
 restriction."
-  (let ((index 0)
+  (let ((accessible-range (cons (point-min) (point-max)))
+        (model-orders (proofread--diagnostic-model-orders))
         entries)
-    (dolist (diagnostic proofread--diagnostics)
-      (let ((range (proofread--diagnostic-live-range diagnostic)))
-        (when (and range
-                   (or (not accessible-only)
-                       (and (<= (point-min) (car range))
-                            (<= (cdr range) (point-max)))))
-          (push (list diagnostic (car range) (cdr range) index)
-                entries)))
-      (setq index (1+ index)))
+    (save-restriction
+      (widen)
+      (dolist (flymake-diagnostic
+               (proofread--owned-flymake-diagnostics
+                nil model-orders))
+        (let* ((data
+                (proofread--owned-flymake-data
+                 flymake-diagnostic model-orders))
+               (range
+                (proofread--flymake-live-range-from-data data))
+               (member-orders
+                (proofread--flymake-data-current-member-orders
+                 data model-orders)))
+          (when (and range
+                     (or (not accessible-only)
+                         (proofread--range-contains-p
+                          accessible-range range)))
+            (dolist (member-order member-orders)
+              (push (list (car member-order)
+                          (car range)
+                          (cdr range)
+                          (cdr member-order))
+                    entries)))))
+      (when (and (null entries)
+                 (= (point-min) (point-max)))
+        (setq entries
+              (proofread--empty-buffer-navigation-entries))))
     (sort entries #'proofread--navigation-entry<)))
 
 (defun proofread--aggregate-navigation-entries (entries)
@@ -6557,45 +6768,71 @@ restriction."
         (mapcar #'proofread--overlay-for-diagnostic
                 (proofread--diagnostic-members diagnostic))))
 
-(defun proofread--local-navigation-entry (overlay position)
-  "Return OVERLAY's navigation entry when it covers POSITION.
-Return nil unless OVERLAY is the canonical live overlay for its raw
-diagnostic in the current buffer."
-  (when (proofread--current-buffer-overlay-p overlay)
-    (let ((diagnostic
-           (overlay-get overlay 'proofread-diagnostic))
-          (beg (overlay-start overlay))
-          (end (overlay-end overlay))
-          (insertion-ordinal
-           (overlay-get
-            overlay 'proofread-diagnostic-insertion-ordinal)))
-      (when (and (hash-table-p proofread--diagnostic-overlays)
-                 (eq (gethash diagnostic
-                              proofread--diagnostic-overlays)
-                     overlay)
-                 beg end
-                 (natnump insertion-ordinal)
-                 (proofread--range-covers-position-p
-                  (cons beg end) position))
-        (list diagnostic beg end insertion-ordinal)))))
-
-(defun proofread--local-navigation-entries-at (position)
-  "Return sorted live navigation entries covering POSITION."
+(defun proofread--owned-flymake-diagnostics-at
+    (position model-orders)
+  "Return unique owned Flymake diagnostics relevant to POSITION.
+MODEL-ORDERS is the current diagnostic order table."
   (let ((seen (make-hash-table :test #'eq))
+        diagnostics)
+    ;; A zero-width logical position at the end of a nonempty buffer
+    ;; is displayed on the preceding character.  Query both possible
+    ;; anchors, then restore and test the logical range below.
+    (dolist (probe (if (> position (point-min))
+                       (list position (1- position))
+                     (list position)))
+      (dolist (flymake-diagnostic
+               (proofread--owned-flymake-diagnostics
+                probe model-orders))
+        (unless (gethash flymake-diagnostic seen)
+          (puthash flymake-diagnostic t seen)
+          (push flymake-diagnostic diagnostics))))
+    (nreverse diagnostics)))
+
+(defun proofread--flymake-navigation-entries-at (position)
+  "Return sorted owned Flymake navigation entries at POSITION."
+  (let ((model-orders (proofread--diagnostic-model-orders))
         entries)
-    ;; `overlays-at' includes ordinary overlays at their front
-    ;; boundary; an empty `overlays-in' query additionally finds
-    ;; zero-width ones.  Ordinary overlays may occur in both results.
-    (dolist (overlay
-             (append (overlays-at position)
-                     (overlays-in position position)))
-      (unless (gethash overlay seen)
-        (puthash overlay t seen)
-        (when-let* ((entry
-                     (proofread--local-navigation-entry
-                      overlay position)))
-          (push entry entries))))
+    (dolist (flymake-diagnostic
+             (proofread--owned-flymake-diagnostics-at
+              position model-orders))
+      (let* ((data
+              (proofread--owned-flymake-data
+               flymake-diagnostic model-orders))
+             (range
+              (proofread--flymake-live-range-from-data data))
+             (member-orders
+              (proofread--flymake-data-current-member-orders
+               data model-orders)))
+        (when (and range
+                   (proofread--range-covers-position-p
+                    range position))
+          (dolist (member-order member-orders)
+            (push (list (car member-order)
+                        (car range)
+                        (cdr range)
+                        (cdr member-order))
+                  entries)))))
     (sort entries #'proofread--navigation-entry<)))
+
+(defun proofread--empty-buffer-navigation-entries ()
+  "Return model entries for Flymake's empty-buffer limitation.
+Flymake does not retain a zero-width diagnostic overlay in an empty
+buffer, so its public query cannot enumerate the bridge report."
+  (when (and proofread--flymake-report-function
+             (= (point-min) (point-max)))
+    (let ((index 0)
+          entries)
+      (dolist (diagnostic proofread--diagnostics)
+        (when-let* ((range (proofread--diagnostic-range diagnostic))
+                    ((proofread--range-contains-p
+                      (cons (point-min) (point-max)) range)))
+          (push (list diagnostic
+                      (car range)
+                      (cdr range)
+                      index)
+                entries))
+        (setq index (1+ index)))
+      (sort entries #'proofread--navigation-entry<))))
 
 (defun proofread--aggregate-local-navigation-entry (entry entries)
   "Return the UI diagnostic for winning local ENTRY among ENTRIES."
@@ -6621,10 +6858,10 @@ diagnostic in the current buffer."
 
 (defun proofread-diagnostic-at-point (&optional position)
   "Return the live proofreading diagnostic at POSITION or point.
-A diagnostic is live only while its proofread-owned overlay exists in
-the current buffer.  An aggregate may be freshly allocated on every
-call, so callers must not rely on `eq' identity across calls.  Compare
-values from `proofread-diagnostic-range',
+A diagnostic is live only while the current Proofread Flymake bridge
+reports it in this buffer.  An aggregate may be freshly allocated on
+every call, so callers must not rely on `eq' identity across calls.
+Compare values from `proofread-diagnostic-range',
 `proofread-diagnostic-message', `proofread-diagnostic-message-entries',
 and `proofread-diagnostic-text' instead."
   (when-let* ((point-position
@@ -6634,8 +6871,16 @@ and `proofread-diagnostic-text' instead."
       (when (and (<= (point-min) point-position)
                  (<= point-position (point-max)))
         (when-let* ((entries
-                     (proofread--local-navigation-entries-at
-                      point-position)))
+                     (or (proofread--flymake-navigation-entries-at
+                          point-position)
+                         (let ((fallback
+                                (proofread--empty-buffer-navigation-entries)))
+                           (cl-remove-if-not
+                            (lambda (entry)
+                              (proofread--range-covers-position-p
+                               (cons (nth 1 entry) (nth 2 entry))
+                               point-position))
+                            fallback)))))
           (proofread--aggregate-local-navigation-entry
            (car entries) entries))))))
 
