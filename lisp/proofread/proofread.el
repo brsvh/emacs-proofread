@@ -3723,12 +3723,12 @@ Record REASON as the cancellation reason, defaulting to `stale'."
 
 (defun proofread--request-cache-status (work)
   "Apply WORK's current cache entry and return its queue status.
-Return `cached' or `stale' when an entry settles WORK, and nil when
-there is no applicable entry."
+Return `cached' when an entry settles WORK, and nil when there is no
+applicable entry.  A stale cache result has already recorded its final
+event, so it is also terminally `cached' from the queue's perspective."
   (when-let* ((entry (proofread--cache-read-request work)))
-    (pcase (proofread--apply-cache-entry work entry)
-      ('applied 'cached)
-      ('stale 'stale))))
+    (when (proofread--apply-cache-entry work entry)
+      'cached)))
 
 (defun proofread--submit-request (work)
   "Submit WORK when cache and concurrency permit.
@@ -4229,20 +4229,32 @@ was already considered while ENTRY was claimed."
       (eq proofread--queue-dispatch-active-p
           proofread--queue-dispatch-transaction)))
 
-(defun proofread--claimed-request-restorable-p (work)
-  "Return non-nil when claimed WORK may safely return to the queue."
-  (and (proofread--queue-dispatch-transaction-current-p)
-       (memq work proofread--claimed-requests)
-       (proofread--request-lifecycle-current-p work)))
+(defun proofread--claimed-request-stale-reason (work)
+  "Return the terminal stale reason for claimed WORK."
+  (if (proofread--request-state-flag-p work :superseded)
+      'superseded
+    'stale))
 
-(defun proofread--retire-unrestorable-claimed-request (work)
-  "Retire claimed WORK after a reentrant lifecycle change."
-  (proofread--release-claimed-request work t)
-  (proofread--record-request-cancellation
-   work
-   (if (proofread--request-state-flag-p work :superseded)
-       'superseded
-     'stale)))
+(defun proofread--transition-claimed-request
+    (work reason &optional restore)
+  "Release claimed WORK, recording REASON or calling RESTORE.
+RESTORE is a no-argument function that relinks WORK's queue entry.  It
+is called only while this dispatch transaction and WORK's lifecycle
+are still current.  A successful restore preserves the pending key;
+otherwise this function forgets it and records one cancellation with
+REASON.  A nil REASON means that an earlier final-result event already
+settled WORK."
+  (when (memq work proofread--claimed-requests)
+    (if (and restore
+             (proofread--queue-dispatch-transaction-current-p)
+             (proofread--request-lifecycle-current-p work)
+             (eq (proofread--request-work-pending-p work) work))
+        (progn
+          (funcall restore)
+          (proofread--release-claimed-request work))
+      (proofread--release-claimed-request work t)
+      (when reason
+        (proofread--record-request-cancellation work reason)))))
 
 (defun proofread--cache-woken-entry< (left right)
   "Return non-nil when queue entry LEFT precedes RIGHT."
@@ -4255,8 +4267,6 @@ Return one of `cached', `miss', or `stale'.  This function never sends
 WORK to a backend."
   (catch 'status
     (unless (proofread--request-ready-to-submit-p work)
-      (throw 'status 'stale))
-    (unless (proofread--request-lifecycle-current-p work)
       (throw 'status 'stale))
     (when-let* ((status (proofread--request-cache-status work)))
       (throw 'status status))
@@ -4300,28 +4310,23 @@ Do not scan unrelated requests."
         (unwind-protect
             (pcase (proofread--cache-woken-request-status work)
               ('cached
-               (proofread--release-claimed-request work t))
+               (proofread--transition-claimed-request
+                work nil))
               ('stale
-               (proofread--release-claimed-request work t)
-               (proofread--record-request-cancellation
+               (proofread--transition-claimed-request
                 work
-                (if (proofread--request-state-flag-p
-                     work :superseded)
-                    'superseded
-                  'stale)))
+                (proofread--claimed-request-stale-reason work)))
               ('miss
                ;; Cache eviction or a defensive text mismatch must not
                ;; promote this request ahead of unrelated FIFO work.
-               (if (proofread--claimed-request-restorable-p work)
-                   (progn
-                     (proofread--insert-request-queue-entry entry t)
-                     (proofread--release-claimed-request work))
-                 (proofread--retire-unrestorable-claimed-request
-                  work))))
-          (when (memq work proofread--claimed-requests)
-            (proofread--release-claimed-request work t)
-            (proofread--record-request-cancellation
-             work 'error)))))
+               (proofread--transition-claimed-request
+                work
+                (proofread--claimed-request-stale-reason work)
+                (lambda ()
+                  (proofread--insert-request-queue-entry
+                   entry t)))))
+          (proofread--transition-claimed-request
+           work 'error))))
     claimed-count))
 
 (defun proofread--drain-request-queue ()
@@ -4342,29 +4347,24 @@ Do not scan unrelated requests."
               ('full
                ;; The current cache state was already considered by
                ;; submission.  Keep unrelated work in strict FIFO order.
-               (if (proofread--claimed-request-restorable-p work)
-                   (progn
-                     (proofread--prepend-request-queue-entry entry t)
-                     (proofread--release-claimed-request work))
-                 (proofread--retire-unrestorable-claimed-request
-                  work))
+               (proofread--transition-claimed-request
+                work
+                (proofread--claimed-request-stale-reason work)
+                (lambda ()
+                  (proofread--prepend-request-queue-entry
+                   entry t)))
                (setq full t))
               ((or 'cached 'error)
-               (proofread--release-claimed-request work t))
+               (proofread--transition-claimed-request
+                work nil))
               ('stale
-               (proofread--release-claimed-request work t)
-               (proofread--record-request-cancellation
+               (proofread--transition-claimed-request
                 work
-                (if (proofread--request-state-flag-p
-                     work :superseded)
-                    'superseded
-                  'stale))))
+                (proofread--claimed-request-stale-reason work))))
           ;; A malformed setting or unexpected predicate failure must
           ;; not strand a request between queue and active state.
-          (when (memq work proofread--claimed-requests)
-            (proofread--release-claimed-request work t)
-            (proofread--record-request-cancellation
-             work 'error)))))
+          (proofread--transition-claimed-request
+           work 'error))))
     (nreverse requests)))
 
 (defun proofread--dispatch-queued-requests ()

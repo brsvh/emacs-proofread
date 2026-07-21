@@ -758,6 +758,16 @@ When PROFILE is nil, use the current profile."
   (should
    (zerop (hash-table-count proofread--pending-request-keys))))
 
+(defun proofread-test--terminal-request-events (events work)
+  "Return terminal EVENTS belonging to WORK."
+  (let ((log-id (proofread--scheduled-work-log-id work)))
+    (cl-remove-if-not
+     (lambda (event)
+       (and (equal (plist-get event :log-id) log-id)
+            (memq (plist-get event :type)
+                  '( cancelled final-result))))
+     events)))
+
 (defmacro proofread-test--with-profile (&rest body)
   "Run BODY with the generic test backend selected by a profile."
   (declare (indent 0) (debug (body)))
@@ -16988,6 +16998,355 @@ This covers URLs, email, invisible text, faces, and properties."
           (should-not (proofread--cache-wakeup-pending-p))
           (should (proofread--request-work-pending-p target))
           (proofread-test--assert-queue-cache-index-consistent))))))
+
+(ert-deftest
+    proofread-test-claimed-terminal-paths-settle-once ()
+  "Settle each queue terminal path once and release its pending key."
+  (dolist (case
+           '(( queue cached final-result applied)
+             ( queue error final-result error)
+             ( queue stale cancelled stale)
+             ( queue invalidated cancelled stale)
+             ( queue signal cancelled error)
+             ( cache-woken cached final-result applied)
+             ( cache-woken stale cancelled stale)
+             ( cache-woken signal cancelled error)))
+    (pcase-let ((`(,drain ,outcome ,event-type ,detail) case))
+      (with-temp-buffer
+        (insert "Alpha")
+        (let ((proofread-auto-check nil)
+              (proofread-cache-max-entries 8)
+              (proofread-context-size 0)
+              events)
+          (proofread-mode 1)
+          (proofread-test--with-profile
+            (let* ((chunk
+                    (car
+                     (proofread-test--request-ready-chunks-for-ranges
+                      '((1 . 6)))))
+                   (work
+                    (proofread--make-request-work
+                     (proofread-test--make-profile-request chunk)))
+                   (request (proofread-test--work-request work))
+                   (batch (proofread--attach-request-batch (list work)))
+                   (proofread-request-log-hook
+                    (list
+                     (lambda (event)
+                       (when (and
+                              (eq (plist-get event :type)
+                                  'cancelled)
+                              (equal
+                               (plist-get event :log-id)
+                               (proofread--scheduled-work-log-id
+                                work)))
+                         (should-not
+                          (memq work proofread--claimed-requests))
+                         (should-not
+                          (eq (proofread--request-work-pending-p work)
+                              work)))
+                       (push event events)))))
+              (proofread--enqueue-requests (list work))
+              (when (eq drain 'cache-woken)
+                (proofread--cache-write-request work nil))
+              (cl-labels
+                  ((terminal-status
+                     ()
+                     (pcase outcome
+                       ('cached
+                        (proofread--record-request-event
+                         work 'final-result
+                         :result
+                         (proofread--backend-success-result request nil)
+                         :status 'applied)
+                        'cached)
+                       ('error
+                        (proofread--record-request-event
+                         work 'final-result
+                         :result
+                         (proofread--backend-error-result
+                          request 'proofread-test-error)
+                         :status 'error)
+                        'error)
+                       ('invalidated
+                        (proofread--invalidate-request work)
+                        'stale)
+                       ('stale 'stale)
+                       ('signal
+                        (error "Simulated claimed-work failure")))))
+                (pcase drain
+                  ('queue
+                   (cl-letf
+                       (((symbol-function 'proofread--submit-request)
+                         (lambda (candidate)
+                           (should (eq candidate work))
+                           (terminal-status))))
+                     (if (eq outcome 'signal)
+                         (should-error
+                          (proofread--drain-request-queue))
+                       (should-not
+                        (proofread--drain-request-queue)))))
+                  ('cache-woken
+                   (cl-letf
+                       (((symbol-function
+                          'proofread--cache-woken-request-status)
+                         (lambda (candidate)
+                           (should (eq candidate work))
+                           (terminal-status))))
+                     (if (eq outcome 'signal)
+                         (should-error
+                          (proofread--drain-cache-woken-requests))
+                       (should
+                        (= (proofread--drain-cache-woken-requests)
+                           1)))))))
+              (let ((terminal-events
+                     (proofread-test--terminal-request-events
+                      events work)))
+                (should (= (length terminal-events) 1))
+                (should (eq (plist-get (car terminal-events) :type)
+                            event-type))
+                (if (eq event-type 'cancelled)
+                    (should (eq (plist-get (car terminal-events)
+                                           :reason)
+                                detail))
+                  (should (eq (plist-get (car terminal-events)
+                                         :status)
+                              detail))))
+              (should (zerop (plist-get batch :pending)))
+              (should (proofread--scheduled-work-batch-settled work))
+              (if (eq event-type 'cancelled)
+                  (should (proofread--request-state-flag-p
+                           work :cancelled))
+                (should-not (proofread--request-state-flag-p
+                             work :cancelled)))
+              (proofread-test--assert-no-pending-request-work))))))))
+
+(ert-deftest
+    proofread-test-cache-stale-result-has-one-terminal-event ()
+  "Treat a stale cache result as already settled by its final event."
+  (with-temp-buffer
+    (insert "Alpha")
+    (let ((proofread-auto-check nil)
+          (proofread-cache-max-entries 8)
+          (proofread-context-size 0)
+          events
+          (freshness-calls 0))
+      (proofread-mode 1)
+      (proofread-test--with-profile
+        (let* ((chunk
+                (car
+                 (proofread-test--request-ready-chunks-for-ranges
+                  '((1 . 6)))))
+               (work
+                (proofread--make-request-work
+                 (proofread-test--make-profile-request chunk)))
+               (batch (proofread--attach-request-batch (list work)))
+               (proofread-request-log-hook
+                (list (lambda (event)
+                        (push event events)))))
+          (proofread--enqueue-requests (list work))
+          (proofread--cache-write-request work nil)
+          (cl-letf (((symbol-function 'proofread--fresh-request-p)
+                     (lambda (candidate)
+                       (should (eq candidate work))
+                       (setq freshness-calls (1+ freshness-calls))
+                       (= freshness-calls 1))))
+            (should (= (proofread--drain-cache-woken-requests) 1)))
+          (let ((terminal-events
+                 (proofread-test--terminal-request-events events work)))
+            (should (= (length terminal-events) 1))
+            (should (eq (plist-get (car terminal-events) :type)
+                        'final-result))
+            (should (eq (plist-get (car terminal-events) :status)
+                        'stale)))
+          (should (= freshness-calls 2))
+          (should (zerop (plist-get batch :pending)))
+          (should-not
+           (proofread--request-state-flag-p work :cancelled))
+          (proofread-test--assert-no-pending-request-work))))))
+
+(ert-deftest
+    proofread-test-cache-woken-status-checks-lifecycle-twice ()
+  "Avoid a redundant lifecycle check after freshness settles."
+  (with-temp-buffer
+    (insert "Alpha")
+    (let ((proofread-auto-check nil)
+          (proofread-cache-max-entries 8)
+          (lifecycle-calls 0))
+      (proofread-mode 1)
+      (proofread-test--with-profile
+        (let* ((chunk (proofread--make-request-ready-chunk 1 6))
+               (work
+                (proofread--make-request-work
+                 (proofread-test--make-profile-request chunk)))
+               (original-lifecycle
+                (symbol-function
+                 'proofread--request-lifecycle-current-p)))
+          (cl-letf
+              (((symbol-function
+                 'proofread--request-lifecycle-current-p)
+                (lambda (candidate)
+                  (setq lifecycle-calls (1+ lifecycle-calls))
+                  (funcall original-lifecycle candidate)))
+               ((symbol-function 'proofread--fresh-request-p)
+                (lambda (candidate)
+                  (should (eq candidate work))
+                  t)))
+            (should (eq (proofread--cache-woken-request-status work)
+                        'miss)))
+          (should (= lifecycle-calls 2)))))))
+
+(ert-deftest
+    proofread-test-claimed-restore-preserves-entry-and-fifo ()
+  "Restore the same claimed entry in FIFO order without settling it."
+  (dolist (drain '( queue cache-woken))
+    (with-temp-buffer
+      (insert "aa bb cc")
+      (let ((proofread-auto-check nil)
+            (proofread-cache-max-entries 8)
+            (proofread-context-size 0)
+            (proofread-max-concurrent-requests 0)
+            events)
+        (proofread-mode 1)
+        (proofread-test--with-profile
+          (let* ((chunks
+                  (proofread-test--request-ready-chunks-for-ranges
+                   '((1 . 3) (4 . 6) (7 . 9))))
+                 (works
+                  (mapcar
+                   (lambda (chunk)
+                     (proofread--make-request-work
+                      (proofread-test--make-profile-request chunk)))
+                   chunks))
+                 (target
+                  (if (eq drain 'queue)
+                      (car works)
+                    (nth 1 works)))
+                 (batch (proofread--attach-request-batch (list target)))
+                 entries
+                 (proofread-request-log-hook
+                  (list (lambda (event)
+                          (push event events)))))
+            (proofread--enqueue-requests works)
+            (setq entries (proofread--request-queue-entries))
+            (pcase drain
+              ('queue
+               (cl-letf
+                   (((symbol-function 'proofread--submit-request)
+                     (lambda (candidate)
+                       (should (eq candidate target))
+                       'full)))
+                 (should-not (proofread--drain-request-queue))))
+              ('cache-woken
+               (proofread--cache-write-request target nil)
+               (cl-letf
+                   (((symbol-function
+                      'proofread--cache-woken-request-status)
+                     (lambda (candidate)
+                       (should (eq candidate target))
+                       'miss)))
+                 (should
+                  (= (proofread--drain-cache-woken-requests) 1)))))
+            (should (cl-every #'eq
+                              (proofread--request-queue-entries)
+                              entries))
+            (should-not proofread--claimed-requests)
+            (should (eq (gethash
+                         (proofread--request-work-key target)
+                         proofread--pending-request-keys)
+                        target))
+            (should-not
+             (proofread-test--terminal-request-events events target))
+            (should (= (plist-get batch :pending) 1))
+            (should-not
+             (proofread--scheduled-work-batch-settled target))
+            (proofread-test--assert-queue-cache-index-consistent)
+            (proofread--clear-scheduled-work)))))))
+
+(ert-deftest
+    proofread-test-claimed-reentrant-state-change-does-not-leak ()
+  "Retire claims once after reentrant dispatch state changes."
+  (dolist (case
+           '(( queue clear stale)
+             ( cache-woken clear miss)
+             ( queue transaction full)
+             ( cache-woken transaction miss)
+             ( queue lifecycle full)
+             ( cache-woken lifecycle miss)
+             ( queue identity full)
+             ( cache-woken identity miss)))
+    (pcase-let ((`(,drain ,change ,status) case))
+      (with-temp-buffer
+        (insert "Alpha")
+        (let ((proofread-auto-check nil)
+              (proofread-cache-max-entries 8)
+              (proofread-context-size 0)
+              events)
+          (proofread-mode 1)
+          (proofread-test--with-profile
+            (let* ((chunk
+                    (car
+                     (proofread-test--request-ready-chunks-for-ranges
+                      '((1 . 6)))))
+                   (work
+                    (proofread--make-request-work
+                     (proofread-test--make-profile-request chunk)))
+                   (batch (proofread--attach-request-batch (list work)))
+                   (transaction
+                    (make-symbol "proofread-test-queue-transaction"))
+                   (replacement
+                    (make-symbol "proofread-test-replacement-transaction"))
+                   (proofread-request-log-hook
+                    (list (lambda (event)
+                            (push event events)))))
+              (proofread--enqueue-requests (list work))
+              (when (eq drain 'cache-woken)
+                (proofread--cache-write-request work nil))
+              (let ((proofread--queue-dispatch-transaction transaction))
+                (setq proofread--queue-dispatch-active-p transaction)
+                (cl-labels
+                    ((change-state
+                       ()
+                       (pcase change
+                         ('clear
+                          (proofread--clear-scheduled-work))
+                         ('transaction
+                          (setq proofread--queue-dispatch-active-p
+                                replacement))
+                         ('lifecycle
+                          (proofread--set-request-state-flag
+                           work :invalidated))
+                         ('identity
+                          (proofread--forget-request-work work)))
+                       status))
+                  (pcase drain
+                    ('queue
+                     (cl-letf
+                         (((symbol-function 'proofread--submit-request)
+                           (lambda (candidate)
+                             (should (eq candidate work))
+                             (change-state))))
+                       (should-not
+                        (proofread--drain-request-queue))))
+                    ('cache-woken
+                     (cl-letf
+                         (((symbol-function
+                            'proofread--cache-woken-request-status)
+                           (lambda (candidate)
+                             (should (eq candidate work))
+                             (change-state))))
+                       (should
+                        (= (proofread--drain-cache-woken-requests)
+                           1)))))))
+              (let ((terminal-events
+                     (proofread-test--terminal-request-events
+                      events work)))
+                (should (= (length terminal-events) 1))
+                (should (eq (plist-get (car terminal-events) :type)
+                            'cancelled)))
+              (should (zerop (plist-get batch :pending)))
+              (should (proofread--scheduled-work-batch-settled work))
+              (should (proofread--request-state-flag-p work :cancelled))
+              (proofread-test--assert-no-pending-request-work))))))))
 
 (ert-deftest proofread-test-queue-state-mutations-preserve-invariants ()
   "Keep queue record links and indexes consistent across mutations."
