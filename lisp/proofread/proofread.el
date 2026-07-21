@@ -601,6 +601,9 @@ also receive the safe fields collected so far; every sanitizer returns
 (defvar-local proofread--diagnostics nil
   "Proofread diagnostics for the current buffer.")
 
+(defvar-local proofread--flymake-report-function nil
+  "Latest Flymake report function for the Proofread bridge.")
+
 (defvar-local proofread--overlays nil
   "Proofread-owned overlays for the current buffer.")
 
@@ -5741,6 +5744,7 @@ BEG and END delimit the changed text."
 
 (defun proofread--kill-buffer ()
   "Clean up Proofread state before killing this buffer."
+  (proofread--disable-flymake-bridge)
   (proofread--disable-echo-area)
   (proofread--close-source-list-buffers (current-buffer))
   (proofread--clear-request-work)
@@ -6119,6 +6123,41 @@ Proofread."
     (when-let* ((data (flymake-diagnostic-data flymake-diagnostic))
                 ((proofread--flymake-data-p data)))
       (proofread--flymake-data-diagnostic data))))
+
+(defun proofread--flymake-diagnostics-snapshot ()
+  "Return Flymake diagnostics for the current Proofread snapshot."
+  (delq nil
+        (mapcar #'proofread--diagnostic-to-flymake
+                proofread--diagnostics)))
+
+(defun proofread--flymake-backend (report-function &rest _arguments)
+  "Publish Proofread diagnostics through REPORT-FUNCTION.
+This named function is the sole Flymake backend used by Proofread."
+  (if proofread-mode
+      (progn
+        (setq proofread--flymake-report-function report-function)
+        (let (conversion-error)
+          (funcall
+           report-function
+           (condition-case error-data
+               (proofread--flymake-diagnostics-snapshot)
+             (error
+              (setq conversion-error error-data)
+              nil)))
+          ;; Reporting the empty replacement first prevents a
+          ;; conversion failure from disabling the bridge and leaving
+          ;; its previous Flymake diagnostics behind.
+          (when conversion-error
+            (condition-case nil
+                (proofread-report-warning-without-window
+                 (format "Proofread Flymake conversion error (%S)"
+                         (proofread--condition-kind conversion-error))
+                 "Flymake conversion failed; see *Warnings*")
+              (error nil)))))
+    ;; A backend invocation already captured by Flymake can outlive
+    ;; removal from `flymake-diagnostic-functions'.  Settle that run
+    ;; without retaining its report token.
+    (funcall report-function nil)))
 
 (defun proofread--navigation-entry< (a b)
   "Return non-nil when navigation entry A should sort before B."
@@ -8126,6 +8165,7 @@ DIAGNOSTICS must be in navigation order.  Return `applied'."
   (setq proofread--generation
         (cl-incf proofread--generation-sequence))
   (setq-local proofread--diagnostics nil)
+  (setq-local proofread--flymake-report-function nil)
   (setq-local proofread--overlays nil)
   (setq-local proofread--diagnostic-overlays
               (make-hash-table :test #'eq))
@@ -8156,6 +8196,7 @@ DIAGNOSTICS must be in navigation order.  Return `applied'."
   "Clear proofread-owned state for the current buffer."
   (proofread--clear-request-work)
   (proofread--clear-diagnostics)
+  (setq proofread--flymake-report-function nil)
   (setq proofread--queue-state nil)
   (setq proofread--claimed-requests nil)
   (setq proofread--queue-dispatch-active-p nil)
@@ -8173,6 +8214,42 @@ DIAGNOSTICS must be in navigation order.  Return `applied'."
   (setq proofread--pending-invalidated-overlays nil)
   (setq proofread--pending-invalidated-diagnostics nil))
 
+(defun proofread--flymake-mode-changed ()
+  "Disable Proofread when its required Flymake layer is disabled."
+  (when (and proofread-mode (not flymake-mode))
+    (proofread-mode -1)))
+
+(defun proofread--enable-flymake-bridge ()
+  "Install and start the buffer-local Proofread Flymake bridge."
+  (add-hook 'flymake-diagnostic-functions
+            #'proofread--flymake-backend t t)
+  (add-hook 'flymake-mode-hook
+            #'proofread--flymake-mode-changed t t)
+  (unless flymake-mode
+    ;; Proofread starts Flymake explicitly below.  Avoid also leaving
+    ;; Flymake's deferred activation start behind.
+    (let ((flymake-start-on-flymake-mode nil))
+      (flymake-mode 1)))
+  (flymake-start))
+
+(defun proofread--disable-flymake-bridge ()
+  "Remove the buffer-local Proofread Flymake bridge.
+Clear only diagnostics reported by that bridge, leaving Flymake and
+all other Flymake backends active."
+  (let ((report-function proofread--flymake-report-function))
+    (setq proofread--flymake-report-function nil)
+    (remove-hook 'flymake-mode-hook
+                 #'proofread--flymake-mode-changed t)
+    (remove-hook 'flymake-diagnostic-functions
+                 #'proofread--flymake-backend t)
+    (when report-function
+      (condition-case nil
+          (save-restriction
+            (widen)
+            (funcall report-function nil
+                     :region (cons (point-min) (point-max))))
+        (error nil)))))
+
 (defun proofread--enable-buffer ()
   "Enable this buffer's local Proofread hooks and state."
   (when (memq (current-buffer) proofread--mode-buffers)
@@ -8183,7 +8260,9 @@ DIAGNOSTICS must be in navigation order.  Return `applied'."
   (proofread--initialize-buffer-state)
   (add-hook 'before-change-functions #'proofread--before-change nil t)
   (add-hook 'after-change-functions #'proofread--after-change nil t)
-  (add-hook 'kill-buffer-hook #'proofread--kill-buffer nil t)
+  ;; Run before Flymake's ordinary-depth kill hook so source-list and
+  ;; request cleanup cannot be skipped when Flymake disables itself.
+  (add-hook 'kill-buffer-hook #'proofread--kill-buffer -10 t)
   (add-hook 'change-major-mode-hook
             #'proofread--change-major-mode nil t)
   (add-hook 'window-scroll-functions #'proofread--window-scroll nil t)
@@ -8191,10 +8270,15 @@ DIAGNOSTICS must be in navigation order.  Return `applied'."
             #'proofread--mark-pending-work nil t)
   (proofread--enable-echo-area)
   (proofread--register-mode-buffer)
-  (proofread--mark-pending-work))
+  (proofread--mark-pending-work)
+  ;; This runs every configured Flymake backend synchronously.  Keep
+  ;; it last so a backend that disables Flymake can tear Proofread
+  ;; down without later enable steps reinstalling state.
+  (proofread--enable-flymake-bridge))
 
 (defun proofread--disable-buffer ()
   "Disable this buffer's local Proofread hooks and state."
+  (proofread--disable-flymake-bridge)
   (remove-hook 'before-change-functions #'proofread--before-change t)
   (remove-hook 'after-change-functions #'proofread--after-change t)
   (remove-hook 'kill-buffer-hook #'proofread--kill-buffer t)

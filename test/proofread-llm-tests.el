@@ -19,6 +19,15 @@
 
 (declare-function make-llm-deepseek "llm-deepseek" (&rest rest))
 
+(setq flymake-no-changes-timeout nil)
+
+(defun proofread-llm-test--clear-major-mode-flymake-backends ()
+  "Keep unrelated major-mode Flymake backends out of LLM test buffers."
+  (setq-local flymake-diagnostic-functions nil))
+
+(add-hook 'after-change-major-mode-hook
+          #'proofread-llm-test--clear-major-mode-flymake-backends 90)
+
 ;;;; Test fixtures
 
 (defconst proofread-llm-test--provider 'proofread-llm-test-provider

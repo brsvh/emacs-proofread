@@ -16,6 +16,9 @@
 (require 'proofread)
 (require 'proofread-popup)
 
+;; Popup timer tests should not count Flymake's independent idle timer.
+(setq flymake-no-changes-timeout nil)
+
 ;;;; Test support
 
 (defun proofread-popup-test--diagnostic

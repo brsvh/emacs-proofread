@@ -16,6 +16,16 @@
 (require 'proofread)
 (require 'proofread-languagetool)
 
+(setq flymake-no-changes-timeout nil)
+
+(defun proofread-languagetool-test--clear-major-mode-flymake-backends ()
+  "Keep unrelated major-mode Flymake backends out of test buffers."
+  (setq-local flymake-diagnostic-functions nil))
+
+(add-hook
+ 'after-change-major-mode-hook
+ #'proofread-languagetool-test--clear-major-mode-flymake-backends 90)
+
 ;;;; Test support
 
 (defun proofread-languagetool-test--request (&rest properties)

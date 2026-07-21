@@ -14,6 +14,17 @@
 (require 'ert)
 (require 'proofread)
 
+;; Keep Proofread's scheduler tests independent of Flymake's own idle
+;; timer and of asynchronous backends installed by major modes.
+(setq flymake-no-changes-timeout nil)
+
+(defun proofread-test--clear-major-mode-flymake-backends ()
+  "Keep unrelated major-mode Flymake backends out of core test buffers."
+  (setq-local flymake-diagnostic-functions nil))
+
+(add-hook 'after-change-major-mode-hook
+          #'proofread-test--clear-major-mode-flymake-backends 90)
+
 ;;;; Test state
 
 (defconst proofread-test--backend 'proofread-test-backend
@@ -113,6 +124,15 @@
    :message "Possible misspelling"
    :suggestions suggestions
    :source 'test))
+
+(defun proofread-test--flymake-foreign-backend
+    (report-function &rest _arguments)
+  "Report one non-Proofread diagnostic through REPORT-FUNCTION."
+  (funcall
+   report-function
+   (list
+    (flymake-make-diagnostic
+     (current-buffer) 1 2 :note "Foreign diagnostic"))))
 
 (defun proofread-test--install-diagnostics (diagnostics)
   "Install DIAGNOSTICS and return their proofread overlays."
@@ -1805,6 +1825,269 @@ When PROFILE is nil, use the current profile."
       (should (equal (buffer-string) ""))
       (should-not (buffer-modified-p)))))
 
+;;;; Flymake bridge tests
+
+(ert-deftest proofread-test-flymake-bridge-snapshots-latest-token ()
+  "Publish each full snapshot and retain only the latest report token."
+  (with-temp-buffer
+    (insert "abcdef")
+    (setq-local proofread-mode t)
+    (let (captured-a captured-b reports-a reports-b report-a report-b)
+      (setq report-a
+            (lambda (&rest arguments)
+              (setq captured-a
+                    (eq proofread--flymake-report-function report-a))
+              (push arguments reports-a)))
+      (setq report-b
+            (lambda (&rest arguments)
+              (setq captured-b
+                    (eq proofread--flymake-report-function report-b))
+              (push arguments reports-b)))
+      (proofread--flymake-backend report-a)
+      (should captured-a)
+      (should (eq proofread--flymake-report-function report-a))
+      (should (equal reports-a '((nil))))
+      (let ((diagnostics
+             (list
+              (proofread-test--diagnostic-for-range 1 3 "ab")
+              (proofread-test--diagnostic-for-range 4 7 "def"))))
+        (setq proofread--diagnostics diagnostics)
+        (proofread--flymake-backend report-b)
+        (should captured-b)
+        (should (eq proofread--flymake-report-function report-b))
+        (should (= (length (caar reports-b)) 2))
+        (should
+         (equal (mapcar #'proofread--flymake-to-diagnostic
+                        (caar reports-b))
+                diagnostics)))
+      (narrow-to-region 2 4)
+      (proofread--disable-flymake-bridge)
+      (should (equal reports-a '((nil))))
+      (should
+       (equal (car reports-b)
+              '(nil :region (1 . 7))))
+      (should-not proofread--flymake-report-function))))
+
+(ert-deftest proofread-test-flymake-bridge-coexists-and-clears-widely ()
+  "Clear only Proofread diagnostics while preserving another backend."
+  (with-temp-buffer
+    (insert "helo foreign")
+    (setq-local proofread-auto-check nil)
+    (setq-local flymake-diagnostic-functions
+                (list #'proofread-test--flymake-foreign-backend))
+    (let ((flymake-start-on-flymake-mode nil))
+      (flymake-mode 1))
+    (unwind-protect
+        (progn
+          (let ((original-mode (symbol-function 'flymake-mode))
+                (original-start (symbol-function 'flymake-start))
+                (mode-calls 0)
+                (start-calls 0))
+            (cl-letf (((symbol-function 'flymake-mode)
+                       (lambda (&optional argument)
+                         (setq mode-calls (1+ mode-calls))
+                         (funcall original-mode argument)))
+                      ((symbol-function 'flymake-start)
+                       (lambda (&rest arguments)
+                         (setq start-calls (1+ start-calls))
+                         (apply original-start arguments))))
+              (proofread-mode 1))
+            (should (= mode-calls 0))
+            (should (= start-calls 1)))
+          (setq proofread--diagnostics
+                (list
+                 (proofread-test--diagnostic-for-range 1 5 "helo")))
+          (flymake-start)
+          (let ((diagnostics (flymake-diagnostics)))
+            (should (= (length diagnostics) 2))
+            (should
+             (= (cl-count #'proofread--flymake-backend diagnostics
+                          :key #'flymake-diagnostic-backend)
+                1))
+            (should
+             (= (cl-count
+                 #'proofread-test--flymake-foreign-backend diagnostics
+                 :key #'flymake-diagnostic-backend)
+                1)))
+          ;; The Proofread diagnostic lies outside this restriction.
+          ;; Teardown must nevertheless clear it from Flymake.
+          (narrow-to-region 7 10)
+          (proofread-mode -1)
+          (should flymake-mode)
+          (should-not
+           (memq #'proofread--flymake-backend
+                 flymake-diagnostic-functions))
+          (should
+           (memq #'proofread-test--flymake-foreign-backend
+                 flymake-diagnostic-functions))
+          (should-not
+           (memq #'proofread--flymake-mode-changed flymake-mode-hook))
+          (should-not proofread--flymake-report-function)
+          (save-restriction
+            (widen)
+            (let ((diagnostics (flymake-diagnostics)))
+              (should (= (length diagnostics) 1))
+              (should
+               (eq (flymake-diagnostic-backend (car diagnostics))
+                   #'proofread-test--flymake-foreign-backend)))))
+      (when proofread-mode
+        (proofread-mode -1))
+      (when flymake-mode
+        (flymake-mode -1)))))
+
+(ert-deftest proofread-test-flymake-bridge-isolates-conversion-errors ()
+  "Replace stale diagnostics without disabling the bridge on errors."
+  (with-temp-buffer
+    (insert "Alpha")
+    (setq-local proofread-auto-check nil)
+    (unwind-protect
+        (progn
+          (proofread-mode 1)
+          (setq proofread--diagnostics
+                (list
+                 (proofread-test--diagnostic-for-range 1 6 "Alpha")))
+          (flymake-start)
+          (should (= (length (flymake-diagnostics)) 1))
+          (cl-letf
+              (((symbol-function
+                 'proofread--flymake-diagnostics-snapshot)
+                (lambda ()
+                  (error "Simulated conversion failure")))
+               ((symbol-function
+                 'proofread-report-warning-without-window)
+                (lambda (_message _summary))))
+            (flymake-start))
+          (should-not (flymake-diagnostics))
+          (should-not
+           (memq #'proofread--flymake-backend
+                 (flymake-disabled-backends)))
+          (flymake-start)
+          (should (= (length (flymake-diagnostics)) 1)))
+      (when proofread-mode
+        (proofread-mode -1))
+      (when flymake-mode
+        (flymake-mode -1)))))
+
+(ert-deftest proofread-test-flymake-bridge-enable-is-idempotent ()
+  "Enable Flymake once and explicitly start one check per enable."
+  (with-temp-buffer
+    (insert "Alpha")
+    (setq-local proofread-auto-check nil)
+    (setq-local flymake-diagnostic-functions
+                (list #'proofread-test--flymake-foreign-backend))
+    (let ((original-mode (symbol-function 'flymake-mode))
+          (original-start (symbol-function 'flymake-start))
+          (flymake-start-on-flymake-mode t)
+          (flymake-no-changes-timeout 17)
+          (mode-calls 0)
+          (start-calls 0))
+      (unwind-protect
+          (cl-letf (((symbol-function 'flymake-mode)
+                     (lambda (&optional argument)
+                       (setq mode-calls (1+ mode-calls))
+                       (funcall original-mode argument)))
+                    ((symbol-function 'flymake-start)
+                     (lambda (&rest arguments)
+                       (setq start-calls (1+ start-calls))
+                       (apply original-start arguments))))
+            (proofread-mode 1)
+            (proofread-mode 1)
+            (should flymake-mode)
+            (should (= mode-calls 1))
+            (should (= start-calls 2))
+            (should flymake-start-on-flymake-mode)
+            (should (= flymake-no-changes-timeout 17))
+            (should
+             (= (cl-count #'proofread--flymake-backend
+                          flymake-diagnostic-functions)
+                1))
+            (should
+             (= (cl-count #'proofread--flymake-mode-changed
+                          flymake-mode-hook)
+                1))
+            (should
+             (memq #'proofread-test--flymake-foreign-backend
+                   flymake-diagnostic-functions))
+            (proofread-mode -1)
+            (should flymake-mode)
+            (should-not
+             (memq #'proofread--flymake-backend
+                   flymake-diagnostic-functions)))
+        (when proofread-mode
+          (proofread-mode -1))
+        (when flymake-mode
+          (funcall original-mode -1))))))
+
+(ert-deftest proofread-test-disabling-flymake-disables-proofread ()
+  "Synchronously tear Proofread down when Flymake is disabled."
+  (with-temp-buffer
+    (insert "Alpha")
+    (setq-local proofread-auto-check nil)
+    (setq-local flymake-diagnostic-functions
+                (list #'proofread-test--flymake-foreign-backend))
+    (proofread-mode 1)
+    (setq proofread--diagnostics
+          (list
+           (proofread-test--diagnostic-for-range 1 6 "Alpha")))
+    (flymake-start)
+    (let ((report-function proofread--flymake-report-function)
+          report-calls)
+      (setq proofread--flymake-report-function
+            (lambda (&rest arguments)
+              (push arguments report-calls)
+              (apply report-function arguments)))
+      (flymake-mode -1)
+      (should-not proofread-mode)
+      (should (equal report-calls
+                     '((nil :region (1 . 6)))))
+      (should-not proofread--flymake-report-function)
+      (should-not
+       (memq #'proofread--flymake-backend
+             flymake-diagnostic-functions))
+      (should-not
+       (memq #'proofread--flymake-mode-changed flymake-mode-hook))
+      (should
+       (memq #'proofread-test--flymake-foreign-backend
+             flymake-diagnostic-functions))
+      (should-not (memq (current-buffer) proofread--mode-buffers))
+      (should-not (flymake-diagnostics)))))
+
+(ert-deftest proofread-test-kill-cleans-flymake-bridge-in-either-order ()
+  "Clean the bridge whether Flymake precedes or follows Proofread."
+  (dolist (flymake-preexisting '(nil t))
+    (let ((buffer
+           (generate-new-buffer
+            (format " *proofread-flymake-kill-%s*"
+                    flymake-preexisting)))
+          report-calls)
+      (unwind-protect
+          (progn
+            (with-current-buffer buffer
+              (insert "Alpha")
+              (setq-local proofread-auto-check nil)
+              (setq-local flymake-diagnostic-functions
+                          (list
+                           #'proofread-test--flymake-foreign-backend))
+              (when flymake-preexisting
+                (let ((flymake-start-on-flymake-mode nil))
+                  (flymake-mode 1)))
+              (proofread-mode 1)
+              (should (eq (car kill-buffer-hook)
+                          #'proofread--kill-buffer))
+              (let ((report-function
+                     proofread--flymake-report-function))
+                (setq proofread--flymake-report-function
+                      (lambda (&rest arguments)
+                        (push arguments report-calls)
+                        (apply report-function arguments)))))
+            (kill-buffer buffer)
+            (should-not (buffer-live-p buffer))
+            (should (equal report-calls
+                           '((nil :region (1 . 6)))))
+            (should-not (memq buffer proofread--mode-buffers)))
+        (when (buffer-live-p buffer)
+          (kill-buffer buffer))))))
+
 ;;;; Overlay and mode tests
 
 (ert-deftest proofread-test-face-defaults-avoid-fixed-colors ()
@@ -3482,12 +3765,14 @@ range; no available backend"))))))
                  (lambda ()
                    (ert-fail "Window activity enumerated frames"))))
         (proofread--window-scroll (selected-window) (point-min))
-        (run-hooks 'window-configuration-change-hook)
+        ;; Exercise Proofread's installed callback without invoking
+        ;; unrelated standard hooks loaded by Flymake.
+        (proofread--mark-pending-work)
         (should (= timer-count 1))
         (should proofread--pending-work)))))
 
 (ert-deftest proofread-test-unload-cleans-stale-local-window-hooks ()
-  "Unload local window hooks from stale registered buffers."
+  "Unload local hooks from normal and stale registered buffers."
   (let* ((first-buffer
           (generate-new-buffer
            " *proofread-window-hooks-stale-first*"))
@@ -3497,20 +3782,36 @@ range; no available backend"))))))
          (buffers (list first-buffer second-buffer))
          (proofread--mode-buffers nil)
          (proofread--request-log-sources nil)
+         (report-calls (make-hash-table :test #'eq))
          (proofread-request-log-hook
           (copy-sequence proofread-request-log-hook)))
     (unwind-protect
         (progn
           (dolist (buffer buffers)
             (with-current-buffer buffer
+              (insert "Alpha")
               (setq-local proofread-auto-check nil)
+              (setq-local flymake-diagnostic-functions
+                          (list
+                           #'proofread-test--flymake-foreign-backend))
               (proofread-mode 1)
               (should
                (memq #'proofread--window-scroll
                      window-scroll-functions))
+              (let ((source buffer)
+                    (report-function
+                     proofread--flymake-report-function))
+                (setq proofread--flymake-report-function
+                      (lambda (&rest arguments)
+                        (puthash
+                         source
+                         (cons arguments (gethash source report-calls))
+                         report-calls)
+                        (apply report-function arguments))))
               ;; Simulate an interrupted teardown that left the
               ;; buffer registered after the mode variable changed.
-              (setq proofread-mode nil)))
+              (when (eq buffer second-buffer)
+                (setq proofread-mode nil))))
           (cl-letf (((symbol-function 'buffer-list)
                      (lambda (&optional _frame) buffers))
                     ((symbol-function 'remove-variable-watcher)
@@ -3518,6 +3819,21 @@ range; no available backend"))))))
             (proofread-unload-function))
           (dolist (buffer buffers)
             (with-current-buffer buffer
+              (should-not proofread-mode)
+              (should flymake-mode)
+              (should
+               (equal (gethash buffer report-calls)
+                      '((nil :region (1 . 6)))))
+              (should-not proofread--flymake-report-function)
+              (should-not
+               (memq #'proofread--flymake-backend
+                     flymake-diagnostic-functions))
+              (should
+               (memq #'proofread-test--flymake-foreign-backend
+                     flymake-diagnostic-functions))
+              (should-not
+               (memq #'proofread--flymake-mode-changed
+                     flymake-mode-hook))
               (should-not
                (memq #'proofread--window-scroll
                      window-scroll-functions))
@@ -17632,11 +17948,26 @@ This covers URLs, email, invisible text, faces, and properties."
     (let* ((diagnostic (proofread-test--diagnostic-for-range 1 5
                                                              "helo"))
            (overlay (car (proofread-test--install-diagnostics
-                          (list diagnostic)))))
+                          (list diagnostic))))
+           (report-function proofread--flymake-report-function)
+           report-calls)
+      (setq proofread--flymake-report-function
+            (lambda (&rest arguments)
+              (push arguments report-calls)
+              (apply report-function arguments)))
+      (narrow-to-region 2 3)
       (text-mode)
       (should-not proofread-mode)
+      (should (equal report-calls
+                     '((nil :region (1 . 5)))))
       (should-not (overlay-buffer overlay))
       (should-not (memq (current-buffer) proofread--mode-buffers))
+      (should-not proofread--flymake-report-function)
+      (should-not
+       (memq #'proofread--flymake-backend
+             flymake-diagnostic-functions))
+      (should-not
+       (memq #'proofread--flymake-mode-changed flymake-mode-hook))
       (should-not (memq #'proofread--before-change
                         before-change-functions))
       (should-not (memq #'proofread--window-scroll
