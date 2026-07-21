@@ -5107,23 +5107,59 @@ requests or by requests that also have no checker owner."
     (dolist (diagnostic diagnostics)
       (puthash diagnostic range table))))
 
-(defun proofread--apply-backend-diagnostics
+(defun proofread--commit-diagnostic-state (region mutate-function)
+  "Commit one diagnostic state change made by MUTATE-FUNCTION.
+REGION is the logical range directly affected by the change, or nil.
+MUTATE-FUNCTION must update the core model and legacy overlays without
+notifying observers.  It returns the diagnostics whose removal or
+addition changed the model, or nil when the model did not change.
+
+After a change, expand REGION with every still-valid Flymake display
+anchor of the changed diagnostics, publish the complete surviving
+snapshot for that region, and then run
+`proofread-diagnostics-changed-hook'."
+  (when-let* ((changed-diagnostics (funcall mutate-function)))
+    (let ((report-region
+           (proofread--flymake-publication-region
+            region changed-diagnostics)))
+      (when (and proofread--flymake-report-function report-region)
+        (condition-case error-data
+            (proofread--report-flymake-snapshot
+             proofread--flymake-report-function report-region)
+          (error
+           (proofread--report-flymake-warning
+            "report" error-data))))
+      (proofread--run-diagnostics-changed-hook))
+    changed-diagnostics))
+
+(defun proofread--add-backend-diagnostics
     (diagnostics &optional request-range)
-  "Record DIAGNOSTICS and create overlays for them.
+  "Add DIAGNOSTICS to the model and return the added copies.
 When REQUEST-RANGE is non-nil, record it as their owning request
-range."
+range.  Do not notify diagnostic observers."
   (let ((diagnostics
          (mapcar #'copy-sequence
                  (proofread--filter-ignored-diagnostics
                   diagnostics))))
-    (when request-range
+    (when (and request-range diagnostics)
       (proofread--record-diagnostic-request-ranges
        diagnostics request-range))
     (setq proofread--diagnostics
           (nconc proofread--diagnostics diagnostics))
     (dolist (diagnostic diagnostics)
       (proofread--create-overlay diagnostic))
-    (proofread--run-diagnostics-changed-hook)))
+    diagnostics))
+
+(defun proofread--apply-backend-diagnostics
+    (diagnostics &optional request-range)
+  "Record DIAGNOSTICS and create overlays for them.
+When REQUEST-RANGE is non-nil, record it as their owning request
+range."
+  (proofread--commit-diagnostic-state
+   request-range
+   (lambda ()
+     (proofread--add-backend-diagnostics
+      diagnostics request-range))))
 
 (defun proofread--replace-backend-diagnostics (request diagnostics)
   "Replace current diagnostics for REQUEST with DIAGNOSTICS."
@@ -5134,12 +5170,19 @@ range."
              (replaced
               (proofread--diagnostics-replaced-by-request
                request request-range)))
-        (proofread--invalidate-affected-diagnostics
-         (delq nil
-               (mapcar #'proofread--overlay-for-diagnostic replaced))
-         replaced t)
-        (proofread--apply-backend-diagnostics
-         diagnostics request-range)))))
+        (proofread--commit-diagnostic-state
+         request-range
+         (lambda ()
+           (when replaced
+             (proofread--invalidate-affected-diagnostics
+              (delq nil
+                    (mapcar #'proofread--overlay-for-diagnostic
+                            replaced))
+              replaced t))
+           (let ((added
+                  (proofread--add-backend-diagnostics
+                   diagnostics request-range)))
+             (append replaced added))))))))
 
 (defun proofread--merge-backend-diagnostics (request diagnostics)
   "Merge partial REQUEST's new DIAGNOSTICS into existing ones."
@@ -5149,8 +5192,12 @@ range."
          (proofread--new-diagnostics
           diagnostics proofread--diagnostics)))
     (when (and beg end new-diagnostics)
-      (proofread--apply-backend-diagnostics
-       new-diagnostics (cons beg end)))))
+      (let ((request-range (cons beg end)))
+        (proofread--commit-diagnostic-state
+         request-range
+         (lambda ()
+           (proofread--add-backend-diagnostics
+            new-diagnostics request-range)))))))
 
 (defun proofread--report-backend-error (result)
   "Report the backend error described by RESULT."
@@ -6124,11 +6171,99 @@ Proofread."
                 ((proofread--flymake-data-p data)))
       (proofread--flymake-data-diagnostic data))))
 
-(defun proofread--flymake-diagnostics-snapshot ()
-  "Return Flymake diagnostics for the current Proofread snapshot."
-  (delq nil
-        (mapcar #'proofread--diagnostic-to-flymake
-                proofread--diagnostics)))
+(defun proofread--flymake-presentation-range (range)
+  "Return the Flymake presentation range for logical RANGE.
+Return nil unless RANGE is valid in the widened current buffer."
+  (save-restriction
+    (widen)
+    (when (and (proofread--range-valid-p range)
+               (proofread--range-contains-p
+                (cons (point-min) (point-max)) range))
+      (pcase-let ((`(,beg ,end ,_anchor-edge)
+                   (proofread--flymake-anchor-region range)))
+        (cons beg end)))))
+
+(defun proofread--flymake-diagnostics-snapshot (&optional region)
+  "Return Flymake diagnostics for the current Proofread snapshot.
+When REGION is non-nil, return only diagnostics whose converted
+display anchors overlap it.  In an empty buffer, retain every
+converted diagnostic because no nonempty display anchor is possible."
+  (save-restriction
+    (widen)
+    (let ((empty-buffer-p (= (point-min) (point-max)))
+          snapshot)
+      (dolist (diagnostic proofread--diagnostics)
+        (when-let* ((logical-range
+                     (proofread--diagnostic-range diagnostic))
+                    (presentation-range
+                     (proofread--flymake-presentation-range
+                      logical-range))
+                    ((or (null region)
+                         empty-buffer-p
+                         (proofread--range-overlaps-p
+                          presentation-range region)))
+                    (flymake-diagnostic
+                     (proofread--diagnostic-to-flymake diagnostic)))
+          (push flymake-diagnostic snapshot)))
+      (nreverse snapshot))))
+
+(defun proofread--flymake-publication-region
+    (region changed-diagnostics)
+  "Return the widened Flymake region for a diagnostic change.
+REGION is the caller's logical seed range.  Expand it to include the
+presentation anchors of CHANGED-DIAGNOSTICS.  Fall back to the full
+widened buffer when no valid affected range remains."
+  (save-restriction
+    (widen)
+    (let (ranges)
+      (when-let* ((beg (proofread--position-integer (car-safe region)))
+                  (end (proofread--position-integer (cdr-safe region)))
+                  (presentation
+                   (proofread--flymake-presentation-range
+                    (cons beg end))))
+        (push presentation ranges))
+      (dolist (diagnostic changed-diagnostics)
+        (when-let* ((logical-range
+                     (proofread-diagnostic-range diagnostic))
+                    (presentation
+                     (proofread--flymake-presentation-range
+                      logical-range)))
+          (push presentation ranges)))
+      (if ranges
+          (cons (apply #'min (mapcar #'car ranges))
+                (apply #'max (mapcar #'cdr ranges)))
+        (cons (point-min) (point-max))))))
+
+(defun proofread--report-flymake-warning (label error-data)
+  "Report a Flymake LABEL warning for ERROR-DATA without disruption."
+  (condition-case nil
+      (proofread-report-warning-without-window
+       (format "Proofread Flymake %s error (%S)"
+               label (proofread--condition-kind error-data))
+       (format "Flymake %s failed; see *Warnings*" label))
+    (error nil)))
+
+(defun proofread--report-flymake-snapshot
+    (report-function &optional region)
+  "Publish the current snapshot through REPORT-FUNCTION.
+When REGION is non-nil, publish a regional replacement.  Convert a
+failed snapshot to an empty replacement, but let reporting errors
+propagate to the caller."
+  (let (conversion-error)
+    (let ((diagnostics
+           (condition-case error-data
+               (proofread--flymake-diagnostics-snapshot region)
+             (error
+              (setq conversion-error error-data)
+              nil))))
+      (if region
+          (funcall report-function diagnostics :region region)
+        (funcall report-function diagnostics)))
+    ;; Reporting the empty replacement first prevents a conversion
+    ;; failure from leaving stale Flymake diagnostics behind.
+    (when conversion-error
+      (proofread--report-flymake-warning
+       "conversion" conversion-error))))
 
 (defun proofread--flymake-backend (report-function &rest _arguments)
   "Publish Proofread diagnostics through REPORT-FUNCTION.
@@ -6136,24 +6271,7 @@ This named function is the sole Flymake backend used by Proofread."
   (if proofread-mode
       (progn
         (setq proofread--flymake-report-function report-function)
-        (let (conversion-error)
-          (funcall
-           report-function
-           (condition-case error-data
-               (proofread--flymake-diagnostics-snapshot)
-             (error
-              (setq conversion-error error-data)
-              nil)))
-          ;; Reporting the empty replacement first prevents a
-          ;; conversion failure from disabling the bridge and leaving
-          ;; its previous Flymake diagnostics behind.
-          (when conversion-error
-            (condition-case nil
-                (proofread-report-warning-without-window
-                 (format "Proofread Flymake conversion error (%S)"
-                         (proofread--condition-kind conversion-error))
-                 "Flymake conversion failed; see *Warnings*")
-              (error nil)))))
+        (proofread--report-flymake-snapshot report-function))
     ;; A backend invocation already captured by Flymake can outlive
     ;; removal from `flymake-diagnostic-functions'.  Settle that run
     ;; without retaining its report token.
@@ -8367,10 +8485,17 @@ from the profile-owner requirement."
                  (member owner owners)))
           (push diagnostic diagnostics))))
     (when diagnostics
-      (proofread--invalidate-affected-diagnostics
-       (delq nil
-             (mapcar #'proofread--overlay-for-diagnostic diagnostics))
-       diagnostics))))
+      (proofread--commit-diagnostic-state
+       (when ranges
+         (cons (apply #'min (mapcar #'car ranges))
+               (apply #'max (mapcar #'cdr ranges))))
+       (lambda ()
+         (proofread--invalidate-affected-diagnostics
+          (delq nil
+                (mapcar #'proofread--overlay-for-diagnostic
+                        diagnostics))
+          diagnostics t)
+         diagnostics)))))
 
 (defun proofread--prepare-forced-check (force-feedback)
   "Retire pending automatic work when FORCE-FEEDBACK is non-nil."

@@ -134,6 +134,12 @@
     (flymake-make-diagnostic
      (current-buffer) 1 2 :note "Foreign diagnostic"))))
 
+(defun proofread-test--flymake-proofread-diagnostics ()
+  "Return current Proofread diagnostics published through Flymake."
+  (delq nil
+        (mapcar #'proofread--flymake-to-diagnostic
+                (flymake-diagnostics))))
+
 (defun proofread-test--install-diagnostics (diagnostics)
   "Install DIAGNOSTICS and return their proofread overlays."
   (setq proofread--diagnostics diagnostics)
@@ -2087,6 +2093,385 @@ When PROFILE is nil, use the current profile."
             (should-not (memq buffer proofread--mode-buffers)))
         (when (buffer-live-p buffer)
           (kill-buffer buffer))))))
+
+;;;; Flymake diagnostic commit tests
+
+(ert-deftest
+    proofread-test-regional-report-precedes-hook-and-preserves-foreign
+    ()
+  "Publish one regional snapshot before hooks without touching peers."
+  (with-temp-buffer
+    (insert "helo")
+    (setq-local proofread-auto-check nil)
+    (setq-local flymake-diagnostic-functions
+                (list #'proofread-test--flymake-foreign-backend))
+    (proofread-test--with-profile
+      (proofread-mode 1)
+      (let* ((foreign-before
+              (cl-find-if
+               (lambda (diagnostic)
+                 (eq (flymake-diagnostic-backend diagnostic)
+                     #'proofread-test--flymake-foreign-backend))
+               (flymake-diagnostics)))
+             (chunk
+              (car
+               (proofread-test--request-ready-chunks-for-ranges
+                '((1 . 5)))))
+             (request (proofread-test--make-profile-request chunk))
+             (work (proofread--make-request-work request))
+             (diagnostic
+              (proofread-test--diagnostic-for-range 1 5 "helo"))
+             (original-report-function
+              proofread--flymake-report-function)
+             (report-count 0)
+             (hook-count 0)
+             events
+             report-arguments
+             hook-flymake
+             hook-model)
+        (should foreign-before)
+        (setq proofread--flymake-report-function
+              (lambda (&rest arguments)
+                (setq report-count (1+ report-count))
+                (setq report-arguments arguments)
+                (push 'report events)
+                (apply original-report-function arguments)))
+        (add-hook
+         'proofread-diagnostics-changed-hook
+         (lambda ()
+           (setq hook-count (1+ hook-count))
+           (setq hook-flymake
+                 (proofread-test--flymake-proofread-diagnostics))
+           (setq hook-model (copy-sequence proofread--diagnostics))
+           (push 'hook events))
+         nil t)
+        (should
+         (eq
+          (proofread--handle-backend-result
+           work
+           (proofread--backend-success-result
+            request (list diagnostic)))
+          'applied))
+        (should (= report-count 1))
+        (should (= hook-count 1))
+        (should (equal (reverse events) '(report hook)))
+        (should (plist-get (cdr report-arguments) :region))
+        (should (equal hook-flymake hook-model))
+        (should (equal hook-model proofread--diagnostics))
+        (should
+         (eq
+          foreign-before
+          (cl-find-if
+           (lambda (candidate)
+             (eq (flymake-diagnostic-backend candidate)
+                 #'proofread-test--flymake-foreign-backend))
+           (flymake-diagnostics))))))))
+
+(ert-deftest
+    proofread-test-equal-final-replacement-publishes-new-identity ()
+  "Publish an equal final replacement with its new model identity."
+  (with-temp-buffer
+    (insert "helo")
+    (let ((proofread-auto-check nil)
+          (proofread-context-size 0))
+      (proofread-test--with-profile
+        (proofread-mode 1)
+        (let* ((chunk
+                (car
+                 (proofread-test--request-ready-chunks-for-ranges
+                  '((1 . 5)))))
+               (work
+                (proofread--make-request-work
+                 (proofread-test--make-profile-request chunk)))
+               (request (proofread-test--work-request work))
+               (raw
+                (proofread-test--diagnostic-for-range 1 5 "helo"))
+               (old
+                (proofread--diagnostic-with-request-provenance
+                 request raw)))
+          (proofread-test--install-diagnostics (list old))
+          (proofread--record-diagnostic-request-ranges
+           (list old) (cons 1 5))
+          (flymake-start)
+          (let ((original-report-function
+                 proofread--flymake-report-function)
+                (report-count 0)
+                (hook-count 0)
+                events
+                report-arguments)
+            (setq proofread--flymake-report-function
+                  (lambda (&rest arguments)
+                    (setq report-count (1+ report-count))
+                    (setq report-arguments arguments)
+                    (push 'report events)
+                    (apply original-report-function arguments)))
+            (add-hook
+             'proofread-diagnostics-changed-hook
+             (lambda ()
+               (setq hook-count (1+ hook-count))
+               (push 'hook events))
+             nil t)
+            (should
+             (eq
+              (proofread--handle-backend-result
+               work
+               (proofread--backend-success-result
+                request (list (copy-sequence raw))))
+              'applied))
+            (let ((live (car proofread--diagnostics))
+                  (reported
+                   (mapcar #'proofread--flymake-to-diagnostic
+                           (car report-arguments))))
+              (should (= report-count 1))
+              (should (= hook-count 1))
+              (should (equal (reverse events) '(report hook)))
+              (should (plist-get (cdr report-arguments) :region))
+              (should (equal live old))
+              (should-not (eq live old))
+              (should (eq (car reported) live))
+              (should
+               (eq
+                (car
+                 (proofread-test--flymake-proofread-diagnostics))
+                live)))))))))
+
+(ert-deftest
+    proofread-test-partial-report-includes-all-checkers-and-skips-no-op
+    ()
+  "Report every checker after a partial change and skip duplicates."
+  (with-temp-buffer
+    (insert "helo")
+    (let ((proofread-auto-check nil)
+          (proofread-context-size 0)
+          (proofread-profile 'multi)
+          (proofread-profiles (proofread-test--ordered-profiles)))
+      (proofread-mode 1)
+      (let* ((profile (proofread--current-profile))
+             (checkers (plist-get profile :checkers))
+             (chunk
+              (car
+               (proofread-test--request-ready-chunks-for-ranges
+                '((1 . 5)))))
+             (first-work
+              (proofread-test--make-request-work
+               chunk proofread-test--backend (car checkers) profile))
+             (second-work
+              (proofread-test--make-request-work
+               chunk proofread-test--backend (cadr checkers) profile))
+             (first-request
+              (proofread-test--work-request first-work))
+             (second-request
+              (proofread-test--work-request second-work))
+             (diagnostic
+              (proofread-test--diagnostic-for-range 1 5 "helo"))
+             (second-diagnostic
+              (plist-put
+               (copy-sequence diagnostic)
+               :message "Second checker issue")))
+        (should
+         (eq
+          (proofread--handle-backend-result
+           first-work
+           (proofread--backend-partial-success-result
+            first-request (list diagnostic)))
+          'applied))
+        (let ((original-report-function
+               proofread--flymake-report-function)
+              (report-count 0)
+              (hook-count 0)
+              events
+              report-arguments
+              hook-flymake
+              hook-model)
+          (setq proofread--flymake-report-function
+                (lambda (&rest arguments)
+                  (setq report-count (1+ report-count))
+                  (setq report-arguments arguments)
+                  (push 'report events)
+                  (apply original-report-function arguments)))
+          (add-hook
+           'proofread-diagnostics-changed-hook
+           (lambda ()
+             (setq hook-count (1+ hook-count))
+             (setq hook-flymake
+                   (proofread-test--flymake-proofread-diagnostics))
+             (setq hook-model
+                   (copy-sequence proofread--diagnostics))
+             (push 'hook events))
+           nil t)
+          (let ((partial
+                 (proofread--backend-partial-success-result
+                  second-request (list second-diagnostic))))
+            (should
+             (eq (proofread--handle-backend-result
+                  second-work partial)
+                 'applied))
+            (should (= report-count 1))
+            (should (= hook-count 1))
+            (should (equal (reverse events) '(report hook)))
+            (should (plist-get (cdr report-arguments) :region))
+            (let ((reported
+                   (mapcar #'proofread--flymake-to-diagnostic
+                           (car report-arguments))))
+              (should
+               (equal
+                (mapcar (lambda (live-diagnostic)
+                          (plist-get live-diagnostic :checker-name))
+                        reported)
+                '(first second))))
+            (should (= (length hook-flymake) (length hook-model)))
+            (dolist (live-diagnostic hook-model)
+              (should (memq live-diagnostic hook-flymake)))
+            (should
+             (eq (proofread--handle-backend-result
+                  second-work partial)
+                 'applied))
+            (should (= report-count 1))
+            (should (= hook-count 1))
+            (should (equal (reverse events) '(report hook)))
+            (should (= (length proofread--diagnostics) 2))))))))
+
+(ert-deftest
+    proofread-test-regional-report-expands-zero-width-anchor-while-narrowed
+    ()
+  "Expand a request-end anchor and retain another checker's survivor."
+  (with-temp-buffer
+    (insert "ab cd")
+    (let ((proofread-auto-check nil)
+          (proofread-context-size 0)
+          (proofread-profile 'multi)
+          (proofread-profiles (proofread-test--ordered-profiles)))
+      (proofread-mode 1)
+      (let* ((profile (proofread--current-profile))
+             (checkers (plist-get profile :checkers))
+             (chunk
+              (car
+               (proofread-test--request-ready-chunks-for-ranges
+                '((1 . 3)))))
+             (first-work
+              (proofread-test--make-request-work
+               chunk proofread-test--backend (car checkers) profile))
+             (first-request
+              (proofread-test--work-request first-work))
+             (first
+              (proofread-test--diagnostic-with-checker
+               (proofread-test--diagnostic-for-range 3 3 "")
+               'first))
+             (second
+              (plist-put
+               (proofread-test--diagnostic-with-checker
+                (proofread-test--diagnostic-for-range 3 3 "")
+                'second)
+               :message "Second checker survivor")))
+        (proofread-test--install-diagnostics (list first second))
+        (proofread--record-diagnostic-request-ranges
+         (list first) (cons 1 3))
+        (flymake-start)
+        (should
+         (= (length
+             (proofread-test--flymake-proofread-diagnostics))
+            2))
+        (let ((original-report-function
+               proofread--flymake-report-function)
+              (report-count 0)
+              (hook-count 0)
+              events
+              report-arguments
+              hook-flymake)
+          (setq proofread--flymake-report-function
+                (lambda (&rest arguments)
+                  (setq report-count (1+ report-count))
+                  (setq report-arguments arguments)
+                  (push 'report events)
+                  (apply original-report-function arguments)))
+          (add-hook
+           'proofread-diagnostics-changed-hook
+           (lambda ()
+             (setq hook-count (1+ hook-count))
+             (setq hook-flymake
+                   (proofread-test--flymake-proofread-diagnostics))
+             (push 'hook events))
+           nil t)
+          (narrow-to-region 4 6)
+          (should
+           (proofread--replace-backend-diagnostics
+            first-request nil))
+          (should (= (point-min) 4))
+          (should (= (point-max) 6))
+          (should (= report-count 1))
+          (should (= hook-count 1))
+          (should (equal (reverse events) '(report hook)))
+          (let* ((region
+                  (plist-get (cdr report-arguments) :region))
+                 (reported
+                  (mapcar #'proofread--flymake-to-diagnostic
+                          (car report-arguments))))
+            (should region)
+            ;; The old logical position 3 was presented at [3, 4].
+            (should (< 3 (cdr region)))
+            (should (< (car region) 4))
+            (should
+             (> (cdr region)
+                (proofread--position-integer
+                 (plist-get first-request :end))))
+            (should (equal reported (list second))))
+          (should (equal proofread--diagnostics (list second)))
+          (should (equal hook-flymake (list second)))
+          (should
+           (equal (proofread-test--flymake-proofread-diagnostics)
+                  (list second))))))))
+
+(ert-deftest
+    proofread-test-empty-buffer-commit-reports-snapshot-and-skips-no-op
+    ()
+  "Report an empty-buffer snapshot once and skip a later no-op."
+  (with-temp-buffer
+    (let ((proofread-auto-check nil)
+          (report-count 0)
+          (hook-count 0)
+          events
+          original-report-function
+          report-arguments
+          report-completed-p
+          hook-model)
+      (proofread-mode 1)
+      (setq original-report-function
+            proofread--flymake-report-function)
+      (setq proofread--flymake-report-function
+            (lambda (&rest arguments)
+              (setq report-count (1+ report-count))
+              (setq report-arguments arguments)
+              (push 'report events)
+              (apply original-report-function arguments)
+              (setq report-completed-p t)))
+      (add-hook
+       'proofread-diagnostics-changed-hook
+       (lambda ()
+         (setq hook-count (1+ hook-count))
+         (setq hook-model (copy-sequence proofread--diagnostics))
+         (push 'hook events))
+       nil t)
+      (proofread--apply-backend-diagnostics
+       (list
+        (proofread-test--diagnostic-for-range 1 1 ""))
+       (cons 1 1))
+      (should (= report-count 1))
+      (should (= hook-count 1))
+      (should (equal (reverse events) '(report hook)))
+      (should (equal (cdr report-arguments)
+                     '(:region (1 . 1))))
+      (should report-completed-p)
+      (let ((reported
+             (mapcar #'proofread--flymake-to-diagnostic
+                     (car report-arguments))))
+        (should (= (length reported) 1))
+        (should (eq (car reported) (car hook-model))))
+      (should-not
+       (proofread--commit-diagnostic-state
+        (cons 1 1) (lambda () nil)))
+      (should (= report-count 1))
+      (should (= hook-count 1))
+      (should (equal (reverse events) '(report hook))))))
 
 ;;;; Overlay and mode tests
 
@@ -17395,8 +17780,11 @@ This covers URLs, email, invisible text, faces, and properties."
             (symbol-function 'proofread--sorted-target-domains))
            (candidate-scan-count 0)
            (domain-sort-count 0)
+           (report-count 0)
            (hook-count 0)
            reentrant-p
+           report-arguments
+           hook-flymake
            observed)
       (should-not
        (proofread--supported-backend-p
@@ -17407,11 +17795,21 @@ This covers URLs, email, invisible text, faces, and properties."
                      (plist-get unsupported :checker-owner)))
       (add-text-properties 9 10 '( proofread-test-ignore t))
       (let ((proofread-ignored-properties '( proofread-test-ignore)))
+        (flymake-start)
+        (let ((original-report-function
+               proofread--flymake-report-function))
+          (setq proofread--flymake-report-function
+                (lambda (&rest arguments)
+                  (setq report-count (1+ report-count))
+                  (setq report-arguments arguments)
+                  (apply original-report-function arguments))))
         (add-hook
          'proofread-diagnostics-changed-hook
          (lambda ()
            (setq hook-count (1+ hook-count))
            (push (copy-sequence proofread--diagnostics) observed)
+           (setq hook-flymake
+                 (proofread-test--flymake-proofread-diagnostics))
            (when (= hook-count 1)
              (setq reentrant-p t)
              (unwind-protect
@@ -17435,9 +17833,20 @@ This covers URLs, email, invisible text, faces, and properties."
            plan profile)))
       (should (= candidate-scan-count 1))
       (should (= domain-sort-count 1))
+      (should (= report-count 1))
       (should (= hook-count 1))
+      (should (equal (cdr report-arguments)
+                     '(:region (1 . 15))))
+      (should
+       (equal
+        (mapcar #'proofread--flymake-to-diagnostic
+                (car report-arguments))
+        (list active unsupported unowned ad-hoc)))
       (should (equal (car observed) retained))
       (should (equal proofread--diagnostics retained))
+      (should (= (length hook-flymake) (length retained)))
+      (dolist (diagnostic retained)
+        (should (memq diagnostic hook-flymake)))
       (dolist (overlay retained-overlays)
         (should (overlay-buffer overlay)))
       (dolist (overlay invalid-overlays)
@@ -18521,7 +18930,10 @@ This covers URLs, email, invisible text, faces, and properties."
           (proofread--enqueue-requests works)
           (setq entries (proofread--request-queue-entries))
           (proofread-test--assert-queue-cache-index-consistent)
-          (proofread--cache-write-request matching-a nil)
+          (proofread--cache-write-request
+           matching-a
+           (list
+            (proofread-test--diagnostic-for-range 4 6 "aa")))
           (should (= (hash-table-count
                       (proofread--queue-state-woken
                        proofread--queue-state))
@@ -18659,7 +19071,10 @@ This covers URLs, email, invisible text, faces, and properties."
                            cache-hit-log-ids))))))
           (proofread--enqueue-requests works)
           (setq entries (proofread--request-queue-entries))
-          (proofread--cache-write-request matching-a nil)
+          (proofread--cache-write-request
+           matching-a
+           (list
+            (proofread-test--diagnostic-for-range 4 6 "aa")))
           (add-hook
            'proofread-diagnostics-changed-hook
            (lambda ()
@@ -20493,7 +20908,10 @@ This covers URLs, email, invisible text, faces, and properties."
                  (proofread-test--make-profile-request first))))
           (should (equal (plist-get first :text) "aaa"))
           (should (equal (plist-get second :text) "aaa"))
-          (proofread--cache-write-request preview nil)
+          (proofread--cache-write-request
+           preview
+           (list
+            (proofread-test--diagnostic-for-range 1 4 "aaa")))
           (add-hook
            'proofread-diagnostics-changed-hook
            (lambda ()
@@ -20538,7 +20956,10 @@ This covers URLs, email, invisible text, faces, and properties."
                   (car (proofread-test--request-ready-chunks-for-ranges
                         '((7 . 9))))))))
           (proofread--register-active-request active)
-          (proofread--cache-write-request cached nil)
+          (proofread--cache-write-request
+           cached
+           (list
+            (proofread-test--diagnostic-for-range 7 9 "cc")))
           (proofread--enqueue-requests (list waiting cached))
           (add-hook 'proofread-diagnostics-changed-hook
                     (lambda ()
