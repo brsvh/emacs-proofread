@@ -450,6 +450,12 @@ request-ready chunks."
 (defvar proofread--inhibit-queue-dispatch nil
   "Buffer whose request lifecycle state is being changed atomically.")
 
+(defvar proofread--profile-dispatch-transactions nil
+  "Dynamically shared profile publication transactions.
+Each entry is a `proofread--profile-dispatch-transaction'.  Nested
+dispatches share one transaction only while they still own the same
+buffer generation and request queue.")
+
 (defvar proofread--queue-dispatch-transaction nil
   "Token for the dynamically active request queue dispatch transaction.")
 
@@ -616,6 +622,19 @@ created."
   (index (make-hash-table :test #'equal))
   (woken (make-hash-table :test #'eq))
   (next-sequence 0))
+
+(cl-defstruct
+    (proofread--profile-dispatch-transaction
+     (:constructor
+      proofread--make-profile-dispatch-transaction
+      (buffer generation queue-state)))
+  "Publication ownership for one profile dispatch state.
+BUFFER, GENERATION, and QUEUE-STATE identify the exact lifecycle state
+that may share preparation and one eventual queue drain."
+  buffer
+  generation
+  queue-state
+  published)
 
 (cl-defstruct
     (proofread--checker-preparation
@@ -993,22 +1012,34 @@ BACKEND-IDENTITY is already detached and is retained unchanged."
    (proofread--checker-discriminator checker)))
 
 (defun proofread--finish-checker-preparation
-    (checker descriptor &optional omit-source-label)
+    (checker descriptor &optional omit-source-label source-buffer)
   "Finish preparation of snapshotted CHECKER using DESCRIPTOR.
 When OMIT-SOURCE-LABEL is non-nil, avoid the presentation-only
-source-label operation."
-  (let* ((backend-identity
-          (proofread--backend-checker-identity checker descriptor))
-         (checker-identity
-          (proofread--checker-identity-from-snapshots
-           checker descriptor backend-identity))
-         (source-label
-          (unless omit-source-label
-            (proofread--backend-checker-source-label
-             checker descriptor))))
-    (proofread--make-checker-preparation
-     descriptor checker backend-identity checker-identity
-     source-label)))
+source-label operation.  When SOURCE-BUFFER is non-nil, run each
+backend adapter operation there and stop if it dies between calls."
+  (let ((backend-identity
+         (if source-buffer
+             (with-current-buffer source-buffer
+               (proofread--backend-checker-identity
+                checker descriptor))
+           (proofread--backend-checker-identity checker descriptor))))
+    (when (and source-buffer
+               (not (buffer-live-p source-buffer)))
+      (error "Proofread source buffer died during checker preparation"))
+    (let ((checker-identity
+           (proofread--checker-identity-from-snapshots
+            checker descriptor backend-identity))
+          (source-label
+           (unless omit-source-label
+             (if source-buffer
+                 (with-current-buffer source-buffer
+                   (proofread--backend-checker-source-label
+                    checker descriptor))
+               (proofread--backend-checker-source-label
+                checker descriptor)))))
+      (proofread--make-checker-preparation
+       descriptor checker backend-identity checker-identity
+       source-label))))
 
 (defun proofread--prepare-checker
     (checker descriptor &optional omit-source-label)
@@ -1642,6 +1673,12 @@ original error value."
      (format "checker %S failed; see *Warnings*"
              (plist-get failure :checker-name)))
     event))
+
+(defun proofread--report-checker-dispatch-failure-safely (failure)
+  "Report checker dispatch FAILURE without interrupting other work."
+  (condition-case nil
+      (proofread--report-checker-dispatch-failure failure)
+    (error nil)))
 
 (defun proofread--progress-message (format-string &rest args)
   "Display a routine progress message using FORMAT-STRING and ARGS."
@@ -3887,7 +3924,8 @@ When SUPPRESS-CACHE-WAKEUP is non-nil, forward it to the cache index."
     ;; generating an unbounded chain of cancellation events.  Nested
     ;; work is still marked terminal, but only the outer rejection is
     ;; reported.
-    (unless proofread--recording-clear-rejection-p
+    (if proofread--recording-clear-rejection-p
+        (proofread--settle-request-batch work)
       (let ((proofread--recording-clear-rejection-p t))
         (proofread--record-request-event
          work 'cancelled :reason 'cleared))))
@@ -4960,6 +4998,17 @@ after removing duplicate pending work."
           (push (cons work chunk) prepared))))
     (nreverse prepared)))
 
+(defun proofread--record-prepared-work-publication (prepared)
+  "Record publication events for PREPARED request work."
+  (dolist (item prepared)
+    (let ((work (car item)))
+      (proofread--record-request-event
+       work 'chunk-request
+       :chunk (cdr item))
+      (proofread--record-request-event
+       work 'queued-request
+       :backend (proofread--scheduled-work-backend work)))))
+
 (defun proofread--dispatch-prepared-checker-work (prepared)
   "Publish and dispatch PREPARED request work."
   (let* ((works (mapcar #'car prepared))
@@ -4974,15 +5023,7 @@ after removing duplicate pending work."
       (let ((proofread--inhibit-queue-dispatch (current-buffer)))
         (proofread--finish-superseded-requests superseded)
         (if enqueued
-            (dolist (work prepared)
-              (let ((scheduled-work (car work)))
-                (proofread--record-request-event
-                 scheduled-work 'chunk-request
-                 :chunk (cdr work))
-                (proofread--record-request-event
-                 scheduled-work 'queued-request
-                 :backend
-                 (proofread--scheduled-work-backend scheduled-work))))
+            (proofread--record-prepared-work-publication prepared)
           (dolist (work works)
             (proofread--reject-request-during-clear work))))
       (when enqueued
@@ -5009,95 +5050,280 @@ Return dispatched requests."
     (chunks profile checker)
   "Prepare CHUNKS for CHECKER in PROFILE and return isolated state.
 The returned plist has `:status' set to `prepared', `unsupported', or
-`failed'.  Prepared state includes unpublished `:work'; failed state
-includes one checker-level `:failure'."
-  (let ((backend (plist-get checker :backend))
+`failed'.  Return `aborted' when the source buffer dies during an
+adapter call.  Prepared state includes unpublished `:work'; failed
+state includes one checker-level `:failure'."
+  (let ((buffer (current-buffer))
+        (backend (plist-get checker :backend))
         descriptor)
     (catch 'result
       (condition-case err
           (setq descriptor
-                (proofread--backend-descriptor backend))
+                (with-current-buffer buffer
+                  (proofread--backend-descriptor backend)))
         (error
          (throw
           'result
-          (list
-           :status 'failed
-           :failure
-           (proofread--make-checker-dispatch-failure
-            profile checker 'backend-loading err)))))
+          (if (buffer-live-p buffer)
+              (list
+               :status 'failed
+               :failure
+               (proofread--make-checker-dispatch-failure
+                profile checker 'backend-loading err))
+            '( :status aborted)))))
+      (unless (buffer-live-p buffer)
+        (throw 'result '( :status aborted)))
       (unless descriptor
         (throw 'result '( :status unsupported)))
       (unless chunks
         (throw 'result
                '( :status prepared :supported t :work nil)))
-      (let* ((checker
-              (condition-case err
-                  (proofread--checker-with-options-snapshot
-                   checker descriptor)
-                (error
-                 (throw
-                  'result
-                  (list
-                   :status 'failed
-                   :supported t
-                   :failure
-                   (proofread--make-checker-dispatch-failure
-                    profile checker 'checker-options err))))))
-             (preparation
-              (condition-case err
-                  (proofread--finish-checker-preparation
-                   checker descriptor)
-                (error
-                 (throw
-                  'result
-                  (list
-                   :status 'failed
-                   :supported t
-                   :failure
-                   (proofread--make-checker-dispatch-failure
-                    profile checker 'checker-identity err)))))))
+      (let (prepared-checker preparation)
         (condition-case err
-            (list
-             :status 'prepared
-             :supported t
-             :work
-             (proofread--prepare-checker-request-work
-              chunks profile preparation))
+            (setq prepared-checker
+                  (with-current-buffer buffer
+                    (proofread--checker-with-options-snapshot
+                     checker descriptor)))
           (error
-           (list
-            :status 'failed
-            :supported t
-            :failure
-            (proofread--make-checker-dispatch-failure
-             profile checker 'request-construction err))))))))
+           (throw
+            'result
+            (if (buffer-live-p buffer)
+                (list
+                 :status 'failed
+                 :supported t
+                 :failure
+                 (proofread--make-checker-dispatch-failure
+                  profile checker 'checker-options err))
+              '( :status aborted)))))
+        (unless (buffer-live-p buffer)
+          (throw 'result '( :status aborted)))
+        (condition-case err
+            (setq preparation
+                  (with-current-buffer buffer
+                    (proofread--finish-checker-preparation
+                     prepared-checker descriptor nil buffer)))
+          (error
+           (throw
+            'result
+            (if (buffer-live-p buffer)
+                (list
+                 :status 'failed
+                 :supported t
+                 :failure
+                 (proofread--make-checker-dispatch-failure
+                  profile checker 'checker-identity err))
+              '( :status aborted)))))
+        (unless (buffer-live-p buffer)
+          (throw 'result '( :status aborted)))
+        (condition-case err
+            (with-current-buffer buffer
+              (list
+               :status 'prepared
+               :supported t
+               :work
+               (proofread--prepare-checker-request-work
+                chunks profile preparation)))
+          (error
+           (if (buffer-live-p buffer)
+               (list
+                :status 'failed
+                :supported t
+                :failure
+                (proofread--make-checker-dispatch-failure
+                 profile checker 'request-construction err))
+             '( :status aborted))))))))
+
+(defun proofread--publish-profile-checker-dispatches
+    (preparations transaction)
+  "Publish work in ordered PREPARATIONS as one transaction.
+Return the enqueued work, or nil when there is none.  All prepared
+checker work is visible and has its checker-local batch before any
+lifecycle or failure hook runs.  TRANSACTION owns the eventual queue
+drain."
+  (let (groups)
+    (dolist (preparation preparations)
+      (when (eq (plist-get preparation :status) 'prepared)
+        (push (plist-get preparation :work) groups)))
+    (setq groups (nreverse groups))
+    (let* ((prepared (apply #'append groups))
+           (works (mapcar #'car prepared))
+           superseded
+           enqueued)
+      (let ((proofread--inhibit-queue-dispatch (current-buffer)))
+        (when works
+          ;; Batch construction cannot strand published work: finish
+          ;; it before mutating the shared request queue.
+          (dolist (group groups)
+            (proofread--attach-request-batch
+             (mapcar #'car group)))
+          (setq superseded
+                (proofread--supersede-conflicting-requests works))
+          (setq enqueued (proofread--enqueue-requests works))
+          (when enqueued
+            (setf
+             (proofread--profile-dispatch-transaction-published
+              transaction)
+             t)))
+        (proofread--finish-superseded-requests superseded)
+        (dolist (preparation preparations)
+          (pcase (plist-get preparation :status)
+            ('prepared
+             (let ((group (plist-get preparation :work)))
+               (if enqueued
+                   (proofread--record-prepared-work-publication group)
+                 (dolist (item group)
+                   (proofread--reject-request-during-clear
+                    (car item))))))
+            ('failed
+             (proofread--report-checker-dispatch-failure-safely
+              (plist-get preparation :failure))))))
+      enqueued)))
+
+(defun proofread--profile-dispatch-state-current-p
+    (buffer generation queue-state)
+  "Return non-nil when BUFFER still owns the captured dispatch state.
+GENERATION and QUEUE-STATE identify the state captured before profile
+preparation began."
+  (and (buffer-live-p buffer)
+       (with-current-buffer buffer
+         (and proofread-mode
+              (equal proofread--generation generation)
+              (eq proofread--queue-state queue-state)))))
+
+(defun proofread--find-profile-dispatch-transaction
+    (buffer generation queue-state)
+  "Return the active profile transaction for BUFFER's captured state.
+GENERATION and QUEUE-STATE distinguish a reinitialized buffer from an
+older dispatch still on the stack."
+  (cl-find-if
+   (lambda (transaction)
+     (and
+      (eq buffer
+          (proofread--profile-dispatch-transaction-buffer
+           transaction))
+      (equal generation
+             (proofread--profile-dispatch-transaction-generation
+              transaction))
+      (eq queue-state
+          (proofread--profile-dispatch-transaction-queue-state
+           transaction))))
+   proofread--profile-dispatch-transactions))
+
+(defun proofread--profile-publication-state-current-p
+    (buffer generation queue-state chars-tick)
+  "Return non-nil when BUFFER still admits the prepared profile work.
+GENERATION, QUEUE-STATE, and CHARS-TICK were captured before checker
+preparation."
+  (and (proofread--profile-dispatch-state-current-p
+        buffer generation queue-state)
+       (with-current-buffer buffer
+         (= (buffer-chars-modified-tick) chars-tick))))
 
 (defun proofread--dispatch-profile-request-ready-chunks-result
     (chunks profile)
   "Dispatch CHUNKS for PROFILE and return checker dispatch state.
 The result contains `:requests', `:supported-count', and `:failures'."
-  (let ((supported-count 0)
-        failures
-        requests)
-    (dolist (checker (plist-get profile :checkers))
-      (let ((preparation
-             (proofread--prepare-profile-checker-dispatch
-              chunks profile checker)))
-        (when (plist-get preparation :supported)
-          (setq supported-count (1+ supported-count)))
-        (pcase (plist-get preparation :status)
-          ('prepared
-           (setq requests
-                 (nconc
-                  requests
-                  (proofread--dispatch-prepared-checker-work
-                   (plist-get preparation :work)))))
-          ('failed
-           (let ((failure (plist-get preparation :failure)))
-             (push failure failures)
-             (proofread--report-checker-dispatch-failure failure))))))
-    (list :requests requests
-          :supported-count supported-count
-          :failures (nreverse failures))))
+  (let* ((buffer (current-buffer))
+         (generation proofread--generation)
+         (queue-state proofread--queue-state)
+         (chars-tick (buffer-chars-modified-tick))
+         (parent-inhibited-p
+          (proofread--queue-dispatch-inhibited-p))
+         (parent-profile-transaction
+          (proofread--find-profile-dispatch-transaction
+           buffer generation queue-state))
+         (profile-transaction
+          (or parent-profile-transaction
+              (proofread--make-profile-dispatch-transaction
+               buffer generation queue-state)))
+         (root-profile-dispatch-p
+          (null parent-profile-transaction))
+         (profile-transactions
+          (if parent-profile-transaction
+              proofread--profile-dispatch-transactions
+            (cons profile-transaction
+                  proofread--profile-dispatch-transactions)))
+         preparations
+         supported-count
+         failures
+         requests
+         completed-p)
+    (unwind-protect
+        (progn
+          (let ((proofread--inhibit-queue-dispatch buffer)
+                (proofread--profile-dispatch-transactions
+                 profile-transactions))
+            (setq preparations
+                  (catch 'aborted
+                    (let (states)
+                      (dolist
+                          (checker (plist-get profile :checkers))
+                        (unless (buffer-live-p buffer)
+                          (throw 'aborted (nreverse states)))
+                        (let ((state
+                               (with-current-buffer buffer
+                                 (proofread--prepare-profile-checker-dispatch
+                                  chunks profile checker))))
+                          (push state states)
+                          (when (eq (plist-get state :status)
+                                    'aborted)
+                            (throw 'aborted
+                                   (nreverse states)))))
+                      (nreverse states))))
+            (setq supported-count
+                  (cl-count-if
+                   (lambda (preparation)
+                     (plist-get preparation :supported))
+                   preparations))
+            (setq failures
+                  (cl-loop
+                   for preparation in preparations
+                   when (eq (plist-get preparation :status)
+                            'failed)
+                   collect (plist-get preparation :failure)))
+            (if (proofread--profile-publication-state-current-p
+                 buffer generation queue-state chars-tick)
+                (with-current-buffer buffer
+                  (proofread--publish-profile-checker-dispatches
+                   preparations profile-transaction))
+              ;; Do not let work prepared before an edit or mode reset
+              ;; supersede newer work.  Preparation failures remain
+              ;; visible.
+              (when (buffer-live-p buffer)
+                (with-current-buffer buffer
+                  (dolist (failure failures)
+                    (proofread--report-checker-dispatch-failure-safely
+                     failure))))))
+          (when (and root-profile-dispatch-p
+                     (proofread--profile-dispatch-transaction-published
+                      profile-transaction)
+                     (proofread--profile-dispatch-state-current-p
+                      buffer generation queue-state))
+            (with-current-buffer buffer
+              (if parent-inhibited-p
+                  (proofread--schedule-queue-dispatch)
+                ;; Reentrant lifecycle hooks may have requested a
+                ;; timer while publication was inhibited.  This direct
+                ;; dispatch supersedes it.
+                (proofread--cancel-queue-dispatch-timer)
+                (let ((dispatched
+                       (proofread--dispatch-queued-requests)))
+                  ;; Reentry into an active queue transaction returns
+                  ;; its request flag rather than a request list.
+                  (when (listp dispatched)
+                    (setq requests dispatched))))))
+          (setq completed-p t)
+          (list :requests requests
+                :supported-count supported-count
+                :failures failures))
+      (when (and root-profile-dispatch-p
+                 (not completed-p)
+                 (proofread--profile-dispatch-transaction-published
+                  profile-transaction)
+                 (proofread--profile-dispatch-state-current-p
+                  buffer generation queue-state))
+        (with-current-buffer buffer
+          (proofread--schedule-queue-dispatch))))))
 
 (defun proofread--dispatch-profile-request-ready-chunks
     (chunks profile)

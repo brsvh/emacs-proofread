@@ -4860,6 +4860,700 @@ This covers URLs, email, invisible text, faces, and properties."
                          '( "en-US" "en-US")))
           (should (= (length proofread--active-requests) 2)))))))
 
+(ert-deftest
+    proofread-test-profile-publishes-checker-batches-and-drains-once ()
+  "Publish checker-major work with one drain and checker-local batches."
+  (with-temp-buffer
+    (insert "First. Second.")
+    (let ((proofread-auto-check nil)
+          (proofread-cache-max-entries 0)
+          (proofread-context-size 0)
+          (proofread-max-concurrent-requests 0)
+          (proofread-profile 'multi)
+          (proofread-profiles (proofread-test--ordered-profiles))
+          (original-dispatch
+           (symbol-function 'proofread--dispatch-queued-requests))
+          (dispatch-count 0))
+      (proofread-mode 1)
+      (let ((chunks
+             (mapcar
+              (lambda (range)
+                (car
+                 (proofread-test--request-ready-chunks-for-ranges
+                  (list range))))
+              '((1 . 7) (8 . 15)))))
+        (should (cl-every #'identity chunks))
+        (cl-letf
+            (((symbol-function 'proofread--dispatch-queued-requests)
+              (lambda ()
+                (setq dispatch-count (1+ dispatch-count))
+                (funcall original-dispatch))))
+          (let* ((result
+                  (proofread--dispatch-profile-request-ready-chunks-result
+                   chunks (proofread--current-profile)))
+                 (works (proofread--request-queue-works))
+                 (batches
+                  (mapcar #'proofread--scheduled-work-batch works)))
+            (should-not (plist-get result :requests))
+            (should (= (plist-get result :supported-count) 2))
+            (should-not (plist-get result :failures))
+            (should (= dispatch-count 1))
+            (should
+             (equal
+              (mapcar
+               (lambda (work)
+                 (plist-get (proofread-test--work-request work)
+                            :checker-name))
+               works)
+              '(first first second second)))
+            (should (= (length batches) 4))
+            (should (cl-every #'identity batches))
+            (should (eq (nth 0 batches) (nth 1 batches)))
+            (should (eq (nth 2 batches) (nth 3 batches)))
+            (should-not (eq (nth 0 batches) (nth 2 batches)))
+            (should (= (plist-get (nth 0 batches) :pending) 2))
+            (should (= (plist-get (nth 2 batches) :pending) 2))
+            (proofread-test--assert-queue-cache-index-consistent)))))))
+
+(ert-deftest
+    proofread-test-profile-preparation-inhibits-reentrant-drain ()
+  "Finish every checker preparation before a reentrant queue drain."
+  (with-temp-buffer
+    (insert "Alpha")
+    (let* ((backend 'proofread-test-preparation-reentry-backend)
+           (proofread-auto-check nil)
+           (proofread-cache-max-entries 0)
+           (proofread-context-size 0)
+           (proofread-max-concurrent-requests 0)
+           (proofread-profile 'multi)
+           (proofread-profiles
+            (list
+             (list
+              'multi
+              :checkers
+              (list
+               (list :name 'first :backend backend
+                     :options '( :name first))
+               (list :name 'second :backend backend
+                     :options '( :name second))))))
+           (proofread--backend-registry
+            (make-hash-table :test #'eq))
+           (original-drain
+            (symbol-function 'proofread--drain-request-queue))
+           preparations
+           drain-observations
+           reentered)
+      (proofread-register-backend
+       backend
+       :check #'ignore
+       :identity
+       (lambda ()
+         (list :backend backend :contract-version 1))
+       :snapshot-options
+       (lambda (options)
+         (let ((name (plist-get options :name)))
+           (unless (memq name preparations)
+             (setq preparations (append preparations (list name))))
+           (unless reentered
+             (setq reentered t)
+             (proofread--dispatch-queued-requests))
+           (copy-sequence options))))
+      (proofread-mode 1)
+      (let ((chunk
+             (car
+              (proofread-test--request-ready-chunks-for-ranges
+               (list (cons (point-min) (point-max)))))))
+        (cl-letf
+            (((symbol-function 'proofread--drain-request-queue)
+              (lambda ()
+                (push (copy-sequence preparations)
+                      drain-observations)
+                (funcall original-drain))))
+          (proofread--dispatch-profile-request-ready-chunks-result
+           (list chunk) (proofread--current-profile))))
+      (should reentered)
+      (should (equal preparations '( first second)))
+      (should (equal (nreverse drain-observations)
+                     '(( first second))))
+      (should (= (proofread--request-queue-length) 2))
+      (should-not proofread--queue-dispatch-timer)
+      (proofread-test--assert-queue-cache-index-consistent))))
+
+(ert-deftest
+    proofread-test-profile-preparation-edit-prevents-publication ()
+  "Do not publish work prepared across a source-buffer edit."
+  (with-temp-buffer
+    (insert "Alpha")
+    (let* ((backend 'proofread-test-preparation-edit-backend)
+           (proofread-auto-check nil)
+           (proofread-cache-max-entries 0)
+           (proofread-context-size 0)
+           (proofread-profile 'multi)
+           (proofread-profiles
+            (list
+             (list
+              'multi
+              :checkers
+              (list
+               (list :name 'first :backend backend
+                     :options '( :edit t))
+               (list :name 'second :backend backend)))))
+           (proofread--backend-registry
+            (make-hash-table :test #'eq))
+           edited
+           events)
+      (proofread-register-backend
+       backend
+       :check #'ignore
+       :identity
+       (lambda ()
+         (list :backend backend :contract-version 1))
+       :snapshot-options
+       (lambda (options)
+         (when (and (plist-get options :edit)
+                    (not edited))
+           (setq edited t)
+           (goto-char (point-max))
+           (insert "!"))
+         (copy-sequence options)))
+      (proofread-mode 1)
+      (let* ((chunk
+              (car
+               (proofread-test--request-ready-chunks-for-ranges
+                '((1 . 6)))))
+             (proofread-request-log-hook
+              (list (lambda (event)
+                      (push (plist-get event :type) events))))
+             (result
+              (proofread--dispatch-profile-request-ready-chunks-result
+               (list chunk) (proofread--current-profile))))
+        (should edited)
+        (should-not (plist-get result :requests))
+        (should (= (plist-get result :supported-count) 2))
+        (should-not (plist-get result :failures))
+        (should-not (memq 'chunk-request events))
+        (should-not (memq 'queued-request events))
+        (should (proofread--request-queue-empty-p))
+        (proofread-test--assert-no-pending-request-work)))))
+
+(ert-deftest
+    proofread-test-profile-preparation-buffer-kill-aborts-remaining-work ()
+  "Stop profile preparation when an adapter kills its source buffer."
+  (let ((buffer (generate-new-buffer " *proofread-killed-preparation*"))
+        result
+        raised
+        (snapshot-calls 0))
+    (unwind-protect
+        (with-current-buffer buffer
+          (insert "Alpha")
+          (let* ((backend 'proofread-test-preparation-kill-backend)
+                 (proofread-auto-check nil)
+                 (proofread-context-size 0)
+                 (proofread-profile 'multi)
+                 (proofread-profiles
+                  (list
+                   (list
+                    'multi
+                    :checkers
+                    (list
+                     (list :name 'first :backend backend)
+                     (list :name 'second :backend backend)))))
+                 (proofread--backend-registry
+                  (make-hash-table :test #'eq)))
+            (proofread-register-backend
+             backend
+             :check #'ignore
+             :identity
+             (lambda ()
+               (list :backend backend :contract-version 1))
+             :snapshot-options
+             (lambda (options)
+               (setq snapshot-calls (1+ snapshot-calls))
+               (kill-buffer buffer)
+               (copy-sequence options)))
+            (proofread-mode 1)
+            (let ((chunk
+                   (car
+                    (proofread-test--request-ready-chunks-for-ranges
+                     '((1 . 6))))))
+              (condition-case err
+                  (setq result
+                        (proofread--dispatch-profile-request-ready-chunks-result
+                         (list chunk) (proofread--current-profile)))
+                (error
+                 (setq raised err))))))
+      (when (buffer-live-p buffer)
+        (kill-buffer buffer)))
+    (should-not raised)
+    (should (= snapshot-calls 1))
+    (should-not (buffer-live-p buffer))
+    (should
+     (equal result
+            '( :requests nil :supported-count 0 :failures nil)))))
+
+(ert-deftest
+    proofread-test-profile-checker-identity-kill-skips-source-label ()
+  "Abort without a source-label call when checker identity kills its buffer."
+  (let ((buffer
+         (generate-new-buffer " *proofread-killed-by-identity*"))
+        result
+        raised
+        (identity-calls 0)
+        (source-label-calls 0))
+    (unwind-protect
+        (with-current-buffer buffer
+          (insert "Alpha")
+          (let* ((backend 'proofread-test-identity-kill-backend)
+                 (proofread-auto-check nil)
+                 (proofread-context-size 0)
+                 (proofread-profile 'multi)
+                 (proofread-profiles
+                  (list
+                   (list
+                    'multi
+                    :checkers
+                    (list (list :name 'only :backend backend)))))
+                 (proofread--backend-registry
+                  (make-hash-table :test #'eq)))
+            (proofread-register-backend
+             backend
+             :check #'ignore
+             :identity
+             (lambda ()
+               (list :backend backend :contract-version 1))
+             :snapshot-options #'copy-sequence
+             :checker-identity
+             (lambda (_checker)
+               (setq identity-calls (1+ identity-calls))
+               (kill-buffer buffer)
+               (list :backend backend :contract-version 1))
+             :source-label
+             (lambda (_checker)
+               (setq source-label-calls (1+ source-label-calls))
+               "unreachable"))
+            (proofread-mode 1)
+            (let ((chunk
+                   (car
+                    (proofread-test--request-ready-chunks-for-ranges
+                     '((1 . 6))))))
+              (condition-case err
+                  (setq result
+                        (proofread--dispatch-profile-request-ready-chunks-result
+                         (list chunk) (proofread--current-profile)))
+                (error
+                 (setq raised err))))))
+      (when (buffer-live-p buffer)
+        (kill-buffer buffer)))
+    (should-not raised)
+    (should (= identity-calls 1))
+    (should (zerop source-label-calls))
+    (should-not (buffer-live-p buffer))
+    (should
+     (equal result
+            '( :requests nil :supported-count 0 :failures nil)))))
+
+(ert-deftest
+    proofread-test-profile-active-transaction-keeps-request-list-contract
+    ()
+  "Return nil requests when an active queue transaction owns draining."
+  (with-temp-buffer
+    (insert "Alpha")
+    (let ((proofread-auto-check nil)
+          (proofread-context-size 0)
+          (proofread-max-concurrent-requests 2)
+          (proofread-profile 'multi)
+          (proofread-profiles (proofread-test--ordered-profiles)))
+      (proofread-mode 1)
+      (let* ((chunk
+              (car
+               (proofread-test--request-ready-chunks-for-ranges
+                '((1 . 6)))))
+             (transaction
+              (make-symbol "proofread-active-transaction"))
+             (proofread--queue-dispatch-active-p transaction)
+             (proofread--queue-dispatch-transaction transaction)
+             (proofread--queue-dispatch-requested-p nil)
+             (result
+              (proofread--dispatch-profile-request-ready-chunks-result
+               (list chunk) (proofread--current-profile))))
+        (should-not (plist-get result :requests))
+        (should proofread--queue-dispatch-requested-p)
+        (should (= (proofread--request-queue-length) 2))
+        (should
+         (equal
+          (mapcar
+           (lambda (work)
+             (plist-get (proofread-test--work-request work)
+                        :checker-name))
+           (proofread--request-queue-works))
+          '( first second)))
+        (proofread-test--assert-queue-cache-index-consistent)
+        (proofread--clear-request-work)
+        (proofread-test--assert-no-pending-request-work)))))
+
+(ert-deftest
+    proofread-test-profile-root-drains-work-published-by-nested-prepare ()
+  "Let the root profile transaction drain nested preparation work."
+  (with-temp-buffer
+    (insert "Alpha")
+    (let* ((backend 'proofread-test-nested-profile-backend)
+           (proofread-auto-check nil)
+           (proofread-cache-max-entries 0)
+           (proofread-context-size 0)
+           (proofread-max-concurrent-requests 2)
+           (proofread-profile 'multi)
+           (proofread-profiles
+            (list
+             (list
+              'multi
+              :checkers
+              (list
+               (list :name 'first :backend backend)
+               (list :name 'second :backend backend)))))
+           (proofread--backend-registry
+            (make-hash-table :test #'eq))
+           reentered
+           dispatch-chunks
+           dispatch-profile
+           nested-result
+           submitted)
+      (proofread-register-backend
+       backend
+       :check
+       (lambda (request _callback)
+         (push (plist-get request :checker-name) submitted)
+         (list :backend backend
+               :request-id (plist-get request :id)))
+       :identity
+       (lambda ()
+         (list :backend backend :contract-version 1))
+       :snapshot-options
+       (lambda (options)
+         (unless reentered
+           (setq reentered t)
+           (setq nested-result
+                 (proofread--dispatch-profile-request-ready-chunks-result
+                  dispatch-chunks dispatch-profile)))
+         (copy-sequence options)))
+      (proofread-mode 1)
+      (setq dispatch-chunks
+            (list
+             (car
+              (proofread-test--request-ready-chunks-for-ranges
+               '((1 . 6))))))
+      (setq dispatch-profile (proofread--current-profile))
+      (let ((result
+             (proofread--dispatch-profile-request-ready-chunks-result
+              dispatch-chunks dispatch-profile)))
+        (should reentered)
+        (should-not (plist-get nested-result :requests))
+        (should
+         (equal
+          (mapcar (lambda (request)
+                    (plist-get request :checker-name))
+                  (plist-get result :requests))
+          '( first second)))
+        (should (equal (nreverse submitted) '( first second)))
+        (should (= (length proofread--active-requests) 2))
+        (should (proofread--request-queue-empty-p))
+        (should-not proofread--queue-dispatch-timer)
+        (proofread--clear-request-work)))))
+
+(ert-deftest
+    proofread-test-profile-buffer-transactions-isolate-a-b-a-reentry ()
+  "Keep each buffer's profile preparation transaction independent."
+  (let ((buffer-a (generate-new-buffer " *proofread-profile-a*"))
+        (buffer-b (generate-new-buffer " *proofread-profile-b*"))
+        (backend-a 'proofread-test-profile-a-backend)
+        (backend-b 'proofread-test-profile-b-backend)
+        (proofread--backend-registry (make-hash-table :test #'eq))
+        chunks-a
+        chunks-b
+        profile-a
+        profile-b
+        a-first-snapshot-count
+        a-second-snapshot-count
+        entered-b
+        entered-nested-a
+        outer-a-second-prepared-p
+        outer-a-second-state
+        nested-a-result
+        b-result
+        a-submissions
+        b-submissions)
+    (unwind-protect
+        (progn
+          (proofread-register-backend
+           backend-a
+           :check
+           (lambda (request _callback)
+             (push (cons (plist-get request :checker-name)
+                         outer-a-second-prepared-p)
+                   a-submissions)
+             (list :backend backend-a
+                   :request-id (plist-get request :id)))
+           :identity
+           (lambda ()
+             (list :backend backend-a :contract-version 1))
+           :snapshot-options
+           (lambda (options)
+             (pcase (plist-get options :name)
+               ('first
+                (setq a-first-snapshot-count
+                      (1+ (or a-first-snapshot-count 0)))
+                (when (= a-first-snapshot-count 1)
+                  (setq entered-b t)
+                  (with-current-buffer buffer-b
+                    (setq b-result
+                          (proofread--dispatch-profile-request-ready-chunks-result
+                           chunks-b profile-b)))))
+               ('second
+                (setq a-second-snapshot-count
+                      (1+ (or a-second-snapshot-count 0)))
+                (when (= a-second-snapshot-count 2)
+                  (setq outer-a-second-state
+                        (list
+                         :a-submissions
+                         (copy-tree a-submissions)
+                         :b-submissions
+                         (copy-sequence b-submissions)
+                         :a-queued
+                         (mapcar
+                          (lambda (work)
+                            (plist-get
+                             (proofread-test--work-request work)
+                             :checker-name))
+                          (proofread--request-queue-works))))
+                  (setq outer-a-second-prepared-p t))))
+             (copy-sequence options)))
+          (proofread-register-backend
+           backend-b
+           :check
+           (lambda (request _callback)
+             (push (plist-get request :checker-name) b-submissions)
+             (list :backend backend-b
+                   :request-id (plist-get request :id)))
+           :identity
+           (lambda ()
+             (list :backend backend-b :contract-version 1))
+           :snapshot-options
+           (lambda (options)
+             (unless entered-nested-a
+               (setq entered-nested-a t)
+               (with-current-buffer buffer-a
+                 (setq nested-a-result
+                       (proofread--dispatch-profile-request-ready-chunks-result
+                        chunks-a profile-a))))
+             (copy-sequence options)))
+          (with-current-buffer buffer-a
+            (insert "Alpha")
+            (setq-local proofread-auto-check nil)
+            (setq-local proofread-cache-max-entries 0)
+            (setq-local proofread-context-size 0)
+            (setq-local proofread-max-concurrent-requests 2)
+            (setq-local proofread-profile 'a)
+            (setq-local
+             proofread-profiles
+             `((a
+                :checkers
+                (( :name first :backend ,backend-a
+                   :options ( :name first))
+                 ( :name second :backend ,backend-a
+                   :options ( :name second))))))
+            (proofread-mode 1)
+            (setq chunks-a
+                  (list
+                   (car
+                    (proofread-test--request-ready-chunks-for-ranges
+                     '((1 . 6))))))
+            (setq profile-a (proofread--current-profile)))
+          (with-current-buffer buffer-b
+            (insert "Beta")
+            (setq-local proofread-auto-check nil)
+            (setq-local proofread-cache-max-entries 0)
+            (setq-local proofread-context-size 0)
+            (setq-local proofread-max-concurrent-requests 1)
+            (setq-local proofread-profile 'b)
+            (setq-local
+             proofread-profiles
+             `((b
+                :checkers
+                (( :name only :backend ,backend-b)))))
+            (proofread-mode 1)
+            (setq chunks-b
+                  (list
+                   (car
+                    (proofread-test--request-ready-chunks-for-ranges
+                     '((1 . 5))))))
+            (setq profile-b (proofread--current-profile)))
+          (with-current-buffer buffer-a
+            (let ((result
+                   (proofread--dispatch-profile-request-ready-chunks-result
+                    chunks-a profile-a)))
+              (should entered-b)
+              (should entered-nested-a)
+              (should-not (plist-get nested-a-result :requests))
+              (should
+               (equal
+                (mapcar
+                 (lambda (request)
+                   (plist-get request :checker-name))
+                 (plist-get b-result :requests))
+                '( only)))
+              (should
+               (equal outer-a-second-state
+                      '( :a-submissions nil
+                         :b-submissions ( only)
+                         :a-queued ( first second))))
+              (should
+               (equal
+                (mapcar
+                 (lambda (request)
+                   (plist-get request :checker-name))
+                 (plist-get result :requests))
+                '( first second)))
+              (should
+               (equal (nreverse a-submissions)
+                      '(( first . t) ( second . t))))
+              (should (= (length proofread--active-requests) 2))
+              (should (proofread--request-queue-empty-p))
+              (should-not proofread--queue-dispatch-timer)
+              (proofread--clear-request-work)))
+          (with-current-buffer buffer-b
+            (should (equal b-submissions '( only)))
+            (should (= (length proofread--active-requests) 1))
+            (should (proofread--request-queue-empty-p))
+            (should-not proofread--queue-dispatch-timer)
+            (proofread--clear-request-work)))
+      (when (buffer-live-p buffer-a)
+        (kill-buffer buffer-a))
+      (when (buffer-live-p buffer-b)
+        (kill-buffer buffer-b)))))
+
+(ert-deftest
+    proofread-test-profile-state-reset-starts-independent-nested-transaction
+    ()
+  "Resume nested profile work after its outer buffer state is replaced."
+  (with-temp-buffer
+    (insert "Alpha")
+    (let* ((backend 'proofread-test-profile-state-reset-backend)
+           (proofread-auto-check nil)
+           (proofread-cache-max-entries 0)
+           (proofread-context-size 0)
+           (proofread-max-concurrent-requests 1)
+           (proofread-profile 'single)
+           (proofread-profiles
+            (list
+             (list
+              'single
+              :checkers
+              (list (list :name 'only :backend backend)))))
+           (proofread--backend-registry
+            (make-hash-table :test #'eq))
+           reentered
+           dispatch-chunks
+           dispatch-profile
+           old-generation
+           old-queue-state
+           new-generation
+           new-queue-state
+           submitted
+           cancelled-events
+           (proofread-request-log-hook
+            (list
+             (lambda (event)
+               (when (eq (plist-get event :type) 'cancelled)
+                 (push event cancelled-events))))))
+      (proofread-register-backend
+       backend
+       :check
+       (lambda (request _callback)
+         (push (cons (plist-get request :checker-name)
+                     (plist-get request :generation))
+               submitted)
+         (list :backend backend
+               :request-id (plist-get request :id)))
+       :identity
+       (lambda ()
+         (list :backend backend :contract-version 1))
+       :snapshot-options
+       (lambda (options)
+         (unless reentered
+           (setq reentered t)
+           (setq old-generation proofread--generation)
+           (setq old-queue-state proofread--queue-state)
+           (proofread--initialize-buffer-state)
+           (setq new-generation proofread--generation)
+           (setq new-queue-state proofread--queue-state)
+           (proofread--dispatch-profile-request-ready-chunks-result
+            dispatch-chunks dispatch-profile))
+         (copy-sequence options)))
+      (proofread-mode 1)
+      (setq dispatch-chunks
+            (list
+             (car
+              (proofread-test--request-ready-chunks-for-ranges
+               '((1 . 6))))))
+      (setq dispatch-profile (proofread--current-profile))
+      (let ((result
+             (proofread--dispatch-profile-request-ready-chunks-result
+              dispatch-chunks dispatch-profile)))
+        (should reentered)
+        (should-not (equal old-generation new-generation))
+        (should-not (eq old-queue-state new-queue-state))
+        (should
+         (equal
+          (list
+           :outer-requests
+           (mapcar
+            (lambda (request)
+              (plist-get request :checker-name))
+            (plist-get result :requests))
+           :submitted (reverse submitted)
+           :active-count (length proofread--active-requests)
+           :queued
+           (mapcar
+            (lambda (work)
+              (let ((request (proofread-test--work-request work)))
+                (cons (plist-get request :checker-name)
+                      (plist-get request :generation))))
+            (proofread--request-queue-works))
+           :cancelled cancelled-events
+           :timer (and (timerp proofread--queue-dispatch-timer) t))
+          (list
+           :outer-requests nil
+           :submitted nil
+           :active-count 0
+           :queued (list (cons 'only new-generation))
+           :cancelled nil
+           :timer t)))
+        (let ((timer proofread--queue-dispatch-timer))
+          (cancel-timer timer)
+          (proofread--queue-dispatch-timer-run (current-buffer)))
+        (should
+         (equal
+          (list
+           :submitted (reverse submitted)
+           :active
+           (mapcar
+            (lambda (work)
+              (let ((request (proofread-test--work-request work)))
+                (cons (plist-get request :checker-name)
+                      (plist-get request :generation))))
+            proofread--active-requests)
+           :queued (proofread--request-queue-works)
+           :cancelled cancelled-events
+           :timer (and (timerp proofread--queue-dispatch-timer) t))
+          (list
+           :submitted (list (cons 'only new-generation))
+           :active (list (cons 'only new-generation))
+           :queued nil
+           :cancelled nil
+           :timer nil)))
+        (proofread-test--assert-queue-cache-index-consistent)
+        (proofread--clear-request-work)
+        (proofread-test--assert-no-pending-request-work)))))
+
 (ert-deftest proofread-test-profile-empty-chunks-skip-checker-identity
     ()
   "Treat no chunks as an empty dispatch for a supported checker."
@@ -4969,6 +5663,156 @@ This covers URLs, email, invisible text, faces, and properties."
       (should (plist-get result :supported))
       (should (eq (plist-get failure :phase) 'checker-identity))
       (should (eq (plist-get failure :error) 'error)))))
+
+(ert-deftest
+    proofread-test-profile-supported-count-isolates-preparation-failure ()
+  "Count supported failures while isolating unsupported checkers."
+  (with-temp-buffer
+    (insert "Alpha")
+    (let* ((backend 'proofread-test-mixed-preparation-backend)
+           (unsupported 'proofread-test-mixed-unsupported-backend)
+           (proofread-auto-check nil)
+           (proofread-cache-max-entries 0)
+           (proofread-context-size 0)
+           (proofread-max-concurrent-requests 0)
+           (proofread-profile 'multi)
+           (proofread-profiles
+            (list
+             (list
+              'multi
+              :checkers
+              (list
+               (list :name 'unsupported :backend unsupported)
+               (list :name 'failed :backend backend
+                     :options '( :fail t))
+               (list :name 'successful :backend backend)))))
+           (proofread--backend-registry
+            (make-hash-table :test #'eq))
+           (failed-snapshot-calls 0)
+           (successful-snapshot-calls 0)
+           reports)
+      (proofread-register-backend
+       backend
+       :check #'ignore
+       :identity
+       (lambda ()
+         (list :backend backend :contract-version 1))
+       :snapshot-options
+       (lambda (options)
+         (if (plist-get options :fail)
+             (progn
+               (setq failed-snapshot-calls
+                     (1+ failed-snapshot-calls))
+               (error "Simulated checker preparation failure"))
+           (setq successful-snapshot-calls
+                 (1+ successful-snapshot-calls))
+           (copy-tree options))))
+      (proofread-mode 1)
+      (let* ((chunk
+              (car
+               (proofread-test--request-ready-chunks-for-ranges
+                (list (cons (point-min) (point-max))))))
+             (result
+              (cl-letf
+                  (((symbol-function
+                     'proofread-report-warning-without-window)
+                    (lambda (detail summary)
+                      (push (list detail summary) reports))))
+                (proofread--dispatch-profile-request-ready-chunks-result
+                 (list chunk) (proofread--current-profile))))
+             (failures (plist-get result :failures))
+             (queued (proofread--request-queue-works)))
+        (should (= failed-snapshot-calls 1))
+        (should (> successful-snapshot-calls 0))
+        (should (= (plist-get result :supported-count) 2))
+        (should-not (plist-get result :requests))
+        (should (= (length failures) 1))
+        (should (= (length reports) 1))
+        (let ((failure (car failures)))
+          (should (eq (plist-get failure :checker-name) 'failed))
+          (should (eq (plist-get failure :phase) 'checker-options)))
+        (should (= (length queued) 1))
+        (should
+         (eq
+          (plist-get (proofread-test--work-request (car queued))
+                     :checker-name)
+          'successful))))))
+
+(ert-deftest
+    proofread-test-profile-failure-reporting-error-does-not-block-dispatch ()
+  "Submit successful checker work when failure reporting signals."
+  (with-temp-buffer
+    (insert "Alpha")
+    (let* ((backend 'proofread-test-failure-reporting-backend)
+           (proofread-auto-check nil)
+           (proofread-cache-max-entries 0)
+           (proofread-context-size 0)
+           (proofread-max-concurrent-requests 2)
+           (proofread-profile 'multi)
+           (proofread-profiles
+            (list
+             (list
+              'multi
+              :checkers
+              (list
+               (list :name 'failed :backend backend
+                     :options '( :fail t))
+               (list :name 'successful :backend backend)))))
+           (proofread--backend-registry
+            (make-hash-table :test #'eq))
+           (report-calls 0)
+           submitted)
+      (proofread-register-backend
+       backend
+       :check
+       (lambda (request _callback)
+         (push request submitted)
+         (list :backend backend
+               :request-id (plist-get request :id)))
+       :identity
+       (lambda ()
+         (list :backend backend :contract-version 1))
+       :snapshot-options
+       (lambda (options)
+         (if (plist-get options :fail)
+             (error "Simulated checker preparation failure")
+           (copy-sequence options))))
+      (proofread-mode 1)
+      (let* ((chunk
+              (car
+               (proofread-test--request-ready-chunks-for-ranges
+                '((1 . 6)))))
+             (result
+              (cl-letf
+                  (((symbol-function
+                     'proofread--report-checker-dispatch-failure)
+                    (lambda (_failure)
+                      (setq report-calls (1+ report-calls))
+                      (signal
+                       'error
+                       '("Simulated failure-reporting error")))))
+                (proofread--dispatch-profile-request-ready-chunks-result
+                 (list chunk) (proofread--current-profile))))
+             (requests (plist-get result :requests))
+             (failures (plist-get result :failures)))
+        (should (= report-calls 1))
+        (should (= (plist-get result :supported-count) 2))
+        (should (= (length failures) 1))
+        (should (eq (plist-get (car failures) :checker-name) 'failed))
+        (should (eq (plist-get (car failures) :phase)
+                    'checker-options))
+        (should (= (length requests) 1))
+        (should (eq (plist-get (car requests) :checker-name)
+                    'successful))
+        (should (= (length submitted) 1))
+        (should (eq (plist-get (car submitted) :checker-name)
+                    'successful))
+        (should (= (length proofread--active-requests) 1))
+        (should (proofread--request-queue-empty-p))
+        (should-not proofread--queue-dispatch-timer)
+        (proofread--clear-request-work)
+        (proofread-test--assert-no-pending-request-work)
+        (should-not proofread--queue-dispatch-timer)))))
 
 (ert-deftest proofread-test-ad-hoc-dispatch-snapshots-options-once ()
   "Snapshot ad-hoc checker options once before request construction."
@@ -5445,6 +6289,125 @@ This covers URLs, email, invisible text, faces, and properties."
           (proofread--cancel-active-requests)
           (should-not old-cancels)
           (should (equal new-cancels '(new-handle))))))))
+
+(ert-deftest
+    proofread-test-profile-synchronous-callback-sees-complete-publication
+    ()
+  "Prepare and publish every checker before a synchronous callback."
+  (with-temp-buffer
+    (insert "Alpha")
+    (let* ((first-backend 'proofread-test-first-sync-backend)
+           (later-backend 'proofread-test-later-sync-backend)
+           (proofread-auto-check nil)
+           (proofread-cache-max-entries 0)
+           (proofread-context-size 0)
+           (proofread-max-concurrent-requests 2)
+           (proofread-profile 'multi)
+           (proofread-profiles
+            (list
+             (list
+              'multi
+              :checkers
+              (list
+               (list :name 'first :backend first-backend)
+               (list :name 'later :backend later-backend
+                     :options '( :tone formal))))))
+           (proofread--backend-registry
+            (make-hash-table :test #'eq))
+           (old-snapshot-calls 0)
+           (new-snapshot-calls 0)
+           (old-check-calls 0)
+           (new-check-calls 0)
+           old-options-snapshot
+           later-request
+           publication-before-first
+           pending-before-first
+           prepared-before-first
+           old-cancelled
+           new-cancelled
+           register-new-later)
+      (setq register-new-later
+            (lambda ()
+              (proofread-register-backend
+               later-backend
+               :check
+               (lambda (request _callback)
+                 (setq new-check-calls (1+ new-check-calls))
+                 (setq later-request request)
+                 'new-later-handle)
+               :identity
+               (lambda ()
+                 (list :backend later-backend :contract-version 1))
+               :snapshot-options
+               (lambda (options)
+                 (setq new-snapshot-calls (1+ new-snapshot-calls))
+                 (proofread-test--snapshot-checker-options options))
+               :cancel
+               (lambda (handle)
+                 (push handle new-cancelled)))))
+      (proofread-register-backend
+       later-backend
+       :check
+       (lambda (_request _callback)
+         (setq old-check-calls (1+ old-check-calls))
+         'old-later-handle)
+       :identity
+       (lambda ()
+         (list :backend later-backend :contract-version 1))
+       :snapshot-options
+       (lambda (options)
+         (setq old-snapshot-calls (1+ old-snapshot-calls))
+         (setq old-options-snapshot
+               (proofread-test--snapshot-checker-options options)))
+       :cancel
+       (lambda (handle)
+         (push handle old-cancelled)))
+      (proofread-register-backend
+       first-backend
+       :check
+       (lambda (request callback)
+         (setq prepared-before-first old-snapshot-calls)
+         (setq publication-before-first
+               (proofread-test--scheduled-checker-names))
+         (setq pending-before-first
+               (hash-table-count proofread--pending-request-keys))
+         (funcall register-new-later)
+         (funcall callback
+                  (proofread--backend-success-result request nil))
+         'first-handle)
+       :identity
+       (lambda ()
+         (list :backend first-backend :contract-version 1))
+       :snapshot-options #'proofread-test--snapshot-checker-options)
+      (proofread-mode 1)
+      (let* ((chunk
+              (car
+               (proofread-test--request-ready-chunks-for-ranges
+                (list (cons (point-min) (point-max))))))
+             (result
+              (proofread--dispatch-profile-request-ready-chunks-result
+               (list chunk) (proofread--current-profile))))
+        (should (= prepared-before-first 1))
+        (should (equal publication-before-first '(first later)))
+        (should (= pending-before-first 2))
+        (should (= old-snapshot-calls 1))
+        (should (> new-snapshot-calls 0))
+        (should (zerop old-check-calls))
+        (should (= new-check-calls 1))
+        (should later-request)
+        (should
+         (eq (plist-get later-request :checker-options)
+             old-options-snapshot))
+        (should
+         (equal
+          (mapcar (lambda (request)
+                    (plist-get request :checker-name))
+                  (plist-get result :requests))
+          '(first later)))
+        (should (= (length proofread--active-requests) 1))
+        (proofread--clear-request-work)
+        (should-not old-cancelled)
+        (should (equal new-cancelled '(new-later-handle)))))))
 
 (ert-deftest proofread-test-bare-cache-key-captures-one-descriptor ()
   "Build both cache identities from one backend descriptor lookup."
@@ -6467,6 +7430,218 @@ This covers URLs, email, invisible text, faces, and properties."
               (should (proofread--active-request-p new-first))
               (should (= (length proofread--active-requests)
                          2)))))))))
+
+(ert-deftest
+    proofread-test-profile-cancellation-hook-invalidates-all-replacements
+    ()
+  "Publish every checker replacement before cancellation hooks can edit."
+  (with-temp-buffer
+    (insert "abcdef")
+    (let* ((proofread-auto-check nil)
+           (proofread-cache-max-entries 0)
+           (proofread-context-size 0)
+           (proofread-max-concurrent-requests 8)
+           (proofread-profile 'multi)
+           (proofread-profiles (proofread-test--ordered-profiles))
+           (proofread-request-log-hook nil)
+           submitted
+           old-works
+           replacement-works
+           replacement-log-ids
+           replacement-cancellations
+           replacement-publications
+           first-hook-state
+           hook-error
+           drain-requested
+           timer-scheduled-in-hook)
+      (proofread-mode 1)
+      (let* ((profile (proofread--current-profile))
+             (old-chunk
+              (car
+               (proofread-test--request-ready-chunks-for-ranges
+                '((1 . 7)))))
+             (replacement-chunk
+              (car
+               (proofread-test--request-ready-chunks-for-ranges
+                '((2 . 6)))))
+             (proofread-test--backend-check-function
+              (lambda (request _callback)
+                (push request submitted)
+                (list :backend proofread-test--backend
+                      :request-id (plist-get request :id)))))
+        (proofread--dispatch-profile-request-ready-chunks-result
+         (list old-chunk) profile)
+        (setq old-works (copy-sequence proofread--active-requests))
+        (should (= (length old-works) 2))
+        (should (= (length submitted) 2))
+        (setq submitted nil)
+        (let ((proofread-request-log-hook
+               (list
+                (lambda (event)
+                  (let ((type (plist-get event :type))
+                        (log-id (plist-get event :log-id)))
+                    (when (and replacement-log-ids
+                               (memq log-id replacement-log-ids))
+                      (pcase type
+                        ('cancelled
+                         (push log-id replacement-cancellations))
+                        ('queued-request
+                         (push log-id replacement-publications))))
+                    (when (and (not first-hook-state)
+                               (eq type 'cancelled)
+                               (eq (plist-get event :reason)
+                                   'superseded))
+                      (condition-case err
+                          (progn
+                            (setq replacement-works
+                                  (copy-sequence
+                                   (proofread--request-queue-works)))
+                            (setq replacement-log-ids
+                                  (mapcar
+                                   #'proofread--scheduled-work-log-id
+                                   replacement-works))
+                            (setq first-hook-state
+                                  (list
+                                   :inhibited
+                                   (proofread--queue-dispatch-inhibited-p)
+                                   :names
+                                   (mapcar
+                                    (lambda (work)
+                                      (plist-get
+                                       (proofread-test--work-request work)
+                                       :checker-name))
+                                    replacement-works)
+                                   :pending-count
+                                   (hash-table-count
+                                    proofread--pending-request-keys)
+                                   :all-pending
+                                   (cl-every
+                                    #'proofread--request-work-pending-p
+                                    replacement-works)
+                                   :active-count
+                                   (length proofread--active-requests)
+                                   :claimed-count
+                                   (length proofread--claimed-requests)
+                                   :batch-count
+                                   (length
+                                    (delete-dups
+                                     (mapcar
+                                      #'proofread--scheduled-work-batch
+                                      replacement-works)))
+                                   :submitted
+                                   (copy-sequence submitted)))
+                            (setq drain-requested t)
+                            (proofread--dispatch-queued-requests)
+                            (setq timer-scheduled-in-hook
+                                  (timerp
+                                   proofread--queue-dispatch-timer))
+                            (goto-char (point-min))
+                            (insert "x"))
+                        (error
+                         (setq hook-error err)))))))))
+          (proofread--dispatch-profile-request-ready-chunks-result
+           (list replacement-chunk) profile)))
+      (should-not hook-error)
+      (should drain-requested)
+      (should timer-scheduled-in-hook)
+      (should
+       (equal first-hook-state
+              '( :inhibited t
+                 :names ( first second)
+                 :pending-count 2
+                 :all-pending t
+                 :active-count 0
+                 :claimed-count 0
+                 :batch-count 2
+                 :submitted nil)))
+      (should (= (length replacement-works) 2))
+      (should-not submitted)
+      (should-not proofread--queue-dispatch-timer)
+      (should
+       (equal (sort (copy-sequence replacement-cancellations) #'<)
+              (sort (copy-sequence replacement-log-ids) #'<)))
+      (should
+       (equal (sort (copy-sequence replacement-publications) #'<)
+              (sort (copy-sequence replacement-log-ids) #'<)))
+      (dolist (work replacement-works)
+        (should (proofread--request-invalidated-p work))
+        (should (proofread--request-state-flag-p work :cancelled))
+        (should (proofread--scheduled-work-batch-settled work)))
+      (dolist (work old-works)
+        (should (proofread--request-state-flag-p work :superseded))
+        (should (proofread--request-state-flag-p work :cancelled)))
+      (proofread-test--assert-no-pending-request-work))))
+
+(ert-deftest
+    proofread-test-profile-batch-attachment-error-publishes-nothing ()
+  "Leave shared request state unchanged when batch attachment fails."
+  (with-temp-buffer
+    (insert "Alpha")
+    (let ((proofread-auto-check nil)
+          (proofread-context-size 0)
+          (proofread-max-concurrent-requests 0)
+          (proofread-profile 'multi)
+          (proofread-profiles (proofread-test--ordered-profiles))
+          (original-attach
+           (symbol-function 'proofread--attach-request-batch))
+          (attach-count 0)
+          raised)
+      (proofread-mode 1)
+      (let ((chunk
+             (car
+              (proofread-test--request-ready-chunks-for-ranges
+               '((1 . 6))))))
+        (cl-letf
+            (((symbol-function 'proofread--attach-request-batch)
+              (lambda (works)
+                (setq attach-count (1+ attach-count))
+                (if (= attach-count 2)
+                    (error "Simulated batch attachment failure")
+                  (funcall original-attach works)))))
+          (condition-case err
+              (proofread--dispatch-profile-request-ready-chunks-result
+               (list chunk) (proofread--current-profile))
+            (error
+             (setq raised err)))))
+      (should (eq (car raised) 'error))
+      (should (= attach-count 2))
+      (should (proofread--request-queue-empty-p))
+      (should-not proofread--active-requests)
+      (should-not proofread--queue-dispatch-timer)
+      (proofread-test--assert-no-pending-request-work))))
+
+(ert-deftest
+    proofread-test-profile-publication-error-schedules-root-fallback ()
+  "Schedule root queue continuation after publication unwinds."
+  (with-temp-buffer
+    (insert "Alpha")
+    (let ((proofread-auto-check nil)
+          (proofread-context-size 0)
+          (proofread-max-concurrent-requests 0)
+          (proofread-profile 'multi)
+          (proofread-profiles (proofread-test--ordered-profiles))
+          raised)
+      (proofread-mode 1)
+      (let ((chunk
+             (car
+              (proofread-test--request-ready-chunks-for-ranges
+               '((1 . 6))))))
+        (cl-letf
+            (((symbol-function
+               'proofread--record-prepared-work-publication)
+              (lambda (_prepared)
+                (error "Simulated publication failure"))))
+          (condition-case err
+              (proofread--dispatch-profile-request-ready-chunks-result
+               (list chunk) (proofread--current-profile))
+            (error
+             (setq raised err)))))
+      (should (eq (car raised) 'error))
+      (should (= (proofread--request-queue-length) 2))
+      (should (timerp proofread--queue-dispatch-timer))
+      (proofread--cancel-queue-dispatch-timer)
+      (proofread--clear-request-work)
+      (proofread-test--assert-no-pending-request-work))))
 
 (ert-deftest
     proofread-test-profile-result-adds-diagnostic-provenance
@@ -16504,6 +17679,88 @@ This covers URLs, email, invisible text, faces, and properties."
         (should-not proofread--queue-dispatch-timer)
         (should (= (hash-table-count proofread--pending-request-keys)
                    0))))))
+
+(ert-deftest
+    proofread-test-nested-profile-clear-rejections-settle-all-batches ()
+  "Settle nested profile batches rejected by cancellation hooks."
+  (with-temp-buffer
+    (insert "abcdef")
+    (let* ((proofread-auto-check nil)
+           (proofread-cache-max-entries 0)
+           (proofread-context-size 0)
+           (proofread-profile 'multi)
+           (proofread-profiles (proofread-test--ordered-profiles))
+           (original-reject
+            (symbol-function 'proofread--reject-request-during-clear))
+           rejection-scope
+           outer-rejected
+           nested-rejected
+           (stage 0))
+      (proofread-mode 1)
+      (let* ((old-chunk (proofread--make-request-ready-chunk 1 5))
+             (dispatch-chunks
+              (proofread-test--request-ready-chunks-for-ranges
+               '((2 . 6))))
+             (dispatch-profile (proofread--current-profile))
+             (old
+              (proofread-test--make-request-work
+               old-chunk proofread-test--backend))
+             (old-log-id (proofread--scheduled-work-log-id old)))
+        (proofread--enqueue-requests (list old))
+        (let ((proofread-request-log-hook
+               (list
+                (lambda (event)
+                  (when (eq (plist-get event :type) 'cancelled)
+                    (cond
+                     ((and (zerop stage)
+                           (equal (plist-get event :log-id)
+                                  old-log-id))
+                      (setq stage 1)
+                      (let ((previous-scope rejection-scope))
+                        (setq rejection-scope 'outer)
+                        (unwind-protect
+                            (proofread--dispatch-profile-request-ready-chunks-result
+                             dispatch-chunks dispatch-profile)
+                          (setq rejection-scope previous-scope))))
+                     ((and (= stage 1)
+                           (eq (plist-get event :reason) 'cleared))
+                      (setq stage 2)
+                      (let ((previous-scope rejection-scope))
+                        (setq rejection-scope 'nested)
+                        (unwind-protect
+                            (proofread--dispatch-profile-request-ready-chunks-result
+                             dispatch-chunks dispatch-profile)
+                          (setq rejection-scope previous-scope))))))))))
+          (cl-letf
+              (((symbol-function 'proofread--reject-request-during-clear)
+                (lambda (work)
+                  (pcase rejection-scope
+                    ('outer (push work outer-rejected))
+                    ('nested (push work nested-rejected)))
+                  (funcall original-reject work))))
+            (proofread--clear-scheduled-work)))
+        (setq outer-rejected (nreverse outer-rejected))
+        (setq nested-rejected (nreverse nested-rejected))
+        (should (= stage 2))
+        (should (= (length outer-rejected) 2))
+        (should (= (length nested-rejected) 2))
+        (let* ((works (append outer-rejected nested-rejected))
+               (batches
+                (delete-dups
+                 (mapcar #'proofread--scheduled-work-batch works))))
+          (should (cl-every #'proofread--scheduled-work-batch works))
+          (should (cl-every
+                   #'proofread--scheduled-work-batch-settled works))
+          (should (= (length batches) 4))
+          (dolist (batch batches)
+            (should (zerop (plist-get batch :pending)))))
+        (should-not proofread--active-requests)
+        (should-not proofread--claimed-requests)
+        (should (proofread--request-queue-empty-p))
+        (should-not proofread--queue-dispatch-timer)
+        (should (zerop
+                 (hash-table-count proofread--pending-request-keys)))
+        (proofread-test--assert-queue-cache-index-consistent)))))
 
 (ert-deftest
     proofread-test-request-cleanup-rejects-active-cancel-hook-work ()
