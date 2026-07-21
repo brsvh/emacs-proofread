@@ -185,6 +185,24 @@ LANGUAGE is the language hint snapshotted for the chunks."
     (proofread--cancel-request-log-refresh-timer)
     (proofread--refresh-request-log-list-buffers)))
 
+(defun proofread-test--record-request-log-event
+    (source key &optional type)
+  "Record a request-log event for SOURCE under KEY.
+TYPE defaults to `chunk-request'."
+  (let* ((type (or type 'chunk-request))
+         (request (list :id key :buffer source :beg 1 :end 1))
+         (event (list :type type
+                      :time (current-time)
+                      :log-id key
+                      :request-id key
+                      :buffer source
+                      :beg 1
+                      :end 1
+                      :request request)))
+    (when (eq type 'chunk-request)
+      (setq event (plist-put event :chunk request)))
+    (proofread--request-log-record-event event)))
+
 (defun proofread-test--wait-for (predicate &optional timeout)
   "Wait for PREDICATE to return non-nil or TIMEOUT seconds to pass."
   (let ((deadline (+ (float-time) (or timeout 1.0)))
@@ -14196,6 +14214,171 @@ This covers URLs, email, invisible text, faces, and properties."
     (should-error (proofread-show-buffer-requests name)
                   :type 'user-error)))
 
+(ert-deftest
+    proofread-test-request-log-ring-preserves-insertion-order ()
+  "Keep insertion order when a bounded request record is updated."
+  (with-temp-buffer
+    (setq-local proofread-request-log-max-records 3)
+    (setq proofread--request-log-enabled t)
+    (dolist (key '(30 10 20))
+      (proofread-test--record-request-log-event
+       (current-buffer) key))
+    (should (ring-p proofread--request-log-order))
+    (should (= (ring-size proofread--request-log-order) 3))
+    (should (equal (ring-elements proofread--request-log-order)
+                   '(20 10 30)))
+    (proofread-test--record-request-log-event
+     (current-buffer) 10 'queued-request)
+    (should (equal (ring-elements proofread--request-log-order)
+                   '(20 10 30)))
+    (should (= (hash-table-count proofread--request-log-records)
+               3))
+    (let* ((records (proofread--request-log-record-list))
+           (updated (cl-find 10 records
+                             :key (lambda (record)
+                                    (plist-get record :key)))))
+      (should (equal (mapcar (lambda (record)
+                               (plist-get record :key))
+                             records)
+                     '(30 10 20)))
+      (should (eq (plist-get updated :status) 'queued))
+      (should (equal (mapcar (lambda (event)
+                               (plist-get event :type))
+                             (plist-get updated :events))
+                     '(chunk-request queued-request))))
+    (proofread-test--record-request-log-event
+     (current-buffer) 40)
+    (should (equal (ring-elements proofread--request-log-order)
+                   '(40 20 10)))
+    (should (= (hash-table-count proofread--request-log-records)
+               3))
+    (should-not (gethash 30 proofread--request-log-records))
+    (should (equal (mapcar (lambda (record)
+                             (plist-get record :key))
+                           (proofread--request-log-record-list))
+                   '(10 20 40)))))
+
+(ert-deftest proofread-test-request-log-ring-migrates-list-order ()
+  "Preserve legacy insertion order while replacing its order list."
+  (with-temp-buffer
+    (setq-local proofread-request-log-max-records 2)
+    (setq proofread--request-log-records
+          (make-hash-table :test #'equal))
+    (dolist (key '(30 10 20))
+      (puthash key
+               (list :key key
+                     :log-id key
+                     :source-buffer (current-buffer))
+               proofread--request-log-records))
+    (setq proofread--request-log-order '(30 10 20))
+    (should (equal (mapcar (lambda (record)
+                             (plist-get record :key))
+                           (proofread--request-log-record-list))
+                   '(10 20)))
+    (should (ring-p proofread--request-log-order))
+    (should (equal (ring-elements proofread--request-log-order)
+                   '(20 10)))
+    (should (= (hash-table-count proofread--request-log-records)
+               2))
+    (should-not (gethash 30 proofread--request-log-records))))
+
+(ert-deftest proofread-test-request-log-ring-resizes-and-prunes ()
+  "Synchronize request record storage when its ring is resized."
+  (with-temp-buffer
+    (setq-local proofread-request-log-max-records 3)
+    (setq proofread--request-log-enabled t)
+    (dolist (key '(1 2 3))
+      (proofread-test--record-request-log-event
+       (current-buffer) key))
+    (setq-local proofread-request-log-max-records 2)
+    (proofread-test--record-request-log-event
+     (current-buffer) 3 'queued-request)
+    (should (equal (mapcar (lambda (record)
+                             (plist-get record :key))
+                           (proofread--request-log-record-list))
+                   '(2 3)))
+    (should (= (ring-size proofread--request-log-order) 2))
+    (should (equal (ring-elements proofread--request-log-order)
+                   '(3 2)))
+    (should (= (hash-table-count proofread--request-log-records)
+               2))
+    (should-not (gethash 1 proofread--request-log-records))
+    (setq-local proofread-request-log-max-records 4)
+    (dolist (key '(4 5))
+      (proofread-test--record-request-log-event
+       (current-buffer) key))
+    (should (= (ring-size proofread--request-log-order) 4))
+    (should (equal (ring-elements proofread--request-log-order)
+                   '(5 4 3 2)))
+    (should (equal (mapcar (lambda (record)
+                             (plist-get record :key))
+                           (proofread--request-log-record-list))
+                   '(2 3 4 5)))
+    (should (= (hash-table-count proofread--request-log-records)
+               4))
+    (setq-local proofread-request-log-max-records 0)
+    (proofread-test--record-request-log-event
+     (current-buffer) 6)
+    (should-not (proofread--request-log-record-list))
+    (should (= (ring-size proofread--request-log-order) 0))
+    (should (ring-empty-p proofread--request-log-order))
+    (should (= (hash-table-count proofread--request-log-records)
+               0))))
+
+(ert-deftest
+    proofread-test-request-log-shrink-does-not-reinsert-update ()
+  "Do not reinsert an updated record evicted by a pending shrink."
+  (with-temp-buffer
+    (setq-local proofread-request-log-max-records 3)
+    (setq proofread--request-log-enabled t)
+    (dolist (key '(1 2 3))
+      (proofread-test--record-request-log-event
+       (current-buffer) key))
+    (setq-local proofread-request-log-max-records 2)
+    (proofread-test--record-request-log-event
+     (current-buffer) 1 'queued-request)
+    (should (equal (ring-elements proofread--request-log-order)
+                   '(3 2)))
+    (should (= (hash-table-count proofread--request-log-records)
+               2))
+    (should-not (gethash 1 proofread--request-log-records))
+    (should (equal (mapcar (lambda (record)
+                             (plist-get record :key))
+                           (proofread--request-log-record-list))
+                   '(2 3)))))
+
+(ert-deftest proofread-test-request-log-ignores-dead-source ()
+  "Ignore request-log records whose source buffer is dead."
+  (let* ((proofread--request-log-sources nil)
+         (source
+          (generate-new-buffer " *proofread-request-dead-log*"))
+         event)
+    (with-current-buffer source
+      (setq proofread--request-log-enabled t)
+      (proofread-test--record-request-log-event source 1)
+      (setq event
+            (proofread--request-log-safe-event
+             (list :type 'chunk-request
+                   :time (current-time)
+                   :log-id 2
+                   :request-id 2
+                   :buffer source
+                   :beg 1
+                   :end 1
+                   :request (list :id 2 :buffer source)))))
+    (setq proofread--request-log-sources (list source))
+    (kill-buffer source)
+    (cl-letf (((symbol-function
+                'proofread--request-log-ensure-records)
+               (lambda ()
+                 (error "Dead source state was accessed"))))
+      (should-not
+       (proofread--request-log-record-canonical-event event))
+      (should-not (proofread--request-log-record-list source))
+      (should-not (proofread--request-log-lookup-record source 1)))
+    (proofread--prune-request-log-sources)
+    (should-not proofread--request-log-sources)))
+
 (ert-deftest proofread-test-negative-request-log-limit-is-safe ()
   "A negative direct request-log limit is clamped instead of looping."
   (with-temp-buffer
@@ -14212,9 +14395,12 @@ This covers URLs, email, invisible text, faces, and properties."
              :end 1
              :request (list :id 1 :buffer
                             (current-buffer))))
-      (should-not proofread--request-log-order)
+      (should (ring-p proofread--request-log-order))
+      (should (= (ring-size proofread--request-log-order) 0))
+      (should (ring-empty-p proofread--request-log-order))
       (should (= (hash-table-count proofread--request-log-records)
-                 0)))))
+                 0))
+      (should-not (proofread--request-log-record-list)))))
 
 (ert-deftest
     proofread-test-request-log-buffer-lists-recorded-requests ()

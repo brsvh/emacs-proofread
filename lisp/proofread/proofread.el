@@ -40,6 +40,7 @@
 (require 'lisp-mode)
 (require 'pp)
 (require 'pulse)
+(require 'ring)
 (require 'subr-x)
 (require 'tabulated-list)
 (require 'url-parse)
@@ -734,7 +735,7 @@ interrupting proofreading.")
   "Hash table of proofread request records for the current buffer.")
 
 (defvar-local proofread--request-log-order nil
-  "Request record keys in oldest-to-newest order.")
+  "Ring of request record keys in newest-to-oldest order.")
 
 (defvar-local proofread--request-log-list-buffers nil
   "Live request list buffers for the current source buffer.")
@@ -6603,6 +6604,63 @@ nil for a change to the default."
           (make-hash-table :test #'equal)))
   proofread--request-log-records)
 
+(defun proofread--request-log-record-sequence (record)
+  "Return RECORD's chronological sequence number."
+  (or (plist-get record :log-id)
+      (plist-get record :request-id)
+      0))
+
+(defun proofread--request-log-insert-key (records order key)
+  "Insert new KEY into ORDER and evict its old RECORDS entry.
+Return non-nil when ORDER has capacity for KEY."
+  (unless (zerop (ring-size order))
+    (let ((evicted
+           (and (= (ring-length order) (ring-size order))
+                (ring-ref order (1- (ring-length order))))))
+      (ring-insert order key)
+      (when evicted
+        (remhash evicted records)))
+    t))
+
+(defun proofread--request-log-rebuild-order (records limit)
+  "Return a LIMIT-sized order ring rebuilt from RECORDS.
+Remove records older than LIMIT from RECORDS."
+  (let* ((order (make-ring limit))
+         (legacy-keys
+          (and (proper-list-p proofread--request-log-order)
+               proofread--request-log-order))
+         (keys
+          (or legacy-keys
+              (mapcar
+               (lambda (record)
+                 (plist-get record :key))
+               (sort
+                (hash-table-values records)
+                (lambda (a b)
+                  (< (proofread--request-log-record-sequence a)
+                     (proofread--request-log-record-sequence b))))))))
+    (if (zerop limit)
+        (clrhash records)
+      (dolist (key keys)
+        (when (gethash key records)
+          (proofread--request-log-insert-key records order key))))
+    order))
+
+(defun proofread--request-log-ensure-order (records)
+  "Return the current order ring synchronized with RECORDS."
+  (let ((limit (max 0 proofread-request-log-max-records)))
+    (if (ring-p proofread--request-log-order)
+        (unless (= (ring-size proofread--request-log-order) limit)
+          (let ((evicted
+                 (nthcdr limit
+                         (ring-elements proofread--request-log-order))))
+            (ring-resize proofread--request-log-order limit)
+            (dolist (key evicted)
+              (remhash key records))))
+      (setq proofread--request-log-order
+            (proofread--request-log-rebuild-order records limit)))
+    proofread--request-log-order))
+
 (defun proofread--request-log-event-request (event)
   "Return the proofread request stored in EVENT."
   (or (plist-get event :request)
@@ -6726,18 +6784,22 @@ nil for a change to the default."
     (when (and key (proofread--request-log-source-enabled-p source))
       (with-current-buffer source
         (let* ((records (proofread--request-log-ensure-records))
-               (record (or (gethash key records)
-                           (list :key key
-                                 :source-buffer source))))
-          (setq record
-                (proofread--request-log-apply-event record event))
-          (puthash key record records)
-          (unless (member key proofread--request-log-order)
-            (setq proofread--request-log-order
-                  (append proofread--request-log-order (list key))))
-          (let ((limit (max 0 proofread-request-log-max-records)))
-            (while (> (length proofread--request-log-order) limit)
-              (remhash (pop proofread--request-log-order) records))))
+               (record (gethash key records))
+               (order (proofread--request-log-ensure-order records)))
+          (if record
+              (when (gethash key records)
+                (puthash
+                 key
+                 (proofread--request-log-apply-event record event)
+                 records))
+            (when (proofread--request-log-insert-key
+                   records order key)
+              (puthash
+               key
+               (proofread--request-log-apply-event
+                (list :key key :source-buffer source)
+                event)
+               records))))
         (proofread--schedule-request-log-refresh)))))
 
 (defun proofread--request-log-record-event (raw-event)
@@ -6748,26 +6810,28 @@ nil for a change to the default."
 
 (defun proofread--request-log-record-list (&optional source)
   "Return proofread request records for SOURCE or the current buffer."
-  (with-current-buffer (or source (current-buffer))
-    (mapcar
-     #'proofread--request-log-copy-record
-     (sort
-      (hash-table-values (proofread--request-log-ensure-records))
-      (lambda (a b)
-        (< (or (plist-get a :log-id)
-               (plist-get a :request-id)
-               0)
-           (or (plist-get b :log-id)
-               (plist-get b :request-id)
-               0)))))))
+  (let ((source (get-buffer (or source (current-buffer)))))
+    (when (buffer-live-p source)
+      (with-current-buffer source
+        (let* ((records (proofread--request-log-ensure-records))
+               (order (proofread--request-log-ensure-order records)))
+          (delq
+           nil
+           (mapcar
+            (lambda (key)
+              (when-let* ((record (gethash key records)))
+                (proofread--request-log-copy-record record)))
+            (nreverse (ring-elements order)))))))))
 
 (defun proofread--request-log-lookup-record (source key)
   "Return request record KEY from SOURCE."
   (when (buffer-live-p source)
     (with-current-buffer source
-      (and (hash-table-p proofread--request-log-records)
-           (proofread--request-log-copy-record
-            (gethash key proofread--request-log-records))))))
+      (when (hash-table-p proofread--request-log-records)
+        (proofread--request-log-ensure-order
+         proofread--request-log-records)
+        (proofread--request-log-copy-record
+         (gethash key proofread--request-log-records))))))
 
 (defun proofread--request-log-source-range-valid-p (source beg end)
   "Return non-nil when BEG to END is valid in SOURCE."
@@ -6979,7 +7043,8 @@ nil for a change to the default."
     (with-current-buffer source
       (setq newly-enabled (not proofread--request-log-enabled))
       (setq proofread--request-log-enabled t)
-      (proofread--request-log-ensure-records)
+      (proofread--request-log-ensure-order
+       (proofread--request-log-ensure-records))
       (proofread--install-source-list-cleanup))
     (cl-pushnew source proofread--request-log-sources)
     (when newly-enabled
