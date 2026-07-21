@@ -14775,6 +14775,446 @@ This covers URLs, email, invisible text, faces, and properties."
       (should (= (plist-get typed-event :max-passes) 2))
       (should (eq (plist-get typed-event :strategy) 'typed)))))
 
+(ert-deftest proofread-test-request-log-schema-declares-every-event ()
+  "Declare every request event with named callable sanitizers."
+  (let* ((property-sanitizers
+          (plist-get proofread--request-log-schema
+                     :property-sanitizers))
+         (objects (plist-get proofread--request-log-schema :objects))
+         (event-schema
+          (plist-get proofread--request-log-schema :events))
+         (event-types (mapcar #'car event-schema))
+         (expected-types
+          '( t chunk-request queued-request active-request
+             backend-dispatched backend-request backend-response
+             backend-result cache-hit cancelled final-result
+             checker-dispatch-failed)))
+    (should
+     (equal (mapcar #'car property-sanitizers)
+            (delete-dups (mapcar #'car property-sanitizers))))
+    (dolist (entry property-sanitizers)
+      (should (keywordp (car entry)))
+      (let ((sanitizer (cdr entry)))
+        (should (symbolp sanitizer))
+        (should (fboundp sanitizer))))
+    (should
+     (equal (mapcar #'car objects)
+            (delete-dups (mapcar #'car objects))))
+    (dolist (entry objects)
+      (let ((fields (cdr entry)))
+        (should
+         (equal (mapcar #'car fields)
+                (delete-dups (mapcar #'car fields))))
+        (dolist (field fields)
+          (should (= (length field) 2))
+          (should (keywordp (car field)))
+          (let ((sanitizer (cadr field)))
+            (should (symbolp sanitizer))
+            (should
+             (string-prefix-p
+              "proofread--request-log-safe-object-"
+              (symbol-name sanitizer)))
+            (should (fboundp sanitizer))))))
+    (should (equal event-types expected-types))
+    (dolist (entry event-schema)
+      (let ((fields (cdr entry)))
+        (should
+         (equal (mapcar #'car fields)
+                (delete-dups (mapcar #'car fields))))
+        (dolist (field fields)
+          (should (= (length field) 2))
+          (should (keywordp (car field)))
+          (let ((sanitizer (cadr field)))
+            (should (symbolp sanitizer))
+            (should
+             (string-prefix-p
+              "proofread--request-log-safe-event-"
+              (symbol-name sanitizer)))
+            (should (fboundp sanitizer))))))))
+
+(ert-deftest proofread-test-request-log-event-schema-golden-projections ()
+  "Project every request event to its complete safe visible shape."
+  (with-temp-buffer
+    (let* ((sentinel
+            "PROOFREAD-TEST-EVENT-SCHEMA-SECRET-MUST-NOT-APPEAR")
+           (opaque (vector 'provider :secret sentinel))
+           (time '(1 2 3 4))
+           (request
+            (list :id 17
+                  :buffer (current-buffer)
+                  :beg 2
+                  :end 6
+                  :text "helo"
+                  :backend proofread-test--backend
+                  :checker-options opaque
+                  :provider opaque))
+           (safe-request
+            (list :id 17
+                  :buffer (current-buffer)
+                  :beg 2
+                  :end 6
+                  :text "helo"
+                  :backend proofread-test--backend))
+           (chunk
+            (list :beg 2
+                  :end 6
+                  :text "helo"
+                  :context-before "Before."
+                  :context-after "After."
+                  :language "en-US"
+                  :major-mode 'text-mode
+                  :target-kind 'text
+                  :domain-beg 1
+                  :domain-end 8
+                  :accessible-beg 1
+                  :accessible-end 8
+                  :provider opaque))
+           (safe-chunk
+            '( :beg 2
+               :end 6
+               :text "helo"
+               :context-before "Before."
+               :context-after "After."
+               :language "en-US"
+               :major-mode text-mode
+               :target-kind text
+               :domain-beg 1
+               :domain-end 8
+               :accessible-beg 1
+               :accessible-end 8))
+           (diagnostic
+            (list :beg 2
+                  :end 6
+                  :text "helo"
+                  :kind 'spelling
+                  :message "Possible misspelling"
+                  :target-kind 'text
+                  :language "en-US"
+                  :display-language "English"
+                  :profile 'writing
+                  :checker-name 'strict
+                  :checker-ordinal 1
+                  :checker-owner
+                  '( :profile writing :checker-name strict :ad-hoc nil)
+                  :source-label "Test checker"
+                  :source 'test
+                  :suggestions '("hello")
+                  :provider opaque))
+           (safe-diagnostic
+            '( :beg 2
+               :end 6
+               :text "helo"
+               :kind spelling
+               :message "Possible misspelling"
+               :target-kind text
+               :language "en-US"
+               :display-language "English"
+               :profile writing
+               :checker-name strict
+               :checker-ordinal 1
+               :checker-owner
+               ( :profile writing :checker-name strict :ad-hoc nil)
+               :source-label "Test checker"
+               :source test
+               :suggestions ("hello")))
+           (entry
+            (list :text "helo"
+                  :diagnostics (list diagnostic)
+                  :provider opaque))
+           (safe-entry
+            (list :text "helo"
+                  :diagnostics (list safe-diagnostic)))
+           (result
+            (list :status 'error
+                  :source 'network
+                  :partial t
+                  :phase 'parse
+                  :diagnostics (list diagnostic)
+                  :error (list 'proofread-test-backend-error opaque)
+                  :message opaque
+                  :provider opaque))
+           (safe-result
+            (list :status 'error
+                  :source 'network
+                  :partial t
+                  :phase 'parse
+                  :diagnostics (list safe-diagnostic)
+                  :error 'proofread-test-backend-error
+                  :message "Backend request failed"))
+           (url
+            (concat
+             "https://private-user:private-password@example.test:9443"
+             "/v2/check?api-key=private-key#private-fragment"))
+           (common-input
+            (list :time time
+                  :log-id 31
+                  :request-id 17
+                  :buffer (current-buffer)
+                  :beg 2
+                  :end 6
+                  :status 'waiting
+                  :request request))
+           (common-expected
+            (list :time time
+                  :log-id 31
+                  :request-id 17
+                  :buffer (current-buffer)
+                  :beg 2
+                  :end 6
+                  :status 'waiting
+                  :request safe-request))
+           (cases
+            (list
+             (list 'chunk-request
+                   (list :chunk chunk)
+                   (list :chunk safe-chunk))
+             (list 'queued-request
+                   (list :backend proofread-test--backend)
+                   (list :backend proofread-test--backend))
+             (list 'active-request
+                   (list :backend proofread-test--backend)
+                   (list :backend proofread-test--backend))
+             (list 'backend-dispatched
+                   (list :backend proofread-test--backend)
+                   (list :backend proofread-test--backend))
+             (list
+              'backend-request
+              (list :backend proofread-test--backend
+                    :method "POST"
+                    :url url
+                    :parameters "language=en-US&text=helo"
+                    :pass 1
+                    :max-passes 2
+                    :strategy 'json
+                    :schema "{\"type\":\"object\"}"
+                    :prompt-text "Review this text: helo."
+                    :reported-diagnostics (list diagnostic))
+              (list :backend proofread-test--backend
+                    :method "POST"
+                    :pass 1
+                    :max-passes 2
+                    :strategy 'json
+                    :url "https://example.test:9443"
+                    :parameters "language=en-US&text=helo"
+                    :schema "{\"type\":\"object\"}"
+                    :prompt-text "Review this text: helo."
+                    :reported-diagnostics (list safe-diagnostic)))
+             (list
+              'backend-response
+              (list :backend proofread-test--backend
+                    :url url
+                    :http-status 503
+                    :pass 1
+                    :response "Safe provider response"
+                    :error (list 'file-error opaque)
+                    :message opaque)
+              (list :backend proofread-test--backend
+                    :http-status 503
+                    :pass 1
+                    :url "https://example.test:9443"
+                    :response "Safe provider response"
+                    :error 'file-error
+                    :message "Backend request failed"))
+             (list
+              'backend-result
+              (list :backend proofread-test--backend
+                    :pass 1
+                    :source 'network
+                    :entry entry
+                    :result result)
+              (list :backend proofread-test--backend
+                    :pass 1
+                    :source 'network
+                    :entry safe-entry
+                    :result safe-result))
+             (list 'cache-hit
+                   (list :entry entry)
+                   (list :entry safe-entry))
+             (list 'cancelled
+                   (list :reason 'cleared)
+                   (list :reason 'cleared))
+             (list 'final-result
+                   (list :result result)
+                   (list :result safe-result))
+             (list
+              'checker-dispatch-failed
+              (list :profile 'writing
+                    :checker-name 'strict
+                    :backend proofread-test--backend
+                    :phase 'checker-options
+                    :error (list 'wrong-type-argument opaque))
+              (list :profile 'writing
+                    :checker-name 'strict
+                    :backend proofread-test--backend
+                    :phase 'checker-options
+                    :error 'wrong-type-argument
+                    :message
+                    "Checker strict failed during checker options snapshot"))))
+           (event-types
+            '( chunk-request queued-request active-request
+               backend-dispatched backend-request backend-response
+               backend-result cache-hit cancelled final-result
+               checker-dispatch-failed)))
+      (should (equal (mapcar #'car cases) event-types))
+      (dolist (case cases)
+        (let* ((type (car case))
+               (event
+                (append
+                 (list :type type)
+                 common-input
+                 (cadr case)
+                 (list :unknown opaque
+                       :checker-options opaque
+                       :prompt opaque
+                       :provider opaque
+                       :handle opaque)))
+               (expected
+                (append (list :type type)
+                        common-expected
+                        (caddr case)))
+               (safe (proofread--request-log-safe-event event)))
+          (should (equal safe expected))
+          (proofread-test--assert-secret-not-printed sentinel safe)
+          (dolist (property
+                   '( :unknown :checker-options :prompt :provider
+                      :handle))
+            (should-not (plist-member safe property))))))))
+
+(ert-deftest
+    proofread-test-request-log-event-schema-bounds-malformed-payloads ()
+  "Reject malformed events or reduce them to bounded safe values."
+  (let* ((sentinel
+          "PROOFREAD-TEST-MALFORMED-EVENT-MUST-NOT-APPEAR")
+         (opaque-symbol 'proofread-test-unknown-event)
+         (opaque (vector 'provider :secret sentinel))
+         (events
+          (list
+           nil
+           opaque
+           (cons :type 'backend-request)
+           '( :type backend-request :method)
+           (list :type opaque-symbol :request opaque)
+           (list :type 'chunk-request :chunk opaque)
+           (list :type 'backend-request
+                 :schema opaque
+                 :prompt-text opaque
+                 :reported-diagnostics opaque)
+           (list :type 'backend-response
+                 :url sentinel
+                 :response opaque
+                 :error opaque
+                 :message opaque)
+           (list :type 'backend-result
+                 :entry opaque
+                 :result
+                 (list :status opaque
+                       :request opaque
+                       :diagnostics (list opaque)
+                       :error opaque
+                       :message opaque))
+           (list :type 'cache-hit :entry opaque)
+           (list :type 'final-result :result opaque)
+           (list :type 'checker-dispatch-failed
+                 :profile opaque
+                 :checker-name opaque
+                 :backend opaque
+                 :phase opaque
+                 :error opaque))))
+    (dolist (event events)
+      (let ((safe (proofread--request-log-safe-event event)))
+        (should (proper-list-p safe))
+        (should (< (length (prin1-to-string safe)) 1024))
+        (proofread-test--assert-secret-not-printed sentinel safe)))))
+
+(ert-deftest proofread-test-request-log-unknown-event-keeps-common-fields ()
+  "Keep only safe common fields for an unknown request event type."
+  (with-temp-buffer
+    (let* ((sentinel "PROOFREAD-TEST-UNKNOWN-EVENT-MUST-NOT-APPEAR")
+           (event
+            (list :type 'proofread-test-unknown-event
+                  :time '(1 2 3 4)
+                  :log-id 31
+                  :request-id 17
+                  :buffer (current-buffer)
+                  :beg 2
+                  :end 6
+                  :status 'waiting
+                  :request
+                  (list :id 17
+                        :buffer (current-buffer)
+                        :beg 2
+                        :end 6
+                        :text "helo"
+                        :checker-options sentinel)
+                  :backend proofread-test--backend
+                  :message sentinel
+                  :unknown sentinel))
+           (safe (proofread--request-log-safe-event event)))
+      (should
+       (equal
+        safe
+        (list :type 'proofread-test-unknown-event
+              :time '(1 2 3 4)
+              :log-id 31
+              :request-id 17
+              :buffer (current-buffer)
+              :beg 2
+              :end 6
+              :status 'waiting
+              :request
+              (list :id 17
+                    :buffer (current-buffer)
+                    :beg 2
+                    :end 6
+                    :text "helo"))))
+      (proofread-test--assert-secret-not-printed sentinel safe)
+      (dolist (property '( :backend :message :unknown))
+        (should-not (plist-member safe property))))))
+
+(ert-deftest
+    proofread-test-request-log-event-schema-preserves-empty-fields ()
+  "Preserve established explicit nil and derived request fields."
+  (with-temp-buffer
+    (let* ((request
+            (list :id 17
+                  :buffer (current-buffer)
+                  :beg 2
+                  :end 6
+                  :text "helo"))
+           (safe-request (copy-sequence request)))
+      (dolist
+          (case
+           '( (( :type chunk-request)
+               ( :type chunk-request :chunk nil))
+              (( :type backend-result)
+               ( :type backend-result :result nil))
+              (( :type cache-hit)
+               ( :type cache-hit :entry nil))
+              (( :type final-result)
+               ( :type final-result :result nil))
+              (( :type backend-response :error nil :message nil)
+               ( :type backend-response
+                 :error nil
+                 :message "Backend request failed"))
+              (( :type checker-dispatch-failed)
+               ( :type checker-dispatch-failed
+                 :error nil
+                 :message "Checker nil failed during nil"))
+              (( :type backend-request :backend nil)
+               ( :type backend-request :backend nil))))
+        (should
+         (equal (proofread--request-log-safe-event (car case))
+                (cadr case))))
+      (should
+       (equal
+        (proofread--request-log-safe-event
+         (list :type 'final-result
+               :result (list :status 'ok :request request)))
+        (list :type 'final-result
+              :request safe-request
+              :result
+              (list :status 'ok :request safe-request)))))))
+
 (ert-deftest proofread-test-request-monitor-redacts-opaque-values ()
   "Exclude opaque backend values from every request-monitor surface."
   (save-window-excursion

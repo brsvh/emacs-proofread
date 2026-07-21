@@ -317,28 +317,204 @@ request-ready chunks."
      :backend :backend-identity)
   "Required keys for proofread backend request plists.")
 
-(defconst proofread--request-log-request-keys
-  '( :id :generation :buffer
-     :beg :end :text
-     :context-before :context-after
-     :language :display-language
-     :profile :checker-name :checker-ordinal :checker-owner
-     :source-label
-     :major-mode :target-kind
-     :domain-beg :domain-end :accessible-beg :accessible-end
-     :backend)
-  "Backend request keys safe to retain in request logs.")
-
-(defconst proofread--request-log-position-keys
-  '( :beg :end :domain-beg :domain-end :accessible-beg :accessible-end)
-  "Request-log properties whose values are frozen as positions.")
-
-(defconst proofread--request-log-diagnostic-keys
-  '( :beg :end :text :kind :message :target-kind
-     :language :display-language
-     :profile :checker-name :checker-ordinal :checker-owner
-     :source-label)
-  "Diagnostic properties safe to retain in request logs.")
+(defconst proofread--request-log-schema
+  '( :property-sanitizers
+     ((:beg . proofread--request-log-safe-position-value)
+      (:end . proofread--request-log-safe-position-value)
+      (:domain-beg . proofread--request-log-safe-position-value)
+      (:domain-end . proofread--request-log-safe-position-value)
+      (:accessible-beg . proofread--request-log-safe-position-value)
+      (:accessible-end . proofread--request-log-safe-position-value)
+      (:text . proofread--request-log-safe-string-value)
+      (:context-before . proofread--request-log-safe-string-value)
+      (:context-after . proofread--request-log-safe-string-value)
+      (:language . proofread--request-log-safe-string-value)
+      (:display-language . proofread--request-log-safe-string-value)
+      (:message . proofread--request-log-safe-string-value)
+      (:method . proofread--request-log-safe-string-value)
+      (:source-label . proofread--request-log-safe-string-value)
+      (:type . proofread--request-log-safe-symbol-value)
+      (:status . proofread--request-log-safe-symbol-value)
+      (:final-status . proofread--request-log-safe-symbol-value)
+      (:profile . proofread--request-log-safe-symbol-value)
+      (:checker-name . proofread--request-log-safe-symbol-value)
+      (:backend . proofread--request-log-safe-symbol-value)
+      (:major-mode . proofread--request-log-safe-symbol-value)
+      (:target-kind . proofread--request-log-safe-symbol-value)
+      (:kind . proofread--request-log-safe-symbol-value)
+      (:strategy . proofread--request-log-safe-symbol-value)
+      (:reason . proofread--request-log-safe-symbol-value)
+      (:phase . proofread--request-log-safe-symbol-value)
+      (:ad-hoc . proofread--request-log-safe-symbol-value)
+      (:partial . proofread--request-log-safe-symbol-value)
+      (:source . proofread--request-log-safe-source-value)
+      (:key . proofread--request-log-safe-integer-value)
+      (:log-id . proofread--request-log-safe-integer-value)
+      (:id . proofread--request-log-safe-integer-value)
+      (:request-id . proofread--request-log-safe-integer-value)
+      (:generation . proofread--request-log-safe-integer-value)
+      (:checker-ordinal . proofread--request-log-safe-integer-value)
+      (:pass . proofread--request-log-safe-integer-value)
+      (:max-passes . proofread--request-log-safe-integer-value)
+      (:http-status . proofread--request-log-safe-integer-value)
+      (:contract-version . proofread--request-log-safe-integer-value)
+      (:buffer . proofread--request-log-safe-buffer-value)
+      (:source-buffer . proofread--request-log-safe-buffer-value)
+      (:time . proofread--request-log-safe-time-value)
+      (:created-at . proofread--request-log-safe-time-value)
+      (:updated-at . proofread--request-log-safe-time-value)
+      (:checker-owner . proofread--request-log-safe-checker-owner-value))
+     :objects
+     ((checker-owner
+       (:profile proofread--request-log-safe-object-property)
+       (:checker-name proofread--request-log-safe-object-property)
+       (:ad-hoc proofread--request-log-safe-object-property))
+      (backend-identity
+       (:backend proofread--request-log-safe-object-property)
+       (:contract-version proofread--request-log-safe-object-property)
+       (:fingerprint
+        proofread--request-log-safe-object-identity-fingerprint))
+      (checker-identity
+       (:profile proofread--request-log-safe-object-property)
+       (:checker-name proofread--request-log-safe-object-property)
+       (:backend proofread--request-log-safe-object-property)
+       (:ad-hoc proofread--request-log-safe-object-property)
+       (:backend-identity
+        proofread--request-log-safe-object-backend-identity)
+       (:fingerprint
+        proofread--request-log-safe-object-summary-fingerprint))
+      (request
+       (:id proofread--request-log-safe-object-property)
+       (:generation proofread--request-log-safe-object-property)
+       (:buffer proofread--request-log-safe-object-property)
+       (:beg proofread--request-log-safe-object-property)
+       (:end proofread--request-log-safe-object-property)
+       (:text proofread--request-log-safe-object-property)
+       (:context-before proofread--request-log-safe-object-property)
+       (:context-after proofread--request-log-safe-object-property)
+       (:language proofread--request-log-safe-object-property)
+       (:display-language proofread--request-log-safe-object-property)
+       (:profile proofread--request-log-safe-object-property)
+       (:checker-name proofread--request-log-safe-object-property)
+       (:checker-ordinal proofread--request-log-safe-object-property)
+       (:checker-owner proofread--request-log-safe-object-property)
+       (:source-label proofread--request-log-safe-object-property)
+       (:major-mode proofread--request-log-safe-object-property)
+       (:target-kind proofread--request-log-safe-object-property)
+       (:domain-beg proofread--request-log-safe-object-property)
+       (:domain-end proofread--request-log-safe-object-property)
+       (:accessible-beg proofread--request-log-safe-object-property)
+       (:accessible-end proofread--request-log-safe-object-property)
+       (:backend proofread--request-log-safe-object-property)
+       (:backend-identity
+        proofread--request-log-safe-object-backend-identity)
+       (:checker-identity
+        proofread--request-log-safe-object-checker-identity))
+      (chunk
+       (:beg proofread--request-log-safe-object-property)
+       (:end proofread--request-log-safe-object-property)
+       (:text proofread--request-log-safe-object-property)
+       (:context-before proofread--request-log-safe-object-property)
+       (:context-after proofread--request-log-safe-object-property)
+       (:language proofread--request-log-safe-object-property)
+       (:major-mode proofread--request-log-safe-object-property)
+       (:target-kind proofread--request-log-safe-object-property)
+       (:domain-beg proofread--request-log-safe-object-property)
+       (:domain-end proofread--request-log-safe-object-property)
+       (:accessible-beg proofread--request-log-safe-object-property)
+       (:accessible-end proofread--request-log-safe-object-property))
+      (diagnostic
+       (:beg proofread--request-log-safe-object-property)
+       (:end proofread--request-log-safe-object-property)
+       (:text proofread--request-log-safe-object-property)
+       (:kind proofread--request-log-safe-object-property)
+       (:message proofread--request-log-safe-object-property)
+       (:target-kind proofread--request-log-safe-object-property)
+       (:language proofread--request-log-safe-object-property)
+       (:display-language proofread--request-log-safe-object-property)
+       (:profile proofread--request-log-safe-object-property)
+       (:checker-name proofread--request-log-safe-object-property)
+       (:checker-ordinal proofread--request-log-safe-object-property)
+       (:checker-owner proofread--request-log-safe-object-property)
+       (:source-label proofread--request-log-safe-object-property)
+       (:source proofread--request-log-safe-object-diagnostic-source)
+       (:suggestions
+        proofread--request-log-safe-object-diagnostic-suggestions))
+      (result
+       (:status proofread--request-log-safe-object-property)
+       (:source proofread--request-log-safe-object-property)
+       (:partial proofread--request-log-safe-object-property)
+       (:phase proofread--request-log-safe-object-property)
+       (:request proofread--request-log-safe-object-request)
+       (:diagnostics proofread--request-log-safe-object-diagnostics)
+       (:error proofread--request-log-safe-object-condition)
+       (:message proofread--request-log-safe-object-backend-message))
+      (cache-entry
+       (:text proofread--request-log-safe-object-property)
+       (:diagnostics proofread--request-log-safe-object-diagnostics)))
+     :events
+     ((t
+       (:type proofread--request-log-safe-event-property)
+       (:time proofread--request-log-safe-event-property)
+       (:log-id proofread--request-log-safe-event-property)
+       (:request-id proofread--request-log-safe-event-property)
+       (:buffer proofread--request-log-safe-event-property)
+       (:beg proofread--request-log-safe-event-property)
+       (:end proofread--request-log-safe-event-property)
+       (:status proofread--request-log-safe-event-property)
+       (:request proofread--request-log-safe-event-request))
+      (chunk-request
+       (:chunk proofread--request-log-safe-event-chunk))
+      (queued-request
+       (:backend proofread--request-log-safe-event-property))
+      (active-request
+       (:backend proofread--request-log-safe-event-property))
+      (backend-dispatched
+       (:backend proofread--request-log-safe-event-property))
+      (backend-request
+       (:backend proofread--request-log-safe-event-property)
+       (:method proofread--request-log-safe-event-property)
+       (:pass proofread--request-log-safe-event-property)
+       (:max-passes proofread--request-log-safe-event-property)
+       (:strategy proofread--request-log-safe-event-property)
+       (:url proofread--request-log-safe-event-url)
+       (:parameters proofread--request-log-safe-event-text)
+       (:schema proofread--request-log-safe-event-text)
+       (:prompt-text proofread--request-log-safe-event-text)
+       (:reported-diagnostics
+        proofread--request-log-safe-event-diagnostics))
+      (backend-response
+       (:backend proofread--request-log-safe-event-property)
+       (:http-status proofread--request-log-safe-event-property)
+       (:pass proofread--request-log-safe-event-property)
+       (:url proofread--request-log-safe-event-url)
+       (:response proofread--request-log-safe-event-text)
+       (:error proofread--request-log-safe-event-condition)
+       (:message proofread--request-log-safe-event-backend-message))
+      (backend-result
+       (:backend proofread--request-log-safe-event-property)
+       (:pass proofread--request-log-safe-event-property)
+       (:source proofread--request-log-safe-event-property)
+       (:entry proofread--request-log-safe-event-cache-entry)
+       (:result proofread--request-log-safe-event-result))
+      (cache-hit
+       (:entry proofread--request-log-safe-event-required-cache-entry))
+      (cancelled
+       (:reason proofread--request-log-safe-event-property))
+      (final-result
+       (:result proofread--request-log-safe-event-result))
+      (checker-dispatch-failed
+       (:profile proofread--request-log-safe-event-property)
+       (:checker-name proofread--request-log-safe-event-property)
+       (:backend proofread--request-log-safe-event-property)
+       (:phase proofread--request-log-safe-event-property)
+       (:error proofread--request-log-safe-event-required-condition)
+       (:message proofread--request-log-safe-event-checker-message))))
+  "Declarative safety schema for request-log objects and events.
+The t event entry lists fields shared by every event.  Every field
+specification has the form (PROPERTY SANITIZER).  Object sanitizers
+also receive the safe fields collected so far; every sanitizer returns
+`(t . SAFE-VALUE)' or nil.")
 
 (defconst proofread--overlay-category 'proofread-overlay
   "Overlay category used for proofread-owned overlays.")
@@ -1243,48 +1419,57 @@ OMIT-SOURCE-LABEL is non-nil, skip the presentation-only operation."
       (when (zerop (plist-get batch :pending))
         (proofread--report-request-batch-errors batch)))))
 
-(defun proofread--request-log-safe-checker-owner (owner)
-  "Return a detached safe representation of checker OWNER."
-  (when (proper-list-p owner)
-    (proofread--request-log-copy-properties
-     owner '( :profile :checker-name :ad-hoc))))
+(defun proofread--request-log-schema-object-fields (object)
+  "Return request-log field specifications for OBJECT."
+  (cdr (assq object (plist-get proofread--request-log-schema :objects))))
+
+(defun proofread--request-log-safe-position-value (value)
+  "Return a detached safe representation of position VALUE."
+  (cons t (proofread--position-integer value)))
+
+(defun proofread--request-log-safe-string-value (value)
+  "Return a detached safe representation of string VALUE."
+  (when (stringp value)
+    (cons t (substring-no-properties value))))
+
+(defun proofread--request-log-safe-symbol-value (value)
+  "Return a safe representation of symbol VALUE."
+  (when (symbolp value)
+    (cons t value)))
+
+(defun proofread--request-log-safe-source-value (value)
+  "Return a detached safe representation of source VALUE."
+  (cond
+   ((symbolp value) (cons t value))
+   ((stringp value)
+    (cons t (substring-no-properties value)))))
+
+(defun proofread--request-log-safe-integer-value (value)
+  "Return a safe representation of integer VALUE."
+  (when (integerp value)
+    (cons t value)))
+
+(defun proofread--request-log-safe-buffer-value (value)
+  "Return a safe representation of buffer VALUE."
+  (when (bufferp value)
+    (cons t value)))
+
+(defun proofread--request-log-safe-time-value (value)
+  "Return a detached safe representation of time VALUE."
+  (when (and (proper-list-p value)
+             (cl-every #'integerp value))
+    (cons t (copy-sequence value))))
 
 (defun proofread--request-log-safe-property-value (property value)
   "Return `(t . COPY)' when PROPERTY and VALUE are safe to log."
-  (cond
-   ((null value) (cons t nil))
-   ((memq property proofread--request-log-position-keys)
-    (cons t (proofread--position-integer value)))
-   ((and (memq property
-               '( :text :context-before :context-after :language
-                  :display-language :message :method :source-label))
-         (stringp value))
-    (cons t (substring-no-properties value)))
-   ((and (memq property
-               '( :type :status :final-status :profile :checker-name
-                  :backend :major-mode :target-kind :kind :strategy
-                  :source :reason :phase :ad-hoc :partial))
-         (symbolp value))
-    (cons t value))
-   ((and (eq property :source) (stringp value))
-    (cons t (substring-no-properties value)))
-   ((and (memq property
-               '( :key :log-id :id :request-id :generation
-                  :checker-ordinal :pass :max-passes :http-status
-                  :contract-version))
-         (integerp value))
-    (cons t value))
-   ((and (memq property '( :buffer :source-buffer))
-         (bufferp value))
-    (cons t value))
-   ((and (memq property '( :time :created-at :updated-at))
-         (proper-list-p value)
-         (cl-every #'integerp value))
-    (cons t (copy-sequence value)))
-   ((eq property :checker-owner)
-    (when-let* ((owner
-                 (proofread--request-log-safe-checker-owner value)))
-      (cons t owner)))))
+  (if (null value)
+      (cons t nil)
+    (when-let* ((sanitizer
+                 (alist-get
+                  property
+                  (plist-get proofread--request-log-schema
+                             :property-sanitizers))))
+      (funcall sanitizer value))))
 
 (defun proofread--request-log-copy-properties
     (source properties &optional target)
@@ -1317,89 +1502,135 @@ Position values are frozen as integers; other values are detached."
               (secure-hash 'sha256 (prin1-to-string identity)))
           (error nil))))))
 
+(defun proofread--request-log-safe-object-property
+    (object property _safe)
+  "Return OBJECT's safe scalar PROPERTY."
+  (when (plist-member object property)
+    (proofread--request-log-safe-property-value
+     property (plist-get object property))))
+
+(defun proofread--request-log-safe-object-identity-fingerprint
+    (object _property _safe)
+  "Return a safe fingerprint of identity OBJECT."
+  (when-let* ((fingerprint
+               (proofread--request-log-identity-fingerprint object)))
+    (cons t fingerprint)))
+
+(defun proofread--request-log-safe-object-summary-fingerprint
+    (_object _property safe)
+  "Return a fingerprint of the fields already in SAFE."
+  (when-let* ((fingerprint
+               (proofread--request-log-identity-fingerprint safe)))
+    (cons t fingerprint)))
+
+(defun proofread--request-log-safe-object-backend-identity
+    (object property _safe)
+  "Return OBJECT's safe backend identity PROPERTY."
+  (when (plist-member object property)
+    (cons t
+          (proofread--request-log-safe-backend-identity
+           (plist-get object property)))))
+
+(defun proofread--request-log-safe-object-checker-identity
+    (object property _safe)
+  "Return OBJECT's safe checker identity PROPERTY."
+  (when (plist-member object property)
+    (cons t
+          (proofread--request-log-safe-checker-identity
+           (plist-get object property)))))
+
+(defun proofread--request-log-safe-object-request
+    (object property _safe)
+  "Return OBJECT's safe nested request PROPERTY."
+  (when (plist-member object property)
+    (cons t
+          (proofread--request-log-safe-request
+           (plist-get object property)))))
+
+(defun proofread--request-log-safe-object-diagnostics
+    (object property _safe)
+  "Return OBJECT's safe nested diagnostics PROPERTY."
+  (when (plist-member object property)
+    (cons t
+          (proofread--request-log-safe-diagnostics
+           (plist-get object property)))))
+
+(defun proofread--request-log-safe-object-diagnostic-source
+    (object property _safe)
+  "Return OBJECT's safe diagnostic source PROPERTY."
+  (when-let* ((source (plist-get object property))
+              ((or (symbolp source) (stringp source))))
+    (cons t (if (stringp source)
+                (substring-no-properties source)
+              source))))
+
+(defun proofread--request-log-safe-object-diagnostic-suggestions
+    (object property _safe)
+  "Return OBJECT's safe diagnostic suggestions PROPERTY."
+  (when (plist-member object property)
+    (let ((suggestions (plist-get object property)))
+      (when (and (proper-list-p suggestions)
+                 (cl-every #'stringp suggestions))
+        (cons t
+              (mapcar #'substring-no-properties suggestions))))))
+
+(defun proofread--request-log-safe-object-condition
+    (object property _safe)
+  "Return the condition kind in OBJECT's PROPERTY."
+  (when (plist-member object property)
+    (cons t (proofread--condition-kind (plist-get object property)))))
+
+(defun proofread--request-log-safe-object-backend-message
+    (object _property _safe)
+  "Return OBJECT's bounded backend failure message."
+  (when (or (eq (plist-get object :status) 'error)
+            (plist-member object :message))
+    (cons t "Backend request failed")))
+
+(defun proofread--request-log-safe-object (kind object)
+  "Return a safe KIND representation of request-log OBJECT."
+  (when (proper-list-p object)
+    (let (safe)
+      (dolist (field (proofread--request-log-schema-object-fields kind))
+        (let ((property (car field))
+              (sanitizer (cadr field)))
+          (when-let* ((safe-value
+                       (condition-case nil
+                           (funcall sanitizer object property safe)
+                         (error nil))))
+            (setq safe
+                  (plist-put safe property (cdr safe-value))))))
+      safe)))
+
+(defun proofread--request-log-safe-checker-owner (owner)
+  "Return a detached safe representation of checker OWNER."
+  (proofread--request-log-safe-object 'checker-owner owner))
+
+(defun proofread--request-log-safe-checker-owner-value (value)
+  "Return a safe checker owner representation of VALUE."
+  (when-let* ((owner
+               (proofread--request-log-safe-checker-owner value)))
+    (cons t owner)))
+
 (defun proofread--request-log-safe-backend-identity (identity)
   "Return a safe summary of backend IDENTITY."
-  (when (proper-list-p identity)
-    (let ((summary
-           (proofread--request-log-copy-properties
-            identity '( :backend :contract-version))))
-      (when-let* ((fingerprint
-                   (proofread--request-log-identity-fingerprint
-                    identity)))
-        (setq summary (plist-put summary :fingerprint fingerprint)))
-      summary)))
+  (proofread--request-log-safe-object 'backend-identity identity))
 
 (defun proofread--request-log-safe-checker-identity (identity)
   "Return a safe summary of checker IDENTITY without raw options."
-  (when (proper-list-p identity)
-    (let ((summary
-           (proofread--request-log-copy-properties
-            identity
-            '( :profile :checker-name :backend :ad-hoc))))
-      (when (and (proper-list-p identity)
-                 (plist-member identity :backend-identity))
-        (setq summary
-              (plist-put
-               summary :backend-identity
-               (proofread--request-log-safe-backend-identity
-                (plist-get identity :backend-identity)))))
-      (when-let* ((fingerprint
-                   (proofread--request-log-identity-fingerprint
-                    summary)))
-        (setq summary (plist-put summary :fingerprint fingerprint)))
-      summary)))
+  (proofread--request-log-safe-object 'checker-identity identity))
 
 (defun proofread--request-log-safe-request (request)
   "Return a detached request-log representation of REQUEST."
-  (when (proper-list-p request)
-    (let ((safe
-           (proofread--request-log-copy-properties
-            request proofread--request-log-request-keys)))
-      (when (plist-member request :backend-identity)
-        (setq safe
-              (plist-put
-               safe :backend-identity
-               (proofread--request-log-safe-backend-identity
-                (plist-get request :backend-identity)))))
-      (when (plist-member request :checker-identity)
-        (setq safe
-              (plist-put
-               safe :checker-identity
-               (proofread--request-log-safe-checker-identity
-                (plist-get request :checker-identity)))))
-      safe)))
+  (proofread--request-log-safe-object 'request request))
 
 (defun proofread--request-log-safe-chunk (chunk)
   "Return a detached request-log representation of CHUNK."
-  (proofread--request-log-copy-properties
-   chunk
-   '( :beg :end :text :context-before :context-after :language
-      :major-mode :target-kind :domain-beg :domain-end
-      :accessible-beg :accessible-end)))
+  (proofread--request-log-safe-object 'chunk chunk))
 
 (defun proofread--request-log-safe-diagnostic (diagnostic)
   "Return a detached request-log representation of DIAGNOSTIC."
-  (let ((safe
-         (proofread--request-log-copy-properties
-          diagnostic proofread--request-log-diagnostic-keys)))
-    (when-let* ((source (and (proper-list-p diagnostic)
-                             (plist-get diagnostic :source)))
-                ((or (symbolp source) (stringp source))))
-      (setq safe
-            (plist-put safe :source
-                       (if (stringp source)
-                           (substring-no-properties source)
-                         source))))
-    (when (and (proper-list-p diagnostic)
-               (plist-member diagnostic :suggestions))
-      (let ((suggestions (plist-get diagnostic :suggestions)))
-        (when (and (proper-list-p suggestions)
-                   (cl-every #'stringp suggestions))
-          (setq safe
-                (plist-put
-                 safe :suggestions
-                 (mapcar #'substring-no-properties suggestions))))))
-    safe))
+  (proofread--request-log-safe-object 'diagnostic diagnostic))
 
 (defun proofread--request-log-safe-diagnostics (diagnostics)
   "Return detached request-log representations of DIAGNOSTICS."
@@ -1408,42 +1639,11 @@ Position values are frozen as integers; other values are detached."
 
 (defun proofread--request-log-safe-result (result)
   "Return a detached request-log representation of RESULT."
-  (when (proper-list-p result)
-    (let ((safe
-           (proofread--request-log-copy-properties
-            result '( :status :source :partial :phase))))
-      (when (plist-member result :request)
-        (setq safe
-              (plist-put safe :request
-                         (proofread--request-log-safe-request
-                          (plist-get result :request)))))
-      (when (plist-member result :diagnostics)
-        (setq safe
-              (plist-put safe :diagnostics
-                         (proofread--request-log-safe-diagnostics
-                          (plist-get result :diagnostics)))))
-      (when (plist-member result :error)
-        (setq safe
-              (plist-put safe :error
-                         (proofread--condition-kind
-                          (plist-get result :error)))))
-      (when (or (eq (plist-get result :status) 'error)
-                (plist-member result :message))
-        (setq safe (plist-put safe :message
-                              "Backend request failed")))
-      safe)))
+  (proofread--request-log-safe-object 'result result))
 
 (defun proofread--request-log-safe-cache-entry (entry)
   "Return a detached request-log representation of cache ENTRY."
-  (when (proper-list-p entry)
-    (let ((safe
-           (proofread--request-log-copy-properties entry '( :text))))
-      (when (plist-member entry :diagnostics)
-        (setq safe
-              (plist-put safe :diagnostics
-                         (proofread--request-log-safe-diagnostics
-                          (plist-get entry :diagnostics)))))
-      safe)))
+  (proofread--request-log-safe-object 'cache-entry entry))
 
 (defun proofread--request-log-safe-http-parameters (parameters)
   "Return detached HTTP PARAMETERS text, or nil."
@@ -1472,131 +1672,124 @@ Position values are frozen as integers; other values are detached."
                     (if port (format ":%s" port) ""))))
       (error nil))))
 
+(defun proofread--request-log-safe-event-property (event property)
+  "Return EVENT's safe scalar PROPERTY, or nil when it is absent."
+  (when (plist-member event property)
+    (proofread--request-log-safe-property-value
+     property (plist-get event property))))
+
+(defun proofread--request-log-safe-event-request (event _property)
+  "Return EVENT's detached request field, including result fallback."
+  (when-let* ((request
+               (or (plist-get event :request)
+                   (let ((result (plist-get event :result)))
+                     (and (proper-list-p result)
+                          (plist-get result :request))))))
+    (cons t (proofread--request-log-safe-request request))))
+
+(defun proofread--request-log-safe-event-nested
+    (event property sanitizer)
+  "Sanitize nested EVENT PROPERTY with SANITIZER."
+  (when (plist-member event property)
+    (cons t (funcall sanitizer (plist-get event property)))))
+
+(defun proofread--request-log-safe-event-chunk (event property)
+  "Return EVENT's safe nested chunk PROPERTY."
+  (cons t (proofread--request-log-safe-chunk
+           (plist-get event property))))
+
+(defun proofread--request-log-safe-event-diagnostics (event property)
+  "Return EVENT's safe nested diagnostics PROPERTY."
+  (proofread--request-log-safe-event-nested
+   event property #'proofread--request-log-safe-diagnostics))
+
+(defun proofread--request-log-safe-event-result (event property)
+  "Return EVENT's safe nested result PROPERTY."
+  (cons t (proofread--request-log-safe-result
+           (plist-get event property))))
+
+(defun proofread--request-log-safe-event-cache-entry (event property)
+  "Return EVENT's safe nested cache entry PROPERTY."
+  (proofread--request-log-safe-event-nested
+   event property #'proofread--request-log-safe-cache-entry))
+
+(defun proofread--request-log-safe-event-required-cache-entry
+    (event property)
+  "Return EVENT's safe nested cache entry PROPERTY, even if absent."
+  (cons t (proofread--request-log-safe-cache-entry
+           (plist-get event property))))
+
+(defun proofread--request-log-safe-event-url (event property)
+  "Return EVENT's safe URL origin PROPERTY."
+  (when (plist-member event property)
+    (when-let* ((url
+                 (proofread--request-log-safe-url
+                  (plist-get event property))))
+      (cons t url))))
+
+(defun proofread--request-log-safe-event-text (event property)
+  "Return EVENT's detached string PROPERTY."
+  (when (plist-member event property)
+    (when-let* ((text
+                 (proofread--request-log-safe-http-parameters
+                  (plist-get event property))))
+      (cons t text))))
+
+(defun proofread--request-log-safe-event-condition (event property)
+  "Return the condition kind in EVENT's PROPERTY."
+  (when (plist-member event property)
+    (cons t (proofread--condition-kind (plist-get event property)))))
+
+(defun proofread--request-log-safe-event-required-condition
+    (event property)
+  "Return the condition kind in EVENT's PROPERTY, even if absent."
+  (cons t (proofread--condition-kind (plist-get event property))))
+
+(defun proofread--request-log-safe-event-backend-message
+    (event _property)
+  "Return EVENT's bounded backend failure message."
+  (when (or (plist-member event :error)
+            (plist-member event :message))
+    (cons t "Backend request failed")))
+
+(defun proofread--request-log-safe-event-checker-message
+    (event _property)
+  "Return EVENT's checker failure message from safe scalar fields."
+  (let ((checker
+         (proofread--request-log-safe-property-value
+          :checker-name (plist-get event :checker-name)))
+        (phase
+         (proofread--request-log-safe-property-value
+          :phase (plist-get event :phase))))
+    (cons
+     t
+     (format "Checker %S failed during %s"
+             (cdr checker)
+             (proofread--checker-dispatch-phase-label
+              (cdr phase))))))
+
+(defun proofread--request-log-event-schema-fields (type)
+  "Return request-log field specifications for event TYPE."
+  (let ((events (plist-get proofread--request-log-schema :events)))
+    (append (cdr (assq t events))
+            (unless (eq type t)
+              (cdr (assq type events))))))
+
 (defun proofread--request-log-safe-event (event)
   "Return a detached safe representation of lifecycle EVENT."
-  (unless (proper-list-p event)
-    (setq event nil))
-  (let* ((type (plist-get event :type))
-         (safe
-          (proofread--request-log-copy-properties
-           event
-           '( :type :time :log-id :request-id :buffer :beg :end
-              :status))))
-    (when-let* ((request
-                 (or (plist-get event :request)
-                     (let ((result (plist-get event :result)))
-                       (and (proper-list-p result)
-                            (plist-get result :request))))))
-      (setq safe
-            (plist-put safe :request
-                       (proofread--request-log-safe-request request))))
-    (pcase type
-      ('chunk-request
-       (setq safe
-             (plist-put safe :chunk
-                        (proofread--request-log-safe-chunk
-                         (plist-get event :chunk)))))
-      ((or 'queued-request 'active-request 'backend-dispatched)
-       (setq safe
-             (proofread--request-log-copy-properties
-              event '( :backend) safe)))
-      ('backend-request
-       (setq safe
-             (proofread--request-log-copy-properties
-              event
-              '( :backend :method :pass :max-passes :strategy)
-              safe))
-       (when-let* ((url
-                    (proofread--request-log-safe-url
-                     (plist-get event :url))))
-         (setq safe (plist-put safe :url url)))
-       (when-let* ((parameters
-                    (proofread--request-log-safe-http-parameters
-                     (plist-get event :parameters))))
-         (setq safe (plist-put safe :parameters parameters)))
-       (when-let* ((schema (plist-get event :schema))
-                   ((stringp schema)))
-         (setq safe
-               (plist-put safe :schema
-                          (substring-no-properties schema))))
-       (when-let* ((prompt-text (plist-get event :prompt-text))
-                   ((stringp prompt-text)))
-         (setq safe
-               (plist-put safe :prompt-text
-                          (substring-no-properties prompt-text))))
-       (when (plist-member event :reported-diagnostics)
-         (setq safe
-               (plist-put
-                safe :reported-diagnostics
-                (proofread--request-log-safe-diagnostics
-                 (plist-get event :reported-diagnostics))))))
-      ('backend-response
-       (setq safe
-             (proofread--request-log-copy-properties
-              event '( :backend :http-status :pass) safe))
-       (when-let* ((url
-                    (proofread--request-log-safe-url
-                     (plist-get event :url))))
-         (setq safe (plist-put safe :url url)))
-       (when-let* ((response (plist-get event :response))
-                   ((stringp response)))
-         (setq safe
-               (plist-put safe :response
-                          (substring-no-properties response))))
-       (when (plist-member event :error)
-         (setq safe
-               (plist-put safe :error
-                          (proofread--condition-kind
-                           (plist-get event :error)))))
-       (when (or (plist-member event :error)
-                 (plist-member event :message))
-         (setq safe (plist-put safe :message
-                               "Backend request failed"))))
-      ('backend-result
-       (setq safe
-             (proofread--request-log-copy-properties
-              event '( :backend :pass :source) safe))
-       (when (plist-member event :entry)
-         (setq safe
-               (plist-put safe :entry
-                          (proofread--request-log-safe-cache-entry
-                           (plist-get event :entry)))))
-       (setq safe
-             (plist-put safe :result
-                        (proofread--request-log-safe-result
-                         (plist-get event :result)))))
-      ('cache-hit
-       (setq safe
-             (plist-put safe :entry
-                        (proofread--request-log-safe-cache-entry
-                         (plist-get event :entry)))))
-      ('cancelled
-       (setq safe
-             (proofread--request-log-copy-properties
-              event '( :reason) safe)))
-      ('final-result
-       (setq safe
-             (plist-put safe :result
-                        (proofread--request-log-safe-result
-                         (plist-get event :result)))))
-      ('checker-dispatch-failed
-       (setq safe
-             (proofread--request-log-copy-properties
-              event
-              '( :profile :checker-name :backend :phase)
-              safe))
-       (setq safe
-             (plist-put safe :error
-                        (proofread--condition-kind
-                         (plist-get event :error))))
-       (setq safe
-             (plist-put
-              safe :message
-              (format "Checker %S failed during %s"
-                      (plist-get event :checker-name)
-                      (proofread--checker-dispatch-phase-label
-                       (plist-get event :phase)))))))
-    safe))
+  (when (proper-list-p event)
+    (let ((type (plist-get event :type))
+          safe)
+      (dolist (field (proofread--request-log-event-schema-fields type))
+        (let ((property (car field))
+              (sanitizer (cadr field)))
+          (when-let* ((safe-value
+                       (condition-case nil
+                           (funcall sanitizer event property)
+                         (error nil))))
+            (setq safe
+                  (plist-put safe property (cdr safe-value))))))
+      safe)))
 
 (defun proofread--run-request-log-hook (event)
   "Run request-log hooks for safe EVENT without disrupting proofreading."
