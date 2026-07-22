@@ -11,12 +11,22 @@
 ;;; Code:
 
 (require 'cl-lib)
+(require 'eieio)
 (require 'ert)
 (require 'json)
 (require 'proofread)
 (require 'proofread-llm)
 
 (declare-function make-llm-deepseek "llm-deepseek" (&rest rest))
+
+(setq flymake-no-changes-timeout nil)
+
+(defun proofread-llm-test--clear-major-mode-flymake-backends ()
+  "Keep unrelated major-mode Flymake backends out of LLM test buffers."
+  (setq-local flymake-diagnostic-functions nil))
+
+(add-hook 'after-change-major-mode-hook
+          #'proofread-llm-test--clear-major-mode-flymake-backends 90)
 
 ;;;; Test fixtures
 
@@ -32,6 +42,10 @@
 
 (defconst proofread-llm-test--checker 'llm-test
   "Checker selected by LLM backend tests.")
+
+(defclass proofread-llm-test--opaque-provider ()
+          ((token :initarg :token))
+          "Opaque EIEIO provider fixture for snapshot tests.")
 
 (defun proofread-llm-test--profiles
     (&optional language display-language)
@@ -57,6 +71,10 @@ When PROFILE is nil, use the current profile."
           (proofread-llm-test--current-profile-checker profile)))
     (proofread--make-backend-request
      chunk (plist-get checker :backend) checker profile)))
+
+(defun proofread-llm-test--make-work (request)
+  "Return scheduled work owning backend REQUEST."
+  (proofread--make-request-work request))
 
 (defmacro proofread-llm-test--with-profile (language &rest body)
   "Run BODY with an LLM test profile using LANGUAGE."
@@ -266,6 +284,347 @@ When PROFILE is nil, use the current profile."
           (proofread-llm--cancel-request-handle handle)
           (should-not proofread-llm--live-handles))))))
 
+(ert-deftest proofread-llm-test-snapshot-checker-options ()
+  "Resolve every LLM checker option into one stable snapshot."
+  (let* ((provider (list 'provider-object))
+         (instructions-function (lambda (_request) "Extra"))
+         (proofread-llm-provider provider)
+         (proofread-llm-provider-identity '(provider-version 1))
+         (proofread-llm-source-label "  Global\nmodel  ")
+         (proofread-llm-response-strategy 'prompt-json)
+         (proofread-llm-max-diagnostic-passes 2)
+         (proofread-llm-request-timeout 12.5)
+         (proofread-llm-instructions-function instructions-function)
+         (proofread-llm-instructions-identity '(instructions 1))
+         (snapshot (proofread-llm--snapshot-checker-options nil)))
+    (should
+     (equal
+      (cl-loop for key in snapshot by #'cddr collect key)
+      proofread-llm--checker-option-keys))
+    (should (eq (plist-get snapshot :provider) provider))
+    (should (equal (plist-get snapshot :provider-identity)
+                   '(provider-version 1)))
+    (should (equal (plist-get snapshot :source-label)
+                   "Global model"))
+    (should (eq (plist-get snapshot :response-strategy)
+                'prompt-json))
+    (should (= (plist-get snapshot :diagnostic-passes) 2))
+    (should (= (plist-get snapshot :request-timeout) 12.5))
+    (should (eq (plist-get snapshot :instructions-function)
+                instructions-function))
+    (should (equal (plist-get snapshot :instructions-identity)
+                   '(instructions 1)))
+    (let ((local
+           (proofread-llm--snapshot-checker-options
+            '( :source-label nil :request-timeout nil))))
+      (should-not (plist-get local :source-label))
+      (should-not (plist-get local :request-timeout)))))
+
+(ert-deftest
+    proofread-llm-test-snapshot-preserves-identity-bearing-objects ()
+  "Keep real providers, records, and functions identical in snapshots."
+  (require 'llm-deepseek)
+  (let* ((provider
+          (make-llm-deepseek :chat-model "deepseek-v4-flash"))
+         (eieio-provider
+          (make-instance 'proofread-llm-test--opaque-provider
+                         :token 'opaque))
+         (instructions-function (lambda (_request) "Extra"))
+         (raw-provider-identity
+          (list 'provider provider eieio-provider))
+         (raw-instructions-identity
+          (list 'instructions instructions-function provider))
+         (snapshot
+          (proofread-llm--snapshot-checker-options
+           (list :provider provider
+                 :provider-identity raw-provider-identity
+                 :instructions-function instructions-function
+                 :instructions-identity
+                 raw-instructions-identity)))
+         (provider-identity
+          (plist-get snapshot :provider-identity))
+         (instructions-identity
+          (plist-get snapshot :instructions-identity)))
+    (should (recordp provider))
+    (should (eieio-object-p eieio-provider))
+    (should (eq (plist-get snapshot :provider) provider))
+    (should-not (eq provider-identity raw-provider-identity))
+    (should-not (eq instructions-identity
+                    raw-instructions-identity))
+    (should (eq (cadr provider-identity) provider))
+    (should (eq (caddr provider-identity) eieio-provider))
+    (should (eq (plist-get snapshot :instructions-function)
+                instructions-function))
+    (should (eq (cadr instructions-identity)
+                instructions-function))
+    (should (eq (caddr instructions-identity) provider))))
+
+(ert-deftest
+    proofread-llm-test-explicit-objects-start-new-identity-pairs ()
+  "Do not apply identities for default objects to checker overrides."
+  (let* ((local-provider (list 'local-provider))
+         (local-instructions (lambda (_request) "Local"))
+         (proofread-llm-provider-identity "global-provider")
+         (proofread-llm-instructions-identity "global-instructions")
+         (provider-snapshot
+          (proofread-llm--snapshot-checker-options
+           (list :provider local-provider))))
+    (should (eq (plist-get provider-snapshot :provider)
+                local-provider))
+    (should-not (plist-get provider-snapshot :provider-identity))
+    (should-error
+     (proofread-llm--snapshot-checker-options
+      (list :instructions-function local-instructions)))))
+
+(ert-deftest proofread-llm-test-snapshot-detaches-mutable-identities ()
+  "Detach mutable data used in explicit LLM cache identities."
+  (let* ((identity-string (copy-sequence "provider-a"))
+         (identity-list (list identity-string 'version 1))
+         (identity-vector (vector (list "nested")))
+         (identity-table (make-hash-table :test #'eq))
+         (table-key (copy-sequence "key"))
+         (table-value (vector "table-value"))
+         (provider-identity
+          (list identity-list identity-vector identity-table)))
+    (puthash table-key table-value identity-table)
+    (let* ((snapshot
+            (proofread-llm--snapshot-checker-options
+             (list :provider-identity provider-identity)))
+           (copy (plist-get snapshot :provider-identity))
+           (copy-list (car copy))
+           (copy-vector (cadr copy))
+           (copy-table (caddr copy)))
+      (should-not (eq copy provider-identity))
+      (should-not (eq copy-list identity-list))
+      (should-not (eq (car copy-list) identity-string))
+      (should-not (eq copy-vector identity-vector))
+      (should-not (eq (aref copy-vector 0)
+                      (aref identity-vector 0)))
+      (should-not (eq copy-table identity-table))
+      (should
+       (proofread-llm--hash-identity-p copy-table))
+      (should
+       (eq (proofread-llm--hash-identity-test copy-table) 'eq))
+      (should
+       (equal (proofread-llm--hash-identity-entries copy-table)
+              '(("key" ["table-value"]))))
+      (should
+       (equal snapshot
+              (proofread-llm--snapshot-checker-options
+               (list :provider-identity provider-identity))))
+      (aset identity-string 0 ?X)
+      (setcar (aref identity-vector 0) "changed")
+      (aset table-key 0 ?X)
+      (aset table-value 0 "changed")
+      (puthash "new" t identity-table)
+      (should (equal (car copy-list) "provider-a"))
+      (should (equal (aref copy-vector 0) '("nested")))
+      (should
+       (equal (proofread-llm--hash-identity-entries copy-table)
+              '(("key" ["table-value"])))))))
+
+(ert-deftest proofread-llm-test-hash-identity-is-cache-stable ()
+  "Keep canonical LLM hash identities fresh and cache-compatible."
+  (with-temp-buffer
+    (insert "Alpha")
+    (let* ((provider (list 'local-provider))
+           (identity (make-hash-table :test #'eq))
+           (key (copy-sequence "key"))
+           (raw-options
+            (list :provider provider
+                  :provider-identity identity
+                  :response-strategy 'prompt-json))
+           (proofread-auto-check nil)
+           (proofread-context-size 0)
+           (proofread-profile 'hash-identity)
+           (proofread-profiles
+            (list
+             (list
+              'hash-identity
+              :checkers
+              (list
+               (list :name 'local :backend 'llm
+                     :options raw-options))))))
+      (puthash key (vector "value") identity)
+      (proofread-mode 1)
+      (let* ((profile (proofread--current-profile))
+             (checker
+              (proofread-llm-test--current-profile-checker profile))
+             (chunk (proofread-llm-test--whole-buffer-chunk))
+             (request
+              (proofread--make-backend-request
+               chunk 'llm checker profile))
+             (work (proofread-llm-test--make-work request))
+             (current-profile (proofread--current-profile))
+             (current-checker
+              (proofread-llm-test--current-profile-checker
+               current-profile))
+             (equivalent-request
+              (proofread--make-backend-request
+               chunk 'llm current-checker current-profile))
+             (equivalent-work
+              (proofread-llm-test--make-work equivalent-request)))
+        (should (proofread--request-current-checker-p request))
+        (should (proofread--fresh-request-p work))
+        (should
+         (equal (proofread--scheduled-work-cache-key equivalent-work)
+                (proofread--scheduled-work-cache-key work)))
+        (aset key 0 ?X)
+        (should-not (proofread--request-current-checker-p request))
+        (should-not (proofread--fresh-request-p work))))))
+
+(ert-deftest proofread-llm-test-snapshot-rejects-invalid-options ()
+  "Reject malformed, unknown, duplicate, or invalid checker options."
+  (dolist (options
+           (list 'invalid
+                 '(:provider)
+                 '(provider value)
+                 '(:unknown value)
+                 '(:provider first :provider second)
+                 '(:response-strategy invalid)
+                 '(:diagnostic-passes 0)
+                 '(:request-timeout 0)
+                 '(:source-label "")
+                 '(:instructions-function
+                   proofread-llm-test-not-a-function)
+                 '(:instructions-function ignore
+                                          :instructions-identity nil)))
+    (should-error
+     (proofread-llm--snapshot-checker-options options)))
+  (let ((marker (copy-marker 1)))
+    (unwind-protect
+        (should-error
+         (proofread-llm--snapshot-checker-options
+          (list :provider-identity marker)))
+      (set-marker marker nil)))
+  (let ((cycle (list 'identity)))
+    (setcdr cycle cycle)
+    (should-error
+     (proofread-llm--snapshot-checker-options
+      (list :provider-identity cycle))))
+  (let ((table (make-hash-table :test #'eq)))
+    (puthash (record 'proofread-llm-test-opaque-key 1) t table)
+    (should-error
+     (proofread-llm--snapshot-checker-options
+      (list :provider-identity table)))))
+
+(ert-deftest proofread-llm-test-profile-captures-checker-options ()
+  "Keep request input stable after raw options and defaults change."
+  (require 'llm-deepseek)
+  (with-temp-buffer
+    (insert "Alpha")
+    (let* ((provider
+            (make-llm-deepseek :chat-model "deepseek-v4-flash"))
+           (identity-string (copy-sequence "provider-a"))
+           (raw-options
+            (list :provider-identity (list identity-string)
+                  :source-label "  First model  "
+                  :request-timeout 5))
+           (proofread-llm-provider provider)
+           (proofread-llm-response-strategy 'prompt-json)
+           (proofread-profiles
+            (list
+             (list 'snapshot
+                   :checkers
+                   (list
+                    (list :name 'local :backend 'llm
+                          :options raw-options)))))
+           (proofread-profile 'snapshot)
+           (profile (proofread--current-profile))
+           (checker
+            (proofread-llm-test--current-profile-checker profile))
+           (chunk (proofread-llm-test--whole-buffer-chunk))
+           (request
+            (proofread--make-backend-request
+             chunk 'llm checker profile)))
+      (let* ((options (plist-get request :checker-options))
+             (identity (plist-get request :backend-identity)))
+        (should (proofread--request-current-checker-p request))
+        (aset identity-string 0 ?X)
+        (setf (plist-get raw-options :source-label) "Second model")
+        (setf (plist-get raw-options :request-timeout) 9)
+        (setq proofread-llm-provider nil
+              proofread-llm-response-strategy 'provider-json)
+        (should (eq (plist-get options :provider) provider))
+        (should (equal (plist-get options :provider-identity)
+                       '("provider-a")))
+        (should (equal (plist-get options :source-label)
+                       "First model"))
+        (should (eq (plist-get options :response-strategy)
+                    'prompt-json))
+        (should (= (plist-get options :request-timeout) 5))
+        (should (eq (proofread-llm--effective-provider request)
+                    provider))
+        (should (equal (plist-get identity :provider)
+                       '("provider-a")))
+        (should (eq (plist-get identity :response-strategy)
+                    'prompt-json))
+        (should-not (proofread--request-current-checker-p request)))
+      (let* ((current-profile (proofread--current-profile))
+             (current-checker
+              (proofread--checker-with-options-snapshot
+               (proofread-llm-test--current-profile-checker
+                current-profile)))
+             (current-options (plist-get current-checker :options)))
+        (should-not (plist-get current-options :provider))
+        (should (equal (plist-get current-options :provider-identity)
+                       '("Xrovider-a")))
+        (should (equal (plist-get current-options :source-label)
+                       "Second model"))
+        (should (eq (plist-get current-options :response-strategy)
+                    'provider-json))
+        (should (= (plist-get current-options :request-timeout) 9))))))
+
+(ert-deftest
+    proofread-llm-test-provider-override-changes-cache-freshness ()
+  "Give checker-local provider objects independent cache identities."
+  (with-temp-buffer
+    (insert "Alpha")
+    (let* ((first-provider (list 'first-provider))
+           (second-provider (list 'second-provider))
+           (raw-options
+            (list :provider first-provider
+                  :response-strategy 'prompt-json))
+           (proofread-auto-check nil)
+           (proofread-context-size 0)
+           (proofread-llm-provider-identity "global-provider")
+           (proofread-profile 'local-provider)
+           (proofread-profiles
+            (list
+             (list
+              'local-provider
+              :checkers
+              (list
+               (list :name 'local :backend 'llm
+                     :options raw-options))))))
+      (proofread-mode 1)
+      (let* ((profile (proofread--current-profile))
+             (checker
+              (proofread-llm-test--current-profile-checker profile))
+             (chunk (proofread-llm-test--whole-buffer-chunk))
+             (request
+              (proofread--make-backend-request
+               chunk 'llm checker profile))
+             (work (proofread-llm-test--make-work request)))
+        (should-not
+         (plist-get (plist-get request :checker-options)
+                    :provider-identity))
+        (should (proofread--fresh-request-p work))
+        (setf (plist-get raw-options :provider) second-provider)
+        (should-not (proofread--fresh-request-p work))
+        (let* ((changed-profile (proofread--current-profile))
+               (changed-checker
+                (proofread-llm-test--current-profile-checker
+                 changed-profile))
+               (changed-request
+                (proofread--make-backend-request
+                 chunk 'llm changed-checker changed-profile))
+               (changed-work
+                (proofread-llm-test--make-work changed-request)))
+          (should-not
+           (equal (proofread--scheduled-work-cache-key changed-work)
+                  (proofread--scheduled-work-cache-key work))))))))
+
 (ert-deftest proofread-llm-test-mode-sets-plz-connect-timeout ()
   "Use the Proofread LLM timeout locally while the mode is enabled."
   (let ((llm-request-plz-connect-timeout 10))
@@ -393,6 +752,15 @@ When PROFILE is nil, use the current profile."
     (dolist (invalid '(42 "" " \t\n"))
       (should-error
        (funcall (get symbol 'custom-set) symbol invalid))))
+  (with-temp-buffer
+    (set-syntax-table (copy-syntax-table (syntax-table)))
+    (modify-syntax-entry ?\n ".")
+    (modify-syntax-entry ?\r ".")
+    (let ((label
+           (proofread-llm--validate-source-label
+            (propertize "　Global\nlabel\rname　" 'face 'bold))))
+      (should (equal label "Global label name"))
+      (should-not (text-properties-at 0 label))))
   (let ((proofread-llm-provider 'global-provider)
         (proofread-llm-source-label
          (propertize "  Global\nlabel  " 'face 'bold))
@@ -519,16 +887,20 @@ When PROFILE is nil, use the current profile."
              (diagnostic
               (proofread-llm-test--diagnostic-for-range
                1 6 "Alpha"))
-             first-request second-request)
+             first-request first-work second-request second-work)
         (proofread-llm-test--with-capabilities
           (let ((proofread-llm-request-timeout 20))
             (setq first-request
                   (proofread--make-backend-request
-                   chunk 'llm first-checker profile)))
+                   chunk 'llm first-checker profile)
+                  first-work
+                  (proofread-llm-test--make-work first-request)))
           (let ((proofread-llm-request-timeout nil))
             (setq second-request
                   (proofread--make-backend-request
-                   chunk 'llm second-checker profile))))
+                   chunk 'llm second-checker profile)
+                  second-work
+                  (proofread-llm-test--make-work second-request))))
         (should (= (proofread-llm--effective-request-timeout
                     first-request)
                    1))
@@ -540,11 +912,12 @@ When PROFILE is nil, use the current profile."
         (should
          (equal (plist-get first-request :checker-identity)
                 (plist-get second-request :checker-identity)))
-        (should (equal (plist-get first-request :cache-key)
-                       (plist-get second-request :cache-key)))
+        (should
+         (equal (proofread--scheduled-work-cache-key first-work)
+                (proofread--scheduled-work-cache-key second-work)))
         (proofread--cache-write-request
-         first-request (list diagnostic))
-        (should (proofread--cache-read-request second-request))))))
+         first-work (list diagnostic))
+        (should (proofread--cache-read-request second-work))))))
 
 (ert-deftest proofread-llm-test-backend-identity-is-cache-compatible
     ()
@@ -560,6 +933,7 @@ When PROFILE is nil, use the current profile."
              (chunk (proofread-llm-test--whole-buffer-chunk))
              (request
               (proofread-llm-test--make-profile-request chunk))
+             (work (proofread-llm-test--make-work request))
              (diagnostic
               (proofread-llm-test--diagnostic-for-range 1 6 "Alpha")))
         (should (equal (proofread--backend-identity 'llm)
@@ -572,8 +946,8 @@ When PROFILE is nil, use the current profile."
                           :contract-version 3)))
         (should (proofread--backend-identity-p
                  (plist-get request :backend-identity)))
-        (proofread--cache-write-request request (list diagnostic))
-        (should (proofread--cache-read-request request))))))
+        (proofread--cache-write-request work (list diagnostic))
+        (should (proofread--cache-read-request work))))))
 
 (ert-deftest proofread-llm-test-backend-registers-adapter ()
   "Register all LLM backend adapter functions."
@@ -582,6 +956,8 @@ When PROFILE is nil, use the current profile."
                 #'proofread-llm--backend-check))
     (should (eq (plist-get descriptor :identity)
                 #'proofread-llm--provider-identity))
+    (should (eq (plist-get descriptor :snapshot-options)
+                #'proofread-llm--snapshot-checker-options))
     (should (eq (plist-get descriptor :checker-identity)
                 #'proofread-llm--checker-identity))
     (should (eq (plist-get descriptor :source-label)
@@ -615,11 +991,10 @@ When PROFILE is nil, use the current profile."
            (request (proofread--make-backend-request chunk 'llm))
            result)
       (let ((handle
-             (proofread--backend-check
+             (proofread-llm--backend-check
               request
               (lambda (backend-result)
-                (setq result backend-result))
-              'llm)))
+                (setq result backend-result)))))
         (proofread-llm-test--assert-handle-shape handle))
       (should-not result)
       (should (proofread-llm-test--wait-for (lambda () result)))
@@ -695,11 +1070,10 @@ When PROFILE is nil, use the current profile."
                  (lambda (&rest _)
                    (error "Unexpected llm-chat-async call"))))
         (let ((handle
-               (proofread--backend-check
+               (proofread-llm--backend-check
                 request
                 (lambda (backend-result)
-                  (setq result backend-result))
-                'llm)))
+                  (setq result backend-result)))))
           (proofread-llm-test--assert-handle-shape handle))
         (should-not result)
         (should (proofread-llm-test--wait-for (lambda () result)))
@@ -793,11 +1167,12 @@ When PROFILE is nil, use the current profile."
            (proofread-llm-request-timeout 0.01)
            (proofread-llm--live-handles nil)
            (chunk (proofread-llm-test--whole-buffer-chunk))
-           request handle provider-success provider-error result
+           request work handle provider-success provider-error result
            cancelled
            (callbacks 0))
       (proofread-llm-test--with-capabilities
         (setq request (proofread--make-backend-request chunk 'llm))
+        (setq work (proofread-llm-test--make-work request))
         (cl-letf
             (((symbol-function 'llm-chat-async)
               (lambda (_provider _prompt success error
@@ -810,16 +1185,15 @@ When PROFILE is nil, use the current profile."
                 (push provider-handle cancelled))))
           (setq handle
                 (proofread--dispatch-backend-request
-                 request
+                 work
                  (lambda (value)
                    (cl-incf callbacks)
-                   (setq result value))
-                 'llm))
+                   (setq result value))))
           (push 'provider-request-b
                 (plist-get handle :requests))
           (should (timerp (plist-get handle :watchdog-timer)))
-          (should (proofread--active-request-p request))
-          (should (proofread--request-work-pending-p request))
+          (should (proofread--active-request-p work))
+          (should (proofread--request-work-pending-p work))
           (should (= (proofread--active-request-slots) 0))
           (should (proofread-llm-test--wait-for
                    (lambda () result)))
@@ -838,10 +1212,10 @@ When PROFILE is nil, use the current profile."
           (dolist (provider-handle
                    '( provider-request-a provider-request-b))
             (should (= (cl-count provider-handle cancelled) 1)))
-          (should-not (proofread--active-request-p request))
+          (should-not (proofread--active-request-p work))
           (should-not proofread--active-requests)
           (should-not
-           (proofread--request-work-pending-p request))
+           (proofread--request-work-pending-p work))
           (should (= (proofread--active-request-slots) 1))
           (funcall provider-success
                    (proofread-llm-test--response-content nil))
@@ -1038,13 +1412,14 @@ When PROFILE is nil, use the current profile."
            (proofread-llm-request-timeout 60)
            (proofread-llm--live-handles nil)
            (chunk (proofread-llm-test--whole-buffer-chunk))
-           request handle watchdog provider-success provider-error result
+           request work handle watchdog provider-success provider-error result
            settled-result callback-saw-provider-cancel cancelled
            (callbacks 0))
       (unwind-protect
           (proofread-llm-test--with-capabilities
             (setq request
                   (proofread--make-backend-request chunk 'llm))
+            (setq work (proofread-llm-test--make-work request))
             (cl-letf
                 (((symbol-function 'llm-chat-async)
                   (lambda (_provider _prompt success error
@@ -1057,16 +1432,15 @@ When PROFILE is nil, use the current profile."
                     (push provider-handle cancelled))))
               (setq handle
                     (proofread--dispatch-backend-request
-                     request
+                     work
                      (lambda (value)
                        (cl-incf callbacks)
                        (setq callback-saw-provider-cancel
                              (equal cancelled
                                     '( proofread-llm-test-request)))
-                       (setq result value))
-                     'llm))
-              (should (proofread--active-request-p request))
-              (should (proofread--request-work-pending-p request))
+                       (setq result value))))
+              (should (proofread--active-request-p work))
+              (should (proofread--request-work-pending-p work))
               (should (= (proofread--active-request-slots) 0))
               (should (memq handle proofread-llm--live-handles))
               (setq watchdog (plist-get handle :watchdog-timer))
@@ -1088,10 +1462,10 @@ When PROFILE is nil, use the current profile."
               (should-not (plist-get handle :watchdog-timer))
               (should (equal cancelled
                              '( proofread-llm-test-request)))
-              (should-not (proofread--active-request-p request))
+              (should-not (proofread--active-request-p work))
               (should-not proofread--active-requests)
               (should-not
-               (proofread--request-work-pending-p request))
+               (proofread--request-work-pending-p work))
               (should (= (hash-table-count
                           proofread--pending-request-keys)
                          0))
@@ -1197,11 +1571,10 @@ When PROFILE is nil, use the current profile."
                    (setq captured-prompt prompt)
                    (funcall success content)
                    'proofread-llm-test-handle)))
-        (should (proofread--backend-check
+        (should (proofread-llm--backend-check
                  request
                  (lambda (backend-result)
-                   (setq result backend-result))
-                 'llm))
+                   (setq result backend-result))))
         (should-not result)
         (should (proofread-llm-test--wait-for (lambda () result)))
         (should (eq (plist-get result :status) 'ok))
@@ -1311,7 +1684,7 @@ When PROFILE is nil, use the current profile."
              (diagnostic
               (proofread-llm-test--diagnostic-for-range
                1 6 "Alpha"))
-             first-request first-backend-identity)
+             first-request first-work first-backend-identity)
         (unwind-protect
             (proofread-llm-test--with-capabilities
               (let ((proofread-llm-provider first-provider)
@@ -1322,8 +1695,10 @@ When PROFILE is nil, use the current profile."
                        chunk))
                 (setq first-backend-identity
                       (plist-get first-request :backend-identity))
+                (setq first-work
+                      (proofread-llm-test--make-work first-request))
                 (proofread--cache-write-request
-                 first-request (list diagnostic)))
+                 first-work (list diagnostic)))
               (proofread--cache-write unrelated-key unrelated-entry)
               (unload-feature 'proofread-llm t)
               (require 'proofread-llm)
@@ -1332,13 +1707,15 @@ When PROFILE is nil, use the current profile."
                       stable-identity)
                      (second-request
                       (proofread-llm-test--make-profile-request
-                       chunk)))
+                       chunk))
+                     (second-work
+                      (proofread-llm-test--make-work second-request)))
                 (should
                  (equal first-backend-identity
                         (plist-get
                          second-request :backend-identity)))
                 (should
-                 (proofread--cache-read-request second-request)))
+                 (proofread--cache-read-request second-work)))
               (should
                (equal (proofread--cache-read unrelated-key)
                       unrelated-entry)))
@@ -1357,15 +1734,19 @@ When PROFILE is nil, use the current profile."
              (chunk (proofread-llm-test--whole-buffer-chunk))
              (request
               (proofread-llm-test--make-profile-request chunk))
+             (work (proofread-llm-test--make-work request))
              (diagnostic
               (proofread-llm-test--diagnostic-for-range 1 6 "Alpha")))
-        (proofread--cache-write-request request (list diagnostic))
-        (should (proofread--cache-read-request
-                 (proofread-llm-test--make-profile-request chunk)))
+        (proofread--cache-write-request work (list diagnostic))
+        (should
+         (proofread--cache-read-request
+          (proofread-llm-test--make-work
+           (proofread-llm-test--make-profile-request chunk))))
         (let ((proofread-llm-provider-identity "provider-b"))
-          (should-not (proofread--cache-read-request
-                       (proofread-llm-test--make-profile-request
-                        chunk))))))))
+          (should-not
+           (proofread--cache-read-request
+            (proofread-llm-test--make-work
+             (proofread-llm-test--make-profile-request chunk)))))))))
 
 (ert-deftest proofread-llm-test-provider-object-cache-miss ()
   "Miss the cache when LLM provider objects change."
@@ -1379,11 +1760,14 @@ When PROFILE is nil, use the current profile."
              (chunk (proofread-llm-test--whole-buffer-chunk))
              (request
               (proofread-llm-test--make-profile-request chunk))
+             (work (proofread-llm-test--make-work request))
              (diagnostic
               (proofread-llm-test--diagnostic-for-range 1 6 "Alpha")))
-        (proofread--cache-write-request request (list diagnostic))
-        (should (proofread--cache-read-request
-                 (proofread-llm-test--make-profile-request chunk)))
+        (proofread--cache-write-request work (list diagnostic))
+        (should
+         (proofread--cache-read-request
+          (proofread-llm-test--make-work
+           (proofread-llm-test--make-profile-request chunk))))
         (let ((proofread-llm-provider [:provider-b :api-key
                                                    "secret-token"]))
           (let ((key
@@ -1393,9 +1777,10 @@ When PROFILE is nil, use the current profile."
                          proofread-llm-provider key))
             (should-not (proofread-llm-test--tree-member-p
                          "secret-token" key)))
-          (should-not (proofread--cache-read-request
-                       (proofread-llm-test--make-profile-request
-                        chunk))))))))
+          (should-not
+           (proofread--cache-read-request
+            (proofread-llm-test--make-work
+             (proofread-llm-test--make-profile-request chunk)))))))))
 
 ;;;; Prompt submission and multi-pass results
 
@@ -1428,11 +1813,10 @@ When PROFILE is nil, use the current profile."
                   ((symbol-function 'llm-capabilities)
                    #'proofread-llm-test--capabilities))
           (let ((handle
-                 (proofread--backend-check
+                 (proofread-llm--backend-check
                   request
                   (lambda (backend-result)
-                    (setq result backend-result))
-                  'llm)))
+                    (setq result backend-result)))))
             (proofread-llm-test--assert-handle-shape handle)
             (should (equal (plist-get handle :requests)
                            '( proofread-llm-test-handle)))
@@ -1571,8 +1955,8 @@ When PROFILE is nil, use the current profile."
                   (proofread-llm-test--make-profile-request
                    chunk))
                  (handle
-                  (proofread--backend-check
-                   request #'ignore 'llm)))
+                  (proofread-llm--backend-check
+                   request #'ignore)))
             (let* ((interaction
                     (car (llm-chat-prompt-interactions
                           captured-prompt)))
@@ -1587,7 +1971,7 @@ When PROFILE is nil, use the current profile."
             (proofread-llm--cancel-request-handle handle)
             (should-not proofread-llm--live-handles)))))))
 
-(ert-deftest proofread-llm-test-success-enters-overlay-pipeline ()
+(ert-deftest proofread-llm-test-success-enters-diagnostic-pipeline ()
   "Send fresh LLM diagnostics through the normal result path."
   (with-temp-buffer
     (insert "helo")
@@ -1597,6 +1981,7 @@ When PROFILE is nil, use the current profile."
            (content
             (proofread-llm-test--response-for-range 1 5 "helo"))
            request
+           work
            result)
       (cl-letf (((symbol-function 'llm-chat-async)
                  (lambda (_provider _prompt success _error
@@ -1610,12 +1995,13 @@ When PROFILE is nil, use the current profile."
               (proofread--make-backend-request
                (proofread-llm-test--whole-buffer-chunk)
                'llm))
+        (setq work (proofread-llm-test--make-work request))
         (should (proofread--dispatch-backend-request
-                 request
+                 work
                  (lambda (backend-result)
                    (setq result backend-result)
-                   (proofread--handle-backend-result backend-result))
-                 'llm))
+                   (proofread--handle-backend-result
+                    work backend-result))))
         (should (proofread-llm-test--wait-for
                  (lambda ()
                    proofread--diagnostics)))
@@ -1631,7 +2017,7 @@ When PROFILE is nil, use the current profile."
           (should (equal (plist-get repair :range) '( 0 . 4))))
         (should-not proofread--active-requests)
         (should (= (length proofread--diagnostics) 1))
-        (should (= (length proofread--overlays) 1))
+        (should (= (length (flymake-diagnostics)) 1))
         (should (= (hash-table-count proofread--cache) 1))))))
 
 (ert-deftest proofread-llm-test-collects-additional-diagnostic-passes
@@ -1644,6 +2030,7 @@ When PROFILE is nil, use the current profile."
            (proofread-llm-max-diagnostic-passes 3)
            (chunk (proofread-llm-test--whole-buffer-chunk))
            request
+           work
            (first
             (proofread-llm-test--response-for-range 0 4 "helo"))
            (second
@@ -1678,12 +2065,12 @@ When PROFILE is nil, use the current profile."
                 ((symbol-function 'llm-capabilities)
                  #'proofread-llm-test--capabilities))
         (setq request (proofread--make-backend-request chunk 'llm))
+        (setq work (proofread-llm-test--make-work request))
         (should (> (plist-get request :generation) 0))
-        (let ((handle (proofread--backend-check
-                       request
+        (let ((handle (proofread--dispatch-backend-request
+                       work
                        (lambda (backend-result)
-                         (setq result backend-result))
-                       'llm)))
+                         (setq result backend-result)))))
           (should (= calls 3))
           (should (= (length (plist-get handle :requests)) 3))
           (let* ((later-prompt (car prompts))
@@ -1728,12 +2115,12 @@ When PROFILE is nil, use the current profile."
                      (funcall success (if (= calls 1) invalid valid))
                      (intern (format "proofread-llm-test-retry-%d"
                                      calls)))))
-          (let ((request
-                 (proofread--make-backend-request chunk 'llm)))
-            (proofread--backend-check
-             request (lambda (backend-result) (setq result
-                                                    backend-result))
-             'llm)
+          (let* ((request
+                  (proofread--make-backend-request chunk 'llm))
+                 (work (proofread-llm-test--make-work request)))
+            (proofread--dispatch-backend-request
+             work (lambda (backend-result) (setq result
+                                                 backend-result)))
             (should (= calls 2))
             (should (proofread-llm-test--wait-for (lambda () result)))
             (should (eq (plist-get result :status) 'ok))
@@ -1776,12 +2163,12 @@ When PROFILE is nil, use the current profile."
                      (funcall success invalid)
                      (intern (format "proofread-llm-test-invalid-%d"
                                      calls)))))
-          (let ((request
-                 (proofread--make-backend-request chunk 'llm)))
-            (proofread--backend-check
-             request (lambda (backend-result) (setq result
-                                                    backend-result))
-             'llm)
+          (let* ((request
+                  (proofread--make-backend-request chunk 'llm))
+                 (work (proofread-llm-test--make-work request)))
+            (proofread--dispatch-backend-request
+             work (lambda (backend-result) (setq result
+                                                 backend-result)))
             (should (= calls 3))
             (should (proofread-llm-test--wait-for (lambda () result)))
             (should (eq (plist-get result :status) 'error))
@@ -1815,12 +2202,12 @@ When PROFILE is nil, use the current profile."
                      (funcall success (if (= calls 1) invalid empty))
                      (intern (format "proofread-llm-test-empty-%d"
                                      calls)))))
-          (let ((request
-                 (proofread--make-backend-request chunk 'llm)))
-            (proofread--backend-check
-             request (lambda (backend-result) (setq result
-                                                    backend-result))
-             'llm)
+          (let* ((request
+                  (proofread--make-backend-request chunk 'llm))
+                 (work (proofread-llm-test--make-work request)))
+            (proofread--dispatch-backend-request
+             work (lambda (backend-result) (setq result
+                                                 backend-result)))
             (should (= calls 3))
             (should (proofread-llm-test--wait-for (lambda () result)))
             (should (eq (plist-get result :status) 'error))
@@ -1855,21 +2242,21 @@ When PROFILE is nil, use the current profile."
                                 "Network failed"))
                      (intern (format "proofread-llm-test-transport-%d"
                                      calls)))))
-          (let ((request
-                 (proofread--make-backend-request chunk 'llm)))
-            (proofread--backend-check
-             request (lambda (backend-result) (setq result
-                                                    backend-result))
-             'llm)
+          (let* ((request
+                  (proofread--make-backend-request chunk 'llm))
+                 (work (proofread-llm-test--make-work request)))
+            (proofread--dispatch-backend-request
+             work (lambda (backend-result) (setq result
+                                                 backend-result)))
             (should (= calls 2))
             (should (proofread-llm-test--wait-for (lambda () result)))
             (should (eq (plist-get result :status) 'ok))
             (should (plist-get result :partial))
             (should (= (length (plist-get result :diagnostics)) 1))
-            (should (eq (proofread--handle-backend-result result)
+            (should (eq (proofread--handle-backend-result work result)
                         'applied))
             (should (= (length proofread--diagnostics) 1))
-            (should (= (length proofread--overlays) 1))
+            (should (= (length (flymake-diagnostics)) 1))
             (should (= (hash-table-count proofread--cache) 0))))))))
 
 (ert-deftest
@@ -1891,7 +2278,8 @@ When PROFILE is nil, use the current profile."
         (proofread-llm-test--with-capabilities
           (let* ((chunk (proofread-llm-test--whole-buffer-chunk))
                  (request (proofread--make-backend-request chunk
-                                                           'llm)))
+                                                           'llm))
+                 (work (proofread-llm-test--make-work request)))
             (should (> (plist-get request :generation) 0))
             (cl-letf (((symbol-function 'llm-chat-async)
                        (lambda (_provider _prompt success _error
@@ -1901,20 +2289,21 @@ When PROFILE is nil, use the current profile."
                          (intern
                           (format "proofread-llm-test-managed-%d"
                                   calls)))))
-              (proofread--backend-check
-               request
+              (proofread--dispatch-backend-request
+               work
                (lambda (backend-result)
-                 (setq result backend-result))
-               'llm)
+                 (setq result backend-result)))
               (should (= calls 1))
               (pcase scenario
                 ('edited
                  (goto-char (point-min))
                  (delete-char 1))
                 ('disabled (proofread-mode -1)))
+              (should-not (proofread--active-request-p work))
+              (should-not (proofread--request-work-pending-p work))
               (funcall (car callbacks) content)
-              (should
-               (proofread-llm-test--wait-for (lambda () result)))
+              (accept-process-output nil 0.02)
+              (should-not result)
               (should (= calls 1)))))))))
 
 (ert-deftest
@@ -1934,18 +2323,18 @@ When PROFILE is nil, use the current profile."
                 ((symbol-function 'llm-capabilities)
                  #'proofread-llm-test--capabilities))
         (let* ((chunk (proofread-llm-test--whole-buffer-chunk))
-               (request (proofread--make-backend-request chunk 'llm)))
+               (request (proofread--make-backend-request chunk 'llm))
+               (work (proofread-llm-test--make-work request)))
           (should (proofread--dispatch-backend-request
-                   request
+                   work
                    (lambda (backend-result)
-                     (setq result backend-result))
-                   'llm))
+                     (setq result backend-result))))
           (should (proofread-llm-test--wait-for (lambda () result)))
           (should (eq (plist-get result :status) 'error))
           (should (eq (plist-get result :error) 'llm-error))
           (should (equal (buffer-string) before-text))
           (should-not proofread--active-requests)
-          (should-not proofread--overlays))))))
+          (should-not (flymake-diagnostics)))))))
 
 (ert-deftest proofread-llm-test-invalid-success-response-is-error ()
   "Turn malformed and non-string LLM success responses into errors."
@@ -1966,21 +2355,21 @@ When PROFILE is nil, use the current profile."
                    #'proofread-llm-test--capabilities))
           (let* ((chunk (proofread-llm-test--whole-buffer-chunk))
                  (request
-                  (proofread--make-backend-request chunk 'llm)))
+                  (proofread--make-backend-request chunk 'llm))
+                 (work (proofread-llm-test--make-work request)))
             (should (proofread--dispatch-backend-request
-                     request
+                     work
                      (lambda (backend-result)
                        (setq result backend-result)
                        (proofread--handle-backend-result
-                        backend-result))
-                     'llm))
+                        work backend-result))))
             (should (proofread-llm-test--wait-for (lambda () result)))
             (should (= calls 1))
             (should (eq (plist-get result :status) 'error))
             (should (eq (plist-get result :error)
                         'llm-invalid-response))
             (should-not proofread--active-requests)
-            (should-not proofread--overlays)
+            (should-not (flymake-diagnostics))
             (should (= (hash-table-count proofread--cache) 0))))))))
 
 (ert-deftest proofread-llm-test-stale-results-are-dropped ()
@@ -1990,6 +2379,7 @@ When PROFILE is nil, use the current profile."
                    (format " *proofread-llm-stale-%s*" scenario)))
           success
           request
+          work
           result)
       (unwind-protect
           (progn
@@ -2013,13 +2403,13 @@ When PROFILE is nil, use the current profile."
                              nil)))
                   (setq request
                         (proofread--make-backend-request chunk 'llm))
+                  (setq work (proofread-llm-test--make-work request))
                   (should (proofread--dispatch-backend-request
-                           request
+                           work
                            (lambda (backend-result)
                              (setq result
                                    (proofread--handle-backend-result
-                                    backend-result)))
-                           'llm)))))
+                                    work backend-result))))))))
             (pcase scenario
               ('killed
                (kill-buffer buffer))
@@ -2038,7 +2428,7 @@ When PROFILE is nil, use the current profile."
              success
              (proofread-llm-test--response-for-range 0 4 "helo"))
             (if (or (memq scenario '( killed disabled))
-                    (proofread--request-invalidated-p request))
+                    (proofread--request-invalidated-p work))
                 (progn
                   (accept-process-output nil 0.02)
                   (should-not result))
@@ -2048,7 +2438,7 @@ When PROFILE is nil, use the current profile."
             (when (buffer-live-p buffer)
               (with-current-buffer buffer
                 (should-not proofread--diagnostics)
-                (should-not proofread--overlays))))
+                (should-not (flymake-diagnostics)))))
         (when (buffer-live-p buffer)
           (kill-buffer buffer))))))
 
@@ -2771,6 +3161,7 @@ When PROFILE is nil, use the current profile."
     (proofread-mode 1)
     (let* ((chunk (proofread-llm-test--whole-buffer-chunk))
            (request (proofread--make-backend-request chunk 'llm))
+           (work (proofread-llm-test--make-work request))
            (content
             (proofread-llm-test--response-for-range 0 4 "helo"))
            (diagnostics
@@ -2781,11 +3172,12 @@ When PROFILE is nil, use the current profile."
       (goto-char (point-max))
       (insert "!")
       (should (eq (proofread--handle-backend-result
+                   work
                    (proofread--backend-success-result
                     request diagnostics))
                   'stale))
       (should-not proofread--diagnostics)
-      (should-not proofread--overlays)
+      (should-not (flymake-diagnostics))
       (should (equal (buffer-string) "helo!")))))
 
 ;;;; Cache, callbacks, and logging
@@ -2804,16 +3196,20 @@ When PROFILE is nil, use the current profile."
              (diagnostic
               (proofread-llm-test--diagnostic-for-range 1 5 "helo")))
         (proofread-llm-test--with-capabilities
-          (let ((request
-                 (proofread-llm-test--make-profile-request chunk)))
-            (proofread--cache-write-request request (list diagnostic))
-            (should (proofread--cache-read-request
-                     (proofread-llm-test--make-profile-request chunk)))
+          (let* ((request
+                  (proofread-llm-test--make-profile-request chunk))
+                 (work (proofread-llm-test--make-work request)))
+            (proofread--cache-write-request work (list diagnostic))
+            (should
+             (proofread--cache-read-request
+              (proofread-llm-test--make-work
+               (proofread-llm-test--make-profile-request chunk))))
             (let ((proofread-llm-response-strategy 'prompt-json))
               (should-not
                (proofread--cache-read-request
-                (proofread-llm-test--make-profile-request
-                 chunk))))))))))
+                (proofread-llm-test--make-work
+                 (proofread-llm-test--make-profile-request
+                  chunk)))))))))))
 
 (ert-deftest proofread-llm-test-diagnostic-passes-cache-miss ()
   "Cache entries miss when LLM diagnostic pass count changes."
@@ -2827,15 +3223,19 @@ When PROFILE is nil, use the current profile."
              (chunk (proofread-llm-test--whole-buffer-chunk))
              (request
               (proofread-llm-test--make-profile-request chunk))
+             (work (proofread-llm-test--make-work request))
              (diagnostic
               (proofread-llm-test--diagnostic-for-range 1 5 "helo")))
-        (proofread--cache-write-request request (list diagnostic))
-        (should (proofread--cache-read-request
-                 (proofread-llm-test--make-profile-request chunk)))
+        (proofread--cache-write-request work (list diagnostic))
+        (should
+         (proofread--cache-read-request
+          (proofread-llm-test--make-work
+           (proofread-llm-test--make-profile-request chunk))))
         (let ((proofread-llm-max-diagnostic-passes 2))
-          (should-not (proofread--cache-read-request
-                       (proofread-llm-test--make-profile-request
-                        chunk))))))))
+          (should-not
+           (proofread--cache-read-request
+            (proofread-llm-test--make-work
+             (proofread-llm-test--make-profile-request chunk)))))))))
 
 (ert-deftest
     proofread-llm-test-checker-instructions-identity-cache-miss ()
@@ -2874,21 +3274,25 @@ When PROFILE is nil, use the current profile."
            (request
             (proofread--make-backend-request
              chunk 'llm base-checker profile))
+           (work (proofread-llm-test--make-work request))
            (diagnostic
             (proofread-llm-test--diagnostic-for-range 1 5 "helo")))
-      (proofread--cache-write-request request (list diagnostic))
+      (proofread--cache-write-request work (list diagnostic))
       (should
        (proofread--cache-read-request
-        (proofread--make-backend-request
-         chunk 'llm changed-function-checker profile)))
+        (proofread-llm-test--make-work
+         (proofread--make-backend-request
+          chunk 'llm changed-function-checker profile))))
       (should-not
        (proofread--cache-read-request
-        (proofread--make-backend-request
-         chunk 'llm changed-identity-checker profile)))
+        (proofread-llm-test--make-work
+         (proofread--make-backend-request
+          chunk 'llm changed-identity-checker profile))))
       (should-not
        (string-match-p
         (regexp-quote "instructions-function")
-        (prin1-to-string (plist-get request :cache-key)))))))
+        (prin1-to-string
+         (proofread--scheduled-work-cache-key work)))))))
 
 (ert-deftest
     proofread-llm-test-instructions-function-requires-identity ()
@@ -2906,6 +3310,7 @@ When PROFILE is nil, use the current profile."
     (proofread-mode 1)
     (let* ((chunk (proofread-llm-test--whole-buffer-chunk))
            (request (proofread--make-backend-request chunk 'llm))
+           (work (proofread-llm-test--make-work request))
            (content
             (proofread-llm-test--response-for-range 0 2 "青晨"))
            (diagnostics
@@ -2916,11 +3321,12 @@ When PROFILE is nil, use the current profile."
       (goto-char (point-max))
       (insert "!")
       (should (eq (proofread--handle-backend-result
+                   work
                    (proofread--backend-success-result
                     request diagnostics))
                   'stale))
       (should-not proofread--diagnostics)
-      (should-not proofread--overlays))))
+      (should-not (flymake-diagnostics)))))
 
 (ert-deftest proofread-llm-test-backend-success-is-asynchronous ()
   "LLM backend success callbacks happen after dispatch returns."
@@ -2929,13 +3335,12 @@ When PROFILE is nil, use the current profile."
     (proofread-llm-test--with-success
         (proofread-llm-test--response-content nil)
       (let* ((chunk (proofread-llm-test--whole-buffer-chunk))
-             (request (proofread--make-backend-request chunk))
+             (request (proofread--make-backend-request chunk 'llm))
              result)
-        (should (proofread--backend-check
+        (should (proofread-llm--backend-check
                  request
                  (lambda (backend-result)
-                   (setq result backend-result))
-                 'llm))
+                   (setq result backend-result))))
         (should-not result)
         (should (proofread-llm-test--wait-for (lambda () result)))
         (should (eq (plist-get result :status) 'ok))
@@ -2949,13 +3354,12 @@ When PROFILE is nil, use the current profile."
     (proofread-llm-test--with-error
         'llm-failure "LLM failure"
       (let* ((chunk (proofread-llm-test--whole-buffer-chunk))
-             (request (proofread--make-backend-request chunk))
+             (request (proofread--make-backend-request chunk 'llm))
              result)
-        (should (proofread--backend-check
+        (should (proofread-llm--backend-check
                  request
                  (lambda (backend-result)
-                   (setq result backend-result))
-                 'llm))
+                   (setq result backend-result))))
         (should-not result)
         (should (proofread-llm-test--wait-for (lambda () result)))
         (should (eq (plist-get result :status) 'error))
@@ -2976,6 +3380,7 @@ When PROFILE is nil, use the current profile."
               (proofread-llm-test--response-diagnostic 1 5 "helo")
               (proofread-llm-test--response-diagnostic 0 4 "hola"))))
            request
+           work
            events
            status)
       (cl-letf (((symbol-function 'llm-chat-async)
@@ -2990,16 +3395,16 @@ When PROFILE is nil, use the current profile."
               (proofread--make-backend-request
                (proofread-llm-test--whole-buffer-chunk)
                'llm))
+        (setq work (proofread-llm-test--make-work request))
         (let ((proofread-request-log-hook
                (list (lambda (event)
                        (push event events)))))
           (should (proofread--dispatch-backend-request
-                   request
+                   work
                    (lambda (backend-result)
                      (setq status
                            (proofread--handle-backend-result
-                            backend-result)))
-                   'llm))
+                            work backend-result)))))
           (should (proofread-llm-test--wait-for (lambda () status)))
           (setq events (nreverse events))
           (let ((types (mapcar (lambda (event)

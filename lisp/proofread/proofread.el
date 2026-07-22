@@ -7,7 +7,7 @@
 ;; Author: Bingshan Chang <chang@bingshan.org>
 ;; Keywords: convenience, wp
 ;; Package-Requires: ((emacs "30.1") (llm "0.31.1"))
-;; Version: 0.2.0
+;; Version: 0.3.0
 
 ;; This file is not part of GNU Emacs.
 
@@ -28,18 +28,37 @@
 
 ;; Proofread provides asynchronous, context-aware proofreading for
 ;; Emacs buffers.  It selects prose from ordinary text, comments, or
-;; docstrings; sends bounded chunks to a configured backend; and
-;; displays diagnostics that can be reviewed, ignored, or corrected in
-;; place.
+;; docstrings; sends bounded chunks through the selected profile's
+;; ordered checkers; and displays diagnostics that can be reviewed,
+;; ignored, or corrected in place.
+;;
+;; Diagnostics are published through a buffer-local Flymake backend.
+;; Enabling `proofread-mode' enables Flymake when necessary and starts
+;; every configured Flymake backend; disabling Proofread removes only
+;; its own backend and diagnostics.  Disabling Flymake while Proofread
+;; is active disables Proofread as well.  Flymake supplies its normal
+;; user interface, including echo-area messages when ElDoc is enabled.
+;; `proofread-show-buffer-diagnostics' provides an additional
+;; Proofread-only list.  Proofread-specific commands ignore diagnostics
+;; owned by other Flymake backends.  Zero-width diagnostics use an
+;; adjacent Flymake presentation anchor when possible while the public
+;; API retains their logical insertion position.
+;;
+;; Optional point-oriented frontends should obtain diagnostics with
+;; `proofread-diagnostic-at-point', read their logical ranges with
+;; `proofread-diagnostic-range', format messages with
+;; `proofread-format-diagnostic-message', and observe
+;; `proofread-diagnostics-changed-hook'.
 
 ;;; Code:
 
 (require 'button)
 (require 'cl-lib)
-(require 'eldoc)
+(require 'flymake)
 (require 'lisp-mode)
 (require 'pp)
 (require 'pulse)
+(require 'ring)
 (require 'subr-x)
 (require 'tabulated-list)
 (require 'url-parse)
@@ -49,6 +68,14 @@
                   (&optional n))
 (declare-function previous-error-this-buffer-no-select "simple"
                   (&optional n))
+(declare-function org-element-at-point "org-element"
+                  (&optional epom cached-only))
+(declare-function org-element-lineage "org-element-ast"
+                  (datum &optional types with-self))
+(declare-function org-element-property "org-element-ast"
+                  (property node &optional dflt force-undefer))
+(declare-function org-element-type "org-element-ast"
+                  (node &optional anonymous))
 
 ;;;; Customization
 
@@ -68,16 +95,6 @@
   'proofread--set-positive-integer-option
   'proofread-set-positive-integer-option
   "0.2.0")
-
-(defcustom proofread-language nil
-  "Legacy language hint used when `proofread-profile' is nil.
-When nil, the selected legacy backend may infer the language from
-buffer contents or other configuration.
-
-This option is obsolete.  Set the `:language' property of the profile
-selected by `proofread-profile' instead."
-  :type '(choice (const :tag "Infer" nil) string)
-  :group 'proofread)
 
 (defcustom proofread-auto-check t
   "Non-nil means schedule automatic checks in `proofread-mode'.
@@ -131,14 +148,6 @@ It does not suppress errors or explicit command feedback."
   :type 'boolean
   :group 'proofread)
 
-(defcustom proofread-echo-area-messages t
-  "Show the Proofread diagnostic at point in the echo area.
-When non-nil, `proofread-mode' uses ElDoc to show diagnostic messages
-at point.  This option becomes buffer-local when set."
-  :type 'boolean
-  :local t
-  :group 'proofread)
-
 (defcustom proofread-max-chunk-size 2000
   "Maximum number of characters in a proofreading chunk."
   :type 'natnum
@@ -169,19 +178,6 @@ prevents new backend requests from being sent."
   :type 'natnum
   :group 'proofread)
 
-(defcustom proofread-backend nil
-  "Legacy backend selected when `proofread-profile' is nil.
-The symbol `llm' uses `proofread-llm-provider'.  The symbol
-`languagetool' uses a local LanguageTool HTTP server.  A nil value
-disables legacy backend dispatch.
-
-This option is obsolete.  Configure named checker entries in
-`proofread-profiles' and select one with `proofread-profile' instead."
-  :type '(choice (const :tag "None" nil)
-                 (const :tag "Generic llm backend" llm)
-                 (const :tag "LanguageTool backend" languagetool))
-  :group 'proofread)
-
 (defcustom proofread-profiles nil
   "Named proofreading profiles.
 Each element maps a stable profile name to a profile property list.
@@ -200,24 +196,27 @@ A profile may contain:
      `:options' property.  Checker names are stable identifiers, not
      display labels, and must be unique inside one profile.  Checker
      options are backend-local data interpreted by the selected
-     backend."
+     backend.  Before dispatch, the backend validates and snapshots
+     these options through its registered `:snapshot-options'
+     operation."
   :type '(alist :key-type symbol :value-type sexp)
   :group 'proofread)
 
 (defcustom proofread-profile nil
   "Selected proofreading profile.
-The value nil keeps the legacy `proofread-backend' and
-`proofread-language' settings active.  A symbol selects the matching
-entry from `proofread-profiles'.
+The value nil disables backend dispatch.  A non-nil symbol selects the
+matching entry from `proofread-profiles'.
 
 This option may be set buffer-locally, for example with
 `setq-local' or file/directory-local variables, when different
 buffers should use different profiles."
   :type '(choice
-          (const :tag "Use legacy backend settings" nil)
+          (const :tag "Disable backend dispatch" nil)
           symbol)
+  :package-version '(proofread . "0.3.0")
   :group 'proofread)
 
+;; Keep compiler-facing tombstones for configuration removed in 0.3.0.
 (make-obsolete-variable
  'proofread-backend
  "configure `proofread-profiles' and select one with `proofread-profile'"
@@ -227,6 +226,11 @@ buffers should use different profiles."
  'proofread-language
  "use the selected profile's `:language' property"
  "0.2.0")
+
+(make-obsolete-variable
+ 'proofread-echo-area-messages
+ "configure `eldoc-mode' directly; Flymake provides diagnostic messages"
+ "0.3.0")
 
 (defcustom proofread-cache-max-entries 128
   "Maximum diagnostic cache entries retained in each buffer.
@@ -259,23 +263,22 @@ request-ready chunks."
 
 (defface proofread-face
   '((t :inherit font-lock-warning-face :underline ( :style wave)))
-  "Face for proofreading diagnostics."
+  "Face used by Flymake for Proofread buffer annotations."
   :group 'proofread)
 
-(defface proofread-current-face
-  '((t :inherit proofread-face))
-  "Face for the current proofreading diagnostic."
-  :group 'proofread)
+;;;; Flymake diagnostic type
 
-(defface proofread-echo-area-source-face
-  '((t :inherit font-lock-keyword-face))
-  "Face for Proofread diagnostic sources in the echo area."
-  :group 'proofread)
+(defconst proofread--flymake-diagnostic-type 'proofread-diagnostic
+  "Flymake diagnostic type used for Proofread diagnostics.")
 
-(defface proofread-echo-area-message-face
-  '((t :inherit font-lock-comment-face))
-  "Face for Proofread diagnostic messages in the echo area."
-  :group 'proofread)
+(put proofread--flymake-diagnostic-type
+     'flymake-category 'flymake-warning)
+(put proofread--flymake-diagnostic-type
+     'flymake-overlay-control '((face . proofread-face)))
+(put proofread--flymake-diagnostic-type
+     'flymake-type-name "proofread")
+(put proofread--flymake-diagnostic-type
+     'severity (warning-numeric-level :warning))
 
 ;;;; Internal constants
 
@@ -284,11 +287,11 @@ request-ready chunks."
     (languagetool . proofread-languagetool))
   "Alist mapping built-in backend names to their library features.")
 
-(defconst proofread--legacy-profile-name 'legacy
-  "Profile name used for synthetic legacy backend settings.")
+(defconst proofread--ad-hoc-profile-name 'ad-hoc
+  "Profile name used for explicit low-level backend requests.")
 
-(defconst proofread--legacy-checker-name 'legacy
-  "Checker name used for synthetic legacy backend settings.")
+(defconst proofread--ad-hoc-checker-name 'ad-hoc
+  "Checker name used for explicit low-level backend requests.")
 
 (defconst proofread--profile-keys
   '( :language :display-language :checkers)
@@ -298,11 +301,22 @@ request-ready chunks."
   '( :name :backend :options)
   "Property keys accepted in proofread profile checker definitions.")
 
+(defconst proofread--backend-descriptor-keys
+  '( :check :identity :snapshot-options
+     :checker-identity :source-label :cancel)
+  "Property keys accepted in proofread backend descriptors.")
+
 (defconst proofread--diagnostic-keys
   '( :beg :end :text :kind :message :suggestions :source :target-kind)
   "Required keys for proofread diagnostic plists.")
 
-(defconst proofread--contract-version 3
+(defconst proofread--diagnostic-provenance-keys
+  '( :language :display-language
+     :profile :checker-name :checker-ordinal :checker-owner
+     :source-label)
+  "Request properties added to live proofread diagnostics.")
+
+(defconst proofread--contract-version 5
   "Version of the internal diagnostic cache-key contract.")
 
 (defconst proofread--backend-request-keys
@@ -318,31 +332,208 @@ request-ready chunks."
      :backend :backend-identity)
   "Required keys for proofread backend request plists.")
 
-(defconst proofread--request-log-request-keys
-  '( :log-id :id :generation :buffer
-     :beg :end :text
-     :context-before :context-after
-     :language :display-language
-     :profile :checker-name :checker-ordinal :checker-owner
-     :source-label
-     :major-mode :target-kind
-     :domain-beg :domain-end :accessible-beg :accessible-end
-     :backend)
-  "Backend request keys safe to retain in request logs.")
+(defconst proofread--request-log-schema
+  '( :property-sanitizers
+     ((:beg . proofread--request-log-safe-position-value)
+      (:end . proofread--request-log-safe-position-value)
+      (:domain-beg . proofread--request-log-safe-position-value)
+      (:domain-end . proofread--request-log-safe-position-value)
+      (:accessible-beg . proofread--request-log-safe-position-value)
+      (:accessible-end . proofread--request-log-safe-position-value)
+      (:text . proofread--request-log-safe-string-value)
+      (:context-before . proofread--request-log-safe-string-value)
+      (:context-after . proofread--request-log-safe-string-value)
+      (:language . proofread--request-log-safe-string-value)
+      (:display-language . proofread--request-log-safe-string-value)
+      (:message . proofread--request-log-safe-string-value)
+      (:method . proofread--request-log-safe-string-value)
+      (:source-label . proofread--request-log-safe-string-value)
+      (:type . proofread--request-log-safe-symbol-value)
+      (:status . proofread--request-log-safe-symbol-value)
+      (:final-status . proofread--request-log-safe-symbol-value)
+      (:profile . proofread--request-log-safe-symbol-value)
+      (:checker-name . proofread--request-log-safe-symbol-value)
+      (:backend . proofread--request-log-safe-symbol-value)
+      (:major-mode . proofread--request-log-safe-symbol-value)
+      (:target-kind . proofread--request-log-safe-symbol-value)
+      (:kind . proofread--request-log-safe-symbol-value)
+      (:strategy . proofread--request-log-safe-symbol-value)
+      (:reason . proofread--request-log-safe-symbol-value)
+      (:phase . proofread--request-log-safe-symbol-value)
+      (:ad-hoc . proofread--request-log-safe-symbol-value)
+      (:partial . proofread--request-log-safe-symbol-value)
+      (:source . proofread--request-log-safe-source-value)
+      (:key . proofread--request-log-safe-integer-value)
+      (:log-id . proofread--request-log-safe-integer-value)
+      (:id . proofread--request-log-safe-integer-value)
+      (:request-id . proofread--request-log-safe-integer-value)
+      (:generation . proofread--request-log-safe-integer-value)
+      (:checker-ordinal . proofread--request-log-safe-integer-value)
+      (:pass . proofread--request-log-safe-integer-value)
+      (:max-passes . proofread--request-log-safe-integer-value)
+      (:http-status . proofread--request-log-safe-integer-value)
+      (:contract-version . proofread--request-log-safe-integer-value)
+      (:buffer . proofread--request-log-safe-buffer-value)
+      (:source-buffer . proofread--request-log-safe-buffer-value)
+      (:time . proofread--request-log-safe-time-value)
+      (:created-at . proofread--request-log-safe-time-value)
+      (:updated-at . proofread--request-log-safe-time-value)
+      (:checker-owner . proofread--request-log-safe-checker-owner-value))
+     :objects
+     ((checker-owner
+       (:profile proofread--request-log-safe-object-property)
+       (:checker-name proofread--request-log-safe-object-property)
+       (:ad-hoc proofread--request-log-safe-object-property))
+      (backend-identity
+       (:backend proofread--request-log-safe-object-property)
+       (:contract-version proofread--request-log-safe-object-property)
+       (:fingerprint
+        proofread--request-log-safe-object-identity-fingerprint))
+      (checker-identity
+       (:profile proofread--request-log-safe-object-property)
+       (:checker-name proofread--request-log-safe-object-property)
+       (:backend proofread--request-log-safe-object-property)
+       (:ad-hoc proofread--request-log-safe-object-property)
+       (:backend-identity
+        proofread--request-log-safe-object-backend-identity)
+       (:fingerprint
+        proofread--request-log-safe-object-summary-fingerprint))
+      (request
+       (:id proofread--request-log-safe-object-property)
+       (:generation proofread--request-log-safe-object-property)
+       (:buffer proofread--request-log-safe-object-property)
+       (:beg proofread--request-log-safe-object-property)
+       (:end proofread--request-log-safe-object-property)
+       (:text proofread--request-log-safe-object-property)
+       (:context-before proofread--request-log-safe-object-property)
+       (:context-after proofread--request-log-safe-object-property)
+       (:language proofread--request-log-safe-object-property)
+       (:display-language proofread--request-log-safe-object-property)
+       (:profile proofread--request-log-safe-object-property)
+       (:checker-name proofread--request-log-safe-object-property)
+       (:checker-ordinal proofread--request-log-safe-object-property)
+       (:checker-owner proofread--request-log-safe-object-property)
+       (:source-label proofread--request-log-safe-object-property)
+       (:major-mode proofread--request-log-safe-object-property)
+       (:target-kind proofread--request-log-safe-object-property)
+       (:domain-beg proofread--request-log-safe-object-property)
+       (:domain-end proofread--request-log-safe-object-property)
+       (:accessible-beg proofread--request-log-safe-object-property)
+       (:accessible-end proofread--request-log-safe-object-property)
+       (:backend proofread--request-log-safe-object-property)
+       (:backend-identity
+        proofread--request-log-safe-object-backend-identity)
+       (:checker-identity
+        proofread--request-log-safe-object-checker-identity))
+      (chunk
+       (:beg proofread--request-log-safe-object-property)
+       (:end proofread--request-log-safe-object-property)
+       (:text proofread--request-log-safe-object-property)
+       (:context-before proofread--request-log-safe-object-property)
+       (:context-after proofread--request-log-safe-object-property)
+       (:language proofread--request-log-safe-object-property)
+       (:major-mode proofread--request-log-safe-object-property)
+       (:target-kind proofread--request-log-safe-object-property)
+       (:domain-beg proofread--request-log-safe-object-property)
+       (:domain-end proofread--request-log-safe-object-property)
+       (:accessible-beg proofread--request-log-safe-object-property)
+       (:accessible-end proofread--request-log-safe-object-property))
+      (diagnostic
+       (:beg proofread--request-log-safe-object-property)
+       (:end proofread--request-log-safe-object-property)
+       (:text proofread--request-log-safe-object-property)
+       (:kind proofread--request-log-safe-object-property)
+       (:message proofread--request-log-safe-object-property)
+       (:target-kind proofread--request-log-safe-object-property)
+       (:language proofread--request-log-safe-object-property)
+       (:display-language proofread--request-log-safe-object-property)
+       (:profile proofread--request-log-safe-object-property)
+       (:checker-name proofread--request-log-safe-object-property)
+       (:checker-ordinal proofread--request-log-safe-object-property)
+       (:checker-owner proofread--request-log-safe-object-property)
+       (:source-label proofread--request-log-safe-object-property)
+       (:source proofread--request-log-safe-object-diagnostic-source)
+       (:suggestions
+        proofread--request-log-safe-object-diagnostic-suggestions))
+      (result
+       (:status proofread--request-log-safe-object-property)
+       (:source proofread--request-log-safe-object-property)
+       (:partial proofread--request-log-safe-object-property)
+       (:phase proofread--request-log-safe-object-property)
+       (:request proofread--request-log-safe-object-request)
+       (:diagnostics proofread--request-log-safe-object-diagnostics)
+       (:error proofread--request-log-safe-object-condition)
+       (:message proofread--request-log-safe-object-backend-message))
+      (cache-entry
+       (:text proofread--request-log-safe-object-property)
+       (:diagnostics proofread--request-log-safe-object-diagnostics)))
+     :events
+     ((t
+       (:type proofread--request-log-safe-event-property)
+       (:time proofread--request-log-safe-event-property)
+       (:log-id proofread--request-log-safe-event-property)
+       (:request-id proofread--request-log-safe-event-property)
+       (:buffer proofread--request-log-safe-event-property)
+       (:beg proofread--request-log-safe-event-property)
+       (:end proofread--request-log-safe-event-property)
+       (:status proofread--request-log-safe-event-property)
+       (:request proofread--request-log-safe-event-request))
+      (chunk-request
+       (:chunk proofread--request-log-safe-event-chunk))
+      (queued-request
+       (:backend proofread--request-log-safe-event-property))
+      (active-request
+       (:backend proofread--request-log-safe-event-property))
+      (backend-dispatched
+       (:backend proofread--request-log-safe-event-property))
+      (backend-request
+       (:backend proofread--request-log-safe-event-property)
+       (:method proofread--request-log-safe-event-property)
+       (:pass proofread--request-log-safe-event-property)
+       (:max-passes proofread--request-log-safe-event-property)
+       (:strategy proofread--request-log-safe-event-property)
+       (:url proofread--request-log-safe-event-url)
+       (:parameters proofread--request-log-safe-event-text)
+       (:schema proofread--request-log-safe-event-text)
+       (:prompt-text proofread--request-log-safe-event-text)
+       (:reported-diagnostics
+        proofread--request-log-safe-event-diagnostics))
+      (backend-response
+       (:backend proofread--request-log-safe-event-property)
+       (:http-status proofread--request-log-safe-event-property)
+       (:pass proofread--request-log-safe-event-property)
+       (:url proofread--request-log-safe-event-url)
+       (:response proofread--request-log-safe-event-text)
+       (:error proofread--request-log-safe-event-condition)
+       (:message proofread--request-log-safe-event-backend-message))
+      (backend-result
+       (:backend proofread--request-log-safe-event-property)
+       (:pass proofread--request-log-safe-event-property)
+       (:source proofread--request-log-safe-event-property)
+       (:entry proofread--request-log-safe-event-cache-entry)
+       (:result proofread--request-log-safe-event-result))
+      (cache-hit
+       (:entry proofread--request-log-safe-event-required-cache-entry))
+      (cancelled
+       (:reason proofread--request-log-safe-event-property))
+      (final-result
+       (:result proofread--request-log-safe-event-result))
+      (checker-dispatch-failed
+       (:profile proofread--request-log-safe-event-property)
+       (:checker-name proofread--request-log-safe-event-property)
+       (:backend proofread--request-log-safe-event-property)
+       (:phase proofread--request-log-safe-event-property)
+       (:error proofread--request-log-safe-event-required-condition)
+       (:message proofread--request-log-safe-event-checker-message))))
+  "Declarative safety schema for request-log objects and events.
+The t event entry lists fields shared by every event.  Every field
+specification has the form (PROPERTY SANITIZER).  Object sanitizers
+also receive the safe fields collected so far; every sanitizer returns
+`(t . SAFE-VALUE)' or nil.")
 
-(defconst proofread--request-log-position-keys
-  '( :beg :end :domain-beg :domain-end :accessible-beg :accessible-end)
-  "Request-log properties whose values are frozen as positions.")
-
-(defconst proofread--request-log-diagnostic-keys
-  '( :beg :end :text :kind :message :target-kind
-     :language :display-language
-     :profile :checker-name :checker-ordinal :checker-owner
-     :source-label)
-  "Diagnostic properties safe to retain in request logs.")
-
-(defconst proofread--overlay-category 'proofread-overlay
-  "Overlay category used for proofread-owned overlays.")
+(defconst proofread--request-log-history-properties
+  '( :events :backend-requests :backend-responses :backend-results)
+  "Record properties stored internally in newest-first order.")
 
 (defconst proofread--description-buffer-name "*Proofread Diagnostic*"
   "Buffer name used to display proofread diagnostic descriptions.")
@@ -403,32 +594,17 @@ request-ready chunks."
 (defvar proofread--ignored-diagnostics (make-hash-table :test #'equal)
   "Session-local table of ignored proofread diagnostic keys.")
 
-(defvar proofread--legacy-dispatch-warning-issued-p nil
-  "Non-nil after warning about legacy dispatch this session.")
-
 (defvar-local proofread--diagnostics nil
   "Proofread diagnostics for the current buffer.")
 
-(defvar-local proofread--overlays nil
-  "Proofread-owned overlays for the current buffer.")
-
-(defvar-local proofread--diagnostic-overlays nil
-  "Map diagnostics to their proofread-owned overlays.")
-
-(defvar-local proofread--next-diagnostic-insertion-ordinal 0
-  "Next insertion ordinal for a proofread diagnostic overlay.")
+(defvar-local proofread--flymake-report-function nil
+  "Latest Flymake report function for the Proofread bridge.")
 
 (defvar-local proofread--diagnostic-request-ranges nil
   "Map diagnostics to their originating request marker ranges.")
 
 (defvar-local proofread--current-diagnostic nil
   "Currently selected proofread diagnostic in the current buffer.")
-
-(defvar-local proofread--eldoc-mode-owned-p nil
-  "Non-nil when Proofread enabled ElDoc in the current buffer.")
-
-(defvar-local proofread--echo-area-refresh-pending-p nil
-  "Non-nil when a guarded Proofread echo-area refresh is pending.")
 
 (defvar-local proofread--diagnostics-current-line 0
   "Current line in a proofread diagnostics listing buffer.")
@@ -442,26 +618,8 @@ request-ready chunks."
 (defvar-local proofread--active-requests nil
   "Active proofread requests for the current buffer.")
 
-(defvar-local proofread--request-queue nil
-  "Proofread requests waiting for an available backend request slot.")
-
-(defvar-local proofread--request-queue-tail nil
-  "Last cons cell of `proofread--request-queue'.")
-
-(defvar-local proofread--request-queue-index nil
-  "Map cache keys to eq sets of queued request entries.")
-
-(defvar-local proofread--request-queue-links nil
-  "Map queued request entries to their queue cells and predecessors.")
-
-(defvar-local proofread--request-queue-sequences nil
-  "Map legacy queue entry identities to stable FIFO sequence numbers.")
-
-(defvar-local proofread--cache-woken-queue-entries nil
-  "Eq set of queued entries woken by an available cache entry.")
-
-(defvar-local proofread--next-request-queue-sequence 0
-  "Next FIFO sequence number for a queued request entry.")
+(defvar-local proofread--queue-state nil
+  "Linked request queue state for the current buffer.")
 
 (defvar-local proofread--claimed-requests nil
   "Requests moving atomically from queued to active or complete.")
@@ -478,6 +636,12 @@ request-ready chunks."
 (defvar proofread--inhibit-queue-dispatch nil
   "Buffer whose request lifecycle state is being changed atomically.")
 
+(defvar proofread--profile-dispatch-transactions nil
+  "Dynamically shared profile publication transactions.
+Each entry is a `proofread--profile-dispatch-transaction'.  Nested
+dispatches share one transaction only while they still own the same
+buffer generation and request queue.")
+
 (defvar proofread--queue-dispatch-transaction nil
   "Token for the dynamically active request queue dispatch transaction.")
 
@@ -487,11 +651,14 @@ request-ready chunks."
 (defvar proofread--clearing-scheduled-work nil
   "Buffer whose queued and scheduled work is being cleared.")
 
+(defvar proofread--buffer-state-cleanup nil
+  "Dynamically nested buffers whose mode-owned state is being cleared.")
+
 (defvar proofread--recording-clear-rejection-p nil
   "Non-nil while reporting work rejected during cleanup.")
 
 (defvar-local proofread--pending-request-keys nil
-  "Map active and queued work keys to owning request log ids.")
+  "Map active and queued work keys to scheduled work records.")
 
 (defvar-local proofread--next-request-id 0
   "Next proofread backend request id for the current buffer.")
@@ -502,11 +669,11 @@ request-ready chunks."
 (defvar proofread--generation-sequence 0
   "Sequence used to distinguish successive proofread buffer states.")
 
-(defvar-local proofread--pending-invalidated-overlays nil
-  "Proofread overlays captured before the current buffer change.")
-
 (defvar-local proofread--pending-invalidated-diagnostics nil
   "Proofread diagnostics captured before the current buffer change.")
+
+(defvar-local proofread--pending-diagnostic-ranges nil
+  "Live diagnostic ranges captured before the current buffer change.")
 
 (defvar-local proofread--cache nil
   "Proofread cache for the current buffer.")
@@ -520,12 +687,6 @@ request-ready chunks."
 (defvar-local proofread--idle-timer nil
   "Idle timer for pending proofreading work in this buffer.")
 
-(defvar-local proofread--org-block-cache-key nil
-  "Buffer state represented by `proofread--org-block-ranges'.")
-
-(defvar-local proofread--org-block-ranges nil
-  "Sorted Org block content ranges for the current buffer state.")
-
 (defvar proofread-mode)
 
 (defvar proofread--active-target-kind nil
@@ -533,33 +694,35 @@ request-ready chunks."
 
 (defvar proofread-request-log-hook nil
   "Abnormal hook run with proofread request lifecycle events.
-Each function receives one detached, safe plist argument.  Raw checker
-options, provider objects, backend handles, and other opaque
-backend-local values are omitted.  Consumers should treat the event as
-read-only and must not signal errors that interrupt proofreading.")
+Each function receives its own detached, safe plist argument.  Raw
+checker options, provider objects, backend handles, and other opaque
+backend-local values are omitted.  Mutating an event cannot affect
+other consumers or recorded state.  Consumers must not signal errors
+that interrupt proofreading.")
 
 (defvar-local proofread-diagnostics-changed-hook nil
-  "Hook run after displayed diagnostics change in the current buffer.
-Functions are called without arguments.  Errors are reported without
-interrupting proofreading.")
+  "Hook run after a Proofread diagnostic model change is committed.
+Any corresponding Flymake publication is attempted before this
+buffer-local hook runs.  Public frontends may use it to refresh values
+read through the Proofread diagnostic accessors.  It does not report
+changes from other Flymake backends.  Functions are called without
+arguments.  Errors are reported without interrupting proofreading.")
 
 (defvar proofread--mode-buffers nil
   "Live buffers where `proofread-mode' has installed local hooks.")
 
-(defvar proofread--window-hooks-installed nil
-  "Non-nil when global window activity hooks are installed.")
-
-(defvar proofread--inhibit-overlay-invalidation nil
-  "Buffer whose correction edits must preserve proofread overlays.")
-
-(defvar proofread--deferred-correction-overlays nil
-  "Overlays invalidated while applying an atomic correction.")
+(defvar proofread--inhibit-diagnostic-invalidation nil
+  "Buffer whose correction edits defer diagnostic invalidation.")
 
 (defvar proofread--deferred-correction-diagnostics nil
   "Diagnostics invalidated while applying an atomic correction.")
 
 (defvar proofread--request-log-sequence 0
   "Session-local sequence for request log identifiers.")
+
+(defvar proofread--request-log-owner-ids
+  (make-hash-table :test #'eq :weakness 'key)
+  "Weak map from backend request payloads to scheduler log ids.")
 
 (defvar proofread--request-batch-sequence 0
   "Session-local sequence for request batch identifiers.")
@@ -574,7 +737,7 @@ interrupting proofreading.")
   "Hash table of proofread request records for the current buffer.")
 
 (defvar-local proofread--request-log-order nil
-  "Request record keys in oldest-to-newest order.")
+  "Ring of request record keys in newest-to-oldest order.")
 
 (defvar-local proofread--request-log-list-buffers nil
   "Live request list buffers for the current source buffer.")
@@ -609,42 +772,137 @@ interrupting proofreading.")
   cancel
   cancelled)
 
-(defvar proofread--backend-descriptor-snapshot nil
-  "Dynamically captured `(BACKEND . DESCRIPTOR)' for submission.")
+(cl-defstruct
+    (proofread--scheduled-work
+     (:constructor
+      proofread--make-scheduled-work (request cache-key log-id)))
+  "Core-owned mutable state for one immutable backend REQUEST.
+CACHE-KEY and LOG-ID belong to the scheduler and are never exposed to
+the backend.  The remaining fields track lifecycle state after the
+work is published."
+  request
+  cache-key
+  log-id
+  superseded
+  invalidated
+  cancelled
+  batch
+  batch-settled
+  handle)
 
-(defun proofread--register-backend (backend &rest descriptor)
-  "Register BACKEND using functions in DESCRIPTOR.
-DESCRIPTOR must contain callable `:check' and `:identity' entries.  An
-optional callable `:checker-identity' entry returns the effective
-identity for one normalized profile checker.  An optional callable
-`:source-label' entry returns nil or a nonempty display string for one
-normalized profile checker, and an optional callable `:cancel' entry
-receives unchanged the opaque handle returned by `:check'."
-  (unless (symbolp backend)
-    (error "Proofread backend name must be a symbol: %S" backend))
-  (dolist (key '( :check :identity))
+(cl-defstruct
+    (proofread--queue-entry
+     (:constructor
+      proofread--make-queue-entry (work sequence)))
+  "One scheduled WORK linked into a request queue.
+SEQUENCE is the immutable FIFO position assigned when the entry is
+created."
+  work
+  sequence
+  previous
+  next
+  owner)
+
+(cl-defstruct
+    (proofread--queue-state
+     (:constructor proofread--make-queue-state ()))
+  "All mutable structural state for one request queue."
+  head
+  tail
+  (index (make-hash-table :test #'equal))
+  (woken (make-hash-table :test #'eq))
+  (next-sequence 0))
+
+(cl-defstruct
+    (proofread--profile-dispatch-transaction
+     (:constructor
+      proofread--make-profile-dispatch-transaction
+      (buffer generation queue-state)))
+  "Publication ownership for one profile dispatch state.
+BUFFER, GENERATION, and QUEUE-STATE identify the exact lifecycle state
+that may share preparation and one eventual queue drain."
+  buffer
+  generation
+  queue-state
+  published)
+
+(cl-defstruct
+    (proofread--checker-preparation
+     (:constructor
+      proofread--make-checker-preparation
+      (descriptor checker backend-identity checker-identity
+                  source-label)))
+  "Immutable-by-convention snapshot of one checker adapter.
+DESCRIPTOR is local to preparation and is never added to requests or
+scheduler state.  CHECKER contains the exact backend-owned options
+snapshot.  The remaining fields are the metadata snapshots shared by
+every request prepared for that checker."
+  descriptor
+  checker
+  backend-identity
+  checker-identity
+  source-label)
+
+(defun proofread--scheduled-work-backend (work)
+  "Return the backend frozen in WORK's immutable request."
+  (plist-get (proofread--scheduled-work-request work) :backend))
+
+(defun proofread--validate-backend-descriptor (backend descriptor)
+  "Return BACKEND DESCRIPTOR after validating its public contract."
+  (let ((context (format "Proofread backend %S descriptor" backend))
+        seen)
+    (dolist (key (proofread--plist-keys descriptor context))
+      (unless (memq key proofread--backend-descriptor-keys)
+        (error "%s contains unknown property %S" context key))
+      (when (memq key seen)
+        (error "%s contains duplicate property %S" context key))
+      (push key seen)))
+  (dolist (key '( :check :identity :snapshot-options))
     (unless (functionp (plist-get descriptor key))
       (error "Proofread backend %S has invalid %S function"
              backend key)))
-  (when (and (plist-member descriptor :cancel)
-             (not (functionp (plist-get descriptor :cancel))))
-    (error "Proofread backend %S has invalid :cancel function"
-           backend))
-  (when (and (plist-member descriptor :checker-identity)
-             (not (functionp (plist-get descriptor :checker-identity))))
-    (error "Proofread backend %S has invalid :checker-identity function"
-           backend))
-  (when (and (plist-member descriptor :source-label)
-             (not (functionp (plist-get descriptor :source-label))))
-    (error "Proofread backend %S has invalid :source-label function"
-           backend))
+  (dolist (key '( :checker-identity :source-label :cancel))
+    (when (and (plist-member descriptor key)
+               (not (functionp (plist-get descriptor key))))
+      (error "Proofread backend %S has invalid %S function"
+             backend key)))
+  descriptor)
+
+(defun proofread-register-backend (backend &rest descriptor)
+  "Register BACKEND using operations in DESCRIPTOR.
+DESCRIPTOR must contain callable `:check', `:identity', and
+`:snapshot-options' entries.  The snapshot operation receives raw
+checker options and must return a detached property-list snapshot.
+The identity operation takes no arguments and must return a property
+list containing `:backend' and `:contract-version'.  The check
+operation receives a read-only request and a callback, submits without
+blocking, and returns an opaque handle.
+
+An optional callable `:checker-identity' entry returns the effective
+complete identity for one normalized profile checker instead of the
+backend-wide identity.  An optional callable `:source-label' entry
+returns nil or a nonempty display string for one normalized profile
+checker.  An optional callable `:cancel' entry receives unchanged the
+opaque handle returned by `:check'.
+
+Signal an error for malformed, duplicate, or unknown descriptor
+properties.  Return BACKEND after registering a shallow copy of the
+descriptor."
+  (unless (symbolp backend)
+    (error "Proofread backend name must be a symbol: %S" backend))
+  (proofread--validate-backend-descriptor backend descriptor)
   (puthash backend (copy-sequence descriptor)
            proofread--backend-registry)
   backend)
 
-(defun proofread--unregister-backend (backend)
-  "Remove BACKEND from the loaded backend registry."
-  (remhash backend proofread--backend-registry))
+(defun proofread-unregister-backend (backend)
+  "Remove BACKEND from the loaded backend registry.
+Return non-nil when BACKEND had a registered descriptor."
+  (let ((registered (and (gethash backend
+                                  proofread--backend-registry)
+                         t)))
+    (remhash backend proofread--backend-registry)
+    registered))
 
 (defun proofread--backend-descriptor (backend)
   "Return BACKEND's loaded descriptor, loading its feature if known."
@@ -660,17 +918,18 @@ receives unchanged the opaque handle returned by `:check'."
   "Return property keys from VALUE, or signal an error for CONTEXT."
   (unless (listp value)
     (error "%s must be a property list" context))
-  (let ((tail value)
+  (let ((value-length (proper-list-p value))
+        (tail value)
         keys)
+    (unless (integerp value-length)
+      (error "%s must be a proper property list" context))
+    (unless (zerop (% value-length 2))
+      (error "%s must contain values for every property" context))
     (while tail
-      (unless (consp tail)
-        (error "%s must be a proper property list" context))
       (let ((key (pop tail)))
         (unless (keywordp key)
           (error "%s contains non-keyword property %S" context key))
         (push key keys))
-      (unless (consp tail)
-        (error "%s must contain values for every property" context))
       (pop tail))
     (nreverse keys)))
 
@@ -742,7 +1001,7 @@ hash table used to reject duplicate checker names inside the profile."
             :name name
             :checker-ordinal ordinal
             :backend backend
-            :options (proofread--snapshot-value options)))))
+            :options options))))
 
 (defun proofread--normalize-profile-checkers
     (profile-name checkers)
@@ -781,42 +1040,40 @@ hash table used to reject duplicate checker names inside the profile."
             (proofread--normalize-profile-checkers
              name checkers)))))
 
-(defun proofread--legacy-profile-checker ()
-  "Return the normalized checker selected by legacy options.
-Return nil when `proofread-backend' is nil.  Mark a returned checker
-so it cannot alias an explicitly named profile and checker."
-  (when proofread-backend
-    (unless (symbolp proofread-backend)
-      (error "Proofread backend must be nil or a symbol"))
-    (list :profile proofread--legacy-profile-name
-          :name proofread--legacy-checker-name
-          :checker-ordinal 0
-          :backend proofread-backend
-          :options nil
-          :legacy t)))
-
 (defun proofread--ad-hoc-checker (backend)
   "Return an internal checker for an explicit low-level BACKEND.
 Ad-hoc checkers are independent of profile selection and cannot alias
-synthetic legacy or explicit profile checkers."
+explicit profile checkers."
   (when backend
     (unless (symbolp backend)
       (error "Proofread backend must be nil or a symbol"))
-    (list :profile proofread--legacy-profile-name
-          :name proofread--legacy-checker-name
+    (list :profile proofread--ad-hoc-profile-name
+          :name proofread--ad-hoc-checker-name
           :backend backend
           :options nil
           :ad-hoc t)))
 
-(defun proofread--legacy-profile ()
-  "Return a normalized profile from legacy backend options."
-  (proofread--validate-language-option
-   proofread-language "proofread-language")
-  (let ((checker (proofread--legacy-profile-checker)))
-    (list :name proofread--legacy-profile-name
-          :language (proofread--snapshot-value proofread-language)
-          :display-language nil
-          :checkers (and checker (list checker)))))
+(defun proofread--checker-with-options-snapshot
+    (checker &optional descriptor)
+  "Return CHECKER with its backend-owned options snapshot.
+The registered backend receives CHECKER's raw `:options' value.  The
+core validates only the returned property-list envelope and retains
+the returned object unchanged.  When DESCRIPTOR is non-nil, use that
+previously captured backend descriptor without querying the registry."
+  (let* ((backend (plist-get checker :backend))
+         (descriptor (or descriptor
+                         (proofread--backend-descriptor backend))))
+    (unless descriptor
+      (error "Unsupported proofread backend %S" backend))
+    (let* ((function (plist-get descriptor :snapshot-options))
+           (options (funcall function
+                             (plist-get checker :options))))
+      (proofread--validate-plist
+       options
+       (format "Proofread backend %S checker options snapshot"
+               backend))
+      (let ((snapshot (copy-sequence checker)))
+        (plist-put snapshot :options options)))))
 
 (defun proofread--current-profile ()
   "Return the normalized selected proofreading profile."
@@ -824,7 +1081,7 @@ synthetic legacy or explicit profile checkers."
       (proofread--normalize-profile
        proofread-profile
        (proofread--profile-definition proofread-profile))
-    (proofread--legacy-profile)))
+    (proofread--normalize-profile nil nil)))
 
 (defun proofread--current-profile-language ()
   "Return the selected proofreading profile's language hint."
@@ -832,9 +1089,8 @@ synthetic legacy or explicit profile checkers."
 
 (defun proofread--checker-discriminator (checker)
   "Return internal provenance properties for CHECKER."
-  (cond
-   ((plist-get checker :legacy) '( :legacy t))
-   ((plist-get checker :ad-hoc) '( :ad-hoc t))))
+  (when (plist-get checker :ad-hoc)
+    '( :ad-hoc t)))
 
 (defun proofread--checker-owner (checker)
   "Return the stable owner identity for CHECKER.
@@ -843,11 +1099,6 @@ Internal checker kinds include their provenance discriminator."
    (list :profile (plist-get checker :profile)
          :checker-name (plist-get checker :name))
    (proofread--checker-discriminator checker)))
-
-(defun proofread--backend-checker-identity-function (backend)
-  "Return BACKEND's checker-local identity function, or nil."
-  (when-let* ((descriptor (proofread--backend-descriptor backend)))
-    (plist-get descriptor :checker-identity)))
 
 (defun proofread--report-checker-source-label-warning
     (checker reason)
@@ -866,13 +1117,16 @@ Do not let reporting errors interrupt checker dispatch."
        "checker source label unavailable; see *Warnings*")
     (error nil)))
 
-(defun proofread--backend-checker-source-label (checker)
+(defun proofread--backend-checker-source-label
+    (checker &optional descriptor)
   "Return a safe display source label for normalized CHECKER.
 Dispatch callers snapshot the backend's optional `:source-label'
 operation once per checker.  Return nil after warning when the
-operation signals an error or returns an invalid non-nil value."
+operation signals an error or returns an invalid non-nil value.  When
+DESCRIPTOR is non-nil, use that previously captured descriptor."
   (let* ((backend (plist-get checker :backend))
-         (descriptor (proofread--backend-descriptor backend))
+         (descriptor (or descriptor
+                         (proofread--backend-descriptor backend)))
          (function (plist-get descriptor :source-label)))
     (when function
       (condition-case err
@@ -884,8 +1138,7 @@ operation signals an error or returns an invalid non-nil value."
                ((null label) nil)
                ((stringp label)
                 (let ((normalized
-                       (replace-regexp-in-string
-                        "[[:space:]]+" " " (string-trim label))))
+                       (string-clean-whitespace label)))
                   (if (string-empty-p normalized)
                       (progn
                         (proofread--report-checker-source-label-warning
@@ -901,23 +1154,30 @@ operation signals an error or returns an invalid non-nil value."
           checker (proofread--condition-kind err))
          nil)))))
 
-(defun proofread--backend-checker-identity (checker)
-  "Return the backend identity effective for normalized CHECKER."
+(defun proofread--backend-checker-identity
+    (checker &optional descriptor)
+  "Return one detached backend identity for normalized CHECKER.
+When DESCRIPTOR is non-nil, use that previously captured descriptor."
   (let* ((backend (plist-get checker :backend))
+         (descriptor (or descriptor
+                         (proofread--backend-descriptor backend)))
          (identity-function
-          (proofread--backend-checker-identity-function backend))
+          (plist-get descriptor :checker-identity))
          (value
-          (if identity-function
-              (let ((identity-checker (copy-sequence checker)))
-                ;; Checker order is presentation metadata.  Keep it out
-                ;; of backend-owned cache identities even when a backend
-                ;; snapshots its complete input.
-                (cl-remf identity-checker :checker-ordinal)
-                (funcall identity-function identity-checker))
-            (proofread--backend-identity backend))))
+          (cond
+           (identity-function
+            (let ((identity-checker (copy-sequence checker)))
+              ;; Checker order is presentation metadata.  Keep it out
+              ;; of backend-owned cache identities even when a backend
+              ;; snapshots its complete input.
+              (cl-remf identity-checker :checker-ordinal)
+              (funcall identity-function identity-checker)))
+           (descriptor
+            (funcall (plist-get descriptor :identity)))
+           (t nil))))
     (cond
      ((null value)
-      (when identity-function
+      (when descriptor
         (error "Invalid checker identity for proofread backend %S"
                backend))
       nil)
@@ -928,36 +1188,57 @@ operation signals an error or returns an invalid non-nil value."
       (error "Invalid checker identity for proofread backend %S"
              backend)))))
 
-(defun proofread--checker-identity
-    (checker &optional backend-identity)
-  "Return the cache and freshness identity for CHECKER.
-BACKEND-IDENTITY, when non-nil, is used instead of recomputing the
-effective backend identity."
-  (let* ((backend (plist-get checker :backend))
-         (backend-owns-options
-          (proofread--backend-checker-identity-function backend)))
-    (append
-     (list :profile (proofread--snapshot-value
-                     (plist-get checker :profile))
-           :checker-name (proofread--snapshot-value
-                          (plist-get checker :name))
-           :backend (proofread--snapshot-value backend)
-           :backend-identity
-           (proofread--snapshot-value
-            (or backend-identity
-                (proofread--backend-checker-identity checker)))
-           :options (proofread--snapshot-value
-                     (unless backend-owns-options
-                       (plist-get checker :options))))
-     (proofread--checker-discriminator checker))))
+(defun proofread--checker-identity-from-snapshots
+    (checker descriptor backend-identity)
+  "Return CHECKER identity using DESCRIPTOR and BACKEND-IDENTITY.
+BACKEND-IDENTITY is already detached and is retained unchanged."
+  (append
+   (list :profile (plist-get checker :profile)
+         :checker-name (plist-get checker :name)
+         :backend (plist-get checker :backend)
+         :backend-identity backend-identity
+         :options (unless (plist-get descriptor :checker-identity)
+                    (plist-get checker :options)))
+   (proofread--checker-discriminator checker)))
 
-(defun proofread--current-profile-supported-checkers (profile)
-  "Return PROFILE checkers whose backends are registered."
-  (cl-remove-if-not
-   (lambda (checker)
-     (proofread--supported-backend-p
-      (plist-get checker :backend)))
-   (plist-get profile :checkers)))
+(defun proofread--finish-checker-preparation
+    (checker descriptor &optional omit-source-label source-buffer)
+  "Finish preparation of snapshotted CHECKER using DESCRIPTOR.
+When OMIT-SOURCE-LABEL is non-nil, avoid the presentation-only
+source-label operation.  When SOURCE-BUFFER is non-nil, run each
+backend adapter operation there and stop if it dies between calls."
+  (let ((backend-identity
+         (if source-buffer
+             (with-current-buffer source-buffer
+               (proofread--backend-checker-identity
+                checker descriptor))
+           (proofread--backend-checker-identity checker descriptor))))
+    (when (and source-buffer
+               (not (buffer-live-p source-buffer)))
+      (error "Proofread source buffer died during checker preparation"))
+    (let ((checker-identity
+           (proofread--checker-identity-from-snapshots
+            checker descriptor backend-identity))
+          (source-label
+           (unless omit-source-label
+             (if source-buffer
+                 (with-current-buffer source-buffer
+                   (proofread--backend-checker-source-label
+                    checker descriptor))
+               (proofread--backend-checker-source-label
+                checker descriptor)))))
+      (proofread--make-checker-preparation
+       descriptor checker backend-identity checker-identity
+       source-label))))
+
+(defun proofread--prepare-checker
+    (checker descriptor &optional omit-source-label)
+  "Return a checker preparation using captured DESCRIPTOR.
+Snapshot CHECKER options before computing identities.  When
+OMIT-SOURCE-LABEL is non-nil, skip the presentation-only operation."
+  (proofread--finish-checker-preparation
+   (proofread--checker-with-options-snapshot checker descriptor)
+   descriptor omit-source-label))
 
 (defun proofread--request-current-checker-p (request)
   "Return non-nil when REQUEST's checker is still current."
@@ -972,46 +1253,54 @@ effective backend identity."
               (checker-name (plist-get request :checker-name)))
          (cond
           ((plist-get owner :ad-hoc)
-           (when-let* ((checker
+           (when-let* ((raw-checker
                         (proofread--ad-hoc-checker
-                         (plist-get request :backend))))
+                         (plist-get request :backend)))
+                       (descriptor
+                        (proofread--backend-descriptor
+                         (plist-get raw-checker :backend)))
+                       (preparation
+                        (proofread--prepare-checker
+                         raw-checker descriptor t))
+                       (checker
+                        (proofread--checker-preparation-checker
+                         preparation)))
              (and (equal owner (proofread--checker-owner checker))
                   (equal (plist-get request :checker-identity)
-                         (proofread--checker-identity checker)))))
+                         (proofread--checker-preparation-checker-identity
+                          preparation)))))
           ((null owner)
            (null (plist-get request :checker-identity)))
           (t
-           (let ((profile (proofread--current-profile)))
-             (if (null proofread-profile)
-                 (and (eq profile-name proofread--legacy-profile-name)
-                      (eq checker-name proofread--legacy-checker-name)
-                      (equal (plist-get request :language)
-                             (plist-get profile :language))
-                      (equal (plist-get request :display-language)
-                             (plist-get profile :display-language))
-                      (when-let* ((checker
-                                   (car (plist-get profile :checkers))))
-                        (and (equal owner
-                                    (proofread--checker-owner checker))
-                             (equal
-                              (plist-get request :checker-identity)
-                              (proofread--checker-identity checker)))))
-               (let ((checker
-                      (cl-find checker-name
-                               (plist-get profile :checkers)
-                               :key (lambda (candidate)
-                                      (plist-get candidate :name)))))
-                 (and (eq profile-name (plist-get profile :name))
-                      (equal (plist-get request :language)
-                             (plist-get profile :language))
-                      (equal (plist-get request :display-language)
-                             (plist-get profile :display-language))
-                      checker
-                      (equal owner
-                             (proofread--checker-owner checker))
-                      (equal (plist-get request :checker-identity)
-                             (proofread--checker-identity
-                              checker))))))))))
+           (let* ((profile (proofread--current-profile))
+                  (checker
+                   (cl-find checker-name
+                            (plist-get profile :checkers)
+                            :key (lambda (candidate)
+                                   (plist-get candidate :name))))
+                  (descriptor
+                   (and checker
+                        (proofread--backend-descriptor
+                         (plist-get checker :backend))))
+                  (preparation
+                   (and descriptor
+                        (proofread--prepare-checker
+                         checker descriptor t)))
+                  (checker
+                   (and preparation
+                        (proofread--checker-preparation-checker
+                         preparation))))
+             (and (eq profile-name (plist-get profile :name))
+                  (equal (plist-get request :language)
+                         (plist-get profile :language))
+                  (equal (plist-get request :display-language)
+                         (plist-get profile :display-language))
+                  checker
+                  (equal owner
+                         (proofread--checker-owner checker))
+                  (equal (plist-get request :checker-identity)
+                         (proofread--checker-preparation-checker-identity
+                          preparation))))))))
     (error nil)))
 
 ;;;; State predicates
@@ -1024,9 +1313,13 @@ effective backend identity."
   "Return non-nil when the current buffer is clearing scheduled work."
   (eq proofread--clearing-scheduled-work (current-buffer)))
 
-(defun proofread--overlay-invalidation-inhibited-p ()
+(defun proofread--buffer-state-cleanup-p ()
+  "Return non-nil when the current buffer is tearing down mode state."
+  (memq (current-buffer) proofread--buffer-state-cleanup))
+
+(defun proofread--diagnostic-invalidation-inhibited-p ()
   "Return non-nil if this buffer owns correction-time inhibition."
-  (eq proofread--inhibit-overlay-invalidation (current-buffer)))
+  (eq proofread--inhibit-diagnostic-invalidation (current-buffer)))
 
 ;;;; Request batches and reporting
 
@@ -1038,20 +1331,20 @@ effective backend identity."
     (car condition))
    (t 'error)))
 
-(defun proofread--make-request-batch (requests)
-  "Return shared lifecycle state for REQUESTS dispatched together."
+(defun proofread--make-request-batch (works)
+  "Return shared lifecycle state for WORKS dispatched together."
   (list :id (cl-incf proofread--request-batch-sequence)
-        :pending (length requests)
+        :pending (length works)
         :errors nil
         :buffer (current-buffer)
         :reported nil))
 
-(defun proofread--attach-request-batch (requests)
-  "Attach one shared request batch to REQUESTS and return it."
-  (when requests
-    (let ((batch (proofread--make-request-batch requests)))
-      (dolist (request requests)
-        (setf (plist-get (plist-get request :state) :batch) batch))
+(defun proofread--attach-request-batch (works)
+  "Attach one shared request batch to WORKS and return it."
+  (when works
+    (let ((batch (proofread--make-request-batch works)))
+      (dolist (work works)
+        (setf (proofread--scheduled-work-batch work) batch))
       batch)))
 
 (defun proofread--backend-error-message (result)
@@ -1063,9 +1356,8 @@ effective backend identity."
   "Display FORMAT-STRING with ARGS as a bounded single-line message."
   (let* ((message-truncate-lines t)
          (message
-          (replace-regexp-in-string
-           "[[:space:]]+" " "
-           (string-trim (apply #'format format-string args)))))
+          (string-clean-whitespace
+           (apply #'format format-string args))))
     (message "%s"
              (truncate-string-to-width message 120 nil nil "..."))))
 
@@ -1080,17 +1372,6 @@ effective backend identity."
   'proofread--report-warning-without-window
   'proofread-report-warning-without-window
   "0.2.0")
-
-(defun proofread--warn-about-legacy-dispatch ()
-  "Warn once per session about legacy configuration use."
-  (unless proofread--legacy-dispatch-warning-issued-p
-    (setq proofread--legacy-dispatch-warning-issued-p t)
-    (proofread-report-warning-without-window
-     (concat
-      "`proofread-backend' and `proofread-language' are obsolete; "
-      "configure `proofread-profiles' and select one with "
-      "`proofread-profile' instead")
-     "legacy configuration is obsolete; see *Warnings*")))
 
 (defun proofread--request-batch-error-counts (errors)
   "Return an alist counting backend error message strings in ERRORS."
@@ -1137,12 +1418,11 @@ effective backend identity."
                  (if (= (length errors) 1) "" "s")))))))
 
 (defun proofread--settle-request-batch
-    (request &optional result status)
-  "Settle REQUEST in its shared batch using RESULT and final STATUS."
-  (when-let* ((state (plist-get request :state))
-              (batch (plist-get state :batch)))
-    (unless (plist-get state :batch-settled)
-      (setf (plist-get state :batch-settled) t)
+    (work &optional result status)
+  "Settle WORK in its shared batch using RESULT and final STATUS."
+  (when-let* ((batch (proofread--scheduled-work-batch work)))
+    (unless (proofread--scheduled-work-batch-settled work)
+      (setf (proofread--scheduled-work-batch-settled work) t)
       (when (eq status 'error)
         (push (proofread--backend-error-message result)
               (plist-get batch :errors)))
@@ -1151,63 +1431,57 @@ effective backend identity."
       (when (zerop (plist-get batch :pending))
         (proofread--report-request-batch-errors batch)))))
 
-(defun proofread--request-log-safe-checker-owner (owner)
-  "Return a detached safe representation of checker OWNER."
-  (when (proper-list-p owner)
-    (proofread--request-log-copy-properties
-     owner '( :profile :checker-name :legacy :ad-hoc))))
+(defun proofread--request-log-schema-object-fields (object)
+  "Return request-log field specifications for OBJECT."
+  (cdr (assq object (plist-get proofread--request-log-schema :objects))))
+
+(defun proofread--request-log-safe-position-value (value)
+  "Return a detached safe representation of position VALUE."
+  (cons t (proofread--position-integer value)))
+
+(defun proofread--request-log-safe-string-value (value)
+  "Return a detached safe representation of string VALUE."
+  (when (stringp value)
+    (cons t (substring-no-properties value))))
+
+(defun proofread--request-log-safe-symbol-value (value)
+  "Return a safe representation of symbol VALUE."
+  (when (symbolp value)
+    (cons t value)))
+
+(defun proofread--request-log-safe-source-value (value)
+  "Return a detached safe representation of source VALUE."
+  (cond
+   ((symbolp value) (cons t value))
+   ((stringp value)
+    (cons t (substring-no-properties value)))))
+
+(defun proofread--request-log-safe-integer-value (value)
+  "Return a safe representation of integer VALUE."
+  (when (integerp value)
+    (cons t value)))
+
+(defun proofread--request-log-safe-buffer-value (value)
+  "Return a safe representation of buffer VALUE."
+  (when (bufferp value)
+    (cons t value)))
+
+(defun proofread--request-log-safe-time-value (value)
+  "Return a detached safe representation of time VALUE."
+  (when (and (proper-list-p value)
+             (cl-every #'integerp value))
+    (cons t (copy-sequence value))))
 
 (defun proofread--request-log-safe-property-value (property value)
   "Return `(t . COPY)' when PROPERTY and VALUE are safe to log."
-  (cond
-   ((null value) (cons t nil))
-   ((memq property proofread--request-log-position-keys)
-    (cons t (proofread--position-integer value)))
-   ((and (memq property
-               '( :text :context-before :context-after :language
-                  :display-language :message :method :source-label))
-         (stringp value))
-    (cons t (substring-no-properties value)))
-   ((and (memq property
-               '( :type :status :final-status :profile :checker-name
-                  :backend :major-mode :target-kind :kind :strategy
-                  :source :reason :phase :legacy :ad-hoc :partial))
-         (symbolp value))
-    (cons t value))
-   ((and (eq property :source) (stringp value))
-    (cons t (substring-no-properties value)))
-   ((and (memq property
-               '( :key :log-id :id :request-id :generation
-                  :checker-ordinal :pass :max-passes :http-status
-                  :contract-version))
-         (integerp value))
-    (cons t value))
-   ((and (memq property '( :buffer :source-buffer))
-         (bufferp value))
-    (cons t value))
-   ((and (memq property '( :time :created-at :updated-at))
-         (proper-list-p value)
-         (cl-every #'integerp value))
-    (cons t (copy-sequence value)))
-   ((eq property :checker-owner)
-    (when-let* ((owner
-                 (proofread--request-log-safe-checker-owner value)))
-      (cons t owner)))))
-
-(defun proofread--request-log-copy-properties
-    (source properties &optional target)
-  "Copy safe PROPERTIES from SOURCE into TARGET.
-Position values are frozen as integers; other values are detached."
-  (let ((copy target))
-    (when (proper-list-p source)
-      (dolist (property properties)
-        (when (plist-member source property)
-          (when-let* ((safe-value
-                       (proofread--request-log-safe-property-value
-                        property (plist-get source property))))
-            (setq copy
-                  (plist-put copy property (cdr safe-value)))))))
-    copy))
+  (if (null value)
+      (cons t nil)
+    (when-let* ((sanitizer
+                 (alist-get
+                  property
+                  (plist-get proofread--request-log-schema
+                             :property-sanitizers))))
+      (funcall sanitizer value))))
 
 (defun proofread--request-log-identity-fingerprint (identity)
   "Return a detached fingerprint for IDENTITY, or nil."
@@ -1225,89 +1499,135 @@ Position values are frozen as integers; other values are detached."
               (secure-hash 'sha256 (prin1-to-string identity)))
           (error nil))))))
 
+(defun proofread--request-log-safe-object-property
+    (object property _safe)
+  "Return OBJECT's safe scalar PROPERTY."
+  (when (plist-member object property)
+    (proofread--request-log-safe-property-value
+     property (plist-get object property))))
+
+(defun proofread--request-log-safe-object-identity-fingerprint
+    (object _property _safe)
+  "Return a safe fingerprint of identity OBJECT."
+  (when-let* ((fingerprint
+               (proofread--request-log-identity-fingerprint object)))
+    (cons t fingerprint)))
+
+(defun proofread--request-log-safe-object-summary-fingerprint
+    (_object _property safe)
+  "Return a fingerprint of the fields already in SAFE."
+  (when-let* ((fingerprint
+               (proofread--request-log-identity-fingerprint safe)))
+    (cons t fingerprint)))
+
+(defun proofread--request-log-safe-object-backend-identity
+    (object property _safe)
+  "Return OBJECT's safe backend identity PROPERTY."
+  (when (plist-member object property)
+    (cons t
+          (proofread--request-log-safe-backend-identity
+           (plist-get object property)))))
+
+(defun proofread--request-log-safe-object-checker-identity
+    (object property _safe)
+  "Return OBJECT's safe checker identity PROPERTY."
+  (when (plist-member object property)
+    (cons t
+          (proofread--request-log-safe-checker-identity
+           (plist-get object property)))))
+
+(defun proofread--request-log-safe-object-request
+    (object property _safe)
+  "Return OBJECT's safe nested request PROPERTY."
+  (when (plist-member object property)
+    (cons t
+          (proofread--request-log-safe-request
+           (plist-get object property)))))
+
+(defun proofread--request-log-safe-object-diagnostics
+    (object property _safe)
+  "Return OBJECT's safe nested diagnostics PROPERTY."
+  (when (plist-member object property)
+    (cons t
+          (proofread--request-log-safe-diagnostics
+           (plist-get object property)))))
+
+(defun proofread--request-log-safe-object-diagnostic-source
+    (object property _safe)
+  "Return OBJECT's safe diagnostic source PROPERTY."
+  (when-let* ((source (plist-get object property))
+              ((or (symbolp source) (stringp source))))
+    (cons t (if (stringp source)
+                (substring-no-properties source)
+              source))))
+
+(defun proofread--request-log-safe-object-diagnostic-suggestions
+    (object property _safe)
+  "Return OBJECT's safe diagnostic suggestions PROPERTY."
+  (when (plist-member object property)
+    (let ((suggestions (plist-get object property)))
+      (when (and (proper-list-p suggestions)
+                 (cl-every #'stringp suggestions))
+        (cons t
+              (mapcar #'substring-no-properties suggestions))))))
+
+(defun proofread--request-log-safe-object-condition
+    (object property _safe)
+  "Return the condition kind in OBJECT's PROPERTY."
+  (when (plist-member object property)
+    (cons t (proofread--condition-kind (plist-get object property)))))
+
+(defun proofread--request-log-safe-object-backend-message
+    (object _property _safe)
+  "Return OBJECT's bounded backend failure message."
+  (when (or (eq (plist-get object :status) 'error)
+            (plist-member object :message))
+    (cons t "Backend request failed")))
+
+(defun proofread--request-log-safe-object (kind object)
+  "Return a safe KIND representation of request-log OBJECT."
+  (when (proper-list-p object)
+    (let (safe)
+      (dolist (field (proofread--request-log-schema-object-fields kind))
+        (let ((property (car field))
+              (sanitizer (cadr field)))
+          (when-let* ((safe-value
+                       (condition-case nil
+                           (funcall sanitizer object property safe)
+                         (error nil))))
+            (setq safe
+                  (plist-put safe property (cdr safe-value))))))
+      safe)))
+
+(defun proofread--request-log-safe-checker-owner (owner)
+  "Return a detached safe representation of checker OWNER."
+  (proofread--request-log-safe-object 'checker-owner owner))
+
+(defun proofread--request-log-safe-checker-owner-value (value)
+  "Return a safe checker owner representation of VALUE."
+  (when-let* ((owner
+               (proofread--request-log-safe-checker-owner value)))
+    (cons t owner)))
+
 (defun proofread--request-log-safe-backend-identity (identity)
   "Return a safe summary of backend IDENTITY."
-  (when (proper-list-p identity)
-    (let ((summary
-           (proofread--request-log-copy-properties
-            identity '( :backend :contract-version))))
-      (when-let* ((fingerprint
-                   (proofread--request-log-identity-fingerprint
-                    identity)))
-        (setq summary (plist-put summary :fingerprint fingerprint)))
-      summary)))
+  (proofread--request-log-safe-object 'backend-identity identity))
 
 (defun proofread--request-log-safe-checker-identity (identity)
   "Return a safe summary of checker IDENTITY without raw options."
-  (when (proper-list-p identity)
-    (let ((summary
-           (proofread--request-log-copy-properties
-            identity
-            '( :profile :checker-name :backend :legacy :ad-hoc))))
-      (when (and (proper-list-p identity)
-                 (plist-member identity :backend-identity))
-        (setq summary
-              (plist-put
-               summary :backend-identity
-               (proofread--request-log-safe-backend-identity
-                (plist-get identity :backend-identity)))))
-      (when-let* ((fingerprint
-                   (proofread--request-log-identity-fingerprint
-                    summary)))
-        (setq summary (plist-put summary :fingerprint fingerprint)))
-      summary)))
+  (proofread--request-log-safe-object 'checker-identity identity))
 
 (defun proofread--request-log-safe-request (request)
   "Return a detached request-log representation of REQUEST."
-  (when (proper-list-p request)
-    (let ((safe
-           (proofread--request-log-copy-properties
-            request proofread--request-log-request-keys)))
-      (when (plist-member request :backend-identity)
-        (setq safe
-              (plist-put
-               safe :backend-identity
-               (proofread--request-log-safe-backend-identity
-                (plist-get request :backend-identity)))))
-      (when (plist-member request :checker-identity)
-        (setq safe
-              (plist-put
-               safe :checker-identity
-               (proofread--request-log-safe-checker-identity
-                (plist-get request :checker-identity)))))
-      safe)))
+  (proofread--request-log-safe-object 'request request))
 
 (defun proofread--request-log-safe-chunk (chunk)
   "Return a detached request-log representation of CHUNK."
-  (proofread--request-log-copy-properties
-   chunk
-   '( :beg :end :text :context-before :context-after :language
-      :major-mode :target-kind :domain-beg :domain-end
-      :accessible-beg :accessible-end)))
+  (proofread--request-log-safe-object 'chunk chunk))
 
 (defun proofread--request-log-safe-diagnostic (diagnostic)
   "Return a detached request-log representation of DIAGNOSTIC."
-  (let ((safe
-         (proofread--request-log-copy-properties
-          diagnostic proofread--request-log-diagnostic-keys)))
-    (when-let* ((source (and (proper-list-p diagnostic)
-                             (plist-get diagnostic :source)))
-                ((or (symbolp source) (stringp source))))
-      (setq safe
-            (plist-put safe :source
-                       (if (stringp source)
-                           (substring-no-properties source)
-                         source))))
-    (when (and (proper-list-p diagnostic)
-               (plist-member diagnostic :suggestions))
-      (let ((suggestions (plist-get diagnostic :suggestions)))
-        (when (and (proper-list-p suggestions)
-                   (cl-every #'stringp suggestions))
-          (setq safe
-                (plist-put
-                 safe :suggestions
-                 (mapcar #'substring-no-properties suggestions))))))
-    safe))
+  (proofread--request-log-safe-object 'diagnostic diagnostic))
 
 (defun proofread--request-log-safe-diagnostics (diagnostics)
   "Return detached request-log representations of DIAGNOSTICS."
@@ -1316,42 +1636,11 @@ Position values are frozen as integers; other values are detached."
 
 (defun proofread--request-log-safe-result (result)
   "Return a detached request-log representation of RESULT."
-  (when (proper-list-p result)
-    (let ((safe
-           (proofread--request-log-copy-properties
-            result '( :status :source :partial :phase))))
-      (when (plist-member result :request)
-        (setq safe
-              (plist-put safe :request
-                         (proofread--request-log-safe-request
-                          (plist-get result :request)))))
-      (when (plist-member result :diagnostics)
-        (setq safe
-              (plist-put safe :diagnostics
-                         (proofread--request-log-safe-diagnostics
-                          (plist-get result :diagnostics)))))
-      (when (plist-member result :error)
-        (setq safe
-              (plist-put safe :error
-                         (proofread--condition-kind
-                          (plist-get result :error)))))
-      (when (or (eq (plist-get result :status) 'error)
-                (plist-member result :message))
-        (setq safe (plist-put safe :message
-                              "Backend request failed")))
-      safe)))
+  (proofread--request-log-safe-object 'result result))
 
 (defun proofread--request-log-safe-cache-entry (entry)
   "Return a detached request-log representation of cache ENTRY."
-  (when (proper-list-p entry)
-    (let ((safe
-           (proofread--request-log-copy-properties entry '( :text))))
-      (when (plist-member entry :diagnostics)
-        (setq safe
-              (plist-put safe :diagnostics
-                         (proofread--request-log-safe-diagnostics
-                          (plist-get entry :diagnostics)))))
-      safe)))
+  (proofread--request-log-safe-object 'cache-entry entry))
 
 (defun proofread--request-log-safe-http-parameters (parameters)
   "Return detached HTTP PARAMETERS text, or nil."
@@ -1380,141 +1669,147 @@ Position values are frozen as integers; other values are detached."
                     (if port (format ":%s" port) ""))))
       (error nil))))
 
+(defun proofread--request-log-safe-event-property (event property)
+  "Return EVENT's safe scalar PROPERTY, or nil when it is absent."
+  (when (plist-member event property)
+    (proofread--request-log-safe-property-value
+     property (plist-get event property))))
+
+(defun proofread--request-log-safe-event-request (event _property)
+  "Return EVENT's detached request field, including result fallback."
+  (when-let* ((request
+               (or (plist-get event :request)
+                   (let ((result (plist-get event :result)))
+                     (and (proper-list-p result)
+                          (plist-get result :request))))))
+    (cons t (proofread--request-log-safe-request request))))
+
+(defun proofread--request-log-safe-event-nested
+    (event property sanitizer)
+  "Sanitize nested EVENT PROPERTY with SANITIZER."
+  (when (plist-member event property)
+    (cons t (funcall sanitizer (plist-get event property)))))
+
+(defun proofread--request-log-safe-event-chunk (event property)
+  "Return EVENT's safe nested chunk PROPERTY."
+  (cons t (proofread--request-log-safe-chunk
+           (plist-get event property))))
+
+(defun proofread--request-log-safe-event-diagnostics (event property)
+  "Return EVENT's safe nested diagnostics PROPERTY."
+  (proofread--request-log-safe-event-nested
+   event property #'proofread--request-log-safe-diagnostics))
+
+(defun proofread--request-log-safe-event-result (event property)
+  "Return EVENT's safe nested result PROPERTY."
+  (cons t (proofread--request-log-safe-result
+           (plist-get event property))))
+
+(defun proofread--request-log-safe-event-cache-entry (event property)
+  "Return EVENT's safe nested cache entry PROPERTY."
+  (proofread--request-log-safe-event-nested
+   event property #'proofread--request-log-safe-cache-entry))
+
+(defun proofread--request-log-safe-event-required-cache-entry
+    (event property)
+  "Return EVENT's safe nested cache entry PROPERTY, even if absent."
+  (cons t (proofread--request-log-safe-cache-entry
+           (plist-get event property))))
+
+(defun proofread--request-log-safe-event-url (event property)
+  "Return EVENT's safe URL origin PROPERTY."
+  (when (plist-member event property)
+    (when-let* ((url
+                 (proofread--request-log-safe-url
+                  (plist-get event property))))
+      (cons t url))))
+
+(defun proofread--request-log-safe-event-text (event property)
+  "Return EVENT's detached string PROPERTY."
+  (when (plist-member event property)
+    (when-let* ((text
+                 (proofread--request-log-safe-http-parameters
+                  (plist-get event property))))
+      (cons t text))))
+
+(defun proofread--request-log-safe-event-condition (event property)
+  "Return the condition kind in EVENT's PROPERTY."
+  (when (plist-member event property)
+    (cons t (proofread--condition-kind (plist-get event property)))))
+
+(defun proofread--request-log-safe-event-required-condition
+    (event property)
+  "Return the condition kind in EVENT's PROPERTY, even if absent."
+  (cons t (proofread--condition-kind (plist-get event property))))
+
+(defun proofread--request-log-safe-event-backend-message
+    (event _property)
+  "Return EVENT's bounded backend failure message."
+  (when (or (plist-member event :error)
+            (plist-member event :message))
+    (cons t "Backend request failed")))
+
+(defun proofread--request-log-safe-event-checker-message
+    (event _property)
+  "Return EVENT's checker failure message from safe scalar fields."
+  (let ((checker
+         (proofread--request-log-safe-property-value
+          :checker-name (plist-get event :checker-name)))
+        (phase
+         (proofread--request-log-safe-property-value
+          :phase (plist-get event :phase))))
+    (cons
+     t
+     (format "Checker %S failed during %s"
+             (cdr checker)
+             (proofread--checker-dispatch-phase-label
+              (cdr phase))))))
+
+(defun proofread--request-log-event-schema-fields (type)
+  "Return request-log field specifications for event TYPE."
+  (let ((events (plist-get proofread--request-log-schema :events)))
+    (append (cdr (assq t events))
+            (unless (eq type t)
+              (cdr (assq type events))))))
+
 (defun proofread--request-log-safe-event (event)
   "Return a detached safe representation of lifecycle EVENT."
-  (unless (proper-list-p event)
-    (setq event nil))
-  (let* ((type (plist-get event :type))
-         (safe
-          (proofread--request-log-copy-properties
-           event
-           '( :type :time :log-id :request-id :buffer :beg :end
-              :status))))
-    (when-let* ((request
-                 (or (plist-get event :request)
-                     (let ((result (plist-get event :result)))
-                       (and (proper-list-p result)
-                            (plist-get result :request))))))
-      (setq safe
-            (plist-put safe :request
-                       (proofread--request-log-safe-request request))))
-    (pcase type
-      ('chunk-request
-       (setq safe
-             (plist-put safe :chunk
-                        (proofread--request-log-safe-chunk
-                         (plist-get event :chunk)))))
-      ((or 'queued-request 'active-request 'backend-dispatched)
-       (setq safe
-             (proofread--request-log-copy-properties
-              event '( :backend) safe)))
-      ('backend-request
-       (setq safe
-             (proofread--request-log-copy-properties
-              event
-              '( :backend :method :pass :max-passes :strategy)
-              safe))
-       (when-let* ((url
-                    (proofread--request-log-safe-url
-                     (plist-get event :url))))
-         (setq safe (plist-put safe :url url)))
-       (when-let* ((parameters
-                    (proofread--request-log-safe-http-parameters
-                     (plist-get event :parameters))))
-         (setq safe (plist-put safe :parameters parameters)))
-       (when-let* ((schema (plist-get event :schema))
-                   ((stringp schema)))
-         (setq safe
-               (plist-put safe :schema
-                          (substring-no-properties schema))))
-       (when-let* ((prompt-text (plist-get event :prompt-text))
-                   ((stringp prompt-text)))
-         (setq safe
-               (plist-put safe :prompt-text
-                          (substring-no-properties prompt-text))))
-       (when (plist-member event :reported-diagnostics)
-         (setq safe
-               (plist-put
-                safe :reported-diagnostics
-                (proofread--request-log-safe-diagnostics
-                 (plist-get event :reported-diagnostics))))))
-      ('backend-response
-       (setq safe
-             (proofread--request-log-copy-properties
-              event '( :backend :http-status :pass) safe))
-       (when-let* ((url
-                    (proofread--request-log-safe-url
-                     (plist-get event :url))))
-         (setq safe (plist-put safe :url url)))
-       (when-let* ((response (plist-get event :response))
-                   ((stringp response)))
-         (setq safe
-               (plist-put safe :response
-                          (substring-no-properties response))))
-       (when (plist-member event :error)
-         (setq safe
-               (plist-put safe :error
-                          (proofread--condition-kind
-                           (plist-get event :error)))))
-       (when (or (plist-member event :error)
-                 (plist-member event :message))
-         (setq safe (plist-put safe :message
-                               "Backend request failed"))))
-      ('backend-result
-       (setq safe
-             (proofread--request-log-copy-properties
-              event '( :backend :pass :source) safe))
-       (when (plist-member event :entry)
-         (setq safe
-               (plist-put safe :entry
-                          (proofread--request-log-safe-cache-entry
-                           (plist-get event :entry)))))
-       (setq safe
-             (plist-put safe :result
-                        (proofread--request-log-safe-result
-                         (plist-get event :result)))))
-      ('cache-hit
-       (setq safe
-             (plist-put safe :entry
-                        (proofread--request-log-safe-cache-entry
-                         (plist-get event :entry)))))
-      ('cancelled
-       (setq safe
-             (proofread--request-log-copy-properties
-              event '( :reason) safe)))
-      ('final-result
-       (setq safe
-             (plist-put safe :result
-                        (proofread--request-log-safe-result
-                         (plist-get event :result)))))
-      ('checker-dispatch-failed
-       (setq safe
-             (proofread--request-log-copy-properties
-              event
-              '( :profile :checker-name :backend :phase)
-              safe))
-       (setq safe
-             (plist-put safe :error
-                        (proofread--condition-kind
-                         (plist-get event :error))))
-       (setq safe
-             (plist-put
-              safe :message
-              (format "Checker %S failed during %s"
-                      (plist-get event :checker-name)
-                      (proofread--checker-dispatch-phase-label
-                       (plist-get event :phase)))))))
-    safe))
+  (when (proper-list-p event)
+    (let ((type (plist-get event :type))
+          safe)
+      (dolist (field (proofread--request-log-event-schema-fields type))
+        (let ((property (car field))
+              (sanitizer (cadr field)))
+          (when-let* ((safe-value
+                       (condition-case nil
+                           (funcall sanitizer event property)
+                         (error nil))))
+            (setq safe
+                  (plist-put safe property (cdr safe-value))))))
+      safe)))
+
+(defun proofread--request-log-copy-safe-value (value)
+  "Return a recursive detached copy of safe request-log VALUE."
+  (cond
+   ((stringp value) (substring-no-properties value))
+   ((consp value)
+    (cons (proofread--request-log-copy-safe-value (car value))
+          (proofread--request-log-copy-safe-value (cdr value))))
+   ((bufferp value) value)
+   ((vectorp value)
+    (apply #'vector
+           (mapcar #'proofread--request-log-copy-safe-value value)))
+   (t value)))
 
 (defun proofread--run-request-log-hook (event)
-  "Run request-log hooks for safe EVENT without disrupting proofreading."
-  (setq event (proofread--request-log-safe-event event))
+  "Run request-log hooks with copies of canonical safe EVENT."
   (when proofread-request-log-hook
     (run-hook-wrapped
      'proofread-request-log-hook
      (lambda (function event)
        (condition-case err
-           (funcall function event)
+           (funcall function
+                    (proofread--request-log-copy-safe-value event))
          (error
           (proofread-report-warning-without-window
            (format "Proofread request log hook error (%S)"
@@ -1524,10 +1819,24 @@ Position values are frozen as integers; other values are detached."
      event))
   event)
 
+(defun proofread--publish-request-log-event (raw-event)
+  "Record and publish one safe projection of RAW-EVENT."
+  (let ((event (proofread--request-log-safe-event raw-event)))
+    (condition-case err
+        (proofread--request-log-record-canonical-event event)
+      (error
+       (proofread-report-warning-without-window
+        (format "Proofread request log recorder error (%S)"
+                (proofread--condition-kind err))
+        "request log recorder failed; see *Warnings*")))
+    (proofread--run-request-log-hook event)
+    (proofread--request-log-copy-safe-value event)))
+
 (defun proofread--checker-dispatch-phase-label (phase)
   "Return a caller-readable label for checker dispatch PHASE."
   (pcase phase
     ('backend-loading "backend loading")
+    ('checker-options "checker options snapshot")
     ('checker-identity "checker identity calculation")
     ('request-construction "request construction")
     (_ (format "%s" phase))))
@@ -1560,12 +1869,11 @@ original error value."
   "Record and report one bounded checker dispatch FAILURE."
   (let* ((message
           (truncate-string-to-width
-           (replace-regexp-in-string
-            "[[:space:]]+" " "
-            (string-trim (plist-get failure :message)))
+           (string-clean-whitespace
+            (plist-get failure :message))
            320 nil nil "..."))
          (event
-          (proofread--request-log-safe-event
+          (proofread--publish-request-log-event
            (append
             (list :type 'checker-dispatch-failed
                   :time (current-time)
@@ -1573,12 +1881,17 @@ original error value."
                   :buffer (current-buffer)
                   :status 'error)
             failure))))
-    (proofread--run-request-log-hook event)
     (proofread-report-warning-without-window
      message
      (format "checker %S failed; see *Warnings*"
              (plist-get failure :checker-name)))
     event))
+
+(defun proofread--report-checker-dispatch-failure-safely (failure)
+  "Report checker dispatch FAILURE without interrupting other work."
+  (condition-case nil
+      (proofread--report-checker-dispatch-failure failure)
+    (error nil)))
 
 (defun proofread--progress-message (format-string &rest args)
   "Display a routine progress message using FORMAT-STRING and ARGS."
@@ -1602,32 +1915,46 @@ original error value."
 
 ;;;; Diagnostic and range data
 
-(defun proofread--record-request-event (request type &rest properties)
-  "Record a lifecycle event of TYPE for REQUEST with PROPERTIES."
-  (let ((raw-event
-         (append
-          (list :type type
-                :time (current-time)
-                :log-id (plist-get request :log-id)
-                :request-id (plist-get request :id)
-                :buffer (plist-get request :buffer)
-                :beg (plist-get request :beg)
-                :end (plist-get request :end)
-                :request request)
-          properties))
-        event)
+(defun proofread--record-request-event (source type &rest properties)
+  "Record a request event of TYPE for SOURCE with PROPERTIES.
+SOURCE is normally a `proofread--scheduled-work' record.  Backends may
+record their own events with the immutable request payload they were
+given; its weak log-owner index supplies the scheduler-owned log id."
+  (let* ((work (and (proofread--scheduled-work-p source) source))
+         (request (if work
+                      (proofread--scheduled-work-request work)
+                    source))
+         (log-id
+          (if work
+              (proofread--scheduled-work-log-id work)
+            (and (hash-table-p proofread--request-log-owner-ids)
+                 (gethash request
+                          proofread--request-log-owner-ids))))
+         (raw-event
+          (append
+           (list :type type
+                 :time (current-time)
+                 :log-id log-id
+                 :request-id (plist-get request :id)
+                 :buffer (plist-get request :buffer)
+                 :beg (plist-get request :beg)
+                 :end (plist-get request :end)
+                 :request request)
+           properties))
+         event)
     (unwind-protect
         (progn
           (setq event
-                (proofread--request-log-safe-event raw-event))
-          (proofread--run-request-log-hook event))
+                (proofread--publish-request-log-event raw-event)))
       (pcase type
         ('final-result
-         (proofread--settle-request-batch
-          request (plist-get raw-event :result)
-          (plist-get raw-event :status)))
+         (when work
+           (proofread--settle-request-batch
+            work (plist-get raw-event :result)
+            (plist-get raw-event :status))))
         ('cancelled
-         (proofread--settle-request-batch request))))
+         (when work
+           (proofread--settle-request-batch work)))))
     event))
 
 (defun proofread--make-diagnostic (&rest properties)
@@ -1641,10 +1968,7 @@ The returned plist contains the keys in `proofread--diagnostic-keys'."
     (request diagnostic)
   "Return DIAGNOSTIC annotated with provenance from REQUEST."
   (let ((diagnostic (copy-sequence diagnostic)))
-    (dolist (key '( :language :display-language
-                    :profile :checker-name
-                    :checker-ordinal :checker-owner
-                    :source-label))
+    (dolist (key proofread--diagnostic-provenance-keys)
       (setq diagnostic
             (plist-put
              diagnostic key
@@ -1671,6 +1995,175 @@ The returned plist contains the keys in `proofread--diagnostic-keys'."
       (and (markerp position)
            (eq (marker-buffer position) (current-buffer)))))
 
+;;;; Range algebra
+
+;; Proofread represents buffer ranges as half-open (BEG . END) pairs.
+;; Most operations accept zero-width ranges, but selectable check ranges
+;; are always nonempty.  Relations below state their zero-width and
+;; adjacency behavior explicitly so callers do not invent local variants.
+
+(defun proofread--range-valid-p (range)
+  "Return non-nil when RANGE is a valid integer buffer range.
+The half-open RANGE may be zero-width."
+  (and (consp range)
+       (integerp (car range))
+       (integerp (cdr range))
+       (<= (car range) (cdr range))))
+
+(defun proofread--range-less-p (left right)
+  "Return non-nil if range LEFT should sort before range RIGHT.
+Compare beginnings first and ends second.  LEFT and RIGHT must be
+valid integer ranges."
+  (or (< (car left) (car right))
+      (and (= (car left) (car right))
+           (< (cdr left) (cdr right)))))
+
+(defun proofread--range-overlaps-p (left right)
+  "Return non-nil when half-open ranges LEFT and RIGHT overlap.
+Adjacent ranges do not overlap.  A zero-width range never overlaps
+another range, including a zero-width range at the same position.
+LEFT and RIGHT must be valid integer ranges."
+  (and (< (car left) (cdr left))
+       (< (car right) (cdr right))
+       (< (car left) (cdr right))
+       (< (car right) (cdr left))))
+
+(defun proofread--range-conflicts-p (left right)
+  "Return non-nil when ranges LEFT and RIGHT conflict.
+Strictly overlapping half-open ranges conflict, but adjacent nonempty
+ranges do not.  A zero-width range conflicts when its position lies on
+either closed boundary of the other range; equal zero-width ranges
+therefore conflict.  LEFT and RIGHT must be valid integer ranges."
+  (or (proofread--range-overlaps-p left right)
+      (and (= (car left) (cdr left))
+           (<= (car right) (car left))
+           (<= (car left) (cdr right)))
+      (and (= (car right) (cdr right))
+           (<= (car left) (car right))
+           (<= (car right) (cdr left)))))
+
+(defun proofread--range-contains-p (outer inner)
+  "Return non-nil if range INNER is contained in range OUTER.
+Containment compares both boundaries inclusively.  Thus a zero-width
+INNER at either boundary of OUTER is contained, including at OUTER's
+half-open end.  A zero-width OUTER contains only the equal zero-width
+range.  OUTER and INNER must be valid integer ranges."
+  (and (<= (car outer) (car inner))
+       (<= (cdr inner) (cdr outer))))
+
+(defun proofread--range-covers-position-p (range position)
+  "Return non-nil when half-open RANGE covers POSITION.
+A nonempty range covers its beginning but not its end.  A zero-width
+range covers only its own position.  RANGE must be a valid integer
+range; POSITION may be an integer or live marker."
+  (let ((position (proofread--position-integer position)))
+    (and position
+         (<= (car range) position)
+         (or (< position (cdr range))
+             (and (= (car range) (cdr range))
+                  (= position (car range)))))))
+
+(defun proofread--range-strictly-contains-position-p (range position)
+  "Return non-nil when POSITION is strictly inside RANGE.
+Neither boundary is contained, and a zero-width range contains no
+position.  RANGE must be a valid integer range; POSITION may be an
+integer or live marker."
+  (let ((position (proofread--position-integer position)))
+    (and position
+         (< (car range) position)
+         (< position (cdr range)))))
+
+(defun proofread--range-intersection (left right)
+  "Return the nonempty intersection of ranges LEFT and RIGHT.
+Return nil for adjacent ranges and whenever either range is
+zero-width.  LEFT and RIGHT must be valid integer ranges."
+  (when (proofread--range-overlaps-p left right)
+    (cons (max (car left) (car right))
+          (min (cdr left) (cdr right)))))
+
+(defun proofread--range-affected-by-edit-p (range edit)
+  "Return non-nil when EDIT affects RANGE.
+For a zero-width EDIT (an insertion), a nonempty RANGE is affected only
+when the insertion is strictly inside it; insertion at either boundary
+does not affect it.  A zero-width RANGE is affected by insertion at its
+exact position.  A nonempty EDIT uses `proofread--range-conflicts-p',
+so adjacent nonempty ranges remain unaffected while zero-width ranges
+at either edit boundary are affected.  RANGE and EDIT must be valid
+integer ranges."
+  (if (= (car edit) (cdr edit))
+      (if (= (car range) (cdr range))
+          (= (car edit) (car range))
+        (proofread--range-strictly-contains-position-p
+         range (car edit)))
+    (proofread--range-conflicts-p edit range)))
+
+(defun proofread--range-conflicts-any-p (range ranges)
+  "Return non-nil when RANGE conflicts with one of RANGES."
+  (cl-some
+   (lambda (candidate)
+     (proofread--range-conflicts-p range candidate))
+   ranges))
+
+(defun proofread--range-precedes-without-conflict-p (left right)
+  "Return non-nil if LEFT precedes RIGHT without a conflict."
+  (and (<= (cdr left) (car right))
+       (not (proofread--range-conflicts-p left right))))
+
+(defun proofread--range-conflicting-entries (ranges entries)
+  "Return ENTRIES whose ranges conflict with one of RANGES.
+Each element of ENTRIES must have the form \=(OBJECT . RANGE).  RANGE
+and every element of RANGES must be valid integer ranges of the form
+\=(BEG . END).  Inputs may be unsorted and are not modified.  Return
+entries ordered by range while retaining original entries, duplicate
+occurrences, and object identity."
+  (let* ((remaining-ranges
+          (sort (copy-sequence ranges) #'proofread--range-less-p))
+         (sorted-entries
+          (sort (copy-sequence entries)
+                (lambda (left right)
+                  (proofread--range-less-p (cdr left) (cdr right)))))
+         conflicts)
+    (dolist (entry sorted-entries)
+      (let ((range (cdr entry)))
+        (while (and remaining-ranges
+                    (proofread--range-precedes-without-conflict-p
+                     (car remaining-ranges) range))
+          (setq remaining-ranges (cdr remaining-ranges)))
+        (when (and remaining-ranges
+                   (proofread--range-conflicts-p
+                    range (car remaining-ranges)))
+          (push entry conflicts))))
+    (nreverse conflicts)))
+
+(defun proofread--range-contained-in-any-p (range ranges)
+  "Return non-nil if RANGE is completely contained in RANGES."
+  (cl-some
+   (lambda (outer)
+     (proofread--range-contains-p outer range))
+   ranges))
+
+(defun proofread--merge-ranges (ranges merge-adjacent-p)
+  "Return sorted copies of nonempty RANGES with overlaps merged.
+RANGES must contain valid, nonempty integer ranges.  When
+MERGE-ADJACENT-P is non-nil, merge adjacent ranges too.  Zero-width
+ranges are outside this helper's contract."
+  (let (merged)
+    (dolist (range
+             (sort
+              (mapcar (lambda (range)
+                        (cons (car range) (cdr range)))
+                      ranges)
+              #'proofread--range-less-p))
+      (if (and merged
+               (if merge-adjacent-p
+                   (<= (car range) (cdar merged))
+                 (proofread--range-overlaps-p
+                  (car merged) range)))
+          (setcdr (car merged)
+                  (max (cdar merged) (cdr range)))
+        (push range merged)))
+    (nreverse merged)))
+
 (defun proofread--normalize-region-range (beg end)
   "Return an ordered range for BEG and END in `current-buffer'.
 Signal a `user-error' when either position is missing, is neither an
@@ -1689,32 +2182,20 @@ Do not clip the range to the accessible portion of the buffer."
 
 (defun proofread--normalize-ranges (ranges)
   "Return sorted, deduplicated RANGES.
-Each range is a cons cell of the form (BEG . END).  Empty or invalid
-ranges are discarded.  Overlapping or adjacent ranges are merged."
-  (let (normalized)
-    (dolist (range
-             (sort
-              (delq nil
-                    (mapcar
-                     (lambda (range)
-                       (when (consp range)
-                         (let
-                             ((beg
-                               (proofread--position-integer
-                                (car range)))
-                              (end
-                               (proofread--position-integer
-                                (cdr range))))
-                           (when (and beg end (< beg end))
-                             (cons beg end)))))
-                     ranges))
-              (lambda (a b)
-                (< (car a) (car b)))))
-      (if (and normalized (<= (car range) (cdar normalized)))
-          (setcdr (car normalized)
-                  (max (cdar normalized) (cdr range)))
-        (push range normalized)))
-    (nreverse normalized)))
+Each range is a cons cell of the form (BEG . END).  Convert markers to
+integers and discard reversed, malformed, and zero-width ranges.  Merge
+both strictly overlapping and adjacent ranges."
+  (proofread--merge-ranges
+   (delq nil
+         (mapcar
+          (lambda (range)
+            (when (consp range)
+              (let ((beg (proofread--position-integer (car range)))
+                    (end (proofread--position-integer (cdr range))))
+                (when (and beg end (< beg end))
+                  (cons beg end)))))
+          ranges))
+   t))
 
 (defun proofread--normalize-accessible-ranges (ranges)
   "Return normalized RANGES clipped to the accessible buffer portion."
@@ -1734,6 +2215,18 @@ ranges are discarded.  Overlapping or adjacent ranges are merged."
     (proofread--normalize-ranges clipped)))
 
 ;;;; Target discovery
+
+(cl-defstruct
+    (proofread--selection-plan
+     (:constructor proofread--make-selection-plan
+                   (ranges domains islands)))
+  "One immutable-by-convention target selection snapshot.
+RANGES are normalized accessible half-open ranges.  DOMAINS are the
+complete target domains returned by discovery, and ISLANDS are their
+intersections with RANGES."
+  ranges
+  domains
+  islands)
 
 (defun proofread--effective-target-policy ()
   "Return the effective proofreading target policy for this buffer."
@@ -1779,24 +2272,12 @@ ranges are discarded.  Overlapping or adjacent ranges are merged."
            (with-syntax-table (or syntax-ppss-table (syntax-table))
              ,@body))))))
 
-(defun proofread--syntax-container-overlaps-range-p (container range)
-  "Return non-nil when CONTAINER and RANGE overlap."
-  (and (< (car container) (cdr range))
-       (< (car range) (cdr container))))
-
 (defun proofread--normalize-overlapping-ranges (ranges)
-  "Return sorted RANGES with duplicates and overlaps merged.
-Unlike `proofread--normalize-ranges', keep adjacent ranges separate."
-  (let (normalized)
-    (dolist (range
-             (sort (mapcar #'copy-tree ranges)
-                   (lambda (left right)
-                     (< (car left) (car right)))))
-      (if (and normalized (< (car range) (cdar normalized)))
-          (setcdr (car normalized)
-                  (max (cdar normalized) (cdr range)))
-        (push range normalized)))
-    (nreverse normalized)))
+  "Return sorted nonempty RANGES with strict overlaps merged.
+RANGES must contain valid, nonempty integer ranges.  Unlike
+`proofread--normalize-ranges', keep adjacent ranges separate.
+Zero-width ranges are outside this function's contract."
+  (proofread--merge-ranges ranges nil))
 
 (defun proofread--advance-to-syntax-container-end
     (position state buffer-end kind)
@@ -1831,8 +2312,7 @@ BUFFER-END is the end of the widened buffer."
               (proofread--advance-to-syntax-container-end
                position state buffer-end kind))
              (container (cons container-beg (car advanced))))
-        (when (proofread--syntax-container-overlaps-range-p
-               container range)
+        (when (proofread--range-overlaps-p container range)
           (push container containers))
         (setq position (car advanced)
               state (cdr advanced))))
@@ -1851,19 +2331,19 @@ BUFFER-END is the end of the widened buffer."
                 (proofread--advance-to-syntax-container-end
                  position state buffer-end kind))
                (container (cons container-beg (car advanced))))
-          (when (proofread--syntax-container-overlaps-range-p
-                 container range)
+          (when (proofread--range-overlaps-p container range)
             (push container containers))
           (setq position (car advanced)
                 state (cdr advanced)))))
     (nreverse containers)))
 
-(defun proofread--syntax-containers-for-ranges (ranges kind)
+(defun proofread--syntax-containers-in-normalized-ranges
+    (ranges kind)
   "Return full syntactic containers of KIND overlapping RANGES.
-KIND is either `comment' or `string'.  Selection is limited to the
-current restriction, but returned containers may extend beyond it."
-  (let ((ranges (proofread--normalize-accessible-ranges ranges))
-        containers)
+RANGES must be normalized inside the current restriction.  KIND is
+either `comment' or `string'.  Returned containers may extend beyond
+the restriction."
+  (let (containers)
     (proofread--with-widened-syntax
       (dolist (range ranges)
         (setq containers
@@ -1873,8 +2353,16 @@ current restriction, but returned containers may extend beyond it."
                containers))))
     (proofread--normalize-overlapping-ranges containers)))
 
-(defun proofread--horizontally-adjacent-ranges-p (left right)
-  "Return non-nil if horizontal space separates LEFT and RIGHT."
+(defun proofread--syntax-containers-for-ranges (ranges kind)
+  "Return full syntactic containers of KIND overlapping RANGES.
+Accept raw RANGES and normalize them within the current restriction.
+KIND is either `comment' or `string'.  Returned containers may extend
+beyond the restriction."
+  (proofread--syntax-containers-in-normalized-ranges
+   (proofread--normalize-accessible-ranges ranges) kind))
+
+(defun proofread--ranges-separated-by-horizontal-space-p (left right)
+  "Return non-nil if only horizontal space separates LEFT and RIGHT."
   (save-excursion
     (goto-char (cdr left))
     (skip-chars-forward " \t" (car right))
@@ -1885,7 +2373,7 @@ current restriction, but returned containers may extend beyond it."
   (let (merged)
     (dolist (range ranges)
       (if (and merged
-               (proofread--horizontally-adjacent-ranges-p
+               (proofread--ranges-separated-by-horizontal-space-p
                 (car merged) range))
           (setcdr (car merged) (cdr range))
         (push (copy-tree range) merged)))
@@ -1926,12 +2414,13 @@ MINIMUM and MAXIMUM bound the expansion."
           (setq expanded t))))
     (cons beg end)))
 
-(defun proofread--comment-domains-for-ranges (ranges)
-  "Return logical comment domains overlapping RANGES.
+(defun proofread--comment-domains-in-normalized-ranges (ranges)
+  "Return logical comment domains overlapping normalized RANGES.
 Consecutive line comments separated only by indentation are treated as
 one domain so sentence context can cross their source lines."
   (let ((comments
-         (proofread--syntax-containers-for-ranges ranges 'comment))
+         (proofread--syntax-containers-in-normalized-ranges
+          ranges 'comment))
         (expansion-size (proofread--comment-domain-expansion-size))
         domains)
     (when comments
@@ -1950,6 +2439,13 @@ one domain so sentence context can cross their source lines."
                           (+ (cdr comment) expansion-size)))
                     domains))))))
     (proofread--normalize-overlapping-ranges domains)))
+
+(defun proofread--comment-domains-for-ranges (ranges)
+  "Return logical comment domains overlapping raw RANGES.
+Consecutive line comments separated only by indentation form one
+domain so sentence context can cross their source lines."
+  (proofread--comment-domains-in-normalized-ranges
+   (proofread--normalize-accessible-ranges ranges)))
 
 (defun proofread--face-value-contains-p (value face)
   "Return non-nil if FACE is present recursively in face VALUE."
@@ -2003,14 +2499,13 @@ Search before POSITION."
 
 (defun proofread--docstring-predicate-matches-p (beg end)
   "Return non-nil if a predicate accepts BEG through END."
-  (catch 'matches
-    (dolist (predicate proofread-docstring-predicate-functions)
-      (when (and (functionp predicate)
-                 (condition-case nil
-                     (funcall predicate beg end)
-                   (error nil)))
-        (throw 'matches t)))
-    nil))
+  (cl-some
+   (lambda (predicate)
+     (and (functionp predicate)
+          (condition-case nil
+              (and (funcall predicate beg end) t)
+            (error nil))))
+   proofread-docstring-predicate-functions))
 
 (defun proofread--expand-range-over-doc-face (range)
   "Expand RANGE over adjacent text marked with a doc face."
@@ -2049,10 +2544,11 @@ Search before POSITION."
     (when face-match
       (proofread--expand-range-over-doc-face string-range))))
 
-(defun proofread--docstring-domains-for-ranges (ranges)
-  "Return full docstring domains overlapping RANGES."
+(defun proofread--docstring-domains-in-normalized-ranges (ranges)
+  "Return full docstring domains overlapping normalized RANGES."
   (let ((strings
-         (proofread--syntax-containers-for-ranges ranges 'string))
+         (proofread--syntax-containers-in-normalized-ranges
+          ranges 'string))
         face-domains
         unmatched-strings
         domains)
@@ -2078,13 +2574,18 @@ Search before POSITION."
                  (proofread--normalize-ranges unmatched-strings))
           (unless (cl-some
                    (lambda (face-domain)
-                     (and (<= (car face-domain) (car domain))
-                          (<= (cdr domain) (cdr face-domain))))
+                     (proofread--range-contains-p
+                      face-domain domain))
                    face-domains)
             (when (proofread--docstring-predicate-matches-p
                    (car domain) (cdr domain))
               (push domain domains))))))
     (proofread--normalize-ranges domains)))
+
+(defun proofread--docstring-domains-for-ranges (ranges)
+  "Return full docstring domains overlapping raw RANGES."
+  (proofread--docstring-domains-in-normalized-ranges
+   (proofread--normalize-accessible-ranges ranges)))
 
 (defun proofread--make-target-domain
     (range kind policy minimum maximum)
@@ -2098,17 +2599,17 @@ MINIMUM and MAXIMUM are the accessible buffer bounds."
             :domain-beg beg
             :domain-end end))))
 
-(defun proofread--target-domains-for-kind
+(defun proofread--target-domains-for-kind-in-normalized-ranges
     (ranges kind policy minimum maximum)
-  "Return target domains of KIND overlapping RANGES under POLICY.
-MINIMUM and MAXIMUM are the accessible buffer bounds."
+  "Return target domains of KIND in normalized RANGES under POLICY.
+MINIMUM and MAXIMUM are the snapshotted accessible buffer bounds."
   (let ((target-ranges
          (pcase kind
            ('text (and ranges (list (cons minimum maximum))))
            ('comment
-            (proofread--comment-domains-for-ranges ranges))
+            (proofread--comment-domains-in-normalized-ranges ranges))
            ('docstring
-            (proofread--docstring-domains-for-ranges ranges))
+            (proofread--docstring-domains-in-normalized-ranges ranges))
            (_ (error "Unsupported proofread target kind: %S" kind))))
         domains)
     (dolist (range target-ranges)
@@ -2118,44 +2619,80 @@ MINIMUM and MAXIMUM are the accessible buffer bounds."
         (push domain domains)))
     (nreverse domains)))
 
-(defun proofread--target-domains-for-ranges (ranges)
-  "Return complete proofreading target domains overlapping RANGES."
-  (let* ((minimum (point-min))
-         (maximum (point-max))
-         (ranges (proofread--normalize-accessible-ranges ranges))
-         (policy (proofread--effective-target-policy))
-         domains)
+(defun proofread--target-domains-for-kind
+    (ranges kind policy minimum maximum)
+  "Return target domains of KIND overlapping raw RANGES under POLICY.
+MINIMUM and MAXIMUM are the accessible buffer bounds."
+  (proofread--target-domains-for-kind-in-normalized-ranges
+   (proofread--normalize-accessible-ranges ranges)
+   kind policy minimum maximum))
+
+(defun proofread--target-domains-in-normalized-ranges
+    (ranges policy minimum maximum)
+  "Return target domains discovered from normalized RANGES.
+POLICY and accessible bounds MINIMUM and MAXIMUM belong to the same
+selection snapshot as RANGES."
+  (let (domains)
     (dolist (kind '( text comment docstring))
       (when (proofread--target-policy-includes-p policy kind)
         (setq domains
               (nconc domains
-                     (proofread--target-domains-for-kind
+                     (proofread--target-domains-for-kind-in-normalized-ranges
                       ranges kind policy minimum maximum)))))
     (sort domains
           (lambda (left right)
             (< (plist-get left :domain-beg)
                (plist-get right :domain-beg))))))
 
-(defun proofread--target-islands-for-ranges (ranges)
-  "Return selected target islands for accessible RANGES.
-Each island records its selected bounds and its complete target
-domain."
-  (let ((ranges (proofread--normalize-accessible-ranges ranges))
-        islands)
-    (dolist (domain (proofread--target-domains-for-ranges ranges))
-      (let ((domain-beg (plist-get domain :domain-beg))
-            (domain-end (plist-get domain :domain-end)))
+(defun proofread--target-islands-in-normalized-ranges
+    (ranges domains)
+  "Return intersections of normalized RANGES and complete DOMAINS."
+  (let (islands)
+    (dolist (domain domains)
+      (let ((domain-range
+             (cons (plist-get domain :domain-beg)
+                   (plist-get domain :domain-end))))
         (dolist (range ranges)
-          (let ((beg (max (car range) domain-beg))
-                (end (min (cdr range) domain-end)))
-            (when (< beg end)
-              (push (append (list :beg beg :end end)
-                            domain)
-                    islands))))))
+          (when-let* ((intersection
+                       (proofread--range-intersection
+                        range domain-range)))
+            (push (append (list :beg (car intersection)
+                                :end (cdr intersection))
+                          domain)
+                  islands)))))
     (sort islands
           (lambda (left right)
             (< (plist-get left :beg)
                (plist-get right :beg))))))
+
+(defun proofread--selection-plan-for-ranges (ranges)
+  "Return a target selection plan for raw RANGES.
+Normalize and clip RANGES exactly once, snapshot the target policy and
+accessible bounds, retain complete discovery domains, and derive
+selected islands from those values."
+  (let* ((minimum (point-min))
+         (maximum (point-max))
+         (ranges (proofread--normalize-accessible-ranges ranges))
+         (policy (proofread--effective-target-policy))
+         (domains
+          (proofread--target-domains-in-normalized-ranges
+           ranges policy minimum maximum)))
+    (proofread--make-selection-plan
+     ranges domains
+     (proofread--target-islands-in-normalized-ranges
+      ranges domains))))
+
+(defun proofread--target-domains-for-ranges (ranges)
+  "Return complete proofreading target domains overlapping RANGES."
+  (proofread--selection-plan-domains
+   (proofread--selection-plan-for-ranges ranges)))
+
+(defun proofread--target-islands-for-ranges (ranges)
+  "Return selected target islands for accessible RANGES.
+Each island records its selected bounds and its complete target
+domain."
+  (proofread--selection-plan-islands
+   (proofread--selection-plan-for-ranges ranges)))
 
 (defun proofread--visible-window-ranges ()
   "Return raw visible ranges for windows showing this buffer."
@@ -2320,12 +2857,6 @@ and confirm it against the buffer's syntax state."
       (forward-char 1))
     (point)))
 
-(defun proofread--skip-sentence-separator-whitespace (limit)
-  "Move point past whitespace between sentences, not beyond LIMIT."
-  (while (and (< (point) limit)
-              (memq (char-after) '( ?\s ?\t ?\n ?\r)))
-    (forward-char 1)))
-
 (defun proofread--sentence-spans-in-paragraph (span)
   "Return sentence spans inside paragraph SPAN.
 The splitter is intentionally local and punctuation-based for Chinese
@@ -2348,7 +2879,7 @@ boundaries unless the preceding text ends with sentence punctuation."
                          span-beg span-end)
                     (push (cons span-beg span-end) spans))
                   (goto-char span-end)
-                  (proofread--skip-sentence-separator-whitespace end)
+                  (skip-chars-forward " \t\n\r" end)
                   (setq span-beg (point)))
               (forward-char 1)))
           (when (proofread--range-nonblank-p span-beg end)
@@ -2516,84 +3047,33 @@ boundaries unless the preceding text ends with sentence punctuation."
         (substring text 0 size)
       text)))
 
-(defun proofread--refresh-org-block-ranges ()
-  "Refresh cached Org block content ranges when the buffer changed."
-  (let ((key (list (buffer-chars-modified-tick)
-                   (point-min) (point-max))))
-    (unless (equal key proofread--org-block-cache-key)
-      (setq proofread--org-block-cache-key key)
-      (setq proofread--org-block-ranges nil)
-      (save-excursion
-        (goto-char (point-min))
-        (let ((case-fold-search t)
-              openings)
-          (while (re-search-forward
-                  "^[ \t]*#\\+\\(begin\\|end\\)_" nil t)
-            (if (string-equal-ignore-case (match-string 1) "begin")
-                (push (min (point-max)
-                           (1+ (line-end-position)))
-                      openings)
-              (when openings
-                (push (cons (pop openings) (line-beginning-position))
-                      proofread--org-block-ranges))))
-          (dolist (beg openings)
-            (push (cons beg (point-max))
-                  proofread--org-block-ranges))))
-      (setq proofread--org-block-ranges
-            (vconcat
-             (proofread--normalize-ranges
-              proofread--org-block-ranges))))))
-
-(defun proofread--position-in-sorted-ranges-p (position ranges)
-  "Return non-nil when POSITION belongs to one of sorted RANGES."
-  (let ((low 0)
-        (high (1- (length ranges)))
-        found)
-    (while (and (not found) (<= low high))
-      (let* ((middle (/ (+ low high) 2))
-             (range (aref ranges middle)))
-        (cond
-         ((< position (car range)) (setq high (1- middle)))
-         ((>= position (cdr range)) (setq low (1+ middle)))
-         (t (setq found t)))))
-    found))
-
-(defun proofread--org-block-content-line-p ()
-  "Return non-nil when point is on a line inside an Org block."
+(defun proofread--org-structural-line-p ()
+  "Return non-nil when point is on an Org structural boundary.
+Ordinary paragraph lines are not boundaries unless they are affiliated
+keywords or belong to an Org block or drawer."
   (when (derived-mode-p 'org-mode)
-    (proofread--refresh-org-block-ranges)
-    (proofread--position-in-sorted-ranges-p
-     (line-beginning-position) proofread--org-block-ranges)))
-
-(defun proofread--org-structural-line-p (line)
-  "Return non-nil when LINE is an Org structural boundary."
-  (and (derived-mode-p 'org-mode)
-       (or (string-match-p "\\`[ \t]*\\*+\\(?:[ \t]\\|\\'\\)" line)
-           (string-match-p "\\`[ \t]*#\\+[[:alpha:]_]+:" line)
-           (let ((case-fold-search t))
-             (string-match-p
-              (concat
-               "\\`[ \t]*#\\+\\(?:begin\\|end\\)_[[:alnum:]_-]+"
-               "\\(?:[ \t]\\|\\'\\)")
-              line))
-           (string-match-p "\\`[ \t]*:[[:alnum:]_@#%]+:" line)
-           (string-match-p "\\`[ \t]*|" line)
-           (string-match-p
-            "\\`[ \t]*\\(?:[-+]\\|[0-9]+[.)]\\)\\(?:[ \t]\\|\\'\\)"
-            line)
-           (string-match-p "\\`[ \t]+\\*\\(?:[ \t]\\|\\'\\)" line))))
+    (require 'org-element)
+    (save-match-data
+      (let* ((element (org-element-at-point))
+             (type (org-element-type element))
+             (post-affiliated
+              (org-element-property :post-affiliated element)))
+        (or (not (memq type '( org-data paragraph section)))
+            (and (eq type 'paragraph)
+                 (integerp post-affiliated)
+                 (< (line-beginning-position) post-affiliated))
+            (org-element-lineage
+             element
+             '( center-block drawer dynamic-block footnote-definition
+                property-drawer quote-block special-block)
+             t))))))
 
 (defun proofread--context-stop-line-at-point-p ()
   "Return non-nil when the current line stops context search."
   (let ((line (buffer-substring-no-properties
                (line-beginning-position) (line-end-position))))
     (or (string-blank-p line)
-        (proofread--org-structural-line-p line)
-        (proofread--org-block-content-line-p))))
-
-(defun proofread--line-end-after-newline ()
-  "Return the position after the current line's terminating newline."
-  (min (point-max) (1+ (line-end-position))))
+        (proofread--org-structural-line-p))))
 
 (defun proofread--context-search-beg (beg)
   "Return the nearest structural context boundary before BEG."
@@ -2609,7 +3089,9 @@ boundaries unless the preceding text ends with sentence punctuation."
         (while (and (not boundary) (> (point) limit))
           (forward-line -1)
           (when (proofread--context-stop-line-at-point-p)
-            (setq boundary (proofread--line-end-after-newline)))))
+            (setq boundary
+                  (min (point-max)
+                       (1+ (line-end-position)))))))
       (max limit (min beg (or boundary limit))))))
 
 (defun proofread--context-search-end (end)
@@ -2643,20 +3125,11 @@ boundaries unless the preceding text ends with sentence punctuation."
            spans)
         spans))))
 
-(defun proofread--take-spans (count spans)
-  "Return the first COUNT items from SPANS."
-  (let (taken)
-    (while (and spans (> count 0))
-      (push (car spans) taken)
-      (setq spans (cdr spans))
-      (setq count (1- count)))
-    (nreverse taken)))
-
 (defun proofread--context-selected-spans (spans direction count)
   "Return selected SPANS for DIRECTION using COUNT sentences."
   (if (eq direction 'before)
       (last spans count)
-    (proofread--take-spans count spans)))
+    (take count spans)))
 
 (defun proofread--context-spans-text (spans)
   "Return filtered context text for SPANS."
@@ -2732,11 +3205,9 @@ LANGUAGE is the language hint snapshotted for the check."
           :context-after
           (proofread--request-ready-context-after end))))
 
-(defun proofread--request-ready-chunks-for-spans
-    (spans &optional language)
-  "Return request-ready chunks for filtered chunk SPANS.
-LANGUAGE is the language hint snapshotted for the check."
-  (let (chunks)
+(defun proofread--retained-request-spans (spans)
+  "Return nonblank portions of SPANS after ignored text is removed."
+  (let (request-spans)
     (dolist (span spans)
       (let ((beg (car span))
             (end (cdr span)))
@@ -2745,10 +3216,8 @@ LANGUAGE is the language hint snapshotted for the check."
                   beg end
                   (proofread--ignored-ranges-in-region beg end)))
           (when (proofread--range-nonblank-p (car range) (cdr range))
-            (push (proofread--make-request-ready-chunk
-                   (car range) (cdr range) language)
-                  chunks)))))
-    (nreverse chunks)))
+            (push range request-spans)))))
+    (nreverse request-spans)))
 
 (defun proofread--chunk-with-target-metadata (chunk island)
   "Return CHUNK annotated with target metadata from ISLAND."
@@ -2758,18 +3227,17 @@ LANGUAGE is the language hint snapshotted for the check."
                 :domain-beg (plist-get island :domain-beg)
                 :domain-end (plist-get island :domain-end))))
 
-(defun proofread--chunk-has-target-prose-p (chunk island)
-  "Return non-nil when CHUNK has useful prose for target ISLAND."
+(defun proofread--request-span-has-target-prose-p (span island)
+  "Return non-nil when SPAN has useful prose for target ISLAND."
   (or (eq (plist-get island :kind) 'text)
-      (string-match-p "[[:alnum:]]" (plist-get chunk :text))))
+      (proofread--range-has-alphanumeric-p
+       (car span) (cdr span))))
 
-(defun proofread--request-ready-chunks-for-islands
-    (islands &optional language)
-  "Return request-ready chunks for target ISLANDS.
-LANGUAGE is the language hint snapshotted for the check."
+(defun proofread--request-spans-for-islands (islands)
+  "Return filtered request span records for target ISLANDS."
   (let ((accessible-beg (and (buffer-narrowed-p) (point-min)))
         (accessible-end (and (buffer-narrowed-p) (point-max)))
-        request-chunks)
+        request-spans)
     (save-mark-and-excursion
       (dolist (island islands)
         (let
@@ -2778,23 +3246,65 @@ LANGUAGE is the language hint snapshotted for the check."
           (save-restriction
             (narrow-to-region (plist-get island :domain-beg)
                               (plist-get island :domain-end))
-            (dolist (chunk
-                     (proofread--request-ready-chunks-for-spans
-                      (proofread--chunk-spans-for-ranges
-                       (list (cons (plist-get island :beg)
-                                   (plist-get island :end))))
-                      language))
-              (when (proofread--chunk-has-target-prose-p chunk island)
-                (let ((chunk (proofread--chunk-with-target-metadata
-                              chunk island)))
-                  (setq chunk
-                        (plist-put
-                         chunk :accessible-beg accessible-beg))
-                  (setq chunk
-                        (plist-put
-                         chunk :accessible-end accessible-end))
-                  (push chunk request-chunks))))))))
+            (dolist
+                (span
+                 (proofread--retained-request-spans
+                  (proofread--chunk-spans-for-ranges
+                   (list (cons (plist-get island :beg)
+                               (plist-get island :end))))))
+              (when (proofread--request-span-has-target-prose-p
+                     span island)
+                (let ((request-span (copy-sequence island)))
+                  (setq request-span
+                        (plist-put request-span :beg (car span)))
+                  (setq request-span
+                        (plist-put request-span :end (cdr span)))
+                  (setq request-span
+                        (plist-put request-span
+                                   :accessible-beg accessible-beg))
+                  (setq request-span
+                        (plist-put request-span
+                                   :accessible-end accessible-end))
+                  (push request-span request-spans))))))))
+    (nreverse request-spans)))
+
+(defun proofread--request-ready-chunks-for-request-spans
+    (request-spans &optional language)
+  "Materialize REQUEST-SPANS using snapshotted LANGUAGE."
+  (let (request-chunks)
+    (save-mark-and-excursion
+      (dolist (span request-spans)
+        (let
+            ((proofread--active-target-kind
+              (plist-get span :kind)))
+          (save-restriction
+            (narrow-to-region (plist-get span :domain-beg)
+                              (plist-get span :domain-end))
+            (let ((chunk
+                   (proofread--make-request-ready-chunk
+                    (plist-get span :beg)
+                    (plist-get span :end)
+                    language)))
+              (setq chunk
+                    (proofread--chunk-with-target-metadata
+                     chunk span))
+              (setq chunk
+                    (plist-put
+                     chunk :accessible-beg
+                     (plist-get span :accessible-beg)))
+              (setq chunk
+                    (plist-put
+                     chunk :accessible-end
+                     (plist-get span :accessible-end)))
+              (push chunk request-chunks))))))
     (nreverse request-chunks)))
+
+(defun proofread--request-ready-chunks-for-islands
+    (islands &optional language)
+  "Return request-ready chunks for target ISLANDS.
+LANGUAGE is the language hint snapshotted for the check."
+  (proofread--request-ready-chunks-for-request-spans
+   (proofread--request-spans-for-islands islands) language))
 
 ;;;; Backend requests
 
@@ -2802,48 +3312,55 @@ LANGUAGE is the language hint snapshotted for the check."
   "Return a fresh backend request id for the current buffer."
   (setq proofread--next-request-id (1+ proofread--next-request-id)))
 
-(defun proofread--checker-request-identities (checker)
-  "Return request metadata snapshots for normalized CHECKER."
-  (let ((backend-identity
-         (proofread--backend-checker-identity checker)))
-    (list :backend-identity backend-identity
-          :checker-identity
-          (proofread--checker-identity checker backend-identity)
-          :source-label
-          (proofread--backend-checker-source-label checker))))
+(defun proofread--request-checker-preparation (checker)
+  "Return a complete adapter preparation for CHECKER.
+Query CHECKER's backend descriptor once.  Unknown backends retain the
+core checker envelope but have no backend identity or source label."
+  (when checker
+    (let ((descriptor
+           (proofread--backend-descriptor
+            (plist-get checker :backend))))
+      (if descriptor
+          (proofread--prepare-checker checker descriptor)
+        (proofread--make-checker-preparation
+         nil checker nil
+         (proofread--checker-identity-from-snapshots
+          checker nil nil)
+         nil)))))
 
 (defun proofread--make-backend-request
-    (chunk &optional backend checker profile identities)
+    (chunk &optional backend checker profile preparation)
   "Return a backend request plist for request-ready CHUNK.
 When BACKEND is non-nil, store its canonical identity in the request.
 CHECKER and PROFILE, when non-nil, identify the profile checker that
 owns the request.  Without CHECKER, create an ad-hoc low-level owner
-that is independent of profile selection.  IDENTITIES, when non-nil,
-contains precomputed identity and source-label snapshots for CHECKER."
-  (let* ((checker (or checker
-                      (proofread--ad-hoc-checker
-                       (or backend proofread-backend))))
+that is independent of profile selection.  PREPARATION, when non-nil,
+contains the checker and metadata snapshots to share across requests."
+  (let* ((checker (or checker (proofread--ad-hoc-checker backend)))
          (backend-name (or (plist-get checker :backend)
-                           backend proofread-backend))
+                           backend))
+         (preparation
+          (or preparation
+              (proofread--request-checker-preparation checker)))
+         (checker
+          (if preparation
+              (proofread--checker-preparation-checker preparation)
+            checker))
          (backend-identity
-          (if identities
-              (plist-get identities :backend-identity)
-            (if checker
-                (proofread--backend-checker-identity checker)
-              (proofread--backend-identity backend-name))))
+          (if preparation
+              (proofread--checker-preparation-backend-identity
+               preparation)
+            (proofread--backend-identity backend-name)))
          (checker-owner (and checker
                              (proofread--checker-owner checker)))
          (checker-identity
-          (if identities
-              (plist-get identities :checker-identity)
-            (and checker
-                 (proofread--checker-identity
-                  checker backend-identity))))
+          (and preparation
+               (proofread--checker-preparation-checker-identity
+                preparation)))
          (source-label
-          (if identities
-              (plist-get identities :source-label)
-            (and checker
-                 (proofread--backend-checker-source-label checker))))
+          (and preparation
+               (proofread--checker-preparation-source-label
+                preparation)))
          (profile-language
           (if profile
               (plist-get profile :language)
@@ -2874,11 +3391,9 @@ contains precomputed identity and source-label snapshots for CHECKER."
                         (plist-get checker :checker-ordinal)))
                      ( :checker-owner checker-owner)
                      ( :checker-options
-                       (proofread--snapshot-value
-                        (plist-get checker :options)))
+                       (plist-get checker :options))
                      ( :checker-identity checker-identity)
-                     ( :source-label
-                       (proofread--snapshot-value source-label))
+                     ( :source-label source-label)
                      ( :language
                        (proofread--snapshot-value
                         profile-language))
@@ -2888,18 +3403,19 @@ contains precomputed identity and source-label snapshots for CHECKER."
                      (_ (proofread--snapshot-value
                          (plist-get chunk key))))))
            proofread--backend-request-keys)))
-    (setq request
-          (plist-put request :log-id
-                     (cl-incf proofread--request-log-sequence)))
-    (setq request
-          (plist-put request :state
-                     (list :superseded nil
-                           :invalidated nil
-                           :cancelled nil
-                           :batch nil
-                           :batch-settled nil)))
-    (plist-put request :cache-key
-               (proofread--cache-key request backend-name))))
+    request))
+
+(defun proofread--make-request-work (request)
+  "Return fresh scheduled work owning backend REQUEST."
+  (let ((work
+         (proofread--make-scheduled-work
+          request
+          (proofread--cache-key request)
+          (cl-incf proofread--request-log-sequence))))
+    (puthash request
+             (proofread--scheduled-work-log-id work)
+             proofread--request-log-owner-ids)
+    work))
 
 (defun proofread--backend-success-result (request diagnostics)
   "Return a successful backend result for REQUEST and DIAGNOSTICS."
@@ -2924,14 +3440,26 @@ When MESSAGE is non-nil, include it as caller-readable error text."
         (append result (list :message message))
       result)))
 
-(defun proofread--active-request-p (request)
-  "Return non-nil if REQUEST is active in the current buffer."
-  (let ((log-id (plist-get request :log-id))
-        active)
-    (dolist (candidate proofread--active-requests)
-      (when (equal log-id (plist-get candidate :log-id))
-        (setq active t)))
-    active))
+(defun proofread--scheduled-work-for-request (request)
+  "Return scheduled work owning backend REQUEST, or nil."
+  (when-let* ((buffer (plist-get request :buffer))
+              ((buffer-live-p buffer)))
+    (with-current-buffer buffer
+      (or (cl-find request proofread--active-requests
+                   :key #'proofread--scheduled-work-request
+                   :test #'eq)
+          (cl-find request proofread--claimed-requests
+                   :key #'proofread--scheduled-work-request
+                   :test #'eq)
+          (cl-find request (proofread--request-queue-entries)
+                   :key (lambda (entry)
+                          (proofread--scheduled-work-request
+                           (proofread--queue-entry-work entry)))
+                   :test #'eq)))))
+
+(defun proofread--active-request-p (work)
+  "Return non-nil if WORK is active in the current buffer."
+  (memq work proofread--active-requests))
 
 (defun proofread--active-request-limit ()
   "Return the current buffer's backend request concurrency limit."
@@ -2946,86 +3474,46 @@ When MESSAGE is non-nil, include it as caller-readable error text."
   "Return non-nil when another backend request may be sent."
   (> (proofread--active-request-slots) 0))
 
-(defun proofread--register-active-request (request)
-  "Register REQUEST as active in the current buffer."
+(defun proofread--register-active-request (work)
+  "Register WORK as active in the current buffer."
   (setq proofread--claimed-requests
-        (delq request proofread--claimed-requests))
-  (push request proofread--active-requests)
-  (puthash (proofread--request-work-key request)
-           (plist-get request :log-id)
+        (delq work proofread--claimed-requests))
+  (push work proofread--active-requests)
+  (puthash (proofread--request-work-key work)
+           work
            proofread--pending-request-keys)
-  request)
+  work)
 
-(defun proofread--record-active-request-handle (request request-handle)
-  "Record REQUEST-HANDLE for active REQUEST in the current buffer."
-  (let ((log-id (plist-get request :log-id))
-        retained)
-    (dolist (candidate proofread--active-requests)
-      (push
-       (if (equal log-id (plist-get candidate :log-id))
-           (plist-put (copy-sequence candidate)
-                      :handle request-handle)
-         candidate)
-       retained))
-    (setq proofread--active-requests (nreverse retained)))
+(defun proofread--record-active-request-handle (work request-handle)
+  "Record REQUEST-HANDLE on active WORK without replacing it."
+  (when (memq work proofread--active-requests)
+    (setf (proofread--scheduled-work-handle work) request-handle))
   request-handle)
 
-(defun proofread--remove-active-request (request)
-  "Remove REQUEST from active request state in the current buffer."
-  (let ((log-id (plist-get request :log-id))
-        retained)
-    (dolist (candidate proofread--active-requests)
-      (unless (equal log-id (plist-get candidate :log-id))
-        (push candidate retained)))
-    (setq proofread--active-requests (nreverse retained))
-    (proofread--forget-request-work request)))
-
-(defun proofread--invoke-backend-callback (callback result)
-  "Invoke CALLBACK with backend RESULT when CALLBACK is non-nil."
-  (when callback
-    (funcall callback result)))
+(defun proofread--remove-active-request (work)
+  "Remove WORK from active request state in the current buffer."
+  (setq proofread--active-requests
+        (delq work proofread--active-requests))
+  (proofread--forget-request-work work))
 
 (defun proofread--defer-backend-callback (callback result)
   "Invoke CALLBACK with RESULT after the current call stack unwinds."
-  (run-at-time
-   0 nil #'proofread--invoke-backend-callback callback result))
-
-(defun proofread--wrap-backend-callback (request callback)
-  "Return a wrapper for CALLBACK that cleans REQUEST state once."
-  (let (finished)
-    (lambda (result)
-      (unless finished
-        (setq finished t)
-        (let ((buffer (plist-get request :buffer))
-              callback-value)
-          (when (buffer-live-p buffer)
-            (with-current-buffer buffer
-              (proofread--remove-active-request request)))
-          (unwind-protect
-              (setq callback-value
-                    (proofread--invoke-backend-callback
-                     callback result))
-            (when (buffer-live-p buffer)
-              (with-current-buffer buffer
-                (when proofread-mode
-                  (proofread--dispatch-queued-requests)))))
-          callback-value)))))
+  (run-at-time 0 nil callback result))
 
 (defun proofread--supported-backend-p (&optional backend)
-  "Return non-nil if BACKEND is a supported proofreading backend.
-When BACKEND is nil, check the selected `proofread-backend'."
-  (and (proofread--backend-descriptor (or backend proofread-backend))
+  "Return non-nil if non-nil BACKEND is a supported backend."
+  (and backend
+       (proofread--backend-descriptor backend)
        t))
 
 (defun proofread--request-relative-range-valid-p (request beg end)
   "Return non-nil if relative BEG and END are valid for REQUEST."
-  (let ((text (plist-get request :text)))
-    (and (integerp beg)
-         (integerp end)
-         (stringp text)
-         (<= 0 beg)
-         (<= beg end)
-         (<= end (length text)))))
+  (let ((text (plist-get request :text))
+        (range (cons beg end)))
+    (and (stringp text)
+         (proofread--range-valid-p range)
+         (proofread--range-contains-p
+          (cons 0 (length text)) range))))
 
 (defun proofread--syntax-state-in-container-p
     (state container-beg kind)
@@ -3156,8 +3644,8 @@ syntactic containers."
                           end-state
                           interior
                           (equal (nth 8 beg-state) (nth 8 end-state))
-                          (<= (car interior) beg)
-                          (<= end (cdr interior))
+                          (proofread--range-contains-p
+                           interior (cons beg end))
                           (not
                            (proofread--range-touches-syntax-escape-p
                             beg end))
@@ -3211,11 +3699,10 @@ bounds."
 
 (defun proofread--diagnostic-member-p (diagnostic diagnostics)
   "Return non-nil when DIAGNOSTIC is already in DIAGNOSTICS."
-  (catch 'found
-    (dolist (candidate diagnostics)
-      (when (proofread--same-diagnostic-p diagnostic candidate)
-        (throw 'found t)))
-    nil))
+  (cl-some
+   (lambda (candidate)
+     (proofread--same-diagnostic-p diagnostic candidate))
+   diagnostics))
 
 (defun proofread--new-diagnostics (diagnostics existing)
   "Return unique DIAGNOSTICS that are not represented in EXISTING.
@@ -3242,23 +3729,6 @@ The report is delivered asynchronously."
     'unsupported-backend
     (format "Unsupported proofread backend: %S" backend))))
 
-(defun proofread--backend-check (request callback &optional backend)
-  "Submit REQUEST to BACKEND and invoke CALLBACK asynchronously.
-When BACKEND is nil, use `proofread-backend'.  The return value is a
-backend handle."
-  (let* ((backend (or backend proofread-backend))
-         (descriptor
-          (if (and (consp proofread--backend-descriptor-snapshot)
-                   (eq (car proofread--backend-descriptor-snapshot)
-                       backend))
-              (cdr proofread--backend-descriptor-snapshot)
-            (proofread--backend-descriptor backend)))
-         (check (plist-get descriptor :check)))
-    (if check
-        (funcall check request callback)
-      (proofread--unsupported-backend-check
-       backend request callback))))
-
 (defun proofread--backend-submission-error-result
     (request error detail)
   "Return a checker-aware submission error for REQUEST.
@@ -3275,59 +3745,67 @@ ERROR identifies the failure and DETAIL describes it."
            detail))))
     (plist-put result :phase 'submission)))
 
-(defun proofread--dispatch-backend-request
-    (request callback &optional backend)
-  "Register and submit REQUEST to BACKEND, then invoke CALLBACK.
-When BACKEND is nil, use `proofread-backend'."
-  (let ((backend (or backend proofread-backend))
-        (buffer (plist-get request :buffer)))
+(defun proofread--dispatch-backend-request (work callback)
+  "Register and submit WORK, then invoke CALLBACK."
+  (let* ((request (proofread--scheduled-work-request work))
+         (backend (proofread--scheduled-work-backend work))
+         (buffer (plist-get request :buffer)))
     (when (buffer-live-p buffer)
       (with-current-buffer buffer
-        (proofread--register-active-request request))
+        (proofread--register-active-request work))
       (proofread--record-request-event
-       request 'active-request
+       work 'active-request
        :backend backend)
-      (if (not (proofread--request-ready-to-submit-p request))
+      (if (not (proofread--request-ready-to-submit-p work))
           (progn
-            (proofread--retire-active-request request)
+            (proofread--retire-active-request work)
             proofread--stale-dispatch-result)
-        (let* ((callback-state 'pending)
-               (lifecycle-callback
-                (proofread--wrap-backend-callback request callback))
-               (wrapped-callback
+        (let* ((settlement-state 'pending)
+               (settle
                 (lambda (result)
-                  (when (eq callback-state 'pending)
-                    (setq callback-state 'running)
+                  (when (eq settlement-state 'pending)
+                    (setq settlement-state 'running)
                     (unwind-protect
                         (prog1
-                            (proofread--invoke-backend-callback
-                             lifecycle-callback result)
-                          (setq callback-state 'completed))
-                      (when (eq callback-state 'running)
-                        (setq callback-state 'failed))))))
+                            (progn
+                              (when (buffer-live-p buffer)
+                                (with-current-buffer buffer
+                                  (proofread--remove-active-request
+                                   work)))
+                              (unwind-protect
+                                  (when callback
+                                    (funcall callback result))
+                                (when (buffer-live-p buffer)
+                                  (with-current-buffer buffer
+                                    (when proofread-mode
+                                      (proofread--dispatch-queued-requests))))))
+                          (setq settlement-state 'completed))
+                      (when (eq settlement-state 'running)
+                        (setq settlement-state 'failed))))))
                (submission
                 (condition-case err
-                    (let* (;; Capture one adapter snapshot before
+                    (let* (;; Capture one descriptor snapshot before
                            ;; submission.  Later registry changes must
                            ;; not redirect cleanup for its handle.
                            (descriptor
                             (proofread--backend-descriptor backend))
+                           (check (plist-get descriptor :check))
                            (cancel
                             (if descriptor
                                 (plist-get descriptor :cancel)
                               ;; This fallback timer is core-owned.
                               #'cancel-timer))
-                           (proofread--backend-descriptor-snapshot
-                            (cons backend descriptor))
                            (handle
-                            (proofread--backend-check
-                             request wrapped-callback backend)))
+                            (if check
+                                (funcall check request settle)
+                              (proofread--unsupported-backend-check
+                               backend request settle))))
                       (list :handle handle :cancel cancel))
                   (error
-                   (pcase callback-state
+                   (pcase settlement-state
                      ('pending
-                      (proofread--invoke-backend-callback
-                       wrapped-callback
+                      (funcall
+                       settle
                        (proofread--backend-submission-error-result
                         request err (error-message-string err)))
                       nil)
@@ -3346,130 +3824,132 @@ When BACKEND is nil, use `proofread-backend'."
                 (and handle
                      (proofread--make-request-handle
                       handle cancel))))
-          (when (and (null handle) (eq callback-state 'pending))
-            (proofread--invoke-backend-callback
-             wrapped-callback
+          (when (and (null handle) (eq settlement-state 'pending))
+            (funcall
+             settle
              (proofread--backend-submission-error-result
               request 'backend-returned-no-handle
               "backend returned no handle without delivering a result")))
           (let* ((active
                   (and (buffer-live-p buffer)
                        (with-current-buffer buffer
-                         (proofread--active-request-p request))))
+                         (proofread--active-request-p work))))
                  (stale
                   (or (not (buffer-live-p buffer))
                       (and active
                            (not
                             (proofread--request-ready-to-submit-p
-                             request)))
+                             work)))
                       (and (not active)
                            (proofread--request-state-flag-p
-                            request :cancelled)))))
+                            work :cancelled)))))
             (cond
              (stale
               (proofread--retire-active-request
-               request request-handle)
+               work request-handle)
               proofread--stale-dispatch-result)
              (t
               (when handle
                 (when active
                   (with-current-buffer buffer
                     (proofread--record-active-request-handle
-                     request request-handle)))
+                     work request-handle)))
                 (proofread--record-request-event
-                 request 'backend-dispatched
+                 work 'backend-dispatched
                  :backend backend
                  :handle handle))
               handle))))))))
 
 ;;;; Request scheduling
 
-(defun proofread--request-lifecycle-current-p (request)
-  "Return non-nil when REQUEST may still change lifecycle state."
-  (let ((buffer (plist-get request :buffer)))
+(defun proofread--request-lifecycle-current-p (work)
+  "Return non-nil when WORK may still change lifecycle state."
+  (let* ((request (proofread--scheduled-work-request work))
+         (buffer (plist-get request :buffer)))
     (and (buffer-live-p buffer)
          (with-current-buffer buffer
            (and proofread-mode
                 (equal proofread--generation
                        (plist-get request :generation))
-                (proofread--latest-request-p request)
+                (proofread--latest-request-p work)
                 (not (proofread--request-state-flag-p
-                      request :cancelled))
-                (not (proofread--request-invalidated-p request)))))))
+                      work :cancelled))
+                (not (proofread--request-invalidated-p work)))))))
 
-(defun proofread--request-ready-to-submit-p (request)
-  "Return non-nil if REQUEST is fresh and lifecycle-current."
-  (and (proofread--request-lifecycle-current-p request)
+(defun proofread--request-ready-to-submit-p (work)
+  "Return non-nil if WORK is fresh and lifecycle-current."
+  (and (proofread--request-lifecycle-current-p work)
        (condition-case nil
-           (proofread--fresh-request-p request)
+           (proofread--fresh-request-p work)
          (error nil))
        ;; Freshness can invoke user predicates that mutate request
        ;; state.
-       (proofread--request-lifecycle-current-p request)))
+       (proofread--request-lifecycle-current-p work)))
 
 (defun proofread--retire-active-request
-    (request &optional request-handle reason)
-  "Remove active REQUEST and cancel optional core REQUEST-HANDLE.
+    (work &optional request-handle reason)
+  "Remove active WORK and cancel optional core REQUEST-HANDLE.
 Record REASON as the cancellation reason, defaulting to `stale'."
-  (let ((buffer (plist-get request :buffer)))
+  (let* ((request (proofread--scheduled-work-request work))
+         (buffer (plist-get request :buffer)))
     (when (buffer-live-p buffer)
       (with-current-buffer buffer
-        (proofread--invalidate-request request)
-        (proofread--remove-active-request request)))
+        (proofread--invalidate-request work)
+        (proofread--remove-active-request work)))
     (let ((proofread--inhibit-queue-dispatch buffer))
       (proofread--record-request-cancellation
-       request (or reason 'stale))
+       work (or reason 'stale))
       (proofread--cancel-request-handle request-handle))))
 
 (defun proofread--prune-stale-active-requests ()
   "Cancel active requests that no longer match this buffer."
   (let ((candidates proofread--active-requests)
         stale)
-    (dolist (request candidates)
-      (unless (proofread--request-ready-to-submit-p request)
-        (push request stale)))
+    (dolist (work candidates)
+      (unless (proofread--request-ready-to-submit-p work)
+        (push work stale)))
     ;; Freshness predicates can reenter request dispatch.  Remove only
     ;; candidates that are still active after all predicates return.
     (setq stale
           (cl-delete-if-not
-           (lambda (request)
-             (memq request proofread--active-requests))
+           (lambda (work)
+             (memq work proofread--active-requests))
            stale))
     (when stale
       (let ((table (make-hash-table :test #'eq)))
-        (dolist (request stale)
-          (puthash request t table)
-          (proofread--invalidate-request request))
+        (dolist (work stale)
+          (puthash work t table)
+          (proofread--invalidate-request work))
         (setq proofread--active-requests
-              (cl-delete-if (lambda (request) (gethash request table))
+              (cl-delete-if (lambda (work) (gethash work table))
                             proofread--active-requests)))
       (let ((proofread--inhibit-queue-dispatch (current-buffer)))
-        (dolist (request stale)
-          (proofread--record-request-cancellation request 'stale)
+        (dolist (work stale)
+          (proofread--record-request-cancellation work 'stale)
           (proofread--cancel-request-handle
-           (plist-get request :handle)))))
+           (proofread--scheduled-work-handle work)))))
     (nreverse stale)))
 
-(defun proofread--request-cache-status (request)
-  "Apply REQUEST's current cache entry and return its queue status.
-Return `cached' or `stale' when an entry settles REQUEST, and nil when
-there is no applicable entry."
-  (when-let* ((entry (proofread--cache-read-request request)))
-    (pcase (proofread--apply-cache-entry request entry)
-      ('applied 'cached)
-      ('stale 'stale))))
+(defun proofread--request-cache-status (work)
+  "Apply WORK's current cache entry and return its queue status.
+Return `cached' when an entry settles WORK, and nil when there is no
+applicable entry.  A stale cache result has already recorded its final
+event, so it is also terminally `cached' from the queue's perspective."
+  (when-let* ((entry (proofread--cache-read-request work)))
+    (when (proofread--apply-cache-entry work entry)
+      'cached)))
 
-(defun proofread--submit-request (request backend)
-  "Submit REQUEST through BACKEND when cache and concurrency permit.
+(defun proofread--submit-request (work)
+  "Submit WORK when cache and concurrency permit.
 Return one of the symbols `sent', `cached', `full', `stale', or
 `error'."
   (catch 'status
-    (unless (proofread--request-ready-to-submit-p request)
+    (unless (proofread--request-ready-to-submit-p work)
       (throw 'status 'stale))
-    (when-let* ((status (proofread--request-cache-status request)))
+    (when-let* ((status (proofread--request-cache-status work)))
       (throw 'status status))
     ;; Cache lifecycle hooks can enqueue a newer conflicting request.
-    (unless (proofread--request-lifecycle-current-p request)
+    (unless (proofread--request-lifecycle-current-p work)
       (throw 'status 'stale))
     (unless (proofread--request-slot-available-p)
       (if proofread--queue-dispatch-transaction
@@ -3477,453 +3957,480 @@ Return one of the symbols `sent', `cached', `full', `stale', or
             (setq proofread--queue-dispatch-pruned-active-p t)
             (proofread--prune-stale-active-requests))
         (proofread--prune-stale-active-requests))
-      (unless (proofread--request-lifecycle-current-p request)
+      (unless (proofread--request-lifecycle-current-p work)
         (throw 'status 'stale))
       ;; Pruning can run freshness, cancellation, and logging hooks while
       ;; this request is claimed and therefore absent from the queue index.
       ;; Consume a same-key cache write from those hooks before either
       ;; submitting the backend request or restoring the queue entry.
-      (when-let* ((status (proofread--request-cache-status request)))
+      (when-let* ((status (proofread--request-cache-status work)))
         (throw 'status status))
-      (unless (proofread--request-lifecycle-current-p request)
+      (unless (proofread--request-lifecycle-current-p work)
         (throw 'status 'stale))
       (unless (proofread--request-slot-available-p)
         (throw 'status 'full)))
     (let ((result
            (proofread--dispatch-backend-request
-            request #'proofread--handle-backend-result backend)))
+            work
+            (lambda (backend-result)
+              (proofread--handle-backend-result
+               work backend-result)))))
       (cond
        ((eq result proofread--stale-dispatch-result) 'stale)
        (result 'sent)
        (t 'error)))))
 
-(defun proofread--ensure-request-queue-bookkeeping ()
-  "Ensure request queue indexes exist in the current buffer."
-  (unless (hash-table-p proofread--request-queue-index)
-    (setq proofread--request-queue-index
-          (make-hash-table :test #'equal)))
-  (unless (hash-table-p proofread--request-queue-links)
-    (setq proofread--request-queue-links
-          (make-hash-table :test #'eq)))
-  (unless (hash-table-p proofread--request-queue-sequences)
-    (setq proofread--request-queue-sequences
-          (make-hash-table :test #'eq)))
-  (unless (hash-table-p proofread--cache-woken-queue-entries)
-    (setq proofread--cache-woken-queue-entries
-          (make-hash-table :test #'eq))))
+(defun proofread--request-queue-entries (&optional state)
+  "Return queued entries in FIFO order from STATE.
+STATE defaults to the current buffer's queue state.  The returned list
+is a snapshot; queue links remain owned by the state record."
+  (let ((entry (when-let* ((queue (or state proofread--queue-state)))
+                 (proofread--queue-state-head queue)))
+        entries)
+    (while entry
+      (push entry entries)
+      (setq entry (proofread--queue-entry-next entry)))
+    (nreverse entries)))
 
-(defun proofread--request-queue-entry-sequence (entry)
-  "Return the stable FIFO sequence number for queue ENTRY."
-  (proofread--ensure-request-queue-bookkeeping)
-  (or (and (consp entry)
-           (plist-get entry :queue-sequence))
-      (gethash entry proofread--request-queue-sequences)
-      (let ((sequence (cl-incf proofread--next-request-queue-sequence)))
-        ;; Keep hand-constructed entries unchanged.  Production entries
-        ;; carry their sequence in the plist before entering eq indexes.
-        (puthash entry sequence proofread--request-queue-sequences)
-        sequence)))
+(defun proofread--request-queue-head ()
+  "Return the first queued entry in the current buffer, or nil."
+  (and proofread--queue-state
+       (proofread--queue-state-head proofread--queue-state)))
+
+(defun proofread--request-queue-empty-p ()
+  "Return non-nil when the current buffer has no queued requests."
+  (null (proofread--request-queue-head)))
+
+(defun proofread--request-queue-length ()
+  "Return the number of queued requests in the current buffer."
+  (length (proofread--request-queue-entries)))
+
+(defun proofread--request-queue-works ()
+  "Return queued scheduled work in FIFO order."
+  (mapcar #'proofread--queue-entry-work
+          (proofread--request-queue-entries)))
 
 (defun proofread--request-queue-entry-cache-key (entry)
   "Return the frozen cache key for queued request ENTRY."
-  (plist-get (plist-get entry :request) :cache-key))
+  (proofread--scheduled-work-cache-key
+   (proofread--queue-entry-work entry)))
 
-(defun proofread--index-request-queue-entry (entry)
-  "Add queued ENTRY to cache-key and cache-wakeup indexes."
-  (proofread--ensure-request-queue-bookkeeping)
-  (proofread--request-queue-entry-sequence entry)
+(defun proofread--index-request-queue-entry
+    (state entry &optional suppress-cache-wakeup)
+  "Add ENTRY to STATE's cache indexes.
+When SUPPRESS-CACHE-WAKEUP is non-nil, do not wake ENTRY for a cache
+value which the current claim already considered."
   (let* ((key (proofread--request-queue-entry-cache-key entry))
-         (bucket (gethash key proofread--request-queue-index)))
+         (index (proofread--queue-state-index state))
+         (bucket (gethash key index)))
     (unless bucket
       (setq bucket (make-hash-table :test #'eq))
-      (puthash key bucket proofread--request-queue-index))
+      (puthash key bucket index))
     (puthash entry t bucket)
-    (when (proofread--cache-key-present-p key)
-      (puthash entry t proofread--cache-woken-queue-entries))))
+    (when (and (not suppress-cache-wakeup)
+               (proofread--cache-key-present-p key))
+      (puthash entry t (proofread--queue-state-woken state)))))
 
-(defun proofread--unindex-request-queue-entry (entry)
-  "Remove queued ENTRY from cache-key and cache-wakeup indexes."
-  (when (hash-table-p proofread--request-queue-index)
-    (let* ((key (proofread--request-queue-entry-cache-key entry))
-           (bucket (gethash key proofread--request-queue-index)))
-      (when bucket
-        (remhash entry bucket)
-        (when (= (hash-table-count bucket) 0)
-          (remhash key proofread--request-queue-index)))))
-  (when (hash-table-p proofread--cache-woken-queue-entries)
-    (remhash entry proofread--cache-woken-queue-entries)))
+(defun proofread--unindex-request-queue-entry (state entry)
+  "Remove ENTRY from STATE's cache indexes."
+  (let* ((key (proofread--request-queue-entry-cache-key entry))
+         (index (proofread--queue-state-index state))
+         (bucket (gethash key index)))
+    (when bucket
+      (remhash entry bucket)
+      (when (= (hash-table-count bucket) 0)
+        (remhash key index))))
+  (remhash entry (proofread--queue-state-woken state)))
 
-(defun proofread--link-request-queue-entry (entry cell previous)
-  "Index queued ENTRY at CELL following PREVIOUS queue cell."
-  (proofread--ensure-request-queue-bookkeeping)
-  (puthash entry (cons cell previous) proofread--request-queue-links)
-  (proofread--index-request-queue-entry entry))
+(defun proofread--link-request-queue-entry
+    (state entry previous next &optional suppress-cache-wakeup)
+  "Link ENTRY into STATE between PREVIOUS and NEXT.
+When SUPPRESS-CACHE-WAKEUP is non-nil, do not wake ENTRY for the cache
+value which the current claim already considered."
+  (when (proofread--queue-entry-owner entry)
+    (error "Queue entry is already linked"))
+  (unless (and (eq (if previous
+                       (proofread--queue-entry-next previous)
+                     (proofread--queue-state-head state))
+                   next)
+               (eq (if next
+                       (proofread--queue-entry-previous next)
+                     (proofread--queue-state-tail state))
+                   previous)
+               (or (null previous)
+                   (eq (proofread--queue-entry-owner previous)
+                       state))
+               (or (null next)
+                   (eq (proofread--queue-entry-owner next) state)))
+    (error "Queue insertion point is inconsistent"))
+  (setf (proofread--queue-entry-previous entry) previous)
+  (setf (proofread--queue-entry-next entry) next)
+  (setf (proofread--queue-entry-owner entry) state)
+  (if previous
+      (setf (proofread--queue-entry-next previous) entry)
+    (setf (proofread--queue-state-head state) entry))
+  (if next
+      (setf (proofread--queue-entry-previous next) entry)
+    (setf (proofread--queue-state-tail state) entry))
+  (proofread--index-request-queue-entry
+   state entry suppress-cache-wakeup)
+  entry)
 
-(defun proofread--rebuild-request-queue-bookkeeping ()
-  "Rebuild all indexes for the current request queue."
-  (proofread--ensure-request-queue-bookkeeping)
-  (clrhash proofread--request-queue-index)
-  (clrhash proofread--request-queue-links)
-  (clrhash proofread--cache-woken-queue-entries)
-  (let ((cell proofread--request-queue)
-        previous)
-    (while cell
-      (let ((entry (car cell)))
-        (proofread--link-request-queue-entry entry cell previous))
-      (setq previous cell)
-      (setq cell (cdr cell)))
-    (setq proofread--request-queue-tail previous)))
+(defun proofread--clear-request-queue (state)
+  "Detach and return every queued entry in STATE."
+  (let ((entry (proofread--queue-state-head state))
+        entries)
+    (setf (proofread--queue-state-head state) nil)
+    (setf (proofread--queue-state-tail state) nil)
+    (clrhash (proofread--queue-state-index state))
+    (clrhash (proofread--queue-state-woken state))
+    (while entry
+      (let ((next (proofread--queue-entry-next entry)))
+        (push entry entries)
+        (setf (proofread--queue-entry-previous entry) nil)
+        (setf (proofread--queue-entry-next entry) nil)
+        (setf (proofread--queue-entry-owner entry) nil)
+        (setq entry next)))
+    (nreverse entries)))
 
-(defun proofread--clear-request-queue-bookkeeping ()
-  "Clear request queue indexes in the current buffer."
-  (dolist (table (list proofread--request-queue-index
-                       proofread--request-queue-links
-                       proofread--request-queue-sequences
-                       proofread--cache-woken-queue-entries))
-    (when (hash-table-p table)
-      (clrhash table))))
+(defun proofread--new-request-queue-entry (state work)
+  "Return a fresh queue entry for WORK in STATE."
+  (proofread--make-queue-entry
+   work
+   (cl-incf (proofread--queue-state-next-sequence state))))
 
-(defun proofread--append-request-queue-entry (entry)
-  "Append queue ENTRY while preserving constant-time tail insertion."
-  (proofread--ensure-request-queue-bookkeeping)
-  (let ((cell (list entry))
-        (previous proofread--request-queue-tail))
-    (if previous
-        (setcdr previous cell)
-      (setq proofread--request-queue cell))
-    (setq proofread--request-queue-tail cell)
-    (proofread--link-request-queue-entry entry cell previous)))
+(defun proofread--append-request-queue-entry
+    (state entry &optional suppress-cache-wakeup)
+  "Append ENTRY to STATE in constant time.
+When SUPPRESS-CACHE-WAKEUP is non-nil, forward it to the cache index."
+  (proofread--link-request-queue-entry
+   state entry (proofread--queue-state-tail state) nil
+   suppress-cache-wakeup))
 
-(defun proofread--enqueue-requests (requests backend)
-  "Append REQUESTS for BACKEND without running lifecycle hooks."
-  (when (and requests (not (proofread--clearing-scheduled-work-p)))
-    (when (and proofread--request-queue
-               (or (not (hash-table-p proofread--request-queue-links))
-                   (= (hash-table-count proofread--request-queue-links)
-                      0)))
-      (proofread--rebuild-request-queue-bookkeeping))
-    (dolist (request requests)
-      (proofread--append-request-queue-entry
-       (list :request request
-             :backend backend
-             :queue-sequence
-             (cl-incf proofread--next-request-queue-sequence)))
-      (puthash (proofread--request-work-key request)
-               (plist-get request :log-id)
-               proofread--pending-request-keys))
+(defun proofread--enqueue-requests (works)
+  "Append WORKS without running lifecycle hooks."
+  (when (and works (not (proofread--clearing-scheduled-work-p)))
+    (let ((state proofread--queue-state))
+      (unless (proofread--queue-state-p state)
+        (error "Proofread request queue is not initialized"))
+      (dolist (work works)
+        (proofread--append-request-queue-entry
+         state
+         (proofread--new-request-queue-entry state work))
+        (puthash (proofread--request-work-key work)
+                 work
+                 proofread--pending-request-keys)))
     (when proofread--queue-dispatch-active-p
       (setq proofread--queue-dispatch-requested-p t))
-    requests))
+    works))
 
-(defun proofread--reject-request-during-clear (request)
-  "Retire REQUEST while this buffer clears scheduled work."
-  (proofread--invalidate-request request)
-  (unless (proofread--request-state-flag-p request :cancelled)
-    (proofread--set-request-state-flag request :cancelled)
+(defun proofread--reject-request-during-clear (work)
+  "Retire WORK while this buffer clears scheduled work."
+  (proofread--invalidate-request work)
+  (unless (proofread--request-state-flag-p work :cancelled)
+    (proofread--set-request-state-flag work :cancelled)
     ;; Prevent an adversarial cancellation hook from recursively
     ;; generating an unbounded chain of cancellation events.  Nested
     ;; work is still marked terminal, but only the outer rejection is
     ;; reported.
-    (unless proofread--recording-clear-rejection-p
+    (if proofread--recording-clear-rejection-p
+        (proofread--settle-request-batch work)
       (let ((proofread--recording-clear-rejection-p t))
         (proofread--record-request-event
-         request 'cancelled :reason 'cleared))))
+         work 'cancelled :reason 'cleared))))
   nil)
 
-(defun proofread--request-work-key (request)
-  "Return the identity of REQUEST's proofreading work."
-  (list (plist-get request :generation)
-        (plist-get request :checker-owner)
-        (proofread--position-integer (plist-get request :beg))
-        (proofread--position-integer (plist-get request :end))
-        (plist-get request :accessible-beg)
-        (plist-get request :accessible-end)
-        (plist-get request :cache-key)
-        (plist-get request :source-label)))
+(defun proofread--request-work-key (work)
+  "Return the identity of scheduled WORK."
+  (let ((request (proofread--scheduled-work-request work)))
+    (list (plist-get request :generation)
+          (plist-get request :checker-owner)
+          (proofread--position-integer (plist-get request :beg))
+          (proofread--position-integer (plist-get request :end))
+          (plist-get request :accessible-beg)
+          (plist-get request :accessible-end)
+          (proofread--scheduled-work-cache-key work)
+          (plist-get request :source-label))))
 
-(defun proofread--forget-request-work (request)
-  "Remove REQUEST's work key from pending state."
+(defun proofread--forget-request-work (work)
+  "Remove WORK's key from pending state."
   (when (hash-table-p proofread--pending-request-keys)
-    (let ((key (proofread--request-work-key request)))
-      (when (equal (gethash key proofread--pending-request-keys)
-                   (plist-get request :log-id))
+    (let ((key (proofread--request-work-key work)))
+      (when (eq (gethash key proofread--pending-request-keys)
+                work)
         (remhash key proofread--pending-request-keys)))))
 
-(defun proofread--request-work-pending-p (request)
-  "Return non-nil when REQUEST's work is already active or queued."
+(defun proofread--request-work-pending-p (work)
+  "Return non-nil when WORK's identity is already active or queued."
   (and (hash-table-p proofread--pending-request-keys)
-       (gethash (proofread--request-work-key request)
+       (gethash (proofread--request-work-key work)
                 proofread--pending-request-keys)))
 
-(defun proofread--request-state-flag-p (request property)
-  "Return non-nil when REQUEST lifecycle PROPERTY is set."
-  (plist-get (plist-get request :state) property))
+(defun proofread--request-state-flag-p (work property)
+  "Return non-nil when WORK lifecycle PROPERTY is set."
+  (pcase property
+    ( :superseded (proofread--scheduled-work-superseded work))
+    ( :invalidated (proofread--scheduled-work-invalidated work))
+    ( :cancelled (proofread--scheduled-work-cancelled work))
+    (_ (error "Unknown scheduled work state property %S" property))))
 
-(defun proofread--set-request-state-flag (request property)
-  "Set REQUEST lifecycle PROPERTY."
-  (when-let* ((state (plist-get request :state)))
-    (setf (plist-get state property) t)))
+(defun proofread--set-request-state-flag (work property)
+  "Set WORK lifecycle PROPERTY."
+  (pcase property
+    ( :superseded
+      (setf (proofread--scheduled-work-superseded work) t))
+    ( :invalidated
+      (setf (proofread--scheduled-work-invalidated work) t))
+    ( :cancelled
+      (setf (proofread--scheduled-work-cancelled work) t))
+    (_ (error "Unknown scheduled work state property %S" property))))
 
 (defun proofread--record-request-cancellation
-    (request &optional reason)
-  "Record one cancellation event for REQUEST, optionally with REASON."
-  (unless (proofread--request-state-flag-p request :cancelled)
-    (proofread--set-request-state-flag request :cancelled)
+    (work &optional reason)
+  "Record one cancellation event for WORK, optionally with REASON."
+  (unless (proofread--request-state-flag-p work :cancelled)
+    (proofread--set-request-state-flag work :cancelled)
     (if reason
         (proofread--record-request-event
-         request 'cancelled :reason reason)
-      (proofread--record-request-event request 'cancelled))))
+         work 'cancelled :reason reason)
+      (proofread--record-request-event work 'cancelled))))
 
 (defun proofread--request-range (request)
   "Return REQUEST's current integer range, or nil."
   (let ((beg (proofread--position-integer (plist-get request :beg)))
         (end (proofread--position-integer (plist-get request :end))))
-    (when (and beg end (<= beg end))
-      (cons beg end))))
-
-(defun proofread--same-request-owner-p (left right)
-  "Return non-nil when LEFT and RIGHT belong to the same checker."
-  (equal (plist-get left :checker-owner)
-         (plist-get right :checker-owner)))
+    (when-let* ((range (cons beg end))
+                ((proofread--range-valid-p range)))
+      range)))
 
 (defun proofread--conflicting-request-table (requests candidates)
-  "Return an eq table of CANDIDATES conflicting with REQUESTS."
-  (let ((table (make-hash-table :test #'eq)))
-    (dolist (request requests)
-      (when-let* ((range (proofread--request-range request)))
-        (let (entries)
-          (dolist (candidate candidates)
-            (when (proofread--same-request-owner-p
-                   request candidate)
-              (when-let* ((candidate-range
-                           (proofread--request-range candidate)))
-                (push (cons candidate candidate-range)
-                      entries))))
-          (dolist (entry
-                   (proofread--range-conflicting-entries
-                    (list range) entries))
-            (puthash (car entry) t table)))))
+  "Return an eq table of CANDIDATES conflicting with REQUESTS.
+Group valid ranges by checker owner and run at most one interval
+conflict sweep for each owner represented in REQUESTS."
+  ;; Each bucket is (RANGES . CANDIDATE-ENTRIES).
+  (let ((buckets (make-hash-table :test #'equal))
+        (table (make-hash-table :test #'eq)))
+    (dolist (work requests)
+      (let* ((request (proofread--scheduled-work-request work))
+             (range (proofread--request-range request)))
+        (when range
+          (let* ((owner (plist-get request :checker-owner))
+                 (bucket (gethash owner buckets)))
+            (unless bucket
+              (setq bucket (cons nil nil))
+              (puthash owner bucket buckets))
+            (push range (car bucket))))))
+    (unless (zerop (hash-table-count buckets))
+      (dolist (candidate candidates)
+        (let* ((request
+                (proofread--scheduled-work-request candidate))
+               (owner (plist-get request :checker-owner))
+               (bucket (gethash owner buckets)))
+          (when bucket
+            (when-let* ((range (proofread--request-range request)))
+              (push (cons candidate range) (cdr bucket)))))))
+    (maphash
+     (lambda (_owner bucket)
+       (when (cdr bucket)
+         (dolist (entry
+                  (proofread--range-conflicting-entries
+                   (car bucket) (cdr bucket)))
+           (puthash (car entry) t table))))
+     buckets)
     table))
 
 (defun proofread--partition-pending-requests (predicate)
-  "Remove pending requests matching PREDICATE and group them by state.
-Call PREDICATE with each active, claimed, then queued request.  It
-must not mutate request lifecycle state or invoke user callbacks.
+  "Remove pending work matching PREDICATE and group it by state.
+Call PREDICATE with each active, claimed, then queued work record.  It
+must not mutate work lifecycle state or invoke user callbacks.
 Publish all retained state after every predicate call finishes while
-preserving request order and queued entry identity.  Return selected
-requests in a plist with the keys :active, :claimed, and :queued.
+preserving work order and queued entry identity.  Return selected work
+in a plist with the keys :active, :claimed, and :queued.
 
-This function updates `proofread--request-queue-tail', but it does not
-change request flags or pending-work identity, run lifecycle hooks,
-cancel handles, or schedule work."
+This function does not change request flags or pending-work identity,
+run lifecycle hooks, cancel handles, or schedule work."
   (let (selected-active
         selected-claimed
-        selected-queued
+        selected-queued-entries
         retained-active
-        retained-claimed
-        retained-queue)
-    (dolist (request proofread--active-requests)
-      (if (funcall predicate request)
-          (push request selected-active)
-        (push request retained-active)))
-    (dolist (request proofread--claimed-requests)
-      (if (funcall predicate request)
-          (push request selected-claimed)
-        (push request retained-claimed)))
-    (dolist (entry proofread--request-queue)
-      (let ((request (plist-get entry :request)))
-        (if (funcall predicate request)
-            (push request selected-queued)
-          (push entry retained-queue))))
+        retained-claimed)
+    (dolist (work proofread--active-requests)
+      (if (funcall predicate work)
+          (push work selected-active)
+        (push work retained-active)))
+    (dolist (work proofread--claimed-requests)
+      (if (funcall predicate work)
+          (push work selected-claimed)
+        (push work retained-claimed)))
+    (dolist (entry (proofread--request-queue-entries))
+      (when (funcall predicate (proofread--queue-entry-work entry))
+        (push entry selected-queued-entries)))
     (setq selected-active (nreverse selected-active))
     (setq selected-claimed (nreverse selected-claimed))
-    (setq selected-queued (nreverse selected-queued))
+    (setq selected-queued-entries
+          (nreverse selected-queued-entries))
     (setq proofread--active-requests (nreverse retained-active))
     (setq proofread--claimed-requests (nreverse retained-claimed))
-    (setq proofread--request-queue (nreverse retained-queue))
-    (setq proofread--request-queue-tail
-          (last proofread--request-queue))
-    (proofread--rebuild-request-queue-bookkeeping)
+    (dolist (entry selected-queued-entries)
+      (proofread--unlink-request-queue-entry entry))
     (list :active selected-active
           :claimed selected-claimed
-          :queued selected-queued)))
+          :queued (mapcar #'proofread--queue-entry-work
+                          selected-queued-entries))))
 
-(defun proofread--supersede-conflicting-requests (requests)
-  "Remove older work that conflicts with REQUESTS.
-Return the removed requests grouped by their previous lifecycle state.
+(defun proofread--supersede-conflicting-requests (works)
+  "Remove older work that conflicts with WORKS.
+Return removed work grouped by its previous lifecycle state.
 This function changes only internal state; it does not run lifecycle
 hooks or call backend cancellation functions."
-  (let* ((queued-requests
-          (mapcar (lambda (entry) (plist-get entry :request))
-                  proofread--request-queue))
+  (let* ((queued-works (proofread--request-queue-works))
          (conflicts
           (proofread--conflicting-request-table
-           requests
+           works
            (append proofread--active-requests
                    proofread--claimed-requests
-                   queued-requests)))
+                   queued-works)))
          (superseded
           (proofread--partition-pending-requests
            (lambda (candidate)
              (gethash candidate conflicts)))))
-    (dolist (candidate
+    (dolist (work
              (append (plist-get superseded :active)
                      (plist-get superseded :claimed)
                      (plist-get superseded :queued)))
-      (proofread--set-request-state-flag candidate :superseded)
-      (proofread--forget-request-work candidate))
+      (proofread--set-request-state-flag work :superseded)
+      (proofread--forget-request-work work))
     superseded))
 
 (defun proofread--finish-superseded-requests (superseded)
   "Finish lifecycle handling for requests in SUPERSEDED."
   (let ((proofread--inhibit-queue-dispatch (current-buffer))
         (active (plist-get superseded :active)))
-    (dolist (request
+    (dolist (work
              (append active
                      (plist-get superseded :claimed)
                      (plist-get superseded :queued)))
-      (proofread--record-request-cancellation request 'superseded))
-    (dolist (request active)
-      (proofread--cancel-request-handle (plist-get request :handle))))
+      (proofread--record-request-cancellation work 'superseded))
+    (dolist (work active)
+      (proofread--cancel-request-handle
+       (proofread--scheduled-work-handle work))))
   superseded)
 
-(defun proofread--latest-request-p (request)
-  "Return non-nil when no newer request supersedes REQUEST."
-  (not (proofread--request-state-flag-p request :superseded)))
+(defun proofread--latest-request-p (work)
+  "Return non-nil when no newer request supersedes WORK."
+  (not (proofread--request-state-flag-p work :superseded)))
 
-(defun proofread--invalidate-request (request)
-  "Mark REQUEST stale because an edit may have shifted its positions."
-  (proofread--set-request-state-flag request :invalidated)
-  (proofread--forget-request-work request))
+(defun proofread--invalidate-request (work)
+  "Mark WORK stale because an edit may have shifted its positions."
+  (proofread--set-request-state-flag work :invalidated)
+  (proofread--forget-request-work work))
 
-(defun proofread--request-invalidated-p (request)
-  "Return non-nil when an edit made REQUEST's positions unsafe."
-  (proofread--request-state-flag-p request :invalidated))
+(defun proofread--request-invalidated-p (work)
+  "Return non-nil when an edit made WORK's positions unsafe."
+  (proofread--request-state-flag-p work :invalidated))
 
 (defun proofread--invalidate-position-shifted-requests (change-beg)
   "Invalidate pending requests that an edit at CHANGE-BEG may shift."
   (let* ((invalid
           (proofread--partition-pending-requests
-           (lambda (request)
-             (when-let* ((request-end
-                          (proofread--position-integer
-                           (plist-get request :end))))
-               (< change-beg request-end)))))
+           (lambda (work)
+             (let ((request
+                    (proofread--scheduled-work-request work)))
+               (when-let* ((request-end
+                            (proofread--position-integer
+                             (plist-get request :end))))
+                 (< change-beg request-end))))))
          (invalid-active (plist-get invalid :active))
          (invalid-requests
           (append invalid-active
                   (plist-get invalid :claimed)
                   (plist-get invalid :queued))))
-    (dolist (request invalid-requests)
-      (proofread--invalidate-request request))
+    (dolist (work invalid-requests)
+      (proofread--invalidate-request work))
     (let ((proofread--inhibit-queue-dispatch (current-buffer)))
-      (dolist (request invalid-requests)
-        (proofread--record-request-cancellation request 'stale))
-      (dolist (request invalid-active)
+      (dolist (work invalid-requests)
+        (proofread--record-request-cancellation work 'stale))
+      (dolist (work invalid-active)
         (proofread--cancel-request-handle
-         (plist-get request :handle))))
-    (when (and invalid-active proofread--request-queue)
+         (proofread--scheduled-work-handle work))))
+    (when (and invalid-active
+               (not (proofread--request-queue-empty-p)))
       (proofread--schedule-queue-dispatch))))
 
 (defun proofread--unlink-request-queue-entry (entry)
   "Remove queued ENTRY in constant time and return it.
 Return nil when ENTRY is no longer queued."
-  (when (and proofread--request-queue
-             (or (not (hash-table-p proofread--request-queue-links))
-                 (= (hash-table-count proofread--request-queue-links)
-                    0)))
-    (proofread--rebuild-request-queue-bookkeeping))
-  (when-let* ((link (and (hash-table-p proofread--request-queue-links)
-                         (gethash entry proofread--request-queue-links))))
-    (let* ((cell (car link))
-           (previous (cdr link))
-           (next (cdr cell)))
+  (when-let* ((state proofread--queue-state)
+              ((eq (proofread--queue-entry-owner entry) state)))
+    (let ((previous (proofread--queue-entry-previous entry))
+          (next (proofread--queue-entry-next entry)))
       (if previous
-          (setcdr previous next)
-        (setq proofread--request-queue next))
+          (setf (proofread--queue-entry-next previous) next)
+        (setf (proofread--queue-state-head state) next))
       (if next
-          (when-let* ((next-link
-                       (gethash (car next)
-                                proofread--request-queue-links)))
-            (setcdr next-link previous))
-        (setq proofread--request-queue-tail previous))
-      (proofread--unindex-request-queue-entry entry)
-      (remhash entry proofread--request-queue-links)
+          (setf (proofread--queue-entry-previous next) previous)
+        (setf (proofread--queue-state-tail state) previous))
+      (proofread--unindex-request-queue-entry state entry)
+      (setf (proofread--queue-entry-previous entry) nil)
+      (setf (proofread--queue-entry-next entry) nil)
+      (setf (proofread--queue-entry-owner entry) nil)
       entry)))
 
 (defun proofread--claim-request-queue-entry (entry)
   "Move queued ENTRY into claimed state and return it."
   (when (proofread--unlink-request-queue-entry entry)
-    (push (plist-get entry :request) proofread--claimed-requests)
+    (push (proofread--queue-entry-work entry)
+          proofread--claimed-requests)
     entry))
 
 (defun proofread--claim-request-queue-head ()
   "Move and return the first queue entry into claimed state."
-  (when proofread--request-queue
-    (proofread--claim-request-queue-entry
-     (car proofread--request-queue))))
+  (when-let* ((entry (proofread--request-queue-head)))
+    (proofread--claim-request-queue-entry entry)))
 
 (defun proofread--release-claimed-request
-    (request &optional forget-work)
-  "Remove REQUEST from claimed state.
+    (work &optional forget-work)
+  "Remove WORK from claimed state.
 When FORGET-WORK is non-nil, also release its pending-work identity."
   (setq proofread--claimed-requests
-        (delq request proofread--claimed-requests))
+        (delq work proofread--claimed-requests))
   (when forget-work
-    (proofread--forget-request-work request)))
+    (proofread--forget-request-work work)))
 
 (defun proofread--prepend-request-queue-entry
     (entry &optional suppress-cache-wakeup)
   "Put ENTRY at the head of the request queue.
 When SUPPRESS-CACHE-WAKEUP is non-nil, do not retry the cache entry
 that was already considered while ENTRY was claimed."
-  (proofread--ensure-request-queue-bookkeeping)
-  (let ((cell (list entry))
-        (next proofread--request-queue))
-    (setcdr cell next)
-    (setq proofread--request-queue cell)
-    (if next
-        (when-let* ((next-link
-                     (gethash (car next)
-                              proofread--request-queue-links)))
-          (setcdr next-link cell))
-      (setq proofread--request-queue-tail cell))
-    (proofread--link-request-queue-entry entry cell nil)
-    (when suppress-cache-wakeup
-      (remhash entry proofread--cache-woken-queue-entries))))
+  (let ((state proofread--queue-state))
+    (proofread--link-request-queue-entry
+     state entry nil (proofread--queue-state-head state)
+     suppress-cache-wakeup)))
 
 (defun proofread--insert-request-queue-entry
     (entry &optional suppress-cache-wakeup)
   "Restore ENTRY to its FIFO position in the request queue.
 When SUPPRESS-CACHE-WAKEUP is non-nil, do not retry a cache entry that
 was already considered while ENTRY was claimed."
-  (let ((sequence (proofread--request-queue-entry-sequence entry))
-        (cell proofread--request-queue))
-    (while (and cell
-                (< (proofread--request-queue-entry-sequence (car cell))
-                   sequence))
-      (setq cell (cdr cell)))
-    (if (null cell)
-        (proofread--append-request-queue-entry entry)
-      (let* ((next-entry (car cell))
-             (next-link (gethash next-entry
-                                 proofread--request-queue-links))
-             (previous (cdr next-link))
-             (new-cell (list entry)))
-        (setcdr new-cell cell)
-        (if previous
-            (setcdr previous new-cell)
-          (setq proofread--request-queue new-cell))
-        (setcdr next-link new-cell)
+  (let* ((state proofread--queue-state)
+         (sequence (proofread--queue-entry-sequence entry))
+         (next (proofread--queue-state-head state)))
+    (while (and next
+                (< (proofread--queue-entry-sequence next) sequence))
+      (setq next (proofread--queue-entry-next next)))
+    (if next
         (proofread--link-request-queue-entry
-         entry new-cell previous)))
-    (when suppress-cache-wakeup
-      (remhash entry proofread--cache-woken-queue-entries))))
+         state entry (proofread--queue-entry-previous next) next
+         suppress-cache-wakeup)
+      (proofread--append-request-queue-entry
+       state entry suppress-cache-wakeup))))
 
 (defun proofread--cache-wakeup-pending-p ()
   "Return non-nil when exact queued cache hits await dispatch."
-  (and (hash-table-p proofread--cache-woken-queue-entries)
-       (> (hash-table-count proofread--cache-woken-queue-entries) 0)))
+  (and proofread--queue-state
+       (> (hash-table-count
+           (proofread--queue-state-woken proofread--queue-state))
+          0)))
 
 (defun proofread--queue-dispatch-transaction-current-p ()
   "Return non-nil when the dynamic dispatch still owns buffer state."
@@ -3931,52 +4438,63 @@ was already considered while ENTRY was claimed."
       (eq proofread--queue-dispatch-active-p
           proofread--queue-dispatch-transaction)))
 
-(defun proofread--claimed-request-restorable-p (request)
-  "Return non-nil when claimed REQUEST may safely return to the queue."
-  (and (proofread--queue-dispatch-transaction-current-p)
-       (memq request proofread--claimed-requests)
-       (proofread--request-lifecycle-current-p request)))
+(defun proofread--claimed-request-stale-reason (work)
+  "Return the terminal stale reason for claimed WORK."
+  (if (proofread--request-state-flag-p work :superseded)
+      'superseded
+    'stale))
 
-(defun proofread--retire-unrestorable-claimed-request (request)
-  "Retire claimed REQUEST after a reentrant lifecycle change."
-  (proofread--release-claimed-request request t)
-  (proofread--record-request-cancellation
-   request
-   (if (proofread--request-state-flag-p request :superseded)
-       'superseded
-     'stale)))
+(defun proofread--transition-claimed-request
+    (work reason &optional restore)
+  "Release claimed WORK, recording REASON or calling RESTORE.
+RESTORE is a no-argument function that relinks WORK's queue entry.  It
+is called only while this dispatch transaction and WORK's lifecycle
+are still current.  A successful restore preserves the pending key;
+otherwise this function forgets it and records one cancellation with
+REASON.  A nil REASON means that an earlier final-result event already
+settled WORK."
+  (when (memq work proofread--claimed-requests)
+    (if (and restore
+             (proofread--queue-dispatch-transaction-current-p)
+             (proofread--request-lifecycle-current-p work)
+             (eq (proofread--request-work-pending-p work) work))
+        (progn
+          (funcall restore)
+          (proofread--release-claimed-request work))
+      (proofread--release-claimed-request work t)
+      (when reason
+        (proofread--record-request-cancellation work reason)))))
 
 (defun proofread--cache-woken-entry< (left right)
   "Return non-nil when queue entry LEFT precedes RIGHT."
-  (< (proofread--request-queue-entry-sequence left)
-     (proofread--request-queue-entry-sequence right)))
+  (< (proofread--queue-entry-sequence left)
+     (proofread--queue-entry-sequence right)))
 
-(defun proofread--cache-woken-request-status (request)
-  "Apply REQUEST's exact cache entry and return its queue status.
+(defun proofread--cache-woken-request-status (work)
+  "Apply WORK's exact cache entry and return its queue status.
 Return one of `cached', `miss', or `stale'.  This function never sends
-REQUEST to a backend."
+WORK to a backend."
   (catch 'status
-    (unless (proofread--request-ready-to-submit-p request)
+    (unless (proofread--request-ready-to-submit-p work)
       (throw 'status 'stale))
-    (unless (proofread--request-lifecycle-current-p request)
-      (throw 'status 'stale))
-    (when-let* ((status (proofread--request-cache-status request)))
+    (when-let* ((status (proofread--request-cache-status work)))
       (throw 'status status))
     'miss))
 
 (defun proofread--claim-current-cache-woken-entry (entry)
   "Claim woken ENTRY only while its exact cache entry remains available."
-  (when (and (proofread--queue-dispatch-transaction-current-p)
-             (hash-table-p proofread--cache-woken-queue-entries)
-             (gethash entry proofread--cache-woken-queue-entries))
+  (when-let* ((state proofread--queue-state)
+              ((proofread--queue-dispatch-transaction-current-p))
+              (woken (proofread--queue-state-woken state))
+              ((gethash entry woken)))
     (if (proofread--cache-key-present-p
          (proofread--request-queue-entry-cache-key entry))
         (let ((claimed
                (proofread--claim-request-queue-entry entry)))
           (unless claimed
-            (remhash entry proofread--cache-woken-queue-entries))
+            (remhash entry woken))
           claimed)
-      (remhash entry proofread--cache-woken-queue-entries)
+      (remhash entry woken)
       nil)))
 
 (defun proofread--drain-cache-woken-requests ()
@@ -3984,44 +4502,40 @@ REQUEST to a backend."
 Do not scan unrelated requests."
   (let (entries
         (claimed-count 0))
-    (when (and (proofread--queue-dispatch-transaction-current-p)
-               (hash-table-p proofread--cache-woken-queue-entries))
+    (when (and proofread--queue-state
+               (proofread--queue-dispatch-transaction-current-p))
       (maphash (lambda (entry _value)
                  (push entry entries))
-               proofread--cache-woken-queue-entries))
+               (proofread--queue-state-woken
+                proofread--queue-state)))
     (setq entries (sort entries #'proofread--cache-woken-entry<))
     (dolist (entry entries)
       ;; Lifecycle hooks from an earlier hit may already have removed
       ;; this exact entry or invalidated its cache wakeup.
       (when-let* ((claimed
                    (proofread--claim-current-cache-woken-entry entry))
-                  (request (plist-get claimed :request)))
+                  (work (proofread--queue-entry-work claimed)))
         (setq claimed-count (1+ claimed-count))
         (unwind-protect
-            (pcase (proofread--cache-woken-request-status request)
+            (pcase (proofread--cache-woken-request-status work)
               ('cached
-               (proofread--release-claimed-request request t))
+               (proofread--transition-claimed-request
+                work nil))
               ('stale
-               (proofread--release-claimed-request request t)
-               (proofread--record-request-cancellation
-                request
-                (if (proofread--request-state-flag-p
-                     request :superseded)
-                    'superseded
-                  'stale)))
+               (proofread--transition-claimed-request
+                work
+                (proofread--claimed-request-stale-reason work)))
               ('miss
                ;; Cache eviction or a defensive text mismatch must not
                ;; promote this request ahead of unrelated FIFO work.
-               (if (proofread--claimed-request-restorable-p request)
-                   (progn
-                     (proofread--insert-request-queue-entry entry t)
-                     (proofread--release-claimed-request request))
-                 (proofread--retire-unrestorable-claimed-request
-                  request))))
-          (when (memq request proofread--claimed-requests)
-            (proofread--release-claimed-request request t)
-            (proofread--record-request-cancellation
-             request 'error)))))
+               (proofread--transition-claimed-request
+                work
+                (proofread--claimed-request-stale-reason work)
+                (lambda ()
+                  (proofread--insert-request-queue-entry
+                   entry t)))))
+          (proofread--transition-claimed-request
+           work 'error))))
     claimed-count))
 
 (defun proofread--drain-request-queue ()
@@ -4030,41 +4544,36 @@ Do not scan unrelated requests."
         full)
     (while (and (not full)
                 (proofread--queue-dispatch-transaction-current-p)
-                proofread--request-queue)
+                (not (proofread--request-queue-empty-p)))
       (let* ((entry (proofread--claim-request-queue-head))
-             (request (plist-get entry :request))
-             (backend (plist-get entry :backend)))
+             (work (proofread--queue-entry-work entry)))
         (unwind-protect
-            (pcase (proofread--submit-request request backend)
+            (pcase (proofread--submit-request work)
               ('sent
-               (proofread--release-claimed-request request)
-               (push request requests))
+               (proofread--release-claimed-request work)
+               (push (proofread--scheduled-work-request work)
+                     requests))
               ('full
                ;; The current cache state was already considered by
                ;; submission.  Keep unrelated work in strict FIFO order.
-               (if (proofread--claimed-request-restorable-p request)
-                   (progn
-                     (proofread--prepend-request-queue-entry entry t)
-                     (proofread--release-claimed-request request))
-                 (proofread--retire-unrestorable-claimed-request
-                  request))
+               (proofread--transition-claimed-request
+                work
+                (proofread--claimed-request-stale-reason work)
+                (lambda ()
+                  (proofread--prepend-request-queue-entry
+                   entry t)))
                (setq full t))
               ((or 'cached 'error)
-               (proofread--release-claimed-request request t))
+               (proofread--transition-claimed-request
+                work nil))
               ('stale
-               (proofread--release-claimed-request request t)
-               (proofread--record-request-cancellation
-                request
-                (if (proofread--request-state-flag-p
-                     request :superseded)
-                    'superseded
-                  'stale))))
+               (proofread--transition-claimed-request
+                work
+                (proofread--claimed-request-stale-reason work))))
           ;; A malformed setting or unexpected predicate failure must
           ;; not strand a request between queue and active state.
-          (when (memq request proofread--claimed-requests)
-            (proofread--release-claimed-request request t)
-            (proofread--record-request-cancellation
-             request 'error)))))
+          (proofread--transition-claimed-request
+           work 'error))))
     (nreverse requests)))
 
 (defun proofread--dispatch-queued-requests ()
@@ -4089,16 +4598,15 @@ Do not scan unrelated requests."
                         (eq proofread--queue-dispatch-active-p
                             transaction))
               (setq proofread--queue-dispatch-requested-p nil)
-              (setq dispatched
-                    (nconc dispatched
-                           (proofread--drain-request-queue)))
+              (dolist (request (proofread--drain-request-queue))
+                (push request dispatched))
               (let ((cache-claims
                      (proofread--drain-cache-woken-requests)))
                 (setq continue
                       (or proofread--queue-dispatch-requested-p
                           (proofread--cache-wakeup-pending-p)
                           (> cache-claims 0)))))
-            dispatched)
+            (nreverse dispatched))
         ;; Mode teardown and reinitialization replace transaction state.
         ;; An old unwind must not clear a newer generation's dispatcher.
         (when (eq proofread--queue-dispatch-active-p transaction)
@@ -4107,12 +4615,9 @@ Do not scan unrelated requests."
 
 (defun proofread--request-range-valid-p (request)
   "Return non-nil if REQUEST range is valid in the current buffer."
-  (let ((beg (proofread--position-integer (plist-get request :beg)))
-        (end (proofread--position-integer (plist-get request :end))))
-    (and beg end
-         (<= (point-min) beg)
-         (<= beg end)
-         (<= end (point-max)))))
+  (when-let* ((range (proofread--request-range request)))
+    (proofread--range-contains-p
+     (cons (point-min) (point-max)) range)))
 
 (defun proofread--request-text-matches-p (request)
   "Return non-nil if REQUEST text still matches the current buffer."
@@ -4133,16 +4638,20 @@ Do not scan unrelated requests."
   "Return the current target domain containing REQUEST, or nil."
   (let ((kind (plist-get request :target-kind))
         (policy (plist-get request :target-policy))
-        (request-beg (plist-get request :beg))
-        (request-end (plist-get request :end)))
-    (cl-find-if
-     (lambda (domain)
-       (and (eq kind (plist-get domain :kind))
-            (<= (plist-get domain :domain-beg) request-beg)
-            (<= request-end (plist-get domain :domain-end))))
-     (proofread--target-domains-for-kind
-      (list (cons request-beg request-end))
-      kind policy (point-min) (point-max)))))
+        (request-range
+         (proofread--request-range request)))
+    (when request-range
+      (cl-find-if
+       (lambda (domain)
+         (and
+          (eq kind (plist-get domain :kind))
+          (proofread--range-contains-p
+           (cons (plist-get domain :domain-beg)
+                 (plist-get domain :domain-end))
+           request-range)))
+       (proofread--target-domains-for-kind
+        (list request-range)
+        kind policy (point-min) (point-max))))))
 
 (defun proofread--request-target-fresh-p (request domain)
   "Return non-nil when REQUEST still belongs to target DOMAIN."
@@ -4160,8 +4669,8 @@ Do not scan unrelated requests."
          domain
          (eq major-mode (plist-get request :major-mode))
          (eq policy (proofread--effective-target-policy))
-         (<= domain-beg beg)
-         (<= end domain-end)
+         (proofread--range-contains-p
+          (cons domain-beg domain-end) (cons beg end))
          (proofread--request-currently-included-p request))))
 
 (defun proofread--request-context-matches-p (request domain)
@@ -4190,15 +4699,16 @@ Do not scan unrelated requests."
              (proofread--backend-identity
               (plist-get request :backend)))))
 
-(defun proofread--fresh-request-p (request)
-  "Return non-nil if REQUEST still matches its originating buffer."
-  (let ((buffer (plist-get request :buffer)))
+(defun proofread--fresh-request-p (work)
+  "Return non-nil if WORK still matches its originating buffer."
+  (let* ((request (proofread--scheduled-work-request work))
+         (buffer (plist-get request :buffer)))
     (and (buffer-live-p buffer)
          (with-current-buffer buffer
            (and proofread-mode
                 (equal proofread--generation
                        (plist-get request :generation))
-                (not (proofread--request-invalidated-p request))
+                (not (proofread--request-invalidated-p work))
                 (let ((accessible-beg
                        (plist-get request :accessible-beg))
                       (accessible-end
@@ -4221,13 +4731,20 @@ Do not scan unrelated requests."
                        (proofread--request-context-matches-p
                         request domain))))))))
 
-(defun proofread--request-continuable-p (request)
-  "Return non-nil if REQUEST may submit another backend pass."
-  (let ((buffer (plist-get request :buffer)))
-    (and (buffer-live-p buffer)
+(defun proofread--request-continuable-p (source)
+  "Return non-nil if SOURCE may submit another backend pass.
+SOURCE may be scheduled work or its backend-facing request payload."
+  (when-let* ((work
+               (if (proofread--scheduled-work-p source)
+                   source
+                 (proofread--scheduled-work-for-request source)))
+              (request (proofread--scheduled-work-request work))
+              (buffer (plist-get request :buffer))
+              ((buffer-live-p buffer)))
+    ;; Freshness predicates may reenter dispatch and supersede WORK.
+    (and (proofread--fresh-request-p work)
          (with-current-buffer buffer
-           (and (proofread--latest-request-p request)
-                (proofread--fresh-request-p request))))))
+           (proofread--latest-request-p work)))))
 
 ;;;; Diagnostic cache
 
@@ -4238,7 +4755,9 @@ Do not scan unrelated requests."
        (plist-member value :contract-version)))
 
 (defun proofread--snapshot-value (value)
-  "Return a detached snapshot of mutable data in VALUE."
+  "Return a detached snapshot of core-owned mutable data in VALUE.
+Backend-local checker options cross their backend's registered
+`:snapshot-options' boundary instead."
   (cond
    ((consp value)
     (cons (proofread--snapshot-value (car value))
@@ -4266,23 +4785,21 @@ Do not scan unrelated requests."
    (t value)))
 
 (defun proofread--backend-identity (&optional backend)
-  "Return canonical identity for BACKEND.
-When BACKEND is nil, use the selected `proofread-backend'."
-  (let ((backend (or backend proofread-backend)))
-    (proofread--snapshot-value
-     (cond
-      ((proofread--backend-identity-p backend) backend)
-      ((null backend) nil)
-      (t
-       (when-let* ((descriptor
-                    (proofread--backend-descriptor backend))
-                   (identity (plist-get descriptor :identity)))
-         (let ((value (funcall identity)))
-           (unless (and (proofread--backend-identity-p value)
-                        (eq (plist-get value :backend) backend))
-             (error "Invalid identity for proofread backend %S"
-                    backend))
-           value)))))))
+  "Return canonical identity for BACKEND, or nil when it is nil."
+  (proofread--snapshot-value
+   (cond
+    ((proofread--backend-identity-p backend) backend)
+    ((null backend) nil)
+    (t
+     (when-let* ((descriptor
+                  (proofread--backend-descriptor backend))
+                 (identity (plist-get descriptor :identity)))
+       (let ((value (funcall identity)))
+         (unless (and (proofread--backend-identity-p value)
+                      (eq (plist-get value :backend) backend))
+           (error "Invalid identity for proofread backend %S"
+                  backend))
+         value))))))
 
 (defun proofread--chunk-text-hash (text)
   "Return a deterministic cache hash for chunk TEXT."
@@ -4300,43 +4817,67 @@ When BACKEND is nil, use the selected `proofread-backend'."
         (proofread--chunk-text-hash
          (plist-get chunk :context-after))))
 
-(defun proofread--cache-checker-identity (chunk &optional backend)
-  "Return checker identity for cache key CHUNK and BACKEND."
-  (or (plist-get chunk :checker-identity)
+(defun proofread--cache-identity-snapshots (chunk &optional backend)
+  "Return backend and checker identities for cache key CHUNK.
+Resolve BACKEND's descriptor at most once when CHUNK does not already
+contain both snapshots."
+  (let* ((checker-identity-present
+          (plist-member chunk :checker-identity))
+         (checker-identity (plist-get chunk :checker-identity))
+         (backend-identity-present
+          (or (plist-member chunk :backend-identity)
+              (and checker-identity-present
+                   (plist-member checker-identity
+                                 :backend-identity))))
+         (backend-identity
+          (if (plist-member chunk :backend-identity)
+              (plist-get chunk :backend-identity)
+            (and checker-identity-present
+                 (plist-get checker-identity :backend-identity)))))
+    (if (and backend-identity-present checker-identity-present)
+        (cons backend-identity checker-identity)
       (when-let* ((backend-name (or backend
-                                    (plist-get chunk :backend)
-                                    proofread-backend))
-                  (checker
+                                    (plist-get chunk :backend)))
+                  (raw-checker
                    (proofread--ad-hoc-checker backend-name)))
-        (if (plist-member chunk :backend-identity)
-            (proofread--checker-identity
-             checker (plist-get chunk :backend-identity))
-          (proofread--checker-identity checker)))))
+        (let* ((descriptor
+                (proofread--backend-descriptor backend-name))
+               (checker
+                (if descriptor
+                    (proofread--checker-with-options-snapshot
+                     raw-checker descriptor)
+                  raw-checker))
+               (backend-identity
+                (if backend-identity-present
+                    backend-identity
+                  (and descriptor
+                       (proofread--backend-checker-identity
+                        checker descriptor))))
+               (checker-identity
+                (if checker-identity-present
+                    checker-identity
+                  (proofread--checker-identity-from-snapshots
+                   checker descriptor backend-identity))))
+          (cons backend-identity checker-identity))))))
 
 (defun proofread--cache-key (chunk &optional backend)
   "Return diagnostic cache key for CHUNK and BACKEND."
-  (list :text-hash
-        (proofread--chunk-text-hash (plist-get chunk :text))
-        :language (proofread--snapshot-value
-                   (plist-get chunk :language))
-        :display-language
-        (proofread--snapshot-value
-         (plist-get chunk :display-language))
-        :major-mode (plist-get chunk :major-mode)
-        :target-policy (plist-get chunk :target-policy)
-        :target-kind (plist-get chunk :target-kind)
-        :backend (or (plist-get chunk :backend-identity)
-                     (proofread--backend-identity backend))
-        :checker (proofread--cache-checker-identity chunk backend)
-        :contract-version proofread--contract-version
-        :context (proofread--context-cache-identity chunk)))
-
-(defun proofread--ensure-cache ()
-  "Return this buffer's cache table when Proofread is active."
-  (when proofread-mode
-    (unless (hash-table-p proofread--cache)
-      (setq proofread--cache (make-hash-table :test #'equal)))
-    proofread--cache))
+  (let ((identities
+         (proofread--cache-identity-snapshots chunk backend)))
+    (list :text-hash
+          (proofread--chunk-text-hash (plist-get chunk :text))
+          :language (proofread--snapshot-value
+                     (plist-get chunk :language))
+          :display-language
+          (proofread--snapshot-value
+           (plist-get chunk :display-language))
+          :major-mode (plist-get chunk :major-mode)
+          :target-policy (plist-get chunk :target-policy)
+          :target-kind (plist-get chunk :target-kind)
+          :backend (car identities)
+          :checker (cdr identities)
+          :contract-version proofread--contract-version
+          :context (proofread--context-cache-identity chunk))))
 
 (defun proofread--cache-key-present-p (key)
   "Return non-nil when the enabled cache has KEY."
@@ -4348,34 +4889,37 @@ When BACKEND is nil, use the selected `proofread-backend'."
 
 (defun proofread--wake-queued-cache-key (key)
   "Wake only queued entries that can consume cache KEY."
-  (when (and (hash-table-p proofread--request-queue-index)
-             (hash-table-p proofread--cache-woken-queue-entries))
-    (when-let* ((bucket (gethash key proofread--request-queue-index)))
-      (maphash
-       (lambda (entry _value)
-         (puthash entry t proofread--cache-woken-queue-entries))
-       bucket)
-      (when proofread--queue-dispatch-active-p
-        (setq proofread--queue-dispatch-requested-p t)))))
+  (when-let* ((state proofread--queue-state)
+              (bucket (gethash key
+                               (proofread--queue-state-index state))))
+    (maphash
+     (lambda (entry _value)
+       (puthash entry t (proofread--queue-state-woken state)))
+     bucket)
+    (when proofread--queue-dispatch-active-p
+      (setq proofread--queue-dispatch-requested-p t))))
 
 (defun proofread--forget-queued-cache-key (key)
   "Forget pending cache wakeups for queued entries using KEY."
-  (when (and (hash-table-p proofread--request-queue-index)
-             (hash-table-p proofread--cache-woken-queue-entries))
-    (when-let* ((bucket (gethash key proofread--request-queue-index)))
-      (maphash
-       (lambda (entry _value)
-         (remhash entry proofread--cache-woken-queue-entries))
-       bucket))))
+  (when-let* ((state proofread--queue-state)
+              (bucket (gethash key
+                               (proofread--queue-state-index state))))
+    (maphash
+     (lambda (entry _value)
+       (remhash entry (proofread--queue-state-woken state)))
+     bucket)))
 
 (defun proofread--clear-queued-cache-wakeups ()
   "Clear every pending exact cache-to-queue wakeup."
-  (when (hash-table-p proofread--cache-woken-queue-entries)
-    (clrhash proofread--cache-woken-queue-entries)))
+  (when proofread--queue-state
+    (clrhash (proofread--queue-state-woken proofread--queue-state))))
 
 (defun proofread--cache-read (key)
   "Return diagnostic cache entry for KEY in the current buffer."
-  (let ((cache (proofread--ensure-cache)))
+  (let ((cache
+         (and proofread-mode
+              (hash-table-p proofread--cache)
+              proofread--cache)))
     (when-let* ((value (and cache
                             (> proofread-cache-max-entries 0)
                             (gethash key cache))))
@@ -4385,7 +4929,10 @@ When BACKEND is nil, use the selected `proofread-backend'."
 
 (defun proofread--cache-write (key value)
   "Store VALUE under KEY in the current buffer diagnostic cache."
-  (let ((cache (proofread--ensure-cache)))
+  (let ((cache
+         (and proofread-mode
+              (hash-table-p proofread--cache)
+              proofread--cache)))
     (when (and cache (> proofread-cache-max-entries 0))
       (puthash key value cache)
       (setq proofread--cache-order
@@ -4420,10 +4967,15 @@ When BACKEND is nil, use the selected `proofread-backend'."
     (setq absolute (plist-put absolute :end (+ base end)))
     absolute))
 
-(defun proofread--diagnostics-to-relative (diagnostics request)
-  "Return DIAGNOSTICS converted to chunk-relative ranges for REQUEST."
+(defun proofread--diagnostics-to-cache-payload (diagnostics request)
+  "Return provider-neutral relative DIAGNOSTICS for REQUEST."
   (mapcar (lambda (diagnostic)
-            (proofread--diagnostic-to-relative diagnostic request))
+            (let ((payload
+                   (proofread--diagnostic-to-relative
+                    diagnostic request)))
+              (dolist (key proofread--diagnostic-provenance-keys)
+                (cl-remf payload key))
+              payload))
           diagnostics))
 
 (defun proofread--diagnostics-to-absolute (diagnostics request)
@@ -4433,57 +4985,48 @@ When BACKEND is nil, use the selected `proofread-backend'."
           diagnostics))
 
 (defun proofread--make-cache-entry (request diagnostics)
-  "Return cache entry for REQUEST and accepted DIAGNOSTICS."
+  "Return a provider-neutral cache entry for REQUEST and DIAGNOSTICS."
   (list :text (plist-get request :text)
         :diagnostics
-        (proofread--diagnostics-to-relative
-         (proofread--diagnostics-with-request-provenance
-          request diagnostics)
-         request)))
+        (proofread--diagnostics-to-cache-payload diagnostics request)))
 
-(defun proofread--cache-read-request (request)
-  "Return cache entry matching REQUEST in the current buffer."
-  (proofread--cache-read (plist-get request :cache-key)))
+(defun proofread--cache-read-request (work)
+  "Return cache entry matching WORK in the current buffer."
+  (proofread--cache-read
+   (proofread--scheduled-work-cache-key work)))
 
-(defun proofread--cache-write-request (request diagnostics)
-  "Write DIAGNOSTICS for REQUEST to the current buffer cache."
-  (proofread--cache-write
-   (plist-get request :cache-key)
-   (proofread--make-cache-entry request diagnostics)))
+(defun proofread--cache-write-request (work diagnostics)
+  "Write DIAGNOSTICS for WORK to the current buffer cache."
+  (let ((request (proofread--scheduled-work-request work)))
+    (proofread--cache-write
+     (proofread--scheduled-work-cache-key work)
+     (proofread--make-cache-entry request diagnostics))))
 
-(defun proofread--apply-cache-entry (request entry)
-  "Apply cached diagnostics from ENTRY for REQUEST when still valid."
-  (when (equal (plist-get entry :text)
-               (plist-get request :text))
-    (proofread--record-request-event
-     request 'cache-hit
-     :entry entry)
-    (let ((result
-           (list :status 'ok
-                 :source 'cache
-                 :request request
-                 :diagnostics
-                 (proofread--diagnostics-with-request-provenance
-                  request
-                  (proofread--diagnostics-to-absolute
-                   (plist-get entry :diagnostics)
-                   request)))))
+(defun proofread--apply-cache-entry (work entry)
+  "Apply cached diagnostics from ENTRY for WORK when still valid."
+  (let ((request (proofread--scheduled-work-request work)))
+    (when (equal (plist-get entry :text)
+                 (plist-get request :text))
       (proofread--record-request-event
-       request 'backend-result
-       :backend (plist-get request :backend)
-       :source 'cache
-       :entry entry
-       :result result)
-      (proofread--handle-backend-result result))))
+       work 'cache-hit
+       :entry entry)
+      (let ((result
+             (list :status 'ok
+                   :source 'cache
+                   :request request
+                   :diagnostics
+                   (proofread--diagnostics-to-absolute
+                    (plist-get entry :diagnostics)
+                    request))))
+        (proofread--record-request-event
+         work 'backend-result
+         :backend (plist-get request :backend)
+         :source 'cache
+         :entry entry
+         :result result)
+        (proofread--handle-backend-result work result)))))
 
 ;;;; Backend results
-
-(defun proofread--ensure-diagnostic-request-ranges ()
-  "Return the current buffer's diagnostic request range table."
-  (unless (hash-table-p proofread--diagnostic-request-ranges)
-    (setq proofread--diagnostic-request-ranges
-          (make-hash-table :test #'eq)))
-  proofread--diagnostic-request-ranges)
 
 (defun proofread--diagnostic-request-range (diagnostic)
   "Return the current request range that produced DIAGNOSTIC, or nil."
@@ -4497,75 +5040,106 @@ When BACKEND is nil, use the selected `proofread-backend'."
       (cons beg end))))
 
 (defun proofread--diagnostic-replaced-by-request-p
-    (diagnostic request request-range)
+    (diagnostic request request-range live-ranges)
   "Return non-nil if DIAGNOSTIC is replaced by REQUEST.
-REQUEST-RANGE is the checked buffer range as a (BEG . END) pair."
+REQUEST-RANGE is the checked buffer range as a (BEG . END) pair.
+LIVE-RANGES maps current diagnostic identities to live ranges."
   (let
       ((diagnostic-range
-        (proofread--diagnostic-live-range diagnostic))
+        (gethash diagnostic live-ranges))
        (owner-range
         (proofread--diagnostic-request-range diagnostic)))
     (and (proofread--diagnostic-owned-by-request-p diagnostic request)
          (or (equal owner-range request-range)
              (and diagnostic-range
                   (if (= (car diagnostic-range) (cdr diagnostic-range))
-                      (and (< (car request-range)
-                              (car diagnostic-range))
-                           (< (car diagnostic-range)
-                              (cdr request-range)))
-                    (proofread--ranges-intersect-p
-                     (car request-range) (cdr request-range)
-                     (car diagnostic-range)
-                     (cdr diagnostic-range))))))))
+                      (proofread--range-strictly-contains-position-p
+                       request-range (car diagnostic-range))
+                    (proofread--range-overlaps-p
+                     request-range diagnostic-range)))))))
 
 (defun proofread--diagnostic-owned-by-request-p (diagnostic request)
   "Return non-nil when REQUEST may replace DIAGNOSTIC.
-Diagnostics without checker provenance are legacy diagnostics.  They
-can be replaced by compatibility or ad-hoc requests, or by requests
-that also have no checker owner."
+Diagnostics without checker provenance can be replaced by ad-hoc
+requests or by requests that also have no checker owner."
   (let ((owner (plist-get request :checker-owner))
         (diagnostic-owner (plist-get diagnostic :checker-owner)))
     (or (equal diagnostic-owner owner)
         (and (null diagnostic-owner)
              (or (null owner)
-                 (plist-get owner :legacy)
                  (plist-get owner :ad-hoc))))))
 
 (defun proofread--diagnostics-replaced-by-request
     (request request-range)
   "Return diagnostics replaced by REQUEST over REQUEST-RANGE."
-  (cl-remove-if-not
-   (lambda (diagnostic)
-     (proofread--diagnostic-replaced-by-request-p
-      diagnostic request request-range))
-   proofread--diagnostics))
+  (let ((live-ranges (proofread--flymake-live-range-table)))
+    (cl-remove-if-not
+     (lambda (diagnostic)
+       (proofread--diagnostic-replaced-by-request-p
+        diagnostic request request-range live-ranges))
+     proofread--diagnostics)))
 
 (defun proofread--record-diagnostic-request-ranges
     (diagnostics request-range)
   "Record REQUEST-RANGE as the owner of DIAGNOSTICS."
-  (let ((range (cons (copy-marker (car request-range) t)
-                     (copy-marker (cdr request-range) nil)))
-        (table (proofread--ensure-diagnostic-request-ranges)))
-    (dolist (diagnostic diagnostics)
-      (puthash diagnostic range table))))
+  (when (hash-table-p proofread--diagnostic-request-ranges)
+    (let ((range (cons (copy-marker (car request-range) t)
+                       (copy-marker (cdr request-range) nil))))
+      (dolist (diagnostic diagnostics)
+        (puthash diagnostic range
+                 proofread--diagnostic-request-ranges)))))
 
-(defun proofread--apply-backend-diagnostics
+(defun proofread--commit-diagnostic-state (region mutate-function)
+  "Commit one diagnostic state change made by MUTATE-FUNCTION.
+REGION is the logical range directly affected by the change, or nil.
+MUTATE-FUNCTION must update the core model without notifying
+observers.  It returns diagnostics whose identity, range, removal, or
+addition changed the published state, or nil when nothing changed.
+
+After a change, expand REGION with every still-valid Flymake display
+anchor of the changed diagnostics, publish the complete surviving
+snapshot for that region, and then run
+`proofread-diagnostics-changed-hook'."
+  (when-let* ((changed-diagnostics (funcall mutate-function)))
+    (let ((report-region
+           (proofread--flymake-publication-region
+            region changed-diagnostics)))
+      (when (and proofread--flymake-report-function report-region)
+        (condition-case error-data
+            (proofread--report-flymake-snapshot
+             proofread--flymake-report-function report-region)
+          (error
+           (proofread--report-flymake-warning
+            "report" error-data))))
+      (proofread--run-diagnostics-changed-hook))
+    changed-diagnostics))
+
+(defun proofread--add-backend-diagnostics
     (diagnostics &optional request-range)
-  "Record DIAGNOSTICS and create overlays for them.
+  "Add DIAGNOSTICS to the model and return the added copies.
 When REQUEST-RANGE is non-nil, record it as their owning request
-range."
+range.  Do not notify diagnostic observers."
   (let ((diagnostics
          (mapcar #'copy-sequence
                  (proofread--filter-ignored-diagnostics
                   diagnostics))))
-    (when request-range
+    (when (and request-range diagnostics)
       (proofread--record-diagnostic-request-ranges
        diagnostics request-range))
     (setq proofread--diagnostics
           (nconc proofread--diagnostics diagnostics))
-    (dolist (diagnostic diagnostics)
-      (proofread--create-overlay diagnostic))
-    (proofread--run-diagnostics-changed-hook)))
+    diagnostics))
+
+(defun proofread--apply-backend-diagnostics
+    (diagnostics &optional request-range)
+  "Record DIAGNOSTICS in the current buffer model.
+When REQUEST-RANGE is non-nil, record it as their owning request
+range."
+  (proofread--commit-diagnostic-state
+   request-range
+   (lambda ()
+     (proofread--add-backend-diagnostics
+      diagnostics request-range))))
 
 (defun proofread--replace-backend-diagnostics (request diagnostics)
   "Replace current diagnostics for REQUEST with DIAGNOSTICS."
@@ -4576,12 +5150,15 @@ range."
              (replaced
               (proofread--diagnostics-replaced-by-request
                request request-range)))
-        (proofread--invalidate-affected-diagnostics
-         (delq nil
-               (mapcar #'proofread--overlay-for-diagnostic replaced))
-         replaced t)
-        (proofread--apply-backend-diagnostics
-         diagnostics request-range)))))
+        (proofread--commit-diagnostic-state
+         request-range
+         (lambda ()
+           (when replaced
+             (proofread--remove-diagnostics replaced))
+           (let ((added
+                  (proofread--add-backend-diagnostics
+                   diagnostics request-range)))
+             (append replaced added))))))))
 
 (defun proofread--merge-backend-diagnostics (request diagnostics)
   "Merge partial REQUEST's new DIAGNOSTICS into existing ones."
@@ -4591,8 +5168,12 @@ range."
          (proofread--new-diagnostics
           diagnostics proofread--diagnostics)))
     (when (and beg end new-diagnostics)
-      (proofread--apply-backend-diagnostics
-       new-diagnostics (cons beg end)))))
+      (let ((request-range (cons beg end)))
+        (proofread--commit-diagnostic-state
+         request-range
+         (lambda ()
+           (proofread--add-backend-diagnostics
+            new-diagnostics request-range)))))))
 
 (defun proofread--report-backend-error (result)
   "Report the backend error described by RESULT."
@@ -4600,204 +5181,371 @@ range."
    (proofread--backend-error-message result)
    "backend request failed; see *Warnings*"))
 
-(defun proofread--handle-backend-result (result)
-  "Handle backend RESULT and return an internal status symbol."
-  (let* ((request (plist-get result :request))
+(defun proofread--handle-backend-result (work result)
+  "Handle backend RESULT for WORK and return an internal status."
+  (let* ((request (proofread--scheduled-work-request work))
          (buffer (plist-get request :buffer))
+         (result-status (plist-get result :status))
+         (continuable-p
+          (and (memq result-status '( ok error))
+               (proofread--request-continuable-p work)))
          (status
-          (pcase (plist-get result :status)
+          (pcase result-status
             ('ok
-             (if (and (proofread--fresh-request-p request)
-                      (with-current-buffer buffer
-                        (proofread--latest-request-p request)))
+             (if continuable-p
                  (with-current-buffer buffer
-                   (let
-                       ((diagnostics
-                         (proofread--diagnostics-with-request-provenance
-                          request
-                          (plist-get result :diagnostics))))
+                   (let* ((backend-diagnostics
+                           (plist-get result :diagnostics))
+                          (cacheable-p
+                           (not
+                            (or (eq (plist-get result :source)
+                                    'cache)
+                                (plist-get result :partial))))
+                          (cache-diagnostics
+                           (and cacheable-p
+                                (mapcar #'copy-sequence
+                                        backend-diagnostics)))
+                          (diagnostics
+                           (proofread--diagnostics-with-request-provenance
+                            request backend-diagnostics)))
                      (if (plist-get result :partial)
                          (proofread--merge-backend-diagnostics
                           request diagnostics)
                        (proofread--replace-backend-diagnostics
                         request diagnostics))
-                     (unless (or (eq (plist-get result :source)
-                                     'cache)
-                                 (plist-get result :partial))
+                     (when cacheable-p
                        (proofread--cache-write-request
-                        request diagnostics)))
+                        work cache-diagnostics)))
                    'applied)
                'stale))
             ('error
-             (if (and (proofread--fresh-request-p request)
-                      (with-current-buffer buffer
-                        (proofread--latest-request-p request)))
+             (if continuable-p
                  (progn
-                   (unless (plist-get
-                            (plist-get request :state) :batch)
+                   (unless (proofread--scheduled-work-batch work)
                      (proofread--report-backend-error result))
                    'error)
                'stale))
             (_ 'error))))
     (proofread--record-request-event
-     request 'final-result
+     work 'final-result
      :result result
      :status status)
     (when (buffer-live-p buffer)
       (with-current-buffer buffer
-        (proofread--forget-request-work request)))
+        (proofread--forget-request-work work)))
     status))
 
 (defun proofread--prepare-checker-request-work
-    (chunks backend checker profile identities)
-  "Prepare unpublished request work for CHECKER.
-CHUNKS, BACKEND, PROFILE, and IDENTITIES describe the work.  Return
-`(REQUEST . CHUNK)' pairs after removing duplicate pending work."
-  (let ((new-work-keys (make-hash-table :test #'equal))
-        prepared)
+    (chunks profile preparation)
+  "Prepare unpublished request work from PREPARATION.
+CHUNKS and PROFILE describe the work.  Return `(WORK . CHUNK)' pairs
+after removing duplicate pending work."
+  (let* ((checker
+          (proofread--checker-preparation-checker preparation))
+         (backend (plist-get checker :backend))
+         (new-work-keys (make-hash-table :test #'equal))
+         prepared)
     (dolist (chunk chunks)
       (let* ((request
               (proofread--make-backend-request
-               chunk backend checker profile identities))
-             (work-key (proofread--request-work-key request)))
-        (unless (or (proofread--request-work-pending-p request)
+               chunk backend checker profile preparation))
+             (work (proofread--make-request-work request))
+             (work-key (proofread--request-work-key work)))
+        (unless (or (proofread--request-work-pending-p work)
                     (gethash work-key new-work-keys))
           (puthash work-key t new-work-keys)
-          (push (cons request chunk) prepared))))
+          (push (cons work chunk) prepared))))
     (nreverse prepared)))
 
-(defun proofread--dispatch-prepared-checker-work (prepared backend)
-  "Publish and dispatch PREPARED request work through BACKEND."
-  (let* ((requests (mapcar #'car prepared))
-         (superseded
-          (proofread--supersede-conflicting-requests requests)))
-    ;; Publish the complete batch before lifecycle hooks or
-    ;; cancellation callbacks can edit the buffer or enqueue more work.
-    (let ((enqueued
-           (proofread--enqueue-requests requests backend)))
-      (when enqueued
-        (proofread--attach-request-batch requests))
-      (let ((proofread--inhibit-queue-dispatch (current-buffer)))
-        (proofread--finish-superseded-requests superseded)
-        (if enqueued
-            (dolist (work prepared)
-              (let ((request (car work)))
-                (proofread--record-request-event
-                 request 'chunk-request
-                 :chunk (cdr work))
-                (proofread--record-request-event
-                 request 'queued-request
-                 :backend backend)))
-          (dolist (request requests)
-            (proofread--reject-request-during-clear request))))
-      (when enqueued
-        (proofread--dispatch-queued-requests)))))
-
-(defun proofread--dispatch-request-ready-chunks
-    (chunks &optional backend checker profile)
-  "Dispatch request-ready CHUNKS through BACKEND.
-When BACKEND is nil, use `proofread-backend'.  CHECKER and PROFILE,
-when non-nil, identify the selected profile checker.  Return
-dispatched requests."
-  (let* ((backend (or backend
-                      (plist-get checker :backend)
-                      proofread-backend))
-         (checker (or checker (proofread--ad-hoc-checker backend))))
-    (when (proofread--supported-backend-p backend)
-      (when chunks
-        (proofread--dispatch-prepared-checker-work
-         (proofread--prepare-checker-request-work
-          chunks backend checker profile
-          (proofread--checker-request-identities checker))
-         backend)))))
+(defun proofread--record-prepared-work-publication (prepared)
+  "Record publication events for PREPARED request work."
+  (dolist (item prepared)
+    (let ((work (car item)))
+      (proofread--record-request-event
+       work 'chunk-request
+       :chunk (cdr item))
+      (proofread--record-request-event
+       work 'queued-request
+       :backend (proofread--scheduled-work-backend work)))))
 
 (defun proofread--prepare-profile-checker-dispatch
     (chunks profile checker)
   "Prepare CHUNKS for CHECKER in PROFILE and return isolated state.
 The returned plist has `:status' set to `prepared', `unsupported', or
-`failed'.  Prepared state includes unpublished `:work'; failed state
-includes one checker-level `:failure'."
-  (let ((backend (plist-get checker :backend)))
+`failed'.  Return `aborted' when the source buffer dies during an
+adapter call.  Prepared state includes unpublished `:work'; failed
+state includes one checker-level `:failure'."
+  (let ((buffer (current-buffer))
+        (backend (plist-get checker :backend))
+        descriptor)
     (catch 'result
       (condition-case err
-          (unless (proofread--supported-backend-p backend)
-            (throw 'result '( :status unsupported)))
+          (setq descriptor
+                (with-current-buffer buffer
+                  (proofread--backend-descriptor backend)))
         (error
          (throw
           'result
-          (list
-           :status 'failed
-           :failure
-           (proofread--make-checker-dispatch-failure
-            profile checker 'backend-loading err)))))
+          (if (buffer-live-p buffer)
+              (list
+               :status 'failed
+               :failure
+               (proofread--make-checker-dispatch-failure
+                profile checker 'backend-loading err))
+            '( :status aborted)))))
+      (unless (buffer-live-p buffer)
+        (throw 'result '( :status aborted)))
+      (unless descriptor
+        (throw 'result '( :status unsupported)))
       (unless chunks
         (throw 'result
                '( :status prepared :supported t :work nil)))
-      (let ((identities
-             (condition-case err
-                 (proofread--checker-request-identities checker)
-               (error
-                (throw
-                 'result
-                 (list
-                  :status 'failed
-                  :supported t
-                  :failure
-                  (proofread--make-checker-dispatch-failure
-                   profile checker 'checker-identity err)))))))
+      (let (prepared-checker preparation)
         (condition-case err
-            (list
-             :status 'prepared
-             :supported t
-             :work
-             (proofread--prepare-checker-request-work
-              chunks backend checker profile identities))
+            (setq prepared-checker
+                  (with-current-buffer buffer
+                    (proofread--checker-with-options-snapshot
+                     checker descriptor)))
           (error
-           (list
-            :status 'failed
-            :supported t
-            :failure
-            (proofread--make-checker-dispatch-failure
-             profile checker 'request-construction err))))))))
+           (throw
+            'result
+            (if (buffer-live-p buffer)
+                (list
+                 :status 'failed
+                 :supported t
+                 :failure
+                 (proofread--make-checker-dispatch-failure
+                  profile checker 'checker-options err))
+              '( :status aborted)))))
+        (unless (buffer-live-p buffer)
+          (throw 'result '( :status aborted)))
+        (condition-case err
+            (setq preparation
+                  (with-current-buffer buffer
+                    (proofread--finish-checker-preparation
+                     prepared-checker descriptor nil buffer)))
+          (error
+           (throw
+            'result
+            (if (buffer-live-p buffer)
+                (list
+                 :status 'failed
+                 :supported t
+                 :failure
+                 (proofread--make-checker-dispatch-failure
+                  profile checker 'checker-identity err))
+              '( :status aborted)))))
+        (unless (buffer-live-p buffer)
+          (throw 'result '( :status aborted)))
+        (condition-case err
+            (with-current-buffer buffer
+              (list
+               :status 'prepared
+               :supported t
+               :work
+               (proofread--prepare-checker-request-work
+                chunks profile preparation)))
+          (error
+           (if (buffer-live-p buffer)
+               (list
+                :status 'failed
+                :supported t
+                :failure
+                (proofread--make-checker-dispatch-failure
+                 profile checker 'request-construction err))
+             '( :status aborted))))))))
+
+(defun proofread--publish-profile-checker-dispatches
+    (preparations transaction)
+  "Publish work in ordered PREPARATIONS as one transaction.
+Return the enqueued work, or nil when there is none.  All prepared
+checker work is visible and has its checker-local batch before any
+lifecycle or failure hook runs.  TRANSACTION owns the eventual queue
+drain."
+  (let (groups)
+    (dolist (preparation preparations)
+      (when (eq (plist-get preparation :status) 'prepared)
+        (push (plist-get preparation :work) groups)))
+    (setq groups (nreverse groups))
+    (let* ((prepared (apply #'append groups))
+           (works (mapcar #'car prepared))
+           superseded
+           enqueued)
+      (let ((proofread--inhibit-queue-dispatch (current-buffer)))
+        (when works
+          ;; Batch construction cannot strand published work: finish
+          ;; it before mutating the shared request queue.
+          (dolist (group groups)
+            (proofread--attach-request-batch
+             (mapcar #'car group)))
+          (setq superseded
+                (proofread--supersede-conflicting-requests works))
+          (setq enqueued (proofread--enqueue-requests works))
+          (when enqueued
+            (setf
+             (proofread--profile-dispatch-transaction-published
+              transaction)
+             t)))
+        (proofread--finish-superseded-requests superseded)
+        (dolist (preparation preparations)
+          (pcase (plist-get preparation :status)
+            ('prepared
+             (let ((group (plist-get preparation :work)))
+               (if enqueued
+                   (proofread--record-prepared-work-publication group)
+                 (dolist (item group)
+                   (proofread--reject-request-during-clear
+                    (car item))))))
+            ('failed
+             (proofread--report-checker-dispatch-failure-safely
+              (plist-get preparation :failure))))))
+      enqueued)))
+
+(defun proofread--profile-dispatch-state-current-p
+    (buffer generation queue-state)
+  "Return non-nil when BUFFER still owns the captured dispatch state.
+GENERATION and QUEUE-STATE identify the state captured before profile
+preparation began."
+  (and (buffer-live-p buffer)
+       (with-current-buffer buffer
+         (and proofread-mode
+              (equal proofread--generation generation)
+              (eq proofread--queue-state queue-state)))))
+
+(defun proofread--find-profile-dispatch-transaction
+    (buffer generation queue-state)
+  "Return the active profile transaction for BUFFER's captured state.
+GENERATION and QUEUE-STATE distinguish a reinitialized buffer from an
+older dispatch still on the stack."
+  (cl-find-if
+   (lambda (transaction)
+     (and
+      (eq buffer
+          (proofread--profile-dispatch-transaction-buffer
+           transaction))
+      (equal generation
+             (proofread--profile-dispatch-transaction-generation
+              transaction))
+      (eq queue-state
+          (proofread--profile-dispatch-transaction-queue-state
+           transaction))))
+   proofread--profile-dispatch-transactions))
+
+(defun proofread--profile-publication-state-current-p
+    (buffer generation queue-state chars-tick)
+  "Return non-nil when BUFFER still admits the prepared profile work.
+GENERATION, QUEUE-STATE, and CHARS-TICK were captured before checker
+preparation."
+  (and (proofread--profile-dispatch-state-current-p
+        buffer generation queue-state)
+       (with-current-buffer buffer
+         (= (buffer-chars-modified-tick) chars-tick))))
 
 (defun proofread--dispatch-profile-request-ready-chunks-result
     (chunks profile)
   "Dispatch CHUNKS for PROFILE and return checker dispatch state.
 The result contains `:requests', `:supported-count', and `:failures'."
-  (let ((supported-count 0)
-        failures
-        requests)
-    (dolist (checker (plist-get profile :checkers))
-      (let ((preparation
-             (proofread--prepare-profile-checker-dispatch
-              chunks profile checker)))
-        (when (plist-get preparation :supported)
-          (setq supported-count (1+ supported-count)))
-        (pcase (plist-get preparation :status)
-          ('prepared
-           (setq requests
-                 (nconc
-                  requests
-                  (proofread--dispatch-prepared-checker-work
-                   (plist-get preparation :work)
-                   (plist-get checker :backend)))))
-          ('failed
-           (let ((failure (plist-get preparation :failure)))
-             (push failure failures)
-             (proofread--report-checker-dispatch-failure failure))))))
-    (list :requests requests
-          :supported-count supported-count
-          :failures (nreverse failures))))
-
-(defun proofread--dispatch-profile-request-ready-chunks
-    (chunks profile)
-  "Dispatch CHUNKS for every supported checker in PROFILE.
-Return requests sent to backends.  Preparation failures are reported
-per checker without preventing later checkers from running."
-  (plist-get
-   (proofread--dispatch-profile-request-ready-chunks-result
-    chunks profile)
-   :requests))
+  (let* ((buffer (current-buffer))
+         (generation proofread--generation)
+         (queue-state proofread--queue-state)
+         (chars-tick (buffer-chars-modified-tick))
+         (parent-inhibited-p
+          (proofread--queue-dispatch-inhibited-p))
+         (parent-profile-transaction
+          (proofread--find-profile-dispatch-transaction
+           buffer generation queue-state))
+         (profile-transaction
+          (or parent-profile-transaction
+              (proofread--make-profile-dispatch-transaction
+               buffer generation queue-state)))
+         (root-profile-dispatch-p
+          (null parent-profile-transaction))
+         (profile-transactions
+          (if parent-profile-transaction
+              proofread--profile-dispatch-transactions
+            (cons profile-transaction
+                  proofread--profile-dispatch-transactions)))
+         preparations
+         supported-count
+         failures
+         requests
+         completed-p)
+    (unwind-protect
+        (progn
+          (let ((proofread--inhibit-queue-dispatch buffer)
+                (proofread--profile-dispatch-transactions
+                 profile-transactions))
+            (setq preparations
+                  (catch 'aborted
+                    (let (states)
+                      (dolist
+                          (checker (plist-get profile :checkers))
+                        (unless (buffer-live-p buffer)
+                          (throw 'aborted (nreverse states)))
+                        (let ((state
+                               (with-current-buffer buffer
+                                 (proofread--prepare-profile-checker-dispatch
+                                  chunks profile checker))))
+                          (push state states)
+                          (when (eq (plist-get state :status)
+                                    'aborted)
+                            (throw 'aborted
+                                   (nreverse states)))))
+                      (nreverse states))))
+            (setq supported-count
+                  (cl-count-if
+                   (lambda (preparation)
+                     (plist-get preparation :supported))
+                   preparations))
+            (setq failures
+                  (cl-loop
+                   for preparation in preparations
+                   when (eq (plist-get preparation :status)
+                            'failed)
+                   collect (plist-get preparation :failure)))
+            (if (proofread--profile-publication-state-current-p
+                 buffer generation queue-state chars-tick)
+                (with-current-buffer buffer
+                  (proofread--publish-profile-checker-dispatches
+                   preparations profile-transaction))
+              ;; Do not let work prepared before an edit or mode reset
+              ;; supersede newer work.  Preparation failures remain
+              ;; visible.
+              (when (buffer-live-p buffer)
+                (with-current-buffer buffer
+                  (dolist (failure failures)
+                    (proofread--report-checker-dispatch-failure-safely
+                     failure))))))
+          (when (and root-profile-dispatch-p
+                     (proofread--profile-dispatch-transaction-published
+                      profile-transaction)
+                     (proofread--profile-dispatch-state-current-p
+                      buffer generation queue-state))
+            (with-current-buffer buffer
+              (if parent-inhibited-p
+                  (proofread--schedule-queue-dispatch)
+                ;; Reentrant lifecycle hooks may have requested a
+                ;; timer while publication was inhibited.  This direct
+                ;; dispatch supersedes it.
+                (proofread--cancel-queue-dispatch-timer)
+                (let ((dispatched
+                       (proofread--dispatch-queued-requests)))
+                  ;; Reentry into an active queue transaction returns
+                  ;; its request flag rather than a request list.
+                  (when (listp dispatched)
+                    (setq requests dispatched))))))
+          (setq completed-p t)
+          (list :requests requests
+                :supported-count supported-count
+                :failures failures))
+      (when (and root-profile-dispatch-p
+                 (not completed-p)
+                 (proofread--profile-dispatch-transaction-published
+                  profile-transaction)
+                 (proofread--profile-dispatch-state-current-p
+                  buffer generation queue-state))
+        (with-current-buffer buffer
+          (proofread--schedule-queue-dispatch))))))
 
 ;;;; Cancellation and automatic checks
 
@@ -4828,15 +5576,15 @@ of later requests can continue."
 
 (defun proofread--cancel-active-requests ()
   "Cancel cancellable active backend requests for the current buffer."
-  (let ((requests proofread--active-requests)
+  (let ((works proofread--active-requests)
         (proofread--inhibit-queue-dispatch (current-buffer)))
     (setq proofread--active-requests nil)
-    (dolist (request requests)
-      (proofread--forget-request-work request))
-    (dolist (request requests)
-      (proofread--record-request-cancellation request)
+    (dolist (work works)
+      (proofread--forget-request-work work))
+    (dolist (work works)
+      (proofread--record-request-cancellation work)
       (proofread--cancel-request-handle
-       (plist-get request :handle)))))
+       (proofread--scheduled-work-handle work)))))
 
 (defun proofread--cancel-idle-timer ()
   "Cancel the current buffer's scheduled idle timer."
@@ -4861,7 +5609,7 @@ of later requests can continue."
 (defun proofread--schedule-queue-dispatch ()
   "Schedule queued work to resume after the current edit."
   (when (and proofread-mode
-             proofread--request-queue
+             (not (proofread--request-queue-empty-p))
              (not (timerp proofread--queue-dispatch-timer)))
     (setq proofread--queue-dispatch-timer
           (run-at-time
@@ -4870,20 +5618,17 @@ of later requests can continue."
 
 (defun proofread--clear-scheduled-work ()
   "Clear pending scheduled proofreading work in the current buffer."
-  (let ((requests
-         (append proofread--claimed-requests
-                 (mapcar (lambda (entry) (plist-get entry :request))
-                         proofread--request-queue)))
+  (let ((works (append proofread--claimed-requests
+                       (proofread--request-queue-works)))
         (proofread--inhibit-queue-dispatch (current-buffer))
         (proofread--clearing-scheduled-work (current-buffer)))
     (setq proofread--pending-work nil)
     (setq proofread--claimed-requests nil)
-    (setq proofread--request-queue nil)
-    (setq proofread--request-queue-tail nil)
-    (proofread--clear-request-queue-bookkeeping)
-    (dolist (request requests)
-      (proofread--forget-request-work request)
-      (proofread--record-request-cancellation request)))
+    (when proofread--queue-state
+      (proofread--clear-request-queue proofread--queue-state))
+    (dolist (work works)
+      (proofread--forget-request-work work)
+      (proofread--record-request-cancellation work)))
   (when (hash-table-p proofread--pending-request-keys)
     (clrhash proofread--pending-request-keys))
   (proofread--cancel-idle-timer)
@@ -4924,47 +5669,28 @@ of later requests can continue."
     (setq proofread--pending-work t)
     (proofread--schedule-idle-timer)))
 
-(defun proofread--range-affected-by-edit-p (range beg end)
-  "Return non-nil when editing BEG through END affects RANGE.
-For an insertion, nonempty ranges keep their diagnostic when text is
-inserted at either boundary, while a zero-width diagnostic is
-invalidated at its exact position."
-  (if (= beg end)
-      (if (= (car range) (cdr range))
-          (= beg (car range))
-        (and (< (car range) beg)
-             (< beg (cdr range))))
-    (proofread--ranges-conflict-p
-     beg end (car range) (cdr range))))
-
-(defun proofread--edit-affected-state (beg end)
-  "Return state affected by editing from BEG through END.
-The car of the result contains overlays in tracked order.  The cdr
-contains diagnostics in diagnostic order.  Preserve the identity of
-every collected object."
-  (cons
-   (cl-remove-if-not
-    (lambda (overlay)
-      (let ((range (cons (overlay-start overlay)
-                         (overlay-end overlay))))
-        (proofread--range-affected-by-edit-p range beg end)))
-    proofread--overlays)
-   (cl-remove-if-not
-    (lambda (diagnostic)
-      (when-let* ((range
-                   (proofread--diagnostic-live-range diagnostic)))
-        (proofread--range-affected-by-edit-p range beg end)))
-    proofread--diagnostics)))
+(defun proofread--edit-affected-diagnostics
+    (beg end &optional range-snapshot)
+  "Return diagnostic identities affected by editing BEG through END.
+RANGE-SNAPSHOT defaults to a strict snapshot of current Flymake live
+ranges.  Preserve diagnostic model order and identity."
+  (let ((edit (cons beg end))
+        (range-snapshot
+         (or range-snapshot
+             (proofread--snapshot-live-diagnostic-ranges)))
+        diagnostics)
+    (dolist (entry range-snapshot)
+      (when (proofread--range-affected-by-edit-p
+             (cdr entry) edit)
+        (push (car entry) diagnostics)))
+    (nreverse diagnostics)))
 
 (defun proofread--defer-correction-invalidation (beg end)
   "Remember diagnostics affected by a correction-time change.
 BEG and END delimit the changed text."
-  (proofread--prune-overlays)
-  (let ((affected-state (proofread--edit-affected-state beg end)))
-    (dolist (overlay (car affected-state))
-      (cl-pushnew overlay proofread--deferred-correction-overlays
-                  :test #'eq))
-    (dolist (diagnostic (cdr affected-state))
+  (let ((diagnostics
+         (proofread--edit-affected-diagnostics beg end)))
+    (dolist (diagnostic diagnostics)
       (cl-pushnew diagnostic
                   proofread--deferred-correction-diagnostics
                   :test #'eq))))
@@ -4972,61 +5698,52 @@ BEG and END delimit the changed text."
 (defun proofread--before-change (beg end)
   "Capture diagnostics affected by a change from BEG to END."
   (proofread--invalidate-position-shifted-requests beg)
-  (if (proofread--overlay-invalidation-inhibited-p)
+  (if (proofread--diagnostic-invalidation-inhibited-p)
       (proofread--defer-correction-invalidation beg end)
-    (proofread--prune-overlays)
-    (let ((affected-state (proofread--edit-affected-state beg end)))
-      (setq proofread--pending-invalidated-overlays
-            (car affected-state))
+    (let ((range-snapshot
+           (proofread--snapshot-live-diagnostic-ranges)))
+      (setq proofread--pending-diagnostic-ranges range-snapshot)
       (setq proofread--pending-invalidated-diagnostics
-            (cdr affected-state)))))
+            (proofread--edit-affected-diagnostics
+             beg end range-snapshot)))))
 
-(defun proofread--after-change (_beg _end _length)
-  "Invalidate changed diagnostics and schedule proofreading."
-  (unless (proofread--overlay-invalidation-inhibited-p)
-    (let ((changed (or proofread--pending-invalidated-overlays
-                       proofread--pending-invalidated-diagnostics)))
-      (proofread--invalidate-affected-diagnostics
-       proofread--pending-invalidated-overlays
-       proofread--pending-invalidated-diagnostics
-       t)
-      (setq proofread--pending-invalidated-overlays nil)
+(defun proofread--after-change (beg end _length)
+  "Invalidate diagnostics changed between BEG and END and schedule work."
+  (unless (proofread--diagnostic-invalidation-inhibited-p)
+    (let ((invalidated proofread--pending-invalidated-diagnostics)
+          (range-snapshot proofread--pending-diagnostic-ranges))
+      ;; Clear outer edit state before reporting or running hooks, so
+      ;; a reentrant edit owns an independent pending snapshot.
       (setq proofread--pending-invalidated-diagnostics nil)
-      (proofread--synchronize-live-diagnostic-ranges)
-      (when changed
-        (proofread--run-diagnostics-changed-hook))))
+      (setq proofread--pending-diagnostic-ranges nil)
+      (let* ((moved
+              (proofread--diagnostics-with-changed-live-ranges
+               range-snapshot))
+             (changed
+              (cl-delete-duplicates
+               (append invalidated moved) :test #'eq)))
+        (when changed
+          (proofread--commit-diagnostic-state
+           (cons beg end)
+           (lambda ()
+             (let ((removed
+                    (proofread--remove-diagnostics invalidated)))
+               (append
+                removed
+                (cl-remove-if-not
+                 (lambda (diagnostic)
+                   (memq diagnostic proofread--diagnostics))
+                 moved)))))))))
   (proofread--mark-pending-work)
   ;; An edit outside an active target can still stale its saved
   ;; context.  Revisit queued work so such an active request cannot
   ;; hold a slot forever.
-  (when proofread--request-queue
+  (unless (proofread--request-queue-empty-p)
     (proofread--schedule-queue-dispatch)))
 
-(defun proofread--mark-window-buffer-pending (window)
-  "Mark WINDOW's buffer pending when it has active `proofread-mode'."
-  (when (and (window-live-p window)
-             (not (window-minibuffer-p window)))
-    (let ((buffer (window-buffer window)))
-      (when (buffer-live-p buffer)
-        (with-current-buffer buffer
-          (proofread--mark-pending-work))))))
-
-(defun proofread--window-scroll (window _display-start)
-  "Mark WINDOW's buffer pending after scroll activity."
-  (proofread--mark-window-buffer-pending window))
-
-(defun proofread--window-configuration-change ()
-  "Mark proofread buffers pending after a window change."
-  (dolist (window (window-list nil nil))
-    (proofread--mark-window-buffer-pending window)))
-
-(defun proofread--install-window-hooks ()
-  "Install global window activity hooks used by `proofread-mode'."
-  (unless proofread--window-hooks-installed
-    (add-hook 'window-scroll-functions #'proofread--window-scroll)
-    (add-hook 'window-configuration-change-hook
-              #'proofread--window-configuration-change)
-    (setq proofread--window-hooks-installed t)))
+(defun proofread--window-scroll (_window _display-start)
+  "Mark the current buffer pending after scroll activity."
+  (proofread--mark-pending-work))
 
 (defun proofread--live-mode-buffer-p (buffer)
   "Return non-nil if BUFFER is live and has `proofread-mode' enabled."
@@ -5042,88 +5759,23 @@ BEG and END delimit the changed text."
         (push buffer buffers)))
     (setq proofread--mode-buffers (nreverse buffers))))
 
-(defun proofread--uninstall-window-hooks-if-unused ()
-  "Uninstall global window hooks when no proofread buffers remain."
-  (proofread--prune-mode-buffers)
-  (unless proofread--mode-buffers
-    (remove-hook 'window-scroll-functions #'proofread--window-scroll)
-    (remove-hook 'window-configuration-change-hook
-                 #'proofread--window-configuration-change)
-    (setq proofread--window-hooks-installed nil)))
-
 (defun proofread--register-mode-buffer ()
   "Register the current buffer as using `proofread-mode' hooks."
   (setq proofread--mode-buffers
         (delq (current-buffer) proofread--mode-buffers))
-  (push (current-buffer) proofread--mode-buffers)
-  (proofread--install-window-hooks))
+  (push (current-buffer) proofread--mode-buffers))
 
 (defun proofread--unregister-mode-buffer ()
   "Unregister the current buffer from `proofread-mode' hooks."
   (setq proofread--mode-buffers
         (delq (current-buffer) proofread--mode-buffers))
-  (proofread--uninstall-window-hooks-if-unused))
+  (proofread--prune-mode-buffers))
 
 (defun proofread--kill-buffer ()
   "Clean up Proofread state before killing this buffer."
-  (proofread--disable-echo-area)
-  (proofread--close-source-list-buffers (current-buffer))
-  (proofread--clear-request-work)
-  (proofread--unregister-mode-buffer))
+  (proofread--disable-buffer t))
 
 ;;;; Diagnostics and navigation
-
-(defun proofread--overlay-p (overlay)
-  "Return non-nil if OVERLAY is a live proofread-owned overlay."
-  (and (overlayp overlay)
-       (overlay-buffer overlay)
-       (eq (overlay-get overlay 'category)
-           proofread--overlay-category)))
-
-(defun proofread--current-buffer-overlay-p (overlay)
-  "Return non-nil if this buffer owns proofread OVERLAY."
-  (and (proofread--overlay-p overlay)
-       (eq (overlay-buffer overlay) (current-buffer))))
-
-(defun proofread--current-buffer-overlays ()
-  "Return all live proofread-owned overlays in the current buffer."
-  (let ((seen (make-hash-table :test #'eq))
-        overlays)
-    (save-restriction
-      (widen)
-      (dolist (overlay (append proofread--overlays
-                               (overlays-in (point-min) (point-max))))
-        (when (and (proofread--current-buffer-overlay-p overlay)
-                   (not (gethash overlay seen)))
-          (puthash overlay t seen)
-          (push overlay overlays))))
-    (nreverse overlays)))
-
-(defun proofread--prune-overlays ()
-  "Remove dead or foreign entries from `proofread--overlays'."
-  (let (retained)
-    (dolist (overlay proofread--overlays)
-      (if (proofread--current-buffer-overlay-p overlay)
-          (push overlay retained)
-        (when (and (overlayp overlay)
-                   (hash-table-p proofread--diagnostic-overlays))
-          (let ((diagnostic
-                 (overlay-get overlay 'proofread-diagnostic)))
-            (when (eq (gethash
-                       diagnostic proofread--diagnostic-overlays)
-                      overlay)
-              (remhash diagnostic proofread--diagnostic-overlays))))))
-    (setq proofread--overlays (nreverse retained))))
-
-(defun proofread--delete-overlay (overlay)
-  "Delete proofread-owned OVERLAY when it is live."
-  (when (proofread--overlay-p overlay)
-    (when (hash-table-p proofread--diagnostic-overlays)
-      (let ((diagnostic (overlay-get overlay 'proofread-diagnostic)))
-        (when (eq (gethash diagnostic proofread--diagnostic-overlays)
-                  overlay)
-          (remhash diagnostic proofread--diagnostic-overlays))))
-    (delete-overlay overlay)))
 
 (defun proofread--diagnostic-range (diagnostic)
   "Return DIAGNOSTIC's valid range as a cons cell, or nil."
@@ -5131,14 +5783,17 @@ BEG and END delimit the changed text."
               (plist-get diagnostic :beg)))
         (end (proofread--position-integer
               (plist-get diagnostic :end))))
-    (when (and beg end (<= beg end))
-      (cons beg end))))
+    (when-let* ((range (cons beg end))
+                ((proofread--range-valid-p range)))
+      range)))
 
 (defun proofread-diagnostic-range (diagnostic)
   "Return DIAGNOSTIC's current well-formed range, or nil.
-Prefer the range tracked by a live proofread overlay in the current
-buffer; otherwise return the diagnostic's stored range."
-  (or (proofread--diagnostic-live-range diagnostic)
+Prefer the range tracked by a current Flymake diagnostic in the
+current buffer; otherwise return the diagnostic's stored range.  For
+a zero-width diagnostic, return its logical insertion position even
+when Flymake displays an adjacent character."
+  (or (proofread--flymake-live-range-for-diagnostic diagnostic)
       (proofread--diagnostic-range diagnostic)))
 
 (defun proofread-diagnostic-message (diagnostic)
@@ -5190,12 +5845,10 @@ nil.  Callers may safely modify the returned records and values."
 
 (defun proofread--diagnostic-source-labels (diagnostic)
   "Return unique source labels for DIAGNOSTIC in display order."
-  (let (labels)
-    (dolist (member (proofread--diagnostic-members diagnostic))
-      (when-let* ((label (proofread--diagnostic-source-label member)))
-        (unless (member label labels)
-          (setq labels (append labels (list label))))))
-    labels))
+  (delete-dups
+   (delq nil
+         (mapcar #'proofread--diagnostic-source-label
+                 (proofread--diagnostic-members diagnostic)))))
 
 (defun proofread--diagnostic-source-summary (diagnostic)
   "Return a source summary string for DIAGNOSTIC, or nil."
@@ -5235,30 +5888,35 @@ nil.  Callers may safely modify the returned records and values."
 (defun proofread--diagnostic-suggestion-records (diagnostic)
   "Return deduplicated suggestion records for DIAGNOSTIC.
 Each record has the keys `:text', `:sources', and `:diagnostics'."
-  (let (records)
+  (let ((records-by-text (make-hash-table :test #'equal))
+        (source-tables (make-hash-table :test #'eq))
+        records)
     (dolist (member (proofread--diagnostic-members diagnostic))
       (let ((source (proofread--diagnostic-source-label member)))
         (dolist (suggestion (proofread--diagnostic-suggestions member))
-          (let ((record
-                 (cl-find suggestion records
-                          :key (lambda (entry)
-                                 (plist-get entry :text))
-                          :test #'equal)))
-            (if record
-                (progn
-                  (when (and source
-                             (not (member source
-                                          (plist-get record :sources))))
-                    (setf (plist-get record :sources)
-                          (append (plist-get record :sources)
-                                  (list source))))
-                  (setf (plist-get record :diagnostics)
-                        (append (plist-get record :diagnostics)
-                                (list member))))
-              (push (list :text suggestion
-                          :sources (and source (list source))
-                          :diagnostics (list member))
-                    records))))))
+          (let ((record (gethash suggestion records-by-text)))
+            (unless record
+              (setq record (list :text suggestion
+                                 :sources nil
+                                 :diagnostics nil))
+              (puthash suggestion record records-by-text)
+              (puthash record (make-hash-table :test #'equal)
+                       source-tables)
+              (push record records))
+            (when source
+              (let ((source-table (gethash record source-tables)))
+                (unless (gethash source source-table)
+                  (puthash source t source-table)
+                  (setf (plist-get record :sources)
+                        (cons source
+                              (plist-get record :sources))))))
+            (setf (plist-get record :diagnostics)
+                  (cons member (plist-get record :diagnostics)))))))
+    (dolist (record records)
+      (setf (plist-get record :sources)
+            (nreverse (plist-get record :sources)))
+      (setf (plist-get record :diagnostics)
+            (nreverse (plist-get record :diagnostics))))
     (nreverse records)))
 
 (defun proofread--diagnostic-aggregate-key (diagnostic beg end)
@@ -5294,9 +5952,18 @@ DIAGNOSTICS must be in navigation order."
 
 (defun proofread--diagnostic-ui-equivalent-p (left right)
   "Return non-nil when LEFT and RIGHT represent the same UI diagnostic."
-  (or (eq left right)
-      (memq left (proofread--diagnostic-members right))
-      (memq right (proofread--diagnostic-members left))))
+  (cond
+   ((eq left right) t)
+   ((and (proofread--aggregate-diagnostic-p left)
+         (proofread--aggregate-diagnostic-p right))
+    (let ((left-members (proofread--diagnostic-members left))
+          (right-members (proofread--diagnostic-members right)))
+      (and (= (length left-members) (length right-members))
+           (cl-every #'eq left-members right-members))))
+   ((proofread--aggregate-diagnostic-p left)
+    (memq right (proofread--diagnostic-members left)))
+   ((proofread--aggregate-diagnostic-p right)
+    (memq left (proofread--diagnostic-members right)))))
 
 (defun proofread-format-diagnostic-field (value)
   "Return VALUE formatted as a Proofread diagnostic field.
@@ -5311,16 +5978,16 @@ using their printed representation."
   "Return VALUE as a clean diagnostic display field, or nil.
 When SINGLE-LINE is non-nil, collapse whitespace to single spaces."
   (when value
-    (let ((field
-           (string-trim
+    (let* ((field
             (substring-no-properties
              (if (stringp value)
                  value
-               (proofread-format-diagnostic-field value))))))
+               (proofread-format-diagnostic-field value))))
+           (field (if single-line
+                      (string-clean-whitespace field)
+                    (string-trim field))))
       (unless (string-empty-p field)
-        (if single-line
-            (replace-regexp-in-string "[[:space:]]+" " " field)
-          field)))))
+        field))))
 
 (defun proofread--format-diagnostic-message-fallback
     (diagnostic single-line)
@@ -5388,6 +6055,474 @@ whitespace inside each field to single spaces."
             (propertize (fallback) 'face message-face)
           (fallback))))))
 
+;;;; Flymake conversion
+
+(cl-defstruct
+    (proofread--flymake-data
+     (:constructor
+      proofread--make-flymake-data
+      (diagnostic range anchor-edge live-beg-marker live-end-marker
+                  model-orders)))
+  "Proofread data attached to one Flymake diagnostic.
+DIAGNOSTIC is the original Proofread plist.  RANGE is its exact logical
+range at conversion time.  ANCHOR-EDGE is nil for a nonempty range,
+`:beg' or `:end' for a single-character zero-width anchor, and `:empty'
+when an empty buffer cannot provide such an anchor.  LIVE-BEG-MARKER
+and LIVE-END-MARKER track its logical live anchor without consulting
+Flymake's private overlay.  MODEL-ORDERS records the stable positions
+of DIAGNOSTIC's raw members in the core model."
+  diagnostic
+  range
+  anchor-edge
+  live-beg-marker
+  live-end-marker
+  model-orders)
+
+(defun proofread--flymake-anchor-region (range)
+  "Return Flymake anchor data for logical RANGE in the current buffer.
+The result is `(BEG END ANCHOR-EDGE)'.  A nonempty range is unchanged.
+A zero-width range uses one displayable character where possible."
+  (let ((beg (car range))
+        (end (cdr range)))
+    (cond
+     ((< beg end) (list beg end nil))
+     ((< beg (point-max)) (list beg (1+ beg) :beg))
+     ((> beg (point-min)) (list (1- beg) beg :end))
+     (t (list beg end :empty)))))
+
+(defun proofread--diagnostic-to-flymake
+    (diagnostic &optional model-orders presentation-message
+                logical-range)
+  "Convert Proofread DIAGNOSTIC for the current buffer to Flymake.
+Return nil when DIAGNOSTIC has no valid range in the widened buffer.
+MODEL-ORDERS records the core order of its raw members.  When non-nil,
+PRESENTATION-MESSAGE overrides its normal Flymake message.
+LOGICAL-RANGE overrides DIAGNOSTIC's stored range."
+  (save-restriction
+    (widen)
+    (when-let* ((range (or logical-range
+                           (proofread--diagnostic-range diagnostic)))
+                ((proofread--range-contains-p
+                  (cons (point-min) (point-max)) range)))
+      (pcase-let ((`(,beg ,end ,anchor-edge)
+                   (proofread--flymake-anchor-region range)))
+        (flymake-make-diagnostic
+         (current-buffer)
+         beg
+         end
+         proofread--flymake-diagnostic-type
+         (or presentation-message
+             (proofread-format-diagnostic-message
+              diagnostic :separator "; " :single-line t))
+         (proofread--make-flymake-data
+          diagnostic
+          range
+          anchor-edge
+          ;; Keep insertions at either logical boundary outside the
+          ;; diagnostic, matching Proofread's range contract.  The
+          ;; diagnostic commit republishes Flymake's annotation at
+          ;; the resulting live range.
+          (copy-marker beg t)
+          (copy-marker end)
+          model-orders))))))
+
+(defun proofread--flymake-to-diagnostic (flymake-diagnostic)
+  "Return the Proofread diagnostic wrapped by FLYMAKE-DIAGNOSTIC.
+Return nil unless its custom type and data wrapper both belong to
+Proofread."
+  (when (eq (flymake-diagnostic-type flymake-diagnostic)
+            proofread--flymake-diagnostic-type)
+    (when-let* ((data (flymake-diagnostic-data flymake-diagnostic))
+                ((proofread--flymake-data-p data)))
+      (proofread--flymake-data-diagnostic data))))
+
+(defun proofread--diagnostic-model-orders ()
+  "Return an `eq' table mapping current diagnostics to model order."
+  (let ((orders (make-hash-table :test #'eq))
+        (index 0))
+    (dolist (diagnostic proofread--diagnostics)
+      (puthash diagnostic index orders)
+      (setq index (1+ index)))
+    orders))
+
+(defun proofread--owned-flymake-data
+    (flymake-diagnostic model-orders)
+  "Return owned data from FLYMAKE-DIAGNOSTIC, or nil.
+An owned diagnostic must come from the current buffer's named bridge,
+carry Proofread's custom type and data tag, and represent at least one
+raw diagnostic in MODEL-ORDERS."
+  (when (and (eq (flymake-diagnostic-backend flymake-diagnostic)
+                 #'proofread--flymake-backend)
+             (eq (flymake-diagnostic-buffer flymake-diagnostic)
+                 (current-buffer))
+             (eq (flymake-diagnostic-type flymake-diagnostic)
+                 proofread--flymake-diagnostic-type))
+    (when-let* ((data (flymake-diagnostic-data flymake-diagnostic))
+                ((proofread--flymake-data-p data))
+                (diagnostic
+                 (proofread--flymake-data-diagnostic data))
+                ((cl-some
+                  (lambda (member)
+                    (gethash member model-orders))
+                  (proofread--diagnostic-members diagnostic))))
+      data)))
+
+(defun proofread--flymake-live-range-from-data (data)
+  "Return the current logical range represented by Flymake DATA."
+  (let ((beg-marker
+         (proofread--flymake-data-live-beg-marker data))
+        (end-marker
+         (proofread--flymake-data-live-end-marker data)))
+    (when (and (markerp beg-marker)
+               (markerp end-marker)
+               (eq (marker-buffer beg-marker) (current-buffer))
+               (eq (marker-buffer end-marker) (current-buffer)))
+      (let* ((anchor-beg (marker-position beg-marker))
+             (anchor-end (marker-position end-marker))
+             (edge (proofread--flymake-data-anchor-edge data))
+             (range
+              (pcase edge
+                (:beg (cons anchor-beg anchor-beg))
+                (:end (cons anchor-end anchor-end))
+                (:empty
+                 (let ((original
+                        (proofread--flymake-data-range data)))
+                   (cons (car original) (cdr original))))
+                (_ (cons anchor-beg anchor-end)))))
+        (when (and (proofread--range-valid-p range)
+                   (proofread--range-contains-p
+                    (cons (point-min) (point-max)) range))
+          range)))))
+
+(defun proofread--flymake-ui-range (flymake-diagnostic data)
+  "Return the logical UI range for FLYMAKE-DIAGNOSTIC and DATA.
+Read the annotation range through Flymake's public accessors, then
+restore the logical position of a zero-width Proofread diagnostic."
+  (let* ((anchor-beg
+          (proofread--position-integer
+           (flymake-diagnostic-beg flymake-diagnostic)))
+         (anchor-end
+          (proofread--position-integer
+           (flymake-diagnostic-end flymake-diagnostic)))
+         (edge (proofread--flymake-data-anchor-edge data))
+         (range
+          (pcase edge
+            (:beg (and anchor-beg (cons anchor-beg anchor-beg)))
+            (:end (and anchor-end (cons anchor-end anchor-end)))
+            (:empty
+             (let ((original (proofread--flymake-data-range data)))
+               (cons (car original) (cdr original))))
+            (_ (and anchor-beg anchor-end
+                    (cons anchor-beg anchor-end))))))
+    (when (and (proofread--range-valid-p range)
+               (proofread--range-contains-p
+                (cons (point-min) (point-max)) range))
+      range)))
+
+(defun proofread--flymake-data-current-member-orders
+    (data model-orders)
+  "Return current raw member and model-order pairs from DATA.
+MODEL-ORDERS maps current diagnostic identities to their model order."
+  (let ((members
+         (proofread--diagnostic-members
+          (proofread--flymake-data-diagnostic data)))
+        (snapshot-orders
+         (proofread--flymake-data-model-orders data))
+        pairs)
+    (while members
+      (let ((member (pop members))
+            (snapshot-order (pop snapshot-orders)))
+        (when-let* ((model-order (gethash member model-orders)))
+          (push (cons member (or snapshot-order model-order))
+                pairs))))
+    (nreverse pairs)))
+
+(defun proofread--owned-flymake-diagnostics
+    (&optional position model-orders)
+  "Return current owned Flymake diagnostics, optionally at POSITION.
+When non-nil, MODEL-ORDERS is the current diagnostic order table."
+  (let ((model-orders
+         (or model-orders (proofread--diagnostic-model-orders)))
+        (seen (make-hash-table :test #'eq))
+        diagnostics)
+    (dolist (flymake-diagnostic
+             (if position
+                 (flymake-diagnostics position)
+               (flymake-diagnostics)))
+      (when (and (not (gethash flymake-diagnostic seen))
+                 (proofread--owned-flymake-data
+                  flymake-diagnostic model-orders))
+        (puthash flymake-diagnostic t seen)
+        (push flymake-diagnostic diagnostics)))
+    (nreverse diagnostics)))
+
+(defun proofread--flymake-live-range-table ()
+  "Return an `eq' table of current raw diagnostics and live ranges.
+Only diagnostics published by Proofread's Flymake bridge and still in
+the core model are included.  Preserve the empty-buffer zero-width
+case that Flymake cannot represent with an overlay."
+  (save-restriction
+    (widen)
+    (let ((model-orders (proofread--diagnostic-model-orders))
+          (ranges (make-hash-table :test #'eq)))
+      (dolist (flymake-diagnostic
+               (proofread--owned-flymake-diagnostics
+                nil model-orders))
+        (let* ((data
+                (proofread--owned-flymake-data
+                 flymake-diagnostic model-orders))
+               (range
+                (proofread--flymake-live-range-from-data data)))
+          (when range
+            (dolist (member-order
+                     (proofread--flymake-data-current-member-orders
+                      data model-orders))
+              (puthash (car member-order) range ranges)))))
+      (when (and proofread--flymake-report-function
+                 (= (point-min) (point-max)))
+        (dolist (diagnostic proofread--diagnostics)
+          (when-let* ((range (proofread--diagnostic-range diagnostic))
+                      ((= (car range) (cdr range)))
+                      ((= (car range) (point-min))))
+            (puthash diagnostic range ranges))))
+      ranges)))
+
+(defun proofread--current-diagnostic-live-range
+    (diagnostic &optional live-ranges)
+  "Return DIAGNOSTIC's strict current live range, or nil.
+LIVE-RANGES is an optional table from
+`proofread--flymake-live-range-table'.  Aggregate diagnostics use the
+first current raw member.  Never fall back to stale stored positions."
+  (let ((live-ranges
+         (or live-ranges (proofread--flymake-live-range-table))))
+    (cl-loop for member in (proofread--diagnostic-members diagnostic)
+             for range = (gethash member live-ranges)
+             when range return range)))
+
+(defun proofread--flymake-live-range-for-diagnostic (diagnostic)
+  "Return DIAGNOSTIC's range from a current owned Flymake object."
+  (proofread--current-diagnostic-live-range diagnostic))
+
+(defun proofread--snapshot-live-diagnostic-ranges ()
+  "Return current raw diagnostic identities paired with live ranges."
+  (let ((live-ranges (proofread--flymake-live-range-table))
+        snapshot)
+    (dolist (diagnostic proofread--diagnostics)
+      (when-let* ((range (gethash diagnostic live-ranges)))
+        (push (cons diagnostic
+                    (cons (car range) (cdr range)))
+              snapshot)))
+    (nreverse snapshot)))
+
+(defun proofread--diagnostics-with-changed-live-ranges
+    (snapshot &optional live-ranges)
+  "Return current diagnostics whose ranges differ from SNAPSHOT.
+SNAPSHOT must have the form returned by
+`proofread--snapshot-live-diagnostic-ranges'.  LIVE-RANGES is an
+optional current strict live-range table."
+  (let ((current
+         (or live-ranges (proofread--flymake-live-range-table)))
+        changed)
+    (dolist (entry snapshot)
+      (when-let* ((range (gethash (car entry) current)))
+        (unless (equal range (cdr entry))
+          (push (car entry) changed))))
+    (nreverse changed)))
+
+(defun proofread--diagnostics-live-region
+    (diagnostics &optional live-ranges)
+  "Return a bounding live region for DIAGNOSTICS, or nil.
+LIVE-RANGES is an optional strict live-range table."
+  (let ((live-ranges
+         (or live-ranges (proofread--flymake-live-range-table)))
+        ranges)
+    (dolist (diagnostic diagnostics)
+      (when-let* ((range
+                   (proofread--current-diagnostic-live-range
+                    diagnostic live-ranges)))
+        (push range ranges)))
+    (when ranges
+      (cons (apply #'min (mapcar #'car ranges))
+            (apply #'max (mapcar #'cdr ranges))))))
+
+(defun proofread--flymake-presentation-range (range)
+  "Return the Flymake presentation range for logical RANGE.
+Return nil unless RANGE is valid in the widened current buffer."
+  (save-restriction
+    (widen)
+    (when (and (proofread--range-valid-p range)
+               (proofread--range-contains-p
+                (cons (point-min) (point-max)) range))
+      (pcase-let ((`(,beg ,end ,_anchor-edge)
+                   (proofread--flymake-anchor-region range)))
+        (cons beg end)))))
+
+(defun proofread--flymake-diagnostics-snapshot
+    (&optional region fallback-ranges)
+  "Return Flymake diagnostics for the current Proofread snapshot.
+When REGION is non-nil, return only diagnostics whose converted
+display anchors overlap it.  In an empty buffer, retain every
+converted diagnostic because no nonempty display anchor is possible.
+FALLBACK-RANGES is an optional `eq' table used when a current model
+diagnostic temporarily has no Flymake live range."
+  (save-restriction
+    (widen)
+    (let ((empty-buffer-p (= (point-min) (point-max)))
+          (model-orders (make-hash-table :test #'eq))
+          (live-ranges (proofread--flymake-live-range-table))
+          (index 0)
+          entries)
+      (dolist (diagnostic proofread--diagnostics)
+        (puthash diagnostic index model-orders)
+        (when-let* ((logical-range
+                     (or (gethash diagnostic live-ranges)
+                         (and fallback-ranges
+                              (gethash diagnostic fallback-ranges))
+                         (proofread--diagnostic-range diagnostic)))
+                    (presentation-range
+                     (proofread--flymake-presentation-range
+                      logical-range))
+                    ((or (null region)
+                         empty-buffer-p
+                         (proofread--range-overlaps-p
+                          presentation-range region))))
+          (push (list diagnostic
+                      (car logical-range)
+                      (cdr logical-range)
+                      index)
+                entries))
+        (setq index (1+ index)))
+      (setq entries
+            (proofread--aggregate-navigation-entries
+             (sort entries #'proofread--navigation-entry<)))
+      (let ((presentation-counts (make-hash-table :test #'equal))
+            (presentation-orders (make-hash-table :test #'equal)))
+        ;; Flymake's equality ignores diagnostic data.  Distinct
+        ;; Proofread UI groups can therefore collide when they have
+        ;; the same anchor and rendered message.  Count those groups
+        ;; before conversion so every group remains queryable.
+        (dolist (entry entries)
+          (let* ((diagnostic (car entry))
+                 (range (cons (nth 1 entry) (nth 2 entry)))
+                 (anchor
+                  (proofread--flymake-presentation-range range))
+                 (message
+                  (proofread-format-diagnostic-message
+                   diagnostic :separator "; " :single-line t))
+                 (key (list anchor message)))
+            (puthash key
+                     (1+ (gethash key presentation-counts 0))
+                     presentation-counts)))
+        (mapcar
+         (lambda (entry)
+           (let* ((diagnostic (car entry))
+                  (range (cons (nth 1 entry) (nth 2 entry)))
+                  (anchor
+                   (proofread--flymake-presentation-range range))
+                  (message
+                   (proofread-format-diagnostic-message
+                    diagnostic :separator "; " :single-line t))
+                  (key (list anchor message))
+                  (count (gethash key presentation-counts))
+                  (order
+                   (when (> count 1)
+                     (let ((next
+                            (1+ (gethash key presentation-orders 0))))
+                       (puthash key next presentation-orders)
+                       next))))
+             (proofread--diagnostic-to-flymake
+              diagnostic
+              (mapcar
+               (lambda (member)
+                 (gethash member model-orders))
+               (proofread--diagnostic-members diagnostic))
+              (and order
+                   (format "%s [%d/%d]" message order count))
+              range)))
+         entries)))))
+
+(defun proofread--flymake-publication-region
+    (region changed-diagnostics)
+  "Return the widened Flymake region for a diagnostic change.
+REGION is the caller's logical seed range.  Expand it to include the
+presentation anchors of CHANGED-DIAGNOSTICS.  Fall back to the full
+widened buffer when no valid affected range remains."
+  (save-restriction
+    (widen)
+    (let ((live-ranges (proofread--flymake-live-range-table))
+          ranges)
+      (when-let* ((beg (proofread--position-integer (car-safe region)))
+                  (end (proofread--position-integer (cdr-safe region)))
+                  (presentation
+                   (proofread--flymake-presentation-range
+                    (cons beg end))))
+        (push presentation ranges))
+      (dolist (diagnostic changed-diagnostics)
+        (when-let* ((logical-range
+                     (or
+                      (proofread--current-diagnostic-live-range
+                       diagnostic live-ranges)
+                      (proofread--diagnostic-range diagnostic)))
+                    (presentation
+                     (proofread--flymake-presentation-range
+                      logical-range)))
+          (push presentation ranges)))
+      (if ranges
+          (cons (apply #'min (mapcar #'car ranges))
+                (apply #'max (mapcar #'cdr ranges)))
+        (cons (point-min) (point-max))))))
+
+(defun proofread--report-flymake-warning (label error-data)
+  "Report a Flymake LABEL warning for ERROR-DATA without disruption."
+  (condition-case nil
+      (proofread-report-warning-without-window
+       (format "Proofread Flymake %s error (%S)"
+               label (proofread--condition-kind error-data))
+       (format "Flymake %s failed; see *Warnings*" label))
+    (error nil)))
+
+(defun proofread--report-flymake-snapshot
+    (report-function &optional region fallback-ranges)
+  "Publish the current snapshot through REPORT-FUNCTION.
+When REGION is non-nil, publish a regional replacement.  Convert a
+failed snapshot to an empty replacement, but let reporting errors
+propagate to the caller.  FALLBACK-RANGES follows the contract of
+`proofread--flymake-diagnostics-snapshot'."
+  (let (conversion-error)
+    (let ((diagnostics
+           (condition-case error-data
+               (cond
+                (fallback-ranges
+                 (proofread--flymake-diagnostics-snapshot
+                  region fallback-ranges))
+                (region
+                 (proofread--flymake-diagnostics-snapshot region))
+                (t
+                 (proofread--flymake-diagnostics-snapshot)))
+             (error
+              (setq conversion-error error-data)
+              nil))))
+      (if region
+          (funcall report-function diagnostics :region region)
+        (funcall report-function diagnostics)))
+    ;; Reporting the empty replacement first prevents a conversion
+    ;; failure from leaving stale Flymake diagnostics behind.
+    (when conversion-error
+      (proofread--report-flymake-warning
+       "conversion" conversion-error))))
+
+(defun proofread--flymake-backend (report-function &rest _arguments)
+  "Publish Proofread diagnostics through REPORT-FUNCTION.
+This named function is the sole Flymake backend used by Proofread."
+  (if proofread-mode
+      (progn
+        (setq proofread--flymake-report-function report-function)
+        (proofread--report-flymake-snapshot report-function))
+    ;; A backend invocation already captured by Flymake can outlive
+    ;; removal from `flymake-diagnostic-functions'.  Settle that run
+    ;; without retaining its report token.
+    (funcall report-function nil)))
+
 (defun proofread--navigation-entry< (a b)
   "Return non-nil when navigation entry A should sort before B."
   (let ((a-beg (nth 1 a))
@@ -5419,17 +6554,37 @@ whitespace inside each field to single spaces."
   "Return sorted entries for live raw diagnostics in the current buffer.
 When ACCESSIBLE-ONLY is non-nil, omit ranges outside the current
 restriction."
-  (let ((index 0)
+  (let ((accessible-range (cons (point-min) (point-max)))
+        (model-orders (proofread--diagnostic-model-orders))
         entries)
-    (dolist (diagnostic proofread--diagnostics)
-      (let ((range (proofread--diagnostic-live-range diagnostic)))
-        (when (and range
-                   (or (not accessible-only)
-                       (and (<= (point-min) (car range))
-                            (<= (cdr range) (point-max)))))
-          (push (list diagnostic (car range) (cdr range) index)
-                entries)))
-      (setq index (1+ index)))
+    (save-restriction
+      (widen)
+      (dolist (flymake-diagnostic
+               (proofread--owned-flymake-diagnostics
+                nil model-orders))
+        (let* ((data
+                (proofread--owned-flymake-data
+                 flymake-diagnostic model-orders))
+               (range
+                (proofread--flymake-ui-range
+                 flymake-diagnostic data))
+               (member-orders
+                (proofread--flymake-data-current-member-orders
+                 data model-orders)))
+          (when (and range
+                     (or (not accessible-only)
+                         (proofread--range-contains-p
+                          accessible-range range)))
+            (dolist (member-order member-orders)
+              (push (list (car member-order)
+                          (car range)
+                          (cdr range)
+                          (cdr member-order))
+                    entries)))))
+      (when (and (null entries)
+                 (= (point-min) (point-max)))
+        (setq entries
+              (proofread--empty-buffer-navigation-entries))))
     (sort entries #'proofread--navigation-entry<)))
 
 (defun proofread--aggregate-navigation-entries (entries)
@@ -5450,14 +6605,14 @@ restriction."
                             :index index
                             :diagnostics nil))
           (puthash key group groups)
-          (setq ordered-groups (append ordered-groups
-                                       (list group))))
+          (push group ordered-groups))
         (setf (plist-get group :diagnostics)
-              (append (plist-get group :diagnostics)
-                      (list diagnostic)))))
+              (cons diagnostic
+                    (plist-get group :diagnostics)))))
     (mapcar
      (lambda (group)
-       (let* ((diagnostics (plist-get group :diagnostics))
+       (let* ((diagnostics
+               (nreverse (plist-get group :diagnostics)))
               (diagnostic
                (if (cdr diagnostics)
                    (proofread--make-aggregate-diagnostic
@@ -5469,7 +6624,7 @@ restriction."
                (plist-get group :beg)
                (plist-get group :end)
                (plist-get group :index))))
-     ordered-groups)))
+     (nreverse ordered-groups))))
 
 (defun proofread--navigation-entries (&optional accessible-only)
   "Return sorted UI diagnostics for navigation.
@@ -5494,14 +6649,16 @@ restriction."
       (car entry) diagnostic))
    entries))
 
-(defun proofread--range-covers-position-p (range position)
-  "Return non-nil when RANGE covers POSITION."
-  (let ((point-position (proofread--position-integer position)))
-    (and point-position
-         (<= (car range) point-position)
-         (or (< point-position (cdr range))
-             (and (= (car range) (cdr range))
-                  (= point-position (car range)))))))
+(defun proofread--navigation-range-for-diagnostic
+    (diagnostic &optional entries)
+  "Return DIAGNOSTIC's current Flymake-backed UI range, or nil.
+ENTRIES is an optional result from `proofread--navigation-entries'.
+By default, query the whole buffer regardless of narrowing."
+  (when-let* ((entry
+               (proofread--navigation-entry-for-diagnostic
+                diagnostic
+                (or entries (proofread--navigation-entries)))))
+    (cons (nth 1 entry) (nth 2 entry))))
 
 (defun proofread--diagnostic-ignore-key (diagnostic)
   "Return the session ignore key for DIAGNOSTIC."
@@ -5549,62 +6706,48 @@ restriction."
   "Return non-nil when DIAGNOSTIC matches ignore KEY."
   (equal (proofread--diagnostic-ignore-key diagnostic) key))
 
-(defun proofread--diagnostics-matching-ignore-key (key)
-  "Return current buffer diagnostics matching ignore KEY."
+(defun proofread--diagnostics-matching-ignore-keys (keys)
+  "Return current buffer diagnostics matching one of ignore KEYS."
   (let (diagnostics)
     (dolist (diagnostic proofread--diagnostics)
-      (when (proofread--diagnostic-matches-ignore-key-p
-             diagnostic key)
+      (when (cl-some
+             (lambda (key)
+               (proofread--diagnostic-matches-ignore-key-p
+                diagnostic key))
+             keys)
         (push diagnostic diagnostics)))
     (nreverse diagnostics)))
 
-(defun proofread--delete-overlays-matching-ignore-key (key)
-  "Delete proofread-owned overlays matching ignore KEY."
-  (proofread--prune-overlays)
-  (dolist (overlay proofread--overlays)
-    (let ((diagnostic (overlay-get overlay 'proofread-diagnostic)))
-      (when (and diagnostic
-                 (proofread--diagnostic-matches-ignore-key-p
-                  diagnostic key))
-        (proofread--delete-overlay overlay))))
-  (proofread--prune-overlays))
-
-(defun proofread--remove-local-diagnostics-matching-ignore-key (key)
-  "Remove this buffer's diagnostics and overlays matching KEY."
+(defun proofread--remove-local-diagnostics-matching-ignore-keys (keys)
+  "Remove this buffer's diagnostics matching ignore KEYS in one commit."
   (let ((diagnostics
-         (proofread--diagnostics-matching-ignore-key key)))
-    (proofread--delete-overlays-matching-ignore-key key)
-    (proofread--remove-diagnostics diagnostics)
-    (when (and proofread--current-diagnostic
-               (cl-some
-                (lambda (diagnostic)
-                  (proofread--diagnostic-matches-ignore-key-p
-                   diagnostic key))
-                (proofread--diagnostic-members
-                 proofread--current-diagnostic)))
-      (setq proofread--current-diagnostic nil))
+         (proofread--diagnostics-matching-ignore-keys keys)))
     (when diagnostics
-      (proofread--run-diagnostics-changed-hook))
-    diagnostics))
+      (let ((region
+             (proofread--diagnostics-live-region diagnostics)))
+        (proofread--commit-diagnostic-state
+         region
+         (lambda ()
+           (proofread--remove-diagnostics diagnostics)))))))
 
-(defun proofread--remove-diagnostics-matching-ignore-key (key)
-  "Remove diagnostics matching ignore KEY from all Proofread buffers."
+(defun proofread--remove-diagnostics-matching-ignore-keys (keys)
+  "Remove diagnostics matching ignore KEYS from all Proofread buffers.
+Return removed diagnostics in mode-buffer and model order."
   (let (removed)
     (proofread--prune-mode-buffers)
-    (dolist (buffer proofread--mode-buffers)
-      (with-current-buffer buffer
-        (setq
-         removed
-         (nconc
-          removed
-          (proofread--remove-local-diagnostics-matching-ignore-key
-           key)))))
-    removed))
+    (dolist (buffer (copy-sequence proofread--mode-buffers))
+      (when (proofread--live-mode-buffer-p buffer)
+        (let ((local-removed
+               (with-current-buffer buffer
+                 (proofread--remove-local-diagnostics-matching-ignore-keys
+                  keys))))
+          (dolist (diagnostic local-removed)
+            (push diagnostic removed)))))
+    (nreverse removed)))
 
-(defun proofread--next-diagnostic-after (position)
-  "Return the nearest diagnostic strictly after POSITION."
-  (let* ((entries (proofread--navigation-entries t))
-         (point-position (proofread--position-integer position))
+(defun proofread--next-navigation-entry-after (position entries)
+  "Return the nearest navigation entry after POSITION in ENTRIES."
+  (let* ((point-position (proofread--position-integer position))
          (candidate
           (and proofread--current-diagnostic
                (proofread--navigation-entry-for-diagnostic
@@ -5615,16 +6758,15 @@ restriction."
                         point-position)
                        candidate)))
     (if current
-        (car (cadr (memq current entries)))
+        (cadr (memq current entries))
       (when point-position
-        (car (cl-find-if (lambda (entry)
-                           (> (nth 1 entry) point-position))
-                         entries))))))
+        (cl-find-if (lambda (entry)
+                      (> (nth 1 entry) point-position))
+                    entries)))))
 
-(defun proofread--previous-diagnostic-before (position)
-  "Return the nearest diagnostic strictly before POSITION."
-  (let* ((entries (proofread--navigation-entries t))
-         (point-position (proofread--position-integer position))
+(defun proofread--previous-navigation-entry-before (position entries)
+  "Return the nearest navigation entry before POSITION in ENTRIES."
+  (let* ((point-position (proofread--position-integer position))
          (candidate
           (and proofread--current-diagnostic
                (proofread--navigation-entry-for-diagnostic
@@ -5640,82 +6782,84 @@ restriction."
           (dolist (entry entries)
             (when (eq entry current)
               (throw 'current previous))
-            (setq previous (car entry)))
+            (setq previous entry))
           previous)
       (when point-position
         (dolist (entry entries)
           (when (< (nth 1 entry) point-position)
-            (setq previous (car entry))))
+            (setq previous entry)))
         previous))))
 
 (defun proofread--clear-current-diagnostic ()
-  "Clear the current diagnostic and its highlight face."
-  (when proofread--current-diagnostic
-    (dolist (overlay
-             (proofread--overlays-for-diagnostic
-              proofread--current-diagnostic))
-      (overlay-put overlay 'face 'proofread-face)))
+  "Clear the current navigation diagnostic."
   (setq proofread--current-diagnostic nil))
 
-(defun proofread--overlay-for-diagnostic (diagnostic)
-  "Return this buffer's proofread overlay for DIAGNOSTIC."
-  (let ((overlay
-         (and (hash-table-p proofread--diagnostic-overlays)
-              (gethash diagnostic proofread--diagnostic-overlays))))
-    (if (and (proofread--current-buffer-overlay-p overlay)
-             (eq (overlay-get overlay 'proofread-diagnostic)
-                 diagnostic))
-        overlay
-      (when (and overlay
-                 (hash-table-p proofread--diagnostic-overlays))
-        (remhash diagnostic proofread--diagnostic-overlays))
-      nil)))
-
-(defun proofread--overlays-for-diagnostic (diagnostic)
-  "Return this buffer's proofread overlays for DIAGNOSTIC."
-  (delq nil
-        (mapcar #'proofread--overlay-for-diagnostic
-                (proofread--diagnostic-members diagnostic))))
-
-(defun proofread--local-navigation-entry (overlay position)
-  "Return OVERLAY's navigation entry when it covers POSITION.
-Return nil unless OVERLAY is the canonical live overlay for its raw
-diagnostic in the current buffer."
-  (when (proofread--current-buffer-overlay-p overlay)
-    (let ((diagnostic
-           (overlay-get overlay 'proofread-diagnostic))
-          (beg (overlay-start overlay))
-          (end (overlay-end overlay))
-          (insertion-ordinal
-           (overlay-get
-            overlay 'proofread-diagnostic-insertion-ordinal)))
-      (when (and (hash-table-p proofread--diagnostic-overlays)
-                 (eq (gethash diagnostic
-                              proofread--diagnostic-overlays)
-                     overlay)
-                 beg end
-                 (natnump insertion-ordinal)
-                 (proofread--range-covers-position-p
-                  (cons beg end) position))
-        (list diagnostic beg end insertion-ordinal)))))
-
-(defun proofread--local-navigation-entries-at (position)
-  "Return sorted live navigation entries covering POSITION."
+(defun proofread--owned-flymake-diagnostics-at
+    (position model-orders)
+  "Return unique owned Flymake diagnostics relevant to POSITION.
+MODEL-ORDERS is the current diagnostic order table."
   (let ((seen (make-hash-table :test #'eq))
+        diagnostics)
+    ;; A zero-width logical position at the end of a nonempty buffer
+    ;; is displayed on the preceding character.  Query both possible
+    ;; anchors, then restore and test the logical range below.
+    (dolist (probe (if (> position (point-min))
+                       (list position (1- position))
+                     (list position)))
+      (dolist (flymake-diagnostic
+               (proofread--owned-flymake-diagnostics
+                probe model-orders))
+        (unless (gethash flymake-diagnostic seen)
+          (puthash flymake-diagnostic t seen)
+          (push flymake-diagnostic diagnostics))))
+    (nreverse diagnostics)))
+
+(defun proofread--flymake-navigation-entries-at (position)
+  "Return sorted owned Flymake navigation entries at POSITION."
+  (let ((model-orders (proofread--diagnostic-model-orders))
         entries)
-    ;; `overlays-at' includes ordinary overlays at their front
-    ;; boundary; an empty `overlays-in' query additionally finds
-    ;; zero-width ones.  Ordinary overlays may occur in both results.
-    (dolist (overlay
-             (append (overlays-at position)
-                     (overlays-in position position)))
-      (unless (gethash overlay seen)
-        (puthash overlay t seen)
-        (when-let* ((entry
-                     (proofread--local-navigation-entry
-                      overlay position)))
-          (push entry entries))))
+    (dolist (flymake-diagnostic
+             (proofread--owned-flymake-diagnostics-at
+              position model-orders))
+      (let* ((data
+              (proofread--owned-flymake-data
+               flymake-diagnostic model-orders))
+             (range
+              (proofread--flymake-ui-range
+               flymake-diagnostic data))
+             (member-orders
+              (proofread--flymake-data-current-member-orders
+               data model-orders)))
+        (when (and range
+                   (proofread--range-covers-position-p
+                    range position))
+          (dolist (member-order member-orders)
+            (push (list (car member-order)
+                        (car range)
+                        (cdr range)
+                        (cdr member-order))
+                  entries)))))
     (sort entries #'proofread--navigation-entry<)))
+
+(defun proofread--empty-buffer-navigation-entries ()
+  "Return model entries for Flymake's empty-buffer limitation.
+Flymake does not retain a zero-width diagnostic overlay in an empty
+buffer, so its public query cannot enumerate the bridge report."
+  (when (and proofread--flymake-report-function
+             (= (point-min) (point-max)))
+    (let ((index 0)
+          entries)
+      (dolist (diagnostic proofread--diagnostics)
+        (when-let* ((range (proofread--diagnostic-range diagnostic))
+                    ((proofread--range-contains-p
+                      (cons (point-min) (point-max)) range)))
+          (push (list diagnostic
+                      (car range)
+                      (cdr range)
+                      index)
+                entries))
+        (setq index (1+ index)))
+      (sort entries #'proofread--navigation-entry<))))
 
 (defun proofread--aggregate-local-navigation-entry (entry entries)
   "Return the UI diagnostic for winning local ENTRY among ENTRIES."
@@ -5741,10 +6885,16 @@ diagnostic in the current buffer."
 
 (defun proofread-diagnostic-at-point (&optional position)
   "Return the live proofreading diagnostic at POSITION or point.
-A diagnostic is live only while its proofread-owned overlay exists in
-the current buffer.  An aggregate may be freshly allocated on every
-call, so callers must not rely on `eq' identity across calls.  Compare
-values from `proofread-diagnostic-range',
+A diagnostic normally is live only while the current Proofread
+Flymake bridge reports it in this buffer.  A zero-width diagnostic in
+an empty buffer remains queryable while the bridge is active because
+Flymake has no character on which to display it.  Diagnostics from
+other Flymake backends are ignored.  An aggregate may be freshly
+allocated on every call, so callers must not rely on `eq' identity
+across calls.  Zero-width diagnostics match their logical insertion
+position rather than the adjacent character used for Flymake
+presentation.
+Compare values from `proofread-diagnostic-range',
 `proofread-diagnostic-message', `proofread-diagnostic-message-entries',
 and `proofread-diagnostic-text' instead."
   (when-let* ((point-position
@@ -5754,195 +6904,23 @@ and `proofread-diagnostic-text' instead."
       (when (and (<= (point-min) point-position)
                  (<= point-position (point-max)))
         (when-let* ((entries
-                     (proofread--local-navigation-entries-at
-                      point-position)))
+                     (or (proofread--flymake-navigation-entries-at
+                          point-position)
+                         (let ((fallback
+                                (proofread--empty-buffer-navigation-entries)))
+                           (cl-remove-if-not
+                            (lambda (entry)
+                              (proofread--range-covers-position-p
+                               (cons (nth 1 entry) (nth 2 entry))
+                               point-position))
+                            fallback)))))
           (proofread--aggregate-local-navigation-entry
            (car entries) entries))))))
 
-(defun proofread--echo-area-message (diagnostic)
-  "Return the echo-area message for DIAGNOSTIC."
-  (let ((message
-         (proofread-format-diagnostic-message
-          diagnostic
-          :separator "; "
-          :source-face 'proofread-echo-area-source-face
-          :message-face 'proofread-echo-area-message-face
-          :single-line t)))
-    (add-text-properties
-     0 (length message)
-     (list 'proofread--echo-area-message (current-buffer))
-     message)
-    message))
-
-(defun proofread--eldoc-function (callback &rest _ignored)
-  "Report the Proofread diagnostic at point through CALLBACK."
-  (when (and proofread-mode proofread-echo-area-messages)
-    (when-let* ((diagnostic (proofread-diagnostic-at-point))
-                (message (proofread--echo-area-message diagnostic)))
-      (funcall callback message :echo message))))
-
-(defun proofread--echo-area-owned-message-p (message)
-  "Return non-nil when this buffer owns Proofread MESSAGE."
-  (and (stringp message)
-       (> (length message) 0)
-       (text-property-any
-        0 (length message)
-        'proofread--echo-area-message (current-buffer) message)))
-
-(defun proofread--echo-area-refresh-permitted-p (&optional after-command)
-  "Return non-nil when Proofread may refresh the echo area now.
-When AFTER-COMMAND is non-nil, do not treat `this-command' as an
-in-progress command."
-  (and eldoc-mode
-       (or after-command (null this-command))
-       (eq (window-buffer (selected-window)) (current-buffer))
-       (not (active-minibuffer-window))
-       (eldoc-display-message-no-interference-p)
-       (let ((current (current-message)))
-         (or (null current)
-             (proofread--echo-area-owned-message-p current)))))
-
-(defun proofread--echo-area-clear-current-message ()
-  "Forget ElDoc state owned by Proofread in the current buffer."
-  (when (proofread--echo-area-owned-message-p (current-message))
-    (eldoc-display-in-echo-area nil t))
-  (when (proofread--echo-area-owned-message-p eldoc-last-message)
-    (setq eldoc-last-message nil)))
-
-(defun proofread--configure-echo-area (enabled)
-  "Configure Proofread's echo-area integration for ENABLED."
-  (if enabled
-      (unless eldoc-mode
-        (eldoc-mode 1)
-        (setq proofread--eldoc-mode-owned-p (and eldoc-mode t)))
-    (proofread--cancel-echo-area-refresh)
-    (proofread--echo-area-clear-current-message)
-    (when proofread--eldoc-mode-owned-p
-      (setq proofread--eldoc-mode-owned-p nil)
-      (when eldoc-mode
-        (eldoc-mode -1)))))
-
-(defun proofread--display-echo-area-message (message)
-  "Display Proofread MESSAGE through ElDoc's echo-area frontend."
-  (eldoc-display-in-echo-area
-   (list
-    (list message
-          :origin #'proofread--eldoc-function
-          :echo message))
-   t))
-
-(defun proofread--refresh-echo-area-now (&optional after-command)
-  "Refresh Proofread's echo-area message when permitted.
-When AFTER-COMMAND is non-nil, the command has finished and may no
-longer be treated as in progress.  Return non-nil when the refresh
-gate permitted an update."
-  (when (proofread--echo-area-refresh-permitted-p after-command)
-    (if-let* ((diagnostic
-               (and proofread-mode
-                    proofread-echo-area-messages
-                    (proofread-diagnostic-at-point)))
-              (message (proofread--echo-area-message diagnostic)))
-        (proofread--display-echo-area-message message)
-      (proofread--echo-area-clear-current-message))
-    t))
-
-(defun proofread--cancel-echo-area-refresh ()
-  "Cancel a pending Proofread echo-area refresh."
-  (setq proofread--echo-area-refresh-pending-p nil)
-  (remove-hook 'post-command-hook
-               #'proofread--retry-echo-area-refresh t))
-
-(defun proofread--retry-echo-area-refresh ()
-  "Retry a guarded Proofread echo-area refresh after a command."
-  (cond
-   ((not (and proofread-mode
-              proofread-echo-area-messages
-              eldoc-mode))
-    (proofread--cancel-echo-area-refresh))
-   ((proofread--refresh-echo-area-now t)
-    (proofread--cancel-echo-area-refresh))))
-
-(defun proofread--queue-echo-area-refresh ()
-  "Retry Proofread's echo-area refresh after the next safe command."
-  (setq proofread--echo-area-refresh-pending-p t)
-  (add-hook 'post-command-hook
-            #'proofread--retry-echo-area-refresh nil t))
-
-(defun proofread--refresh-echo-area ()
-  "Refresh Proofread's ElDoc message after diagnostics change."
-  (cond
-   ((not (and proofread-mode
-              proofread-echo-area-messages
-              eldoc-mode))
-    (proofread--cancel-echo-area-refresh))
-   ((proofread--refresh-echo-area-now)
-    (proofread--cancel-echo-area-refresh))
-   (t
-    (proofread--queue-echo-area-refresh))))
-
-(defun proofread--enable-echo-area ()
-  "Enable Proofread's echo-area integration in the current buffer."
-  (add-hook 'eldoc-documentation-functions
-            #'proofread--eldoc-function nil t)
-  (add-hook 'proofread-diagnostics-changed-hook
-            #'proofread--refresh-echo-area nil t)
-  (proofread--configure-echo-area proofread-echo-area-messages))
-
-(defun proofread--disable-echo-area ()
-  "Disable Proofread's echo-area integration in the current buffer."
-  (proofread--cancel-echo-area-refresh)
-  (remove-hook 'proofread-diagnostics-changed-hook
-               #'proofread--refresh-echo-area t)
-  (remove-hook 'eldoc-documentation-functions
-               #'proofread--eldoc-function t)
-  (proofread--echo-area-clear-current-message)
-  (when proofread--eldoc-mode-owned-p
-    (setq proofread--eldoc-mode-owned-p nil)
-    (when eldoc-mode
-      (eldoc-mode -1))))
-
-(defun proofread--configure-echo-area-in-buffer (buffer enabled)
-  "Configure Proofread echo display in BUFFER for ENABLED."
-  (when (buffer-live-p buffer)
-    (with-current-buffer buffer
-      (when proofread-mode
-        (proofread--configure-echo-area enabled)))))
-
-(defun proofread--configure-default-echo-area (symbol enabled)
-  "Configure non-local SYMBOL users for default value ENABLED."
-  (dolist (buffer (copy-sequence proofread--mode-buffers))
-    (when (and (buffer-live-p buffer)
-               (not (local-variable-p symbol buffer)))
-      (proofread--configure-echo-area-in-buffer buffer enabled))))
-
-(defun proofread--echo-area-option-watcher
-    (symbol value operation where)
-  "Synchronize echo display when SYMBOL receives VALUE.
-OPERATION describes the variable change, and WHERE is its buffer or
-nil for a change to the default."
-  (pcase operation
-    ((or 'set 'let 'unlet)
-     (if (and (buffer-live-p where)
-              (or (eq operation 'set)
-                  (local-variable-p symbol where)))
-         (proofread--configure-echo-area-in-buffer where value)
-       ;; A dynamic binding of the default may report the buffer that
-       ;; initiated it even though that buffer has no local value.
-       (unless (equal value (default-value symbol))
-         (proofread--configure-default-echo-area symbol value))))
-    ('makunbound
-     (when (buffer-live-p where)
-       ;; `kill-local-variable' reports nil as VALUE before exposing
-       ;; the default value, so synchronize to that default directly.
-       (proofread--configure-echo-area-in-buffer
-        where (default-value symbol))))))
-
 (defun proofread--mark-current-diagnostic (diagnostic)
-  "Mark DIAGNOSTIC current and update its overlay face."
+  "Mark DIAGNOSTIC as the current navigation diagnostic."
   (proofread--clear-current-diagnostic)
   (setq proofread--current-diagnostic diagnostic)
-  (dolist (overlay (proofread--overlays-for-diagnostic diagnostic))
-    (overlay-put overlay 'face 'proofread-current-face))
   diagnostic)
 
 ;;;; Request listings
@@ -5954,6 +6932,63 @@ nil for a change to the default."
           (make-hash-table :test #'equal)))
   proofread--request-log-records)
 
+(defun proofread--request-log-record-sequence (record)
+  "Return RECORD's chronological sequence number."
+  (or (plist-get record :log-id)
+      (plist-get record :request-id)
+      0))
+
+(defun proofread--request-log-insert-key (records order key)
+  "Insert new KEY into ORDER and evict its old RECORDS entry.
+Return non-nil when ORDER has capacity for KEY."
+  (unless (zerop (ring-size order))
+    (let ((evicted
+           (and (= (ring-length order) (ring-size order))
+                (ring-ref order (1- (ring-length order))))))
+      (ring-insert order key)
+      (when evicted
+        (remhash evicted records)))
+    t))
+
+(defun proofread--request-log-rebuild-order (records limit)
+  "Return a LIMIT-sized order ring rebuilt from RECORDS.
+Remove records older than LIMIT from RECORDS."
+  (let* ((order (make-ring limit))
+         (legacy-keys
+          (and (proper-list-p proofread--request-log-order)
+               proofread--request-log-order))
+         (keys
+          (or legacy-keys
+              (mapcar
+               (lambda (record)
+                 (plist-get record :key))
+               (sort
+                (hash-table-values records)
+                (lambda (a b)
+                  (< (proofread--request-log-record-sequence a)
+                     (proofread--request-log-record-sequence b))))))))
+    (if (zerop limit)
+        (clrhash records)
+      (dolist (key keys)
+        (when (gethash key records)
+          (proofread--request-log-insert-key records order key))))
+    order))
+
+(defun proofread--request-log-ensure-order (records)
+  "Return the current order ring synchronized with RECORDS."
+  (let ((limit (max 0 proofread-request-log-max-records)))
+    (if (ring-p proofread--request-log-order)
+        (unless (= (ring-size proofread--request-log-order) limit)
+          (let ((evicted
+                 (nthcdr limit
+                         (ring-elements proofread--request-log-order))))
+            (ring-resize proofread--request-log-order limit)
+            (dolist (key evicted)
+              (remhash key records))))
+      (setq proofread--request-log-order
+            (proofread--request-log-rebuild-order records limit)))
+    proofread--request-log-order))
+
 (defun proofread--request-log-event-request (event)
   "Return the proofread request stored in EVENT."
   (or (plist-get event :request)
@@ -5963,14 +6998,13 @@ nil for a change to the default."
   "Return the request record key for EVENT."
   (let ((request (proofread--request-log-event-request event)))
     (or (plist-get event :log-id)
-        (plist-get request :log-id)
         (plist-get event :request-id)
         (plist-get request :id))))
 
-(defun proofread--request-log-plist-append (plist property value)
-  "Return PLIST with VALUE appended to list PROPERTY."
+(defun proofread--request-log-plist-push (plist property value)
+  "Return PLIST with VALUE prepended to list PROPERTY."
   (plist-put plist property
-             (append (plist-get plist property) (list value))))
+             (cons value (plist-get plist property))))
 
 (defun proofread--request-log-record-status (type event)
   "Return the request status implied by event TYPE and EVENT."
@@ -6005,8 +7039,7 @@ nil for a change to the default."
     record))
 
 (defun proofread--request-log-apply-event (record event)
-  "Return RECORD updated with request lifecycle EVENT."
-  (setq event (proofread--request-log-safe-event event))
+  "Return RECORD updated with canonical request lifecycle EVENT."
   (let* ((type (plist-get event :type))
          (time (plist-get event :time))
          (request (proofread--request-log-event-request event))
@@ -6017,7 +7050,7 @@ nil for a change to the default."
       (setq record (plist-put record :created-at time)))
     (setq record (plist-put record :updated-at time))
     (setq record
-          (proofread--request-log-plist-append
+          (proofread--request-log-plist-push
            record :events event))
     (when status
       (setq record (plist-put record :status status)))
@@ -6028,15 +7061,15 @@ nil for a change to the default."
                         (plist-get event :chunk))))
       ('backend-request
        (setq record
-             (proofread--request-log-plist-append
+             (proofread--request-log-plist-push
               record :backend-requests event)))
       ('backend-response
        (setq record
-             (proofread--request-log-plist-append
+             (proofread--request-log-plist-push
               record :backend-responses event)))
       ('backend-result
        (setq record
-             (proofread--request-log-plist-append
+             (proofread--request-log-plist-push
               record :backend-results (plist-get event :result))))
       ('cache-hit
        (setq record (plist-put record :cache-entry
@@ -6055,69 +7088,16 @@ nil for a change to the default."
                           (plist-get event property))))))
     record))
 
-(defun proofread--request-log-safe-record (record)
-  "Return a detached safe representation of request RECORD."
+(defun proofread--request-log-copy-record (record)
+  "Return a detached public copy of canonical request RECORD."
   (when (proper-list-p record)
-    (let ((safe
-           (proofread--request-log-copy-properties
-            record
-            '( :key :source-buffer :log-id :request-id :buffer
-               :beg :end :created-at :updated-at :status
-               :profile :checker-name :backend :phase
-               :final-status))))
-      (when (plist-member record :error)
-        (setq safe
-              (plist-put safe :error
-                         (proofread--condition-kind
-                          (plist-get record :error)))))
-      (when (plist-member record :message)
-        (setq safe (plist-put safe :message
-                              "Backend request failed")))
-      (when (plist-member record :request)
-        (setq safe
-              (plist-put safe :request
-                         (proofread--request-log-safe-request
-                          (plist-get record :request)))))
-      (when (plist-member record :chunk)
-        (setq safe
-              (plist-put safe :chunk
-                         (proofread--request-log-safe-chunk
-                          (plist-get record :chunk)))))
-      (when (proper-list-p (plist-get record :events))
-        (setq safe
-              (plist-put
-               safe :events
-               (mapcar #'proofread--request-log-safe-event
-                       (plist-get record :events)))))
-      (when (proper-list-p (plist-get record :backend-requests))
-        (setq safe
-              (plist-put
-               safe :backend-requests
-               (mapcar #'proofread--request-log-safe-event
-                       (plist-get record :backend-requests)))))
-      (when (proper-list-p (plist-get record :backend-responses))
-        (setq safe
-              (plist-put
-               safe :backend-responses
-               (mapcar #'proofread--request-log-safe-event
-                       (plist-get record :backend-responses)))))
-      (when (proper-list-p (plist-get record :backend-results))
-        (setq safe
-              (plist-put
-               safe :backend-results
-               (mapcar #'proofread--request-log-safe-result
-                       (plist-get record :backend-results)))))
-      (when (plist-member record :final-result)
-        (setq safe
-              (plist-put safe :final-result
-                         (proofread--request-log-safe-result
-                          (plist-get record :final-result)))))
-      (when (plist-member record :cache-entry)
-        (setq safe
-              (plist-put safe :cache-entry
-                         (proofread--request-log-safe-cache-entry
-                          (plist-get record :cache-entry)))))
-      safe)))
+    (let ((copy (proofread--request-log-copy-safe-value record)))
+      (dolist (property proofread--request-log-history-properties)
+        (when (plist-member copy property)
+          (setq copy
+                (plist-put copy property
+                           (nreverse (plist-get copy property))))))
+      copy)))
 
 (defun proofread--request-log-source-enabled-p (source)
   "Return non-nil when SOURCE records proofread request events."
@@ -6125,48 +7105,61 @@ nil for a change to the default."
        (with-current-buffer source
          proofread--request-log-enabled)))
 
-(defun proofread--request-log-record-event (event)
-  "Record a proofread request EVENT when its buffer is monitored."
-  (setq event (proofread--request-log-safe-event event))
+(defun proofread--request-log-record-canonical-event (event)
+  "Record canonical EVENT when its source buffer is monitored."
   (let ((source (plist-get event :buffer))
         (key (proofread--request-log-event-key event)))
     (when (and key (proofread--request-log-source-enabled-p source))
       (with-current-buffer source
         (let* ((records (proofread--request-log-ensure-records))
-               (record (or (gethash key records)
-                           (list :key key
-                                 :source-buffer source))))
-          (setq record
-                (proofread--request-log-safe-record
-                 (proofread--request-log-apply-event record event)))
-          (puthash key record records)
-          (unless (member key proofread--request-log-order)
-            (setq proofread--request-log-order
-                  (append proofread--request-log-order (list key))))
-          (let ((limit (max 0 proofread-request-log-max-records)))
-            (while (> (length proofread--request-log-order) limit)
-              (remhash (pop proofread--request-log-order) records))))
+               (record (gethash key records))
+               (order (proofread--request-log-ensure-order records)))
+          (if record
+              (when (gethash key records)
+                (puthash
+                 key
+                 (proofread--request-log-apply-event record event)
+                 records))
+            (when (proofread--request-log-insert-key
+                   records order key)
+              (puthash
+               key
+               (proofread--request-log-apply-event
+                (list :key key :source-buffer source)
+                event)
+               records))))
         (proofread--schedule-request-log-refresh)))))
+
+(defun proofread--request-log-record-event (raw-event)
+  "Safely record RAW-EVENT when its source buffer is monitored."
+  (let ((event (proofread--request-log-safe-event raw-event)))
+    (proofread--request-log-record-canonical-event event)
+    (proofread--request-log-copy-safe-value event)))
 
 (defun proofread--request-log-record-list (&optional source)
   "Return proofread request records for SOURCE or the current buffer."
-  (with-current-buffer (or source (current-buffer))
-    (sort
-     (hash-table-values (proofread--request-log-ensure-records))
-     (lambda (a b)
-       (< (or (plist-get a :log-id)
-              (plist-get a :request-id)
-              0)
-          (or (plist-get b :log-id)
-              (plist-get b :request-id)
-              0))))))
+  (let ((source (get-buffer (or source (current-buffer)))))
+    (when (buffer-live-p source)
+      (with-current-buffer source
+        (let* ((records (proofread--request-log-ensure-records))
+               (order (proofread--request-log-ensure-order records)))
+          (delq
+           nil
+           (mapcar
+            (lambda (key)
+              (when-let* ((record (gethash key records)))
+                (proofread--request-log-copy-record record)))
+            (nreverse (ring-elements order)))))))))
 
 (defun proofread--request-log-lookup-record (source key)
   "Return request record KEY from SOURCE."
   (when (buffer-live-p source)
     (with-current-buffer source
-      (and (hash-table-p proofread--request-log-records)
-           (gethash key proofread--request-log-records)))))
+      (when (hash-table-p proofread--request-log-records)
+        (proofread--request-log-ensure-order
+         proofread--request-log-records)
+        (proofread--request-log-copy-record
+         (gethash key proofread--request-log-records))))))
 
 (defun proofread--request-log-source-range-valid-p (source beg end)
   "Return non-nil when BEG to END is valid in SOURCE."
@@ -6174,11 +7167,10 @@ nil for a change to the default."
        (with-current-buffer source
          (save-restriction
            (widen)
-           (and (integerp beg)
-                (integerp end)
-                (<= (point-min) beg)
-                (<= beg end)
-                (<= end (point-max)))))))
+           (let ((range (cons beg end)))
+             (and (proofread--range-valid-p range)
+                  (proofread--range-contains-p
+                   (cons (point-min) (point-max)) range)))))))
 
 (defun proofread--request-log-record-range (record)
   "Return RECORD's source range as a cons cell, or nil."
@@ -6188,7 +7180,7 @@ nil for a change to the default."
       (cons beg end))))
 
 (defun proofread--request-log-record-line-column (record)
-  "Return RECORD's source line and column as a cons cell."
+  "Return RECORD's source line and zero-based display column."
   (let* ((source (plist-get record :source-buffer))
          (range (proofread--request-log-record-range record))
          (beg (car-safe range))
@@ -6200,7 +7192,7 @@ nil for a change to the default."
           (save-excursion
             (goto-char beg)
             (cons (line-number-at-pos)
-                  (- (point) (line-beginning-position)))))))))
+                  (current-column))))))))
 
 (defun proofread--request-log-record-current-text (record)
   "Return RECORD's current source text, or nil when stale."
@@ -6227,10 +7219,7 @@ nil for a change to the default."
                 ((stringp value) value)
                 ((symbolp value) (symbol-name value))
                 (t (format "%S" value))))
-         (single-line (string-trim
-                       (replace-regexp-in-string "[[:space:]\n\r]+"
-                                                 " "
-                                                 text))))
+         (single-line (string-clean-whitespace text)))
     (if (and width (> (string-width single-line) width))
         (truncate-string-to-width single-line width nil nil "...")
       single-line)))
@@ -6326,49 +7315,37 @@ nil for a change to the default."
   "Fit proofread list WINDOW to its buffer."
   (fit-window-to-buffer window 15 8))
 
-(defun proofread--request-log-source-buffer (buffer)
-  "Return BUFFER as a live buffer, or signal `user-error'."
-  (let ((source (if (bufferp buffer)
-                    buffer
-                  (get-buffer buffer))))
-    (unless (buffer-live-p source)
-      (user-error "No such live buffer: %S" buffer))
-    source))
-
-(defun proofread--request-log-ensure-hook ()
-  "Install the proofread request log hook."
-  (add-hook 'proofread-request-log-hook
-            #'proofread--request-log-record-event))
-
 (defun proofread--request-log-seed-active-requests (source)
   "Record active requests already present in SOURCE."
   (with-current-buffer source
-    (dolist (request proofread--active-requests)
-      (proofread--request-log-record-event
-       (list :type 'active-request
-             :time (current-time)
-             :log-id (plist-get request :log-id)
-             :request-id (plist-get request :id)
-             :buffer source
-             :beg (plist-get request :beg)
-             :end (plist-get request :end)
-             :request request)))))
+    (dolist (work proofread--active-requests)
+      (let ((request (proofread--scheduled-work-request work)))
+        (proofread--request-log-record-event
+         (list :type 'active-request
+               :time (current-time)
+               :log-id (proofread--scheduled-work-log-id work)
+               :request-id (plist-get request :id)
+               :buffer source
+               :beg (plist-get request :beg)
+               :end (plist-get request :end)
+               :request request))))))
 
 (defun proofread--request-log-seed-queued-requests (source)
   "Record queued requests already present in SOURCE."
   (with-current-buffer source
-    (dolist (entry proofread--request-queue)
-      (let ((request (plist-get entry :request)))
+    (dolist (entry (proofread--request-queue-entries))
+      (let* ((work (proofread--queue-entry-work entry))
+             (request (proofread--scheduled-work-request work)))
         (proofread--request-log-record-event
          (list :type 'queued-request
                :time (current-time)
-               :log-id (plist-get request :log-id)
+               :log-id (proofread--scheduled-work-log-id work)
                :request-id (plist-get request :id)
                :buffer source
                :beg (plist-get request :beg)
                :end (plist-get request :end)
                :request request
-               :backend (plist-get entry :backend)))))))
+               :backend (proofread--scheduled-work-backend work)))))))
 
 (defun proofread--install-source-list-cleanup ()
   "Install lifecycle cleanup for lists owned by the current source."
@@ -6394,10 +7371,10 @@ nil for a change to the default."
     (with-current-buffer source
       (setq newly-enabled (not proofread--request-log-enabled))
       (setq proofread--request-log-enabled t)
-      (proofread--request-log-ensure-records)
+      (proofread--request-log-ensure-order
+       (proofread--request-log-ensure-records))
       (proofread--install-source-list-cleanup))
     (cl-pushnew source proofread--request-log-sources)
-    (proofread--request-log-ensure-hook)
     (when newly-enabled
       (proofread--request-log-seed-active-requests source)
       (proofread--request-log-seed-queued-requests source))))
@@ -6417,10 +7394,7 @@ nil for a change to the default."
       (proofread--uninstall-source-list-cleanup-if-unused)))
   (setq proofread--request-log-sources
         (delq source proofread--request-log-sources))
-  (proofread--prune-request-log-sources)
-  (unless proofread--request-log-sources
-    (remove-hook 'proofread-request-log-hook
-                 #'proofread--request-log-record-event)))
+  (proofread--prune-request-log-sources))
 
 (defun proofread--request-log-list-buffer-p (buffer source)
   "Return non-nil when BUFFER is a live request list for SOURCE."
@@ -6507,11 +7481,7 @@ nil for a change to the default."
            (current-buffer)))))
 
 (defun proofread--request-log-backend-request-details (event)
-  "Return printable backend request details for EVENT."
-  (unless (plist-get event :type)
-    (setq event
-          (plist-put (copy-sequence event) :type 'backend-request)))
-  (setq event (proofread--request-log-safe-event event))
+  "Return printable backend request details from canonical EVENT."
   (list :backend (plist-get event :backend)
         :method (plist-get event :method)
         :url (plist-get event :url)
@@ -6525,11 +7495,7 @@ nil for a change to the default."
         (plist-get event :reported-diagnostics)))
 
 (defun proofread--request-log-backend-response-details (event)
-  "Return printable backend response details for EVENT."
-  (unless (plist-get event :type)
-    (setq event
-          (plist-put (copy-sequence event) :type 'backend-response)))
-  (setq event (proofread--request-log-safe-event event))
+  "Return printable backend response details from canonical EVENT."
   (list :backend (plist-get event :backend)
         :url (plist-get event :url)
         :http-status (plist-get event :http-status)
@@ -6540,8 +7506,7 @@ nil for a change to the default."
 
 (defun proofread--request-log-record-summary (record)
   "Return a summary plist for RECORD."
-  (let* ((record (proofread--request-log-safe-record record))
-         (request (plist-get record :request))
+  (let* ((request (plist-get record :request))
          (line-column
           (proofread--request-log-record-line-column record)))
     (list :log-id (plist-get record :log-id)
@@ -6576,7 +7541,6 @@ nil for a change to the default."
 
 (defun proofread--request-log-show-record (record)
   "Display detailed proofread request information for RECORD."
-  (setq record (proofread--request-log-safe-record record))
   (let ((buffer
          (get-buffer-create
           (proofread--request-log-request-buffer-name record))))
@@ -6628,7 +7592,9 @@ events."
                           proofread--request-log-list-source)
                      (current-buffer))
                  t)))
-  (let ((source (proofread--request-log-source-buffer buffer)))
+  (let ((source (get-buffer buffer)))
+    (unless (buffer-live-p source)
+      (user-error "No such live buffer: %S" buffer))
     (unless (with-current-buffer source proofread-mode)
       (user-error "Proofread mode is not enabled in %s" source))
     (proofread--request-log-enable-source source)
@@ -6678,49 +7644,37 @@ events."
     ('style 2)
     (_ 3)))
 
-(defun proofread--diagnostic-live-range (diagnostic)
-  "Return DIAGNOSTIC's current live range, or nil."
-  (if (proofread--aggregate-diagnostic-p diagnostic)
-      (let (range)
-        (dolist (member (proofread--diagnostic-members diagnostic))
-          (unless range
-            (setq range
-                  (proofread--diagnostic-live-range member))))
-        range)
-    (let ((overlay (proofread--overlay-for-diagnostic diagnostic)))
-      (when (and overlay
-                 (overlay-start overlay)
-                 (overlay-end overlay))
-        (cons (overlay-start overlay)
-              (overlay-end overlay))))))
-
-(defun proofread--diagnostic-line-column (diagnostic)
-  "Return DIAGNOSTIC's current line and column as a cons cell."
-  (let ((range (proofread--diagnostic-live-range diagnostic)))
+(defun proofread--diagnostic-line-column (diagnostic &optional range)
+  "Return DIAGNOSTIC's current line and zero-based display column.
+RANGE is an optional live range already read from Flymake."
+  (let ((range
+         (or range
+             (proofread--navigation-range-for-diagnostic diagnostic))))
     (when range
       (save-excursion
         (save-restriction
           (widen)
           (goto-char (car range))
           (cons (line-number-at-pos)
-                (- (point) (line-beginning-position))))))))
+                (current-column)))))))
 
 (defun proofread--diagnostics-in-range (beg end)
-  "Return proofread diagnostics intersecting BEG to END."
-  (let (diagnostics)
-    (dolist (diagnostic (proofread--navigation-diagnostics))
-      (let ((range (proofread--diagnostic-live-range diagnostic)))
-        (when (and range
-                   (proofread--ranges-conflict-p
-                    beg end (car range) (cdr range)))
-          (push diagnostic diagnostics))))
+  "Return proofread diagnostics conflicting with BEG to END.
+This includes zero-width diagnostics on either boundary."
+  (let ((selected-range (cons beg end))
+        diagnostics)
+    (dolist (entry (proofread--navigation-entries))
+      (let ((range (cons (nth 1 entry) (nth 2 entry))))
+        (when (proofread--range-conflicts-p selected-range range)
+          (push (car entry) diagnostics))))
     (nreverse diagnostics)))
 
-(defun proofread--diagnostics-list-entry (diagnostic)
-  "Return a tabulated list entry for live DIAGNOSTIC, or nil."
+(defun proofread--diagnostics-list-entry (diagnostic &optional range)
+  "Return a tabulated list entry for live DIAGNOSTIC, or nil.
+RANGE is an optional live range already read from Flymake."
   (when-let*
       ((line-column
-        (proofread--diagnostic-line-column diagnostic)))
+        (proofread--diagnostic-line-column diagnostic range)))
     (let* ((line (car line-column))
            (column (cdr line-column))
            (kind (plist-get diagnostic :kind))
@@ -6754,8 +7708,11 @@ events."
 (defun proofread--diagnostics-list-entries ()
   "Return tabulated list entries for the current buffer diagnostics."
   (delq nil
-        (mapcar #'proofread--diagnostics-list-entry
-                (proofread--navigation-diagnostics))))
+        (mapcar
+         (lambda (entry)
+           (proofread--diagnostics-list-entry
+            (car entry) (cons (nth 1 entry) (nth 2 entry))))
+         (proofread--navigation-entries))))
 
 (defun proofread--diagnostics-buffer-refresh ()
   "Refresh entries in the current proofread diagnostics buffer."
@@ -6815,7 +7772,7 @@ window."
          (range (and diagnostic
                      (buffer-live-p source)
                      (with-current-buffer source
-                       (proofread--diagnostic-live-range
+                       (proofread--navigation-range-for-diagnostic
                         diagnostic)))))
     (unless (and (buffer-live-p source) range)
       (user-error "Proofread diagnostic is stale"))
@@ -6860,7 +7817,7 @@ When RESET is non-nil, move from the beginning of the buffer."
 (define-derived-mode proofread-diagnostics-buffer-mode
   tabulated-list-mode
   "Proofread diagnostics"
-  "A mode for listing Proofread diagnostics."
+  "A mode for listing live Proofread-only diagnostics."
   :interactive nil
   (proofread--diagnostics-buffer-setup))
 
@@ -6884,6 +7841,57 @@ When RESET is non-nil, move from the beginning of the buffer."
 
 ;;;; Corrections
 
+(cl-defstruct
+    (proofread--correction-entry
+     (:constructor
+      proofread--make-correction-entry
+      (diagnostic suggestion range container-snapshotted-p
+                  container)))
+  "One validated replacement in a correction plan.
+DIAGNOSTIC is the live diagnostic being replaced.  SUGGESTION is the
+replacement string and RANGE is its validated live range.
+CONTAINER-SNAPSHOTTED-P distinguishes a deliberately captured nil
+CONTAINER from one that must be captured immediately before a batch
+edit."
+  diagnostic
+  suggestion
+  range
+  container-snapshotted-p
+  container)
+
+(cl-defstruct
+    (proofread--correction-buffer-state
+     (:constructor
+      proofread--make-correction-buffer-state
+      (buffer tick range-snapshot)))
+  "State used to repair one Proofread buffer after correction hooks.
+BUFFER is the observed buffer, TICK is its character modification
+tick, and RANGE-SNAPSHOT contains its pre-edit live diagnostic ranges."
+  buffer
+  tick
+  range-snapshot)
+
+(cl-defstruct
+    (proofread--correction-plan
+     (:constructor
+      proofread--make-correction-plan
+      (entries region affected-diagnostics buffer-states source
+               source-range-snapshot preserve-excursion-p)))
+  "Prepared state for one atomic correction transaction.
+ENTRIES are validated `proofread--correction-entry' records in
+navigation order.  REGION bounds their logical ranges.
+AFFECTED-DIAGNOSTICS are invalidated when the transaction commits.
+BUFFER-STATES support repair of reentrant edits, while SOURCE and
+SOURCE-RANGE-SNAPSHOT identify the source buffer state.
+PRESERVE-EXCURSION-P is non-nil for batch commands."
+  entries
+  region
+  affected-diagnostics
+  buffer-states
+  source
+  source-range-snapshot
+  preserve-excursion-p)
+
 (defun proofread--select-diagnostic-suggestion (diagnostic)
   "Return the selected suggestion string for DIAGNOSTIC."
   (let ((suggestions (proofread--diagnostic-suggestions diagnostic)))
@@ -6897,21 +7905,22 @@ When RESET is non-nil, move from the beginning of the buffer."
 
 (defun proofread--validate-suggestion-application (diagnostic)
   "Validate DIAGNOSTIC for application and return its range."
-  (let* ((range (proofread--diagnostic-live-range diagnostic))
-         (beg (car range))
-         (end (cdr range))
-         (text (plist-get diagnostic :text)))
+  (let ((range
+         (proofread--current-diagnostic-live-range diagnostic))
+        (text (plist-get diagnostic :text)))
     (unless range
       (user-error "Proofread diagnostic is stale"))
-    (unless (and (<= (point-min) beg)
-                 (<= beg end)
-                 (<= end (point-max)))
-      (user-error "Invalid proofread diagnostic range"))
-    (unless (stringp text)
-      (user-error "Invalid proofread diagnostic text"))
-    (unless (equal (buffer-substring-no-properties beg end) text)
-      (user-error "Proofread diagnostic text no longer matches"))
-    range))
+    (let ((beg (car range))
+          (end (cdr range)))
+      (unless (and (proofread--range-valid-p range)
+                   (proofread--range-contains-p
+                    (cons (point-min) (point-max)) range))
+        (user-error "Invalid proofread diagnostic range"))
+      (unless (stringp text)
+        (user-error "Invalid proofread diagnostic text"))
+      (unless (equal (buffer-substring-no-properties beg end) text)
+        (user-error "Proofread diagnostic text no longer matches"))
+      range)))
 
 (defun proofread--diagnostic-correction-container (diagnostic range)
   "Return syntax-container metadata for DIAGNOSTIC at RANGE.
@@ -6970,197 +7979,125 @@ length change."
           (user-error
            "Proofread suggestion would alter a source delimiter"))))))
 
-(defun proofread--ranges-intersect-p (beg end other-beg other-end)
-  "Return non-nil if BEG to END intersects OTHER-BEG to OTHER-END."
-  (and (< beg other-end)
-       (< other-beg end)))
-
-(defun proofread--ranges-conflict-p (beg end other-beg other-end)
-  "Return non-nil if changing BEG to END affects another range.
-The other range extends from OTHER-BEG through OTHER-END.  Zero-width
-ranges conflict with ranges whose closed boundaries contain their
-position."
-  (or (proofread--ranges-intersect-p beg end other-beg other-end)
-      (and (= beg end)
-           (<= other-beg beg)
-           (<= beg other-end))
-      (and (= other-beg other-end)
-           (<= beg other-beg)
-           (<= other-beg end))))
-
-(defun proofread--range-conflicts-any-p (range ranges)
-  "Return non-nil when RANGE conflicts with one of RANGES."
-  (cl-some
-   (lambda (candidate)
-     (proofread--ranges-conflict-p
-      (car range) (cdr range) (car candidate) (cdr candidate)))
-   ranges))
-
-(defun proofread--range-precedes-without-conflict-p (left right)
-  "Return non-nil if LEFT precedes RIGHT without a conflict."
-  (and (<= (cdr left) (car right))
-       (not (proofread--ranges-conflict-p
-             (car left) (cdr left) (car right) (cdr right)))))
-
-(defun proofread--range-conflicting-entries (ranges entries)
-  "Return ENTRIES whose ranges conflict with one of RANGES.
-Each element of ENTRIES must have the form \=(OBJECT . RANGE).  RANGE
-and every element of RANGES must be valid integer ranges of the form
-\=(BEG . END).  Inputs may be unsorted and are not modified.  Return
-entries ordered by range while retaining original entries, duplicate
-occurrences, and object identity."
-  (let* ((range-less-p
-          (lambda (left right)
-            (or (< (car left) (car right))
-                (and (= (car left) (car right))
-                     (< (cdr left) (cdr right))))))
-         (remaining-ranges
-          (sort (copy-sequence ranges) range-less-p))
-         (sorted-entries
-          (sort (copy-sequence entries)
-                (lambda (left right)
-                  (funcall range-less-p (cdr left) (cdr right)))))
-         conflicts)
-    (dolist (entry sorted-entries)
-      (let ((range (cdr entry)))
-        (while (and remaining-ranges
-                    (proofread--range-precedes-without-conflict-p
-                     (car remaining-ranges) range))
-          (setq remaining-ranges (cdr remaining-ranges)))
-        (when (and remaining-ranges
-                   (proofread--ranges-conflict-p
-                    (car range) (cdr range)
-                    (caar remaining-ranges)
-                    (cdar remaining-ranges)))
-          (push entry conflicts))))
-    (nreverse conflicts)))
-
 (defun proofread--remove-diagnostics (diagnostics)
-  "Remove DIAGNOSTICS from current buffer proofread state."
-  (let ((removed (make-hash-table :test #'eq)))
+  "Remove identities in DIAGNOSTICS from current buffer state.
+Return the identities actually removed, in their model order."
+  (let ((remove-set (make-hash-table :test #'eq))
+        removed
+        retained)
     (dolist (diagnostic diagnostics)
-      (puthash diagnostic t removed)
-      (when (hash-table-p proofread--diagnostic-overlays)
-        (remhash diagnostic proofread--diagnostic-overlays))
+      (puthash diagnostic t remove-set))
+    (dolist (diagnostic proofread--diagnostics)
+      (if (gethash diagnostic remove-set)
+          (push diagnostic removed)
+        (push diagnostic retained)))
+    (setq removed (nreverse removed))
+    (setq proofread--diagnostics (nreverse retained))
+    (dolist (diagnostic removed)
       (when (hash-table-p proofread--diagnostic-request-ranges)
         (remhash diagnostic proofread--diagnostic-request-ranges)))
-    (setq proofread--diagnostics
-          (cl-delete-if (lambda (diagnostic)
-                          (gethash diagnostic removed))
-                        proofread--diagnostics))))
+    (when (and proofread--current-diagnostic
+               (cl-some (lambda (diagnostic)
+                          (memq diagnostic removed))
+                        (proofread--diagnostic-members
+                         proofread--current-diagnostic)))
+      (setq proofread--current-diagnostic nil))
+    removed))
 
-(defun proofread--invalidate-affected-diagnostics
-    (overlays diagnostics &optional inhibit-notification)
-  "Invalidate OVERLAYS and DIAGNOSTICS after a text change.
-When INHIBIT-NOTIFICATION is non-nil, defer the diagnostics change
-hook."
-  (dolist (overlay overlays)
-    (proofread--delete-overlay overlay))
-  (proofread--remove-diagnostics diagnostics)
-  (when (and proofread--current-diagnostic
-             (cl-some (lambda (diagnostic)
-                        (memq diagnostic diagnostics))
-                      (proofread--diagnostic-members
-                       proofread--current-diagnostic)))
-    (setq proofread--current-diagnostic nil))
-  (proofread--prune-overlays)
-  (unless inhibit-notification
-    (proofread--run-diagnostics-changed-hook)))
-
-(defun proofread--synchronize-live-diagnostic-ranges ()
-  "Synchronize stored diagnostic ranges with their live overlays."
-  (let (overlays)
-    (dolist (overlay proofread--overlays)
-      (when (proofread--current-buffer-overlay-p overlay)
-        (push overlay overlays)
-        (let ((diagnostic (overlay-get overlay 'proofread-diagnostic))
-              (beg (overlay-start overlay))
-              (end (overlay-end overlay)))
-          (when (and (eq overlay
-                         (and
-                          (hash-table-p
-                           proofread--diagnostic-overlays)
-                          (gethash
-                           diagnostic
-                           proofread--diagnostic-overlays)))
-                     beg end)
-            (setf (plist-get diagnostic :beg) beg)
-            (setf (plist-get diagnostic :end) end)))))
-    (setq proofread--overlays (nreverse overlays))))
-
-(defun proofread--mode-buffer-character-ticks ()
-  "Return modification ticks for live Proofread buffers."
+(defun proofread--correction-buffer-states ()
+  "Return correction repair state for every Proofread buffer."
   (proofread--prune-mode-buffers)
   (mapcar (lambda (buffer)
-            (cons buffer
-                  (with-current-buffer buffer
-                    (buffer-chars-modified-tick))))
+            (with-current-buffer buffer
+              (proofread--make-correction-buffer-state
+               buffer
+               (buffer-chars-modified-tick)
+               (proofread--snapshot-live-diagnostic-ranges))))
           proofread--mode-buffers))
 
-(defun proofread--diagnostic-text-current-p (diagnostic)
-  "Return non-nil when DIAGNOSTIC still identifies its recorded text."
-  (when-let* ((range (or (proofread--diagnostic-live-range diagnostic)
-                         (proofread--diagnostic-range diagnostic)))
+(defun proofread--diagnostic-text-current-p
+    (diagnostic &optional live-ranges)
+  "Return non-nil when DIAGNOSTIC still identifies its recorded text.
+LIVE-RANGES is an optional strict live-range table."
+  (when-let* ((range
+               (proofread--current-diagnostic-live-range
+                diagnostic live-ranges))
               (beg (car range))
               (end (cdr range)))
-    (and (<= (point-min) beg)
-         (<= beg end)
-         (<= end (point-max))
+    (and (proofread--range-valid-p range)
+         (proofread--range-contains-p
+          (cons (point-min) (point-max)) range)
          (equal (buffer-substring-no-properties beg end)
                 (plist-get diagnostic :text)))))
 
-(defun proofread--repair-correction-time-buffer-changes
-    (ticks source &optional repair-source)
-  "Repair proofread state changed since TICKS while correcting SOURCE.
+(defun proofread--repair-correction-plan (plan)
+  "Repair other Proofread buffers changed while executing PLAN.
 Modification hooks suppress recursively triggered hooks, even in
 another buffer.  Revalidate every proofread buffer whose character
-tick changed.  When REPAIR-SOURCE is nil, preserve SOURCE state after
-an atomic rollback."
-  (dolist (entry ticks)
-    (let ((buffer (car entry))
-          (tick (cdr entry)))
-      (when (and (or repair-source (not (eq buffer source)))
-                 (buffer-live-p buffer)
-                 (with-current-buffer buffer
-                   (and proofread-mode
-                        (/= tick (buffer-chars-modified-tick)))))
-        (with-current-buffer buffer
-          ;; A suppressed nested edit may have shifted any pending
-          ;; request.
-          (proofread--clear-request-work)
-          (save-restriction
-            (widen)
-            (let ((stale
-                   (cl-delete-if
-                    #'proofread--diagnostic-text-current-p
-                    (copy-sequence proofread--diagnostics))))
-              (when stale
-                (proofread--invalidate-affected-diagnostics
-                 (delq nil
-                       (mapcar
-                        #'proofread--overlay-for-diagnostic
-                        stale))
-                 stale t)
-                (proofread--synchronize-live-diagnostic-ranges)
-                (unless (eq buffer source)
-                  (proofread--run-diagnostics-changed-hook)))))
-          (proofread--mark-pending-work))))))
+tick changed.  PLAN's source is committed separately and is never
+repaired here."
+  (let ((source (proofread--correction-plan-source plan)))
+    (dolist (state (proofread--correction-plan-buffer-states plan))
+      (let ((buffer
+             (proofread--correction-buffer-state-buffer state))
+            (tick (proofread--correction-buffer-state-tick state))
+            (range-snapshot
+             (proofread--correction-buffer-state-range-snapshot
+              state)))
+        (when (and (not (eq buffer source))
+                   (buffer-live-p buffer)
+                   (with-current-buffer buffer
+                     (and proofread-mode
+                          (/= tick (buffer-chars-modified-tick)))))
+          (with-current-buffer buffer
+            ;; A suppressed nested edit may have shifted any pending
+            ;; request.
+            (proofread--clear-request-work)
+            (save-restriction
+              (widen)
+              (let* ((live-ranges
+                      (proofread--flymake-live-range-table))
+                     (stale
+                      (cl-remove-if
+                       (lambda (diagnostic)
+                         (proofread--diagnostic-text-current-p
+                          diagnostic live-ranges))
+                       proofread--diagnostics))
+                     (moved
+                      (proofread--diagnostics-with-changed-live-ranges
+                       range-snapshot live-ranges))
+                     (changed
+                      (cl-delete-duplicates
+                       (append stale moved) :test #'eq)))
+                (when changed
+                  (proofread--commit-diagnostic-state
+                   (cons (point-min) (point-max))
+                   (lambda ()
+                     (let ((removed
+                            (proofread--remove-diagnostics stale)))
+                       (append
+                        removed
+                        (cl-remove-if-not
+                         (lambda (diagnostic)
+                           (memq diagnostic proofread--diagnostics))
+                         moved))))))))
+            (proofread--mark-pending-work)))))))
 
-(defun proofread--prepare-diagnostic-corrections (diagnostics)
-  "Return selected nonoverlapping corrections for DIAGNOSTICS.
+(defun proofread--select-diagnostic-corrections (diagnostics)
+  "Return selected nonconflicting corrections for DIAGNOSTICS.
 Each returned element is a cons cell of the form (DIAGNOSTIC
 . SUGGESTION).  DIAGNOSTICS must be in navigation order.  An earlier
 diagnostic takes precedence over any later diagnostic whose range
-overlaps it."
+conflicts with it, including equal or boundary-conflicting zero-width
+ranges."
   (let (corrections previous-range)
     (dolist (diagnostic diagnostics)
       (let ((range
              (proofread--validate-suggestion-application
               diagnostic)))
         (unless (and previous-range
-                     (proofread--ranges-conflict-p
-                      (car range) (cdr range)
-                      (car previous-range) (cdr previous-range)))
+                     (proofread--range-conflicts-p
+                      range previous-range))
           (let ((suggestion
                  (proofread--select-diagnostic-suggestion
                   diagnostic)))
@@ -7168,142 +8105,232 @@ overlaps it."
             (push (cons diagnostic suggestion) corrections)))))
     (nreverse corrections)))
 
-(defun proofread--corrections-affected-state
-    (corrections &optional correction-ranges)
-  "Return overlays and diagnostics affected by CORRECTIONS.
-The return value is a cons cell whose car contains overlays and whose
-cdr contains diagnostics.  When CORRECTION-RANGES is non-nil, use
-the validated live ranges instead of the diagnostics' stored ranges."
-  (let* ((ranges
-          (or correction-ranges
-              (mapcar
-               (lambda (correction)
-                 (proofread--diagnostic-range (car correction)))
-               corrections)))
-         (entries
+(defun proofread--prepare-correction-entry
+    (correction snapshot-container-p)
+  "Return a validated entry for CORRECTION.
+CORRECTION has the form (DIAGNOSTIC . SUGGESTION).  When
+SNAPSHOT-CONTAINER-P is non-nil, capture the diagnostic's source
+container now, including an explicit nil result."
+  (let* ((diagnostic (car correction))
+         (suggestion (cdr correction))
+         (range
+          (proofread--validate-suggestion-application diagnostic))
+         (container
+          (and snapshot-container-p
+               (proofread--diagnostic-correction-container
+                diagnostic range))))
+    (proofread--make-correction-entry
+     diagnostic suggestion range snapshot-container-p container)))
+
+(defun proofread--corrections-affected-diagnostics (entries)
+  "Return diagnostic identities affected by correction ENTRIES."
+  (let* ((live-ranges (proofread--flymake-live-range-table))
+         (ranges
+          (mapcar #'proofread--correction-entry-range entries))
+         (diagnostic-entries
           (delq nil
                 (mapcar
                  (lambda (diagnostic)
-                   (when-let* ((range
-                                (proofread--diagnostic-range
-                                 diagnostic)))
+                   (when-let* ((range (gethash diagnostic live-ranges)))
                      (cons diagnostic range)))
                  proofread--diagnostics)))
-         (affected (make-hash-table :test #'eq))
-         overlays
          diagnostics)
     (dolist (entry
-             (proofread--range-conflicting-entries ranges entries))
-      (puthash (car entry) t affected)
+             (proofread--range-conflicting-entries
+              ranges diagnostic-entries))
       (push (car entry) diagnostics))
-    (proofread--prune-overlays)
-    (dolist (overlay proofread--overlays)
-      (when (gethash
-             (overlay-get overlay 'proofread-diagnostic)
-             affected)
-        (push overlay overlays)))
-    (cons overlays diagnostics)))
+    diagnostics))
+
+(defun proofread--prepare-correction-plan
+    (corrections preserve-excursion-p)
+  "Return a validated correction plan for CORRECTIONS.
+CORRECTIONS contains (DIAGNOSTIC . SUGGESTION) pairs.
+PRESERVE-EXCURSION-P is non-nil for a batch transaction.  Batch
+containers are captured immediately before their reverse-order edits;
+a point correction captures its container before opening an undo
+transaction."
+  (let* ((entries
+          (mapcar
+           (lambda (correction)
+             (proofread--prepare-correction-entry
+              correction (not preserve-excursion-p)))
+           corrections))
+         (ranges
+          (mapcar #'proofread--correction-entry-range entries)))
+    (unless entries
+      (error "Cannot prepare an empty correction plan"))
+    (let* ((region
+            (cons (apply #'min (mapcar #'car ranges))
+                  (apply #'max (mapcar #'cdr ranges))))
+           (affected-diagnostics
+            (proofread--corrections-affected-diagnostics entries))
+           (buffer-states (proofread--correction-buffer-states))
+           (source (current-buffer))
+           (source-state
+            (cl-find
+             source buffer-states
+             :key #'proofread--correction-buffer-state-buffer
+             :test #'eq))
+           (source-range-snapshot
+            (if source-state
+                (proofread--correction-buffer-state-range-snapshot
+                 source-state)
+              (proofread--snapshot-live-diagnostic-ranges))))
+      (proofread--make-correction-plan
+       entries region affected-diagnostics buffer-states source
+       source-range-snapshot preserve-excursion-p))))
+
+(defun proofread--restore-correction-plan-after-rollback (plan)
+  "Restore Flymake diagnostics lost while rolling back PLAN.
+Buffer text and the core model have already been rolled back.  Report
+the unchanged pre-edit snapshot only when an owned Flymake diagnostic
+disappeared; do not run the diagnostic change hook because no logical
+state changed."
+  (when proofread--flymake-report-function
+    (let ((range-snapshot
+           (proofread--correction-plan-source-range-snapshot plan))
+          (live-ranges (proofread--flymake-live-range-table))
+          (fallback-ranges (make-hash-table :test #'eq)))
+      (dolist (entry range-snapshot)
+        (puthash (car entry) (cdr entry) fallback-ranges))
+      (when (cl-some
+             (lambda (entry)
+               (and (memq (car entry) proofread--diagnostics)
+                    (not (gethash (car entry) live-ranges))))
+             range-snapshot)
+        (condition-case error-data
+            (proofread--report-flymake-snapshot
+             proofread--flymake-report-function nil fallback-ranges)
+          (error
+           (proofread--report-flymake-warning
+            "rollback report" error-data)))))))
+
+(defun proofread--apply-correction-entry
+    (entry preserve-excursion-p)
+  "Apply correction ENTRY and validate its source container.
+When PRESERVE-EXCURSION-P is non-nil, move point before deleting the
+entry's range."
+  (let* ((diagnostic
+          (proofread--correction-entry-diagnostic entry))
+         (suggestion
+          (proofread--correction-entry-suggestion entry))
+         (range (proofread--correction-entry-range entry))
+         (beg (car range))
+         (end (cdr range))
+         (container
+          (if (proofread--correction-entry-container-snapshotted-p
+               entry)
+              (proofread--correction-entry-container entry)
+            (proofread--diagnostic-correction-container
+             diagnostic range))))
+    (if preserve-excursion-p
+        (progn
+          (goto-char beg)
+          (delete-region beg end))
+      (delete-region beg end)
+      (goto-char beg))
+    (insert suggestion)
+    (proofread--validate-correction-container
+     container beg (point)
+     (- (length suggestion) (- end beg)))))
+
+(defun proofread--apply-correction-plan-atomically (plan)
+  "Apply PLAN entries atomically and return deferred diagnostics."
+  (let ((proofread--inhibit-diagnostic-invalidation
+         (current-buffer))
+        (proofread--deferred-correction-diagnostics nil)
+        (preserve-excursion-p
+         (proofread--correction-plan-preserve-excursion-p plan)))
+    (atomic-change-group
+      (dolist (entry
+               (reverse
+                (copy-sequence
+                 (proofread--correction-plan-entries plan))))
+        (proofread--apply-correction-entry
+         entry preserve-excursion-p)))
+    (copy-sequence proofread--deferred-correction-diagnostics)))
+
+(defun proofread--apply-correction-plan (plan)
+  "Apply PLAN and return diagnostics invalidated by reentrant edits.
+For a batch plan, restore point, mark, and mark activation before
+returning, and close its undo unit before later notification hooks."
+  (if (proofread--correction-plan-preserve-excursion-p plan)
+      (save-mark-and-excursion
+        (prog1 (proofread--apply-correction-plan-atomically plan)
+          (undo-boundary)))
+    (proofread--apply-correction-plan-atomically plan)))
+
+(defun proofread--commit-correction-plan
+    (plan deferred-diagnostics)
+  "Commit PLAN after edits and invalidate DEFERRED-DIAGNOSTICS."
+  (proofread--clear-request-work)
+  (save-restriction
+    (widen)
+    (let* ((live-ranges (proofread--flymake-live-range-table))
+           (stale
+            (cl-remove-if
+             (lambda (diagnostic)
+               (proofread--diagnostic-text-current-p
+                diagnostic live-ranges))
+             proofread--diagnostics))
+           (moved
+            (proofread--diagnostics-with-changed-live-ranges
+             (proofread--correction-plan-source-range-snapshot plan)
+             live-ranges))
+           (invalidated
+            (cl-delete-duplicates
+             (append
+              (proofread--correction-plan-affected-diagnostics plan)
+              deferred-diagnostics
+              stale)
+             :test #'eq))
+           (changed
+            (cl-delete-duplicates
+             (append invalidated moved) :test #'eq)))
+      (when changed
+        (proofread--commit-diagnostic-state
+         (proofread--correction-plan-region plan)
+         (lambda ()
+           (let ((removed
+                  (proofread--remove-diagnostics invalidated)))
+             (append
+              removed
+              (cl-remove-if-not
+               (lambda (diagnostic)
+                 (memq diagnostic proofread--diagnostics))
+               moved))))))))
+  (proofread--mark-pending-work))
 
 (defun proofread--run-correction-transaction
     (corrections &optional preserve-excursion)
   "Apply CORRECTIONS in one atomic correction transaction.
 Each element of CORRECTIONS has the form (DIAGNOSTIC . SUGGESTION).
-Validate every diagnostic before editing, then apply the corrections
-from end to beginning.  When PRESERVE-EXCURSION is non-nil, restore
-point, mark, and mark activation before notifying diagnostics hooks."
-  (let* ((validated-corrections
-          (mapcar
-           (lambda (correction)
-             (let* ((diagnostic (car correction))
-                    (range
-                     (proofread--validate-suggestion-application
-                      diagnostic)))
-               (list
-                correction
-                range
-                ;; A single correction validates its container before
-                ;; opening an undo transaction.  A batch must instead
-                ;; snapshot each updated container immediately before
-                ;; its reverse-order edit.
-                (unless preserve-excursion
-                  (cons
-                   t
-                   (proofread--diagnostic-correction-container
-                    diagnostic range))))))
-           corrections))
-         (affected-state
-          (proofread--corrections-affected-state
-           corrections
-           (mapcar (lambda (validated-correction)
-                     (nth 1 validated-correction))
-                   validated-corrections)))
-         (affected-overlays (car affected-state))
-         (affected-diagnostics (cdr affected-state))
-         (buffer-ticks (proofread--mode-buffer-character-ticks))
-         (source (current-buffer)))
-    (cl-labels
-        ((run-transaction
-           ()
-           (undo-boundary)
-           (let ((proofread--inhibit-overlay-invalidation
-                  (current-buffer))
-                 (proofread--deferred-correction-overlays nil)
-                 (proofread--deferred-correction-diagnostics nil)
-                 correction-committed)
-             (unwind-protect
-                 (progn
-                   (atomic-change-group
-                     (dolist (validated-correction
-                              (reverse validated-corrections))
-                       (let* ((correction
-                               (car validated-correction))
-                              (diagnostic (car correction))
-                              (suggestion (cdr correction))
-                              (range (nth 1 validated-correction))
-                              (beg (car range))
-                              (end (cdr range))
-                              (container-state
-                               (nth 2 validated-correction))
-                              (container
-                               (if container-state
-                                   (cdr container-state)
-                                 (proofread--diagnostic-correction-container
-                                  diagnostic
-                                  range))))
-                         (if preserve-excursion
-                             (progn
-                               (goto-char beg)
-                               (delete-region beg end))
-                           (delete-region beg end)
-                           (goto-char beg))
-                         (insert suggestion)
-                         (proofread--validate-correction-container
-                          container beg (point)
-                          (- (length suggestion) (- end beg))))))
-                   (setq correction-committed t)
-                   (proofread--invalidate-affected-diagnostics
-                    (cl-delete-duplicates
-                     (append proofread--deferred-correction-overlays
-                             affected-overlays)
-                     :test #'eq)
-                    (cl-delete-duplicates
-                     (append
-                      proofread--deferred-correction-diagnostics
-                      affected-diagnostics)
-                     :test #'eq)
-                    t)
-                   (proofread--synchronize-live-diagnostic-ranges))
-               (proofread--repair-correction-time-buffer-changes
-                buffer-ticks source correction-committed)))
-           (unless preserve-excursion
-             (proofread--run-diagnostics-changed-hook))
-           (undo-boundary)))
-      (if preserve-excursion
-          (save-mark-and-excursion
-            (run-transaction))
-        (run-transaction)))
-    (when preserve-excursion
-      (proofread--run-diagnostics-changed-hook))))
+Prepare and validate a plan, apply it from end to beginning, commit
+diagnostic invalidation, and repair reentrant cross-buffer edits.  When
+PRESERVE-EXCURSION is non-nil, restore point, mark, and mark activation
+before notifying diagnostic hooks."
+  (let ((plan
+         (proofread--prepare-correction-plan
+          corrections preserve-excursion))
+        deferred-diagnostics
+        edits-completed-p
+        repairs-completed-p)
+    (undo-boundary)
+    (unwind-protect
+        (progn
+          (setq deferred-diagnostics
+                (proofread--apply-correction-plan plan))
+          (setq edits-completed-p t)
+          (proofread--commit-correction-plan
+           plan deferred-diagnostics)
+          (proofread--repair-correction-plan plan)
+          (setq repairs-completed-p t))
+      (unless repairs-completed-p
+        (unless edits-completed-p
+          (proofread--restore-correction-plan-after-rollback plan))
+        (proofread--repair-correction-plan plan)))
+    (unless (proofread--correction-plan-preserve-excursion-p plan)
+      (undo-boundary))))
 
 (defun proofread--apply-suggestion-to-diagnostic
     (diagnostic suggestion)
@@ -7328,7 +8355,7 @@ DIAGNOSTICS must be in navigation order.  Return `applied'."
     (unless actionable
       (user-error "No proofread suggestions available"))
     (let* ((corrections
-            (proofread--prepare-diagnostic-corrections actionable))
+            (proofread--select-diagnostic-corrections actionable))
            (count (length corrections))
            (skipped (- (length diagnostics) count)))
       (proofread--apply-diagnostic-corrections corrections)
@@ -7348,225 +8375,246 @@ DIAGNOSTICS must be in navigation order.  Return `applied'."
         (kind (plist-get diagnostic :kind))
         (text (plist-get diagnostic :text))
         (suggestions (proofread--diagnostic-suggestions diagnostic))
-        (lines '( "Proofread diagnostic")))
+        lines)
+    (push "Proofread diagnostic" lines)
     (when kind
-      (setq lines
-            (append lines
-                    (list ""
-                          (format "Kind: %s"
-                                  (proofread-format-diagnostic-field
-                                   kind))))))
+      (push "" lines)
+      (push (format "Kind: %s"
+                    (proofread-format-diagnostic-field kind))
+            lines))
     (if aggregate
         (when-let* ((entries
                      (proofread--diagnostic-message-entries
                       diagnostic)))
-          (setq lines (append lines (list "" "Messages:")))
+          (push "" lines)
+          (push "Messages:" lines)
           (dolist (entry entries)
             (let ((source (plist-get entry :source))
                   (message
                    (proofread-format-diagnostic-field
                     (plist-get entry :message))))
-              (setq lines
-                    (append
-                     lines
-                     (list (if source
-                               (format "%s: %s" source message)
-                             message)))))))
+              (push (if source
+                        (format "%s: %s" source message)
+                      message)
+                    lines))))
       (when-let* ((message (plist-get diagnostic :message)))
-        (setq lines
-              (append lines
-                      (list (format "Message: %s"
-                                    (proofread-format-diagnostic-field
-                                     message)))))))
+        (push (format "Message: %s"
+                      (proofread-format-diagnostic-field message))
+              lines)))
     (when text
-      (setq lines
-            (append lines
-                    (list ""
-                          "Original text:"
-                          (proofread-format-diagnostic-field
-                           text)))))
+      (push "" lines)
+      (push "Original text:" lines)
+      (push (proofread-format-diagnostic-field text) lines))
     (when suggestions
-      (setq lines (append lines (list "" "Suggestions:")))
+      (push "" lines)
+      (push "Suggestions:" lines)
       (let ((index 1))
         (if aggregate
             (dolist (record
                      (proofread--diagnostic-suggestion-records
                       diagnostic))
               (let ((sources (plist-get record :sources)))
-                (setq lines
-                      (append
-                       lines
-                       (list
-                        (format
-                         "%d. %s%s"
-                         index
-                         (proofread-format-diagnostic-field
-                          (plist-get record :text))
-                         (if sources
-                             (format " (from %s)"
-                                     (string-join sources ", "))
-                           ""))))))
+                (push
+                 (format
+                  "%d. %s%s"
+                  index
+                  (proofread-format-diagnostic-field
+                   (plist-get record :text))
+                  (if sources
+                      (format " (from %s)"
+                              (string-join sources ", "))
+                    ""))
+                 lines))
               (setq index (1+ index)))
           (dolist (suggestion suggestions)
-            (setq lines
-                  (append
-                   lines
-                   (list
-                    (format
-                     "%d. %s"
-                     index
-                     (proofread-format-diagnostic-field
-                      suggestion)))))
+            (push (format "%d. %s"
+                          index
+                          (proofread-format-diagnostic-field suggestion))
+                  lines)
             (setq index (1+ index))))))
     (when-let* ((source
                  (proofread--diagnostic-source-summary diagnostic)))
-      (setq lines
-            (append lines
-                    (list (format "%s: %s"
-                                  (if aggregate "Sources" "Source")
-                                  source)))))
-    (mapconcat #'identity lines "\n")))
+      (push (format "%s: %s"
+                    (if aggregate "Sources" "Source")
+                    source)
+            lines))
+    (mapconcat #'identity (nreverse lines) "\n")))
 
 (defun proofread--display-diagnostic-description (diagnostic)
   "Display formatted details for DIAGNOSTIC in a help buffer."
   (with-help-window proofread--description-buffer-name
     (princ (proofread--format-diagnostic-description diagnostic))))
 
-(defun proofread--create-overlay (diagnostic)
-  "Create and return a proofread overlay for DIAGNOSTIC."
-  (let ((beg (plist-get diagnostic :beg))
-        (end (plist-get diagnostic :end)))
-    (unless (and (integer-or-marker-p beg)
-                 (integer-or-marker-p end)
-                 (<= beg end))
-      (error "Invalid proofread diagnostic range: %S" diagnostic))
-    (proofread--prune-overlays)
-    (let ((overlay (make-overlay beg end nil t nil)))
-      (overlay-put overlay 'category proofread--overlay-category)
-      (overlay-put overlay 'face 'proofread-face)
-      (overlay-put overlay 'proofread-diagnostic diagnostic)
-      (overlay-put
-       overlay 'proofread-diagnostic-insertion-ordinal
-       proofread--next-diagnostic-insertion-ordinal)
-      (setq proofread--next-diagnostic-insertion-ordinal
-            (1+ proofread--next-diagnostic-insertion-ordinal))
-      (unless (hash-table-p proofread--diagnostic-overlays)
-        (setq proofread--diagnostic-overlays
-              (make-hash-table :test #'eq)))
-      (puthash diagnostic overlay proofread--diagnostic-overlays)
-      (push overlay proofread--overlays)
-      overlay)))
-
 (defun proofread--clear-diagnostics ()
-  "Clear this buffer's proofread diagnostics and overlays."
-  (dolist (overlay (proofread--current-buffer-overlays))
-    (delete-overlay overlay))
-  (setq proofread--overlays nil)
-  (setq proofread--diagnostics nil)
-  (when (hash-table-p proofread--diagnostic-overlays)
-    (clrhash proofread--diagnostic-overlays))
-  (when (hash-table-p proofread--diagnostic-request-ranges)
-    (clrhash proofread--diagnostic-request-ranges))
-  (setq proofread--current-diagnostic nil)
-  (force-window-update (current-buffer))
-  (proofread--run-diagnostics-changed-hook))
+  "Clear this buffer's diagnostic model in one commit."
+  (save-restriction
+    (widen)
+    (let ((region (cons (point-min) (point-max)))
+          (diagnostics (copy-sequence proofread--diagnostics)))
+      (when diagnostics
+        (proofread--commit-diagnostic-state
+         region
+         (lambda ()
+           (let ((removed
+                  (proofread--remove-diagnostics diagnostics)))
+             (when (hash-table-p
+                    proofread--diagnostic-request-ranges)
+               (clrhash proofread--diagnostic-request-ranges))
+             (setq proofread--current-diagnostic nil)
+             removed))))
+      (unless diagnostics
+        (when (hash-table-p proofread--diagnostic-request-ranges)
+          (clrhash proofread--diagnostic-request-ranges))
+        (setq proofread--current-diagnostic nil)))))
 
 ;;;; Mode lifecycle
 
-(defun proofread--initialize-buffer-state ()
-  "Initialize proofread-owned state for the current buffer."
+(defun proofread--reset-buffer-state (active-p)
+  "Replace proofread-owned state for the current buffer.
+When ACTIVE-P is non-nil, allocate fresh maps and structured queue
+state for a new generation.  Otherwise install the inactive scalar
+state.  Callers must settle requests, timers, diagnostics, and Flymake
+publication before replacing active state."
   (setq proofread--generation
-        (cl-incf proofread--generation-sequence))
-  (setq-local proofread--diagnostics nil)
-  (setq-local proofread--overlays nil)
-  (setq-local proofread--diagnostic-overlays
-              (make-hash-table :test #'eq))
-  (setq-local proofread--next-diagnostic-insertion-ordinal 0)
-  (setq-local proofread--diagnostic-request-ranges
-              (make-hash-table :test #'eq))
-  (setq-local proofread--current-diagnostic nil)
-  (setq-local proofread--eldoc-mode-owned-p nil)
-  (setq-local proofread--echo-area-refresh-pending-p nil)
-  (setq-local proofread--active-requests nil)
-  (setq-local proofread--request-queue nil)
-  (setq-local proofread--request-queue-tail nil)
-  (setq-local proofread--request-queue-index
-              (make-hash-table :test #'equal))
-  (setq-local proofread--request-queue-links
-              (make-hash-table :test #'eq))
-  (setq-local proofread--request-queue-sequences
-              (make-hash-table :test #'eq))
-  (setq-local proofread--cache-woken-queue-entries
-              (make-hash-table :test #'eq))
-  (setq-local proofread--next-request-queue-sequence 0)
-  (setq-local proofread--claimed-requests nil)
-  (setq-local proofread--queue-dispatch-active-p nil)
-  (setq-local proofread--queue-dispatch-requested-p nil)
-  (setq-local proofread--queue-dispatch-timer nil)
-  (setq-local proofread--pending-request-keys
-              (make-hash-table :test #'equal))
-  (setq-local proofread--next-request-id 0)
-  (setq-local proofread--cache (make-hash-table :test #'equal))
-  (setq-local proofread--cache-order nil)
-  (setq-local proofread--pending-work nil)
-  (setq-local proofread--idle-timer nil)
-  (setq-local proofread--pending-invalidated-overlays nil)
-  (setq-local proofread--pending-invalidated-diagnostics nil))
+        (if active-p
+            (cl-incf proofread--generation-sequence)
+          0)
+        proofread--diagnostics nil
+        proofread--diagnostic-request-ranges
+        (and active-p (make-hash-table :test #'eq))
+        proofread--current-diagnostic nil
+        proofread--active-requests nil
+        proofread--queue-state
+        (and active-p (proofread--make-queue-state))
+        proofread--claimed-requests nil
+        proofread--queue-dispatch-active-p nil
+        proofread--queue-dispatch-requested-p nil
+        proofread--queue-dispatch-timer nil
+        proofread--pending-request-keys
+        (and active-p (make-hash-table :test #'equal))
+        proofread--next-request-id 0
+        proofread--pending-invalidated-diagnostics nil
+        proofread--pending-diagnostic-ranges nil
+        proofread--cache
+        (and active-p (make-hash-table :test #'equal))
+        proofread--cache-order nil
+        proofread--pending-work nil
+        proofread--idle-timer nil))
 
 (defun proofread--clear-buffer-state ()
-  "Clear proofread-owned state for the current buffer."
-  (proofread--clear-request-work)
-  (proofread--clear-diagnostics)
-  (setq proofread--request-queue nil)
-  (setq proofread--request-queue-tail nil)
-  (setq proofread--request-queue-index nil)
-  (setq proofread--request-queue-links nil)
-  (setq proofread--request-queue-sequences nil)
-  (setq proofread--cache-woken-queue-entries nil)
-  (setq proofread--next-request-queue-sequence 0)
-  (setq proofread--claimed-requests nil)
-  (setq proofread--queue-dispatch-active-p nil)
-  (setq proofread--queue-dispatch-requested-p nil)
-  (setq proofread--queue-dispatch-timer nil)
-  (setq proofread--pending-request-keys nil)
-  (setq proofread--next-request-id 0)
-  (setq proofread--cache nil)
-  (setq proofread--cache-order nil)
-  (setq proofread--diagnostic-overlays nil)
-  (setq proofread--next-diagnostic-insertion-ordinal nil)
-  (setq proofread--diagnostic-request-ranges nil)
-  (setq proofread--eldoc-mode-owned-p nil)
-  (setq proofread--echo-area-refresh-pending-p nil)
-  (setq proofread--pending-invalidated-overlays nil)
-  (setq proofread--pending-invalidated-diagnostics nil))
+  "Settle and clear proofread-owned state in the current buffer.
+This cleanup is idempotent.  The second request cleanup rejects and
+settles work scheduled reentrantly by the diagnostic notification."
+  (let ((proofread-mode nil)
+        (proofread--clearing-scheduled-work (current-buffer)))
+    (proofread--clear-request-work)
+    (proofread--clear-diagnostics)
+    (proofread--clear-request-work))
+  (proofread--reset-buffer-state nil))
 
-(defun proofread--enable-buffer ()
-  "Enable this buffer's local Proofread hooks and state."
-  (when (memq (current-buffer) proofread--mode-buffers)
-    (proofread--disable-buffer)
-    ;; Teardown hooks can schedule work while the mode variable still
-    ;; remains non-nil during an explicit re-enable.
-    (proofread--clear-scheduled-work))
-  (proofread--initialize-buffer-state)
+(defun proofread--flymake-mode-changed ()
+  "Disable Proofread when its required Flymake layer is disabled."
+  (when (and proofread-mode (not flymake-mode))
+    (proofread-mode -1)))
+
+(defun proofread--enable-flymake-bridge ()
+  "Install and start the buffer-local Proofread Flymake bridge."
+  (add-hook 'flymake-diagnostic-functions
+            #'proofread--flymake-backend t t)
+  (add-hook 'flymake-mode-hook
+            #'proofread--flymake-mode-changed t t)
+  (unless flymake-mode
+    ;; Proofread starts Flymake explicitly below.  Avoid also leaving
+    ;; Flymake's deferred activation start behind.
+    (let ((flymake-start-on-flymake-mode nil))
+      (flymake-mode 1)))
+  (flymake-start))
+
+(defun proofread--disable-flymake-bridge ()
+  "Remove the buffer-local Proofread Flymake bridge.
+Clear only diagnostics reported by that bridge, leaving Flymake and
+all other Flymake backends active."
+  (let ((report-function proofread--flymake-report-function))
+    (setq proofread--flymake-report-function nil)
+    (remove-hook 'flymake-mode-hook
+                 #'proofread--flymake-mode-changed t)
+    (remove-hook 'flymake-diagnostic-functions
+                 #'proofread--flymake-backend t)
+    (when report-function
+      (condition-case nil
+          (save-restriction
+            (widen)
+            (funcall report-function nil
+                     :region (cons (point-min) (point-max))))
+        (error nil)))))
+
+(defun proofread--install-buffer-hooks ()
+  "Install Proofread's mode-owned hooks in the current buffer."
   (add-hook 'before-change-functions #'proofread--before-change nil t)
   (add-hook 'after-change-functions #'proofread--after-change nil t)
-  (add-hook 'kill-buffer-hook #'proofread--kill-buffer nil t)
+  ;; Run before Flymake's ordinary-depth kill hook so source-list and
+  ;; request cleanup cannot be skipped when Flymake disables itself.
+  (add-hook 'kill-buffer-hook #'proofread--kill-buffer -10 t)
   (add-hook 'change-major-mode-hook
             #'proofread--change-major-mode nil t)
-  (proofread--enable-echo-area)
-  (proofread--register-mode-buffer)
-  (proofread--mark-pending-work))
+  (add-hook 'window-scroll-functions #'proofread--window-scroll nil t)
+  (add-hook 'window-configuration-change-hook
+            #'proofread--mark-pending-work nil t))
 
-(defun proofread--disable-buffer ()
-  "Disable this buffer's local Proofread hooks and state."
+(defun proofread--remove-buffer-hooks ()
+  "Remove Proofread's mode-owned hooks from the current buffer."
   (remove-hook 'before-change-functions #'proofread--before-change t)
   (remove-hook 'after-change-functions #'proofread--after-change t)
   (remove-hook 'kill-buffer-hook #'proofread--kill-buffer t)
   (remove-hook 'change-major-mode-hook
                #'proofread--change-major-mode t)
-  (proofread--disable-echo-area)
-  (proofread--clear-buffer-state)
-  (proofread--unregister-mode-buffer))
+  (remove-hook 'window-scroll-functions #'proofread--window-scroll t)
+  (remove-hook 'window-configuration-change-hook
+               #'proofread--mark-pending-work t))
+
+(defun proofread--enable-buffer ()
+  "Enable this buffer's local Proofread hooks and state."
+  (if (proofread--buffer-state-cleanup-p)
+      ;; A lifecycle observer can invoke the mode command recursively.
+      ;; Keep the dynamic mode binding disabled so the outer cleanup wins.
+      (setq proofread-mode nil)
+    (let (completed-p)
+      (unwind-protect
+          (progn
+            ;; Always start from the same idempotent teardown path.  This
+            ;; also repairs state left by an interrupted earlier enable.
+            (proofread--disable-buffer)
+            (proofread--reset-buffer-state t)
+            (proofread--install-buffer-hooks)
+            (proofread--register-mode-buffer)
+            (proofread--mark-pending-work)
+            ;; This runs every configured Flymake backend synchronously.
+            ;; Keep it last so a backend that disables Flymake can tear
+            ;; Proofread down without later steps reinstalling state.
+            (proofread--enable-flymake-bridge)
+            (setq completed-p t))
+        (unless completed-p
+          ;; Use the minor-mode entry point so standard mode hooks and an
+          ;; optional frontend observe the failed enable as disabled.
+          (if proofread-mode
+              (proofread-mode -1)
+            (proofread--disable-buffer)))))))
+
+(defun proofread--disable-buffer (&optional close-source-lists-p)
+  "Disable this buffer's local Proofread hooks and state.
+When CLOSE-SOURCE-LISTS-P is non-nil, close auxiliary buffers and stop
+their request-log monitor before cancelling request work."
+  (if (proofread--buffer-state-cleanup-p)
+      (setq proofread-mode nil)
+    (let ((proofread--buffer-state-cleanup
+           (cons (current-buffer) proofread--buffer-state-cleanup))
+          (proofread-mode nil))
+      (proofread--disable-flymake-bridge)
+      (when close-source-lists-p
+        (proofread--close-source-list-buffers (current-buffer)))
+      (proofread--remove-buffer-hooks)
+      (proofread--clear-buffer-state)
+      (proofread--unregister-mode-buffer))))
 
 (defun proofread--change-major-mode ()
   "Disable `proofread-mode' before changing the current major mode."
@@ -7578,14 +8626,6 @@ DIAGNOSTICS must be in navigation order.  Return `applied'."
     (user-error
      "Proofread mode is not enabled in the current buffer")))
 
-(defun proofread--range-contained-in-any-p (range ranges)
-  "Return non-nil if RANGE is completely contained in RANGES."
-  (cl-some
-   (lambda (candidate)
-     (and (<= (car candidate) (car range))
-          (<= (cdr range) (cdr candidate))))
-   ranges))
-
 (defun proofread--sorted-target-domains (domains)
   "Return a copy of DOMAINS sorted by beginning position."
   (sort (copy-sequence domains)
@@ -7595,122 +8635,104 @@ DIAGNOSTICS must be in navigation order.  Return `applied'."
 
 (defun proofread--range-in-sorted-domains-p (range domains)
   "Return non-nil when RANGE is contained in one of sorted DOMAINS."
-  (let ((beg (car range))
-        (end (cdr range)))
+  (let ((beg (car range)))
     (catch 'contained
       (dolist (domain domains)
         (let ((domain-beg (plist-get domain :domain-beg))
               (domain-end (plist-get domain :domain-end)))
           (when (> domain-beg beg)
             (throw 'contained nil))
-          (when (and (<= domain-beg beg) (<= end domain-end))
+          (when (proofread--range-contains-p
+                 (cons domain-beg domain-end) range)
             (throw 'contained t))))
       nil)))
 
 (defun proofread--checked-diagnostic-entries (ranges)
-  "Return diagnostics intersecting RANGES with positions sorted."
-  (let (entries)
+  "Return diagnostics conflicting with RANGES, sorted by position."
+  (let ((live-ranges (proofread--flymake-live-range-table))
+        entries)
     (dolist (diagnostic proofread--diagnostics)
-      (when-let* ((range (proofread--diagnostic-range diagnostic)))
+      (when-let* ((range (gethash diagnostic live-ranges)))
         (when (proofread--range-conflicts-any-p range ranges)
           (push (cons diagnostic range) entries))))
     (sort entries
           (lambda (left right)
             (< (cadr left) (cadr right))))))
 
-(defun proofread--prune-inactive-checker-diagnostics
-    (ranges profile)
-  "Remove checked diagnostics whose checker is absent from PROFILE.
-Only remove diagnostics intersecting RANGES.  Keep unowned
-diagnostics and diagnostics owned by explicit ad-hoc requests."
-  (let ((owners
+(defun proofread--prune-invalid-checked-diagnostics (plan profile)
+  "Remove checked diagnostics invalid under PLAN or PROFILE.
+A diagnostic selected by PLAN must remain wholly within one target
+domain, avoid ignored text, and, when profile-owned, belong to a
+checker in PROFILE.  Unowned and ad-hoc diagnostics are exempt only
+from the profile-owner requirement."
+  (let ((ranges (proofread--selection-plan-ranges plan))
+        (remaining-domains
+         (proofread--sorted-target-domains
+          (proofread--selection-plan-domains plan)))
+        (owners
          (mapcar #'proofread--checker-owner
                  (plist-get profile :checkers)))
         diagnostics)
     (dolist (entry (proofread--checked-diagnostic-entries ranges))
       (let* ((diagnostic (car entry))
-             (owner (plist-get diagnostic :checker-owner)))
-        (when (and owner
-                   (not (plist-get owner :ad-hoc))
-                   (not (member owner owners)))
-          (push diagnostic diagnostics))))
-    (when diagnostics
-      (proofread--invalidate-affected-diagnostics
-       (delq nil
-             (mapcar #'proofread--overlay-for-diagnostic diagnostics))
-       diagnostics))))
-
-(defun proofread--prune-diagnostics-outside-targets (ranges domains)
-  "Remove checked diagnostics in RANGES that are invalid in DOMAINS."
-  (let ((remaining-domains (proofread--sorted-target-domains domains))
-        diagnostics)
-    (dolist (entry (proofread--checked-diagnostic-entries ranges))
-      (let* ((diagnostic (car entry))
              (range (cdr entry))
              (beg (car range))
-             (end (cdr range)))
+             (end (cdr range))
+             (owner (plist-get diagnostic :checker-owner)))
         (while (and remaining-domains
                     (< (plist-get (car remaining-domains) :domain-end)
                        beg))
           (setq remaining-domains (cdr remaining-domains)))
-        (unless (and (proofread--range-in-sorted-domains-p
-                      range remaining-domains)
-                     (null
-                      (proofread--ignored-ranges-in-region
-                       beg end)))
+        (unless
+            (and
+             (proofread--range-in-sorted-domains-p
+              range remaining-domains)
+             (null (proofread--ignored-ranges-in-region beg end))
+             (or (null owner)
+                 (plist-get owner :ad-hoc)
+                 (member owner owners)))
           (push diagnostic diagnostics))))
     (when diagnostics
-      (proofread--invalidate-affected-diagnostics
-       (delq nil
-             (mapcar #'proofread--overlay-for-diagnostic diagnostics))
-       diagnostics))))
+      (proofread--commit-diagnostic-state
+       (when ranges
+         (cons (apply #'min (mapcar #'car ranges))
+               (apply #'max (mapcar #'cdr ranges))))
+       (lambda ()
+         (proofread--remove-diagnostics diagnostics))))))
 
-(defun proofread--check-ranges (ranges scope &optional force-feedback)
-  "Check RANGES and describe them as SCOPE in progress feedback.
-When FORCE-FEEDBACK is non-nil, report feedback even when routine
-progress messages are inhibited."
-  (proofread--require-mode)
+(defun proofread--prepare-forced-check (force-feedback)
+  "Retire pending automatic work when FORCE-FEEDBACK is non-nil."
   (when force-feedback
     (setq proofread--pending-work nil)
-    (proofread--cancel-idle-timer))
+    (proofread--cancel-idle-timer)))
+
+(defun proofread--check-selection-plan
+    (plan profile scope &optional force-feedback request-spans)
+  "Check PLAN with PROFILE and describe it as SCOPE.
+When FORCE-FEEDBACK is non-nil, use `message' for feedback.  Optional
+REQUEST-SPANS are already selected and filtered request span records."
   (let* ((progress-message
           (if force-feedback
               #'message
             #'proofread--progress-message))
          (normalized-ranges
-          (proofread--normalize-accessible-ranges ranges))
-         (profile (proofread--current-profile))
-         (legacy-profile-p
-          (null proofread-profile))
-         (islands
-          (proofread--target-islands-for-ranges
-           normalized-ranges))
-         (domains
-          (cl-delete-duplicates
-           (mapcar
-            (lambda (island)
-              (list :kind (plist-get island :kind)
-                    :domain-beg (plist-get island :domain-beg)
-                    :domain-end (plist-get island :domain-end)))
-            islands)
-           :test #'equal)))
-    (when (and legacy-profile-p (plist-get profile :checkers))
-      (proofread--warn-about-legacy-dispatch))
-    (proofread--prune-diagnostics-outside-targets
-     normalized-ranges domains)
-    (proofread--prune-inactive-checker-diagnostics
-     normalized-ranges profile)
+          (proofread--selection-plan-ranges plan))
+         (islands (proofread--selection-plan-islands plan)))
+    (proofread--prune-invalid-checked-diagnostics plan profile)
     (let* ((dispatch-result
             (when (plist-get profile :checkers)
               (proofread--dispatch-profile-request-ready-chunks-result
-               (proofread--request-ready-chunks-for-islands
-                islands (plist-get profile :language))
+               (if request-spans
+                   (proofread--request-ready-chunks-for-request-spans
+                    request-spans (plist-get profile :language))
+                 (proofread--request-ready-chunks-for-islands
+                  islands (plist-get profile :language)))
                profile)))
            (supported-count
             (or (plist-get dispatch-result :supported-count) 0)))
       (if (> supported-count 0)
           (let ((requests (plist-get dispatch-result :requests))
-                (queued (length proofread--request-queue)))
+                (queued (proofread--request-queue-length)))
             (funcall
              progress-message
              "proofread: dispatched %d request%s%s from %d %s range%s"
@@ -7729,14 +8751,25 @@ progress messages are inhibited."
          scope
          (if (= (length normalized-ranges) 1) "" "s"))))))
 
+(defun proofread--check-ranges (ranges scope &optional force-feedback)
+  "Check RANGES and describe them as SCOPE in progress feedback.
+When FORCE-FEEDBACK is non-nil, report feedback even when routine
+progress messages are inhibited."
+  (proofread--require-mode)
+  (proofread--prepare-forced-check force-feedback)
+  (let ((profile (proofread--current-profile)))
+    (proofread--check-selection-plan
+     (proofread--selection-plan-for-ranges ranges)
+     profile scope force-feedback)))
+
 (defun proofread--span-at-position (spans position)
   "Return the most useful member of sorted SPANS for POSITION.
-Spans are half-open ranges.  At the end of the accessible buffer or
-the first sentence-ending separator whitespace, return the preceding
-span only when it ends exactly at POSITION."
+SPANS are nonempty half-open ranges.  At the end of the accessible
+buffer or the first sentence-ending separator whitespace, return the
+preceding span only when it ends exactly at POSITION."
   (or (cl-find-if (lambda (span)
-                    (and (<= (car span) position)
-                         (< position (cdr span))))
+                    (proofread--range-covers-position-p
+                     span position))
                   spans)
       (when (or (= position (point-max))
                 (and (< position (point-max))
@@ -7769,64 +8802,108 @@ span only when it ends exactly at POSITION."
          (end (if (= beg domain-beg)
                   (min domain-end (+ beg (* 4 size)))
                 (min domain-end (+ beg (* 3 size))))))
-    (append (list :beg beg :end end) domain)))
+    (append (list :beg beg :end end :owner-domain domain)
+            domain)))
 
-(defun proofread--request-ready-chunks-at-point ()
-  "Return request-ready chunks in the target domain at point."
-  (let* ((position (point))
-         (ranges (proofread--point-probe-ranges))
-         (policy (proofread--effective-target-policy))
-         (minimum (point-min))
-         (maximum (point-max))
-         (domains
-          (cond
-           ((eq policy 'all)
-            (proofread--target-domains-for-kind
-             ranges 'text policy minimum maximum))
-           ((proofread--target-policy-includes-p policy 'comment)
-            (or (proofread--target-domains-for-kind
-                 ranges 'comment policy minimum maximum)
-                (when (proofread--target-policy-includes-p
-                       policy 'docstring)
-                  (proofread--target-domains-for-kind
-                   ranges 'docstring policy minimum maximum))))
-           (t
-            (proofread--target-domains-for-kind
-             ranges 'docstring policy minimum maximum)))))
-    (proofread--request-ready-chunks-for-islands
-     (mapcar
-      (lambda (domain)
-        (proofread--point-island-for-domain domain position))
-      domains))))
+(defun proofread--point-target-domains (plan)
+  "Return the preferred point target domains from PLAN.
+Comments take precedence over docstrings when discovery reports both."
+  (let ((domains (proofread--selection-plan-domains plan)))
+    (or (cl-remove-if-not
+         (lambda (domain)
+           (eq (plist-get domain :kind) 'comment))
+         domains)
+        (cl-remove-if-not
+         (lambda (domain)
+           (eq (plist-get domain :kind) 'docstring))
+         domains)
+        (cl-remove-if-not
+         (lambda (domain)
+           (eq (plist-get domain :kind) 'text))
+         domains))))
 
-(defun proofread--request-ready-range-at-point ()
-  "Return the request-ready chunk range selected by point, or nil."
-  (let* ((position (point))
-         (chunks (proofread--request-ready-chunks-at-point))
-         (spans
-          (mapcar (lambda (chunk)
-                    (cons (plist-get chunk :beg)
-                          (plist-get chunk :end)))
-                  chunks)))
-    (or (proofread--span-at-position spans position)
-        ;; A comment delimiter can form a punctuation-only chunk that
+(defun proofread--request-span-at-position
+    (request-spans position)
+  "Return the member of REQUEST-SPANS selected by POSITION."
+  (let* ((ranges
+          (mapcar
+           (lambda (span)
+             (cons (plist-get span :beg)
+                   (plist-get span :end)))
+           request-spans))
+         (range (proofread--span-at-position ranges position)))
+    (or (and range
+             (cl-find-if
+              (lambda (span)
+                (and (= (plist-get span :beg) (car range))
+                     (= (plist-get span :end) (cdr range))))
+              request-spans))
+        ;; A comment delimiter can form a punctuation-only span that
         ;; is intentionally filtered.  Select the following prose in
         ;; that same target domain when point is on the delimiter.
         (when (cl-some
-               (lambda (chunk)
-                 (memq (plist-get chunk :target-kind)
+               (lambda (span)
+                 (memq (plist-get span :kind)
                        '( comment docstring)))
-               chunks)
+               request-spans)
           (when-let* ((span
                        (cl-find-if
                         (lambda (candidate)
-                          (<= position (car candidate)))
-                        spans)))
-            (when (and (not (proofread--range-has-alphanumeric-p
-                             position (car span)))
-                       (null (proofread--ignored-ranges-in-region
-                              position (car span))))
+                          (let ((domain
+                                 (plist-get candidate
+                                            :owner-domain)))
+                            (and domain
+                                 (proofread--range-covers-position-p
+                                  (cons
+                                   (plist-get domain :domain-beg)
+                                   (plist-get domain :domain-end))
+                                  position)
+                                 (<= position
+                                     (plist-get candidate :beg)))))
+                        request-spans)))
+            (when (and
+                   (not
+                    (proofread--range-has-alphanumeric-p
+                     position (plist-get span :beg)))
+                   (null
+                    (proofread--ignored-ranges-in-region
+                     position (plist-get span :beg))))
               span))))))
+
+(defun proofread--point-check-selection ()
+  "Return the point check selection, or nil when point has no prose.
+The return value is a cons whose car is the final selection plan and
+whose cdr contains its one filtered request span record."
+  (let* ((position (point))
+         (probe-plan
+          (proofread--selection-plan-for-ranges
+           (proofread--point-probe-ranges)))
+         (domains (proofread--point-target-domains probe-plan))
+         (islands
+          (mapcar
+           (lambda (domain)
+             (proofread--point-island-for-domain domain position))
+           domains))
+         (request-spans
+          (proofread--request-spans-for-islands islands)))
+    (when-let* ((span
+                 (proofread--request-span-at-position
+                  request-spans position))
+                (domain (plist-get span :owner-domain)))
+      (let* ((range
+              (cons (plist-get span :beg)
+                    (plist-get span :end)))
+             (island
+              (append (list :beg (car range) :end (cdr range))
+                      domain)))
+        (cons (proofread--make-selection-plan
+               (list range) (list domain) (list island))
+              (list span))))))
+
+(defun proofread--request-ready-range-at-point ()
+  "Return the request-ready chunk range selected by point, or nil."
+  (when-let* ((selection (proofread--point-check-selection)))
+    (car (proofread--selection-plan-ranges (car selection)))))
 
 ;;;; Minor mode
 
@@ -7834,14 +8911,20 @@ span only when it ends exactly at POSITION."
 (define-minor-mode proofread-mode
   "Toggle context-aware proofreading in the current buffer.
 
+Enabling installs a buffer-local Flymake backend, enables
+`flymake-mode' when necessary, and starts all configured Flymake
+backends.  Disabling removes only Proofread's backend and diagnostics;
+it leaves Flymake and other backends active.  Disabling `flymake-mode'
+while Proofread is active disables this mode.
+
 When enabled and `proofread-auto-check' is non-nil, proofread
 schedules an initial visible-buffer check when enabled, and further
 checks after editing or window activity.  It then dispatches
-request-ready visible chunks through the configured backend.  The
-option `proofread-targets' controls which kinds of text are selected.
-When point is on a diagnostic and `proofread-echo-area-messages' is
-non-nil, its source and message are also shown through ElDoc in the
-echo area.
+request-ready visible chunks through the selected profile's ordered
+checkers.  The option `proofread-targets' controls which kinds of text
+are selected.  Diagnostics are published through Flymake.  When
+`eldoc-mode' is enabled, Flymake shows diagnostics at point from
+Proofread and other backends; Proofread does not manage ElDoc itself.
 When automatic checking is disabled, use
 `proofread-check-at-point', `proofread-check-region',
 `proofread-check-buffer', or `proofread-check-visible-range' manually.
@@ -7897,16 +8980,23 @@ When FORCE-FEEDBACK is non-nil, report command feedback even when
 routine progress messages are inhibited."
   (interactive (list t))
   (proofread--require-mode)
-  (let ((range (proofread--request-ready-range-at-point)))
-    (unless range
+  (let ((selection (proofread--point-check-selection)))
+    (unless selection
       (user-error "No text to proofread at point"))
-    (proofread--check-ranges (list range) "point" force-feedback)))
+    (proofread--prepare-forced-check force-feedback)
+    (let ((profile (proofread--current-profile)))
+      (proofread--check-selection-plan
+       (car selection) profile "point" force-feedback
+       (cdr selection)))))
 
 ;;;###autoload
 (defun proofread-show-buffer-diagnostics (&optional diagnostic)
-  "Show a listing of Proofread diagnostics for the current buffer.
+  "Show a supplemental Proofread-only diagnostic listing.
 With optional DIAGNOSTIC, find and highlight this diagnostic in the
-listing.
+listing.  Flymake's standard listing remains the primary view of all
+Flymake backends in the current buffer.  This list omits other
+backends, aggregates Proofread diagnostics with the same live range
+and text, and retains logical zero-width positions.
 
 Interactively, use the diagnostic at point.  For mouse events in
 margins and fringes, use the first diagnostic in the corresponding
@@ -7977,30 +9067,36 @@ This function does not move point in the source buffer."
 
 ;;;###autoload
 (defun proofread-next ()
-  "Move point to the next proofreading diagnostic."
+  "Move point to the next live Proofread diagnostic without wrapping."
   (interactive)
-  (let ((diagnostic (proofread--next-diagnostic-after (point))))
+  (let* ((entries (proofread--navigation-entries t))
+         (entry
+          (proofread--next-navigation-entry-after
+           (point) entries)))
     (cond
-     (diagnostic
-      (goto-char (car (proofread--diagnostic-live-range diagnostic)))
-      (proofread--mark-current-diagnostic diagnostic)
+     (entry
+      (goto-char (nth 1 entry))
+      (proofread--mark-current-diagnostic (car entry))
       (message "proofread: moved to next diagnostic"))
-     ((proofread--navigation-diagnostics)
+     (entries
       (user-error "No next proofread diagnostic"))
      (t
       (user-error "No proofread diagnostics")))))
 
 ;;;###autoload
 (defun proofread-previous ()
-  "Move point to the previous proofreading diagnostic."
+  "Move point to the previous live Proofread diagnostic without wrapping."
   (interactive)
-  (let ((diagnostic (proofread--previous-diagnostic-before (point))))
+  (let* ((entries (proofread--navigation-entries t))
+         (entry
+          (proofread--previous-navigation-entry-before
+           (point) entries)))
     (cond
-     (diagnostic
-      (goto-char (car (proofread--diagnostic-live-range diagnostic)))
-      (proofread--mark-current-diagnostic diagnostic)
+     (entry
+      (goto-char (nth 1 entry))
+      (proofread--mark-current-diagnostic (car entry))
       (message "proofread: moved to previous diagnostic"))
-     ((proofread--navigation-diagnostics)
+     (entries
       (user-error "No previous proofread diagnostic"))
      (t
       (user-error "No proofread diagnostics")))))
@@ -8022,7 +9118,6 @@ When the diagnostic has multiple suggestions, choose one using
 provide the selection interface."
   (interactive)
   (proofread--require-mode)
-  (proofread--synchronize-live-diagnostic-ranges)
   (let ((diagnostic (proofread-diagnostic-at-point)))
     (unless diagnostic
       (user-error "No proofread diagnostic at point"))
@@ -8044,7 +9139,6 @@ provide the selection interface."
 (defun proofread--correct-ranges (ranges scope)
   "Correct diagnostics contained in RANGES described by SCOPE."
   (proofread--require-mode)
-  (proofread--synchronize-live-diagnostic-ranges)
   (let ((diagnostics (proofread--diagnostics-in-ranges ranges)))
     (unless diagnostics
       (user-error "No proofread diagnostics in %s" scope))
@@ -8086,15 +9180,21 @@ buffer."
   (let ((diagnostic (proofread-diagnostic-at-point)))
     (unless diagnostic
       (user-error "No proofread diagnostic at point"))
-    (dolist (member (proofread--diagnostic-members diagnostic))
-      (proofread--remove-diagnostics-matching-ignore-key
-       (proofread--record-ignored-diagnostic member)))
+    (let (keys)
+      (dolist (member (proofread--diagnostic-members diagnostic))
+        (cl-pushnew
+         (proofread--record-ignored-diagnostic member)
+         keys :test #'equal))
+      (proofread--remove-diagnostics-matching-ignore-keys
+       (nreverse keys)))
     (message "proofread: ignored diagnostic")
     'ignored))
 
 ;;;###autoload
 (defun proofread-clear ()
-  "Clear proofreading diagnostics from the current buffer."
+  "Clear the current buffer's Proofread model and publication.
+Leave `flymake-mode' and diagnostics reported by other Flymake
+backends unchanged."
   (interactive)
   (proofread--clear-diagnostics))
 
@@ -8113,16 +9213,16 @@ buffer."
 
 (defun proofread-unload-function ()
   "Remove Proofread state and hooks before unloading this library."
-  (let (auxiliary-buffers)
+  (let ((registered-buffers
+         (copy-sequence proofread--mode-buffers))
+        auxiliary-buffers)
     (dolist (buffer (buffer-list))
       (with-current-buffer buffer
         (cond
          ((bound-and-true-p proofread-mode)
           (proofread-mode -1))
-         ((memq buffer proofread--mode-buffers)
-          (proofread--disable-echo-area)
-          (proofread--clear-buffer-state)
-          (proofread--unregister-mode-buffer)))
+         ((memq buffer registered-buffers)
+          (proofread--disable-buffer)))
         (when (memq major-mode
                     '( proofread-requests-buffer-mode
                        proofread-diagnostics-buffer-mode))
@@ -8130,24 +9230,12 @@ buffer."
     (dolist (buffer auxiliary-buffers)
       (when (buffer-live-p buffer)
         (kill-buffer buffer))))
-  (remove-hook 'window-scroll-functions #'proofread--window-scroll)
-  (remove-hook 'window-configuration-change-hook
-               #'proofread--window-configuration-change)
   (dolist (source (copy-sequence proofread--request-log-sources))
     (proofread--request-log-disable-source source))
-  (remove-hook 'proofread-request-log-hook
-               #'proofread--request-log-record-event)
+  (clrhash proofread--request-log-owner-ids)
   (setq proofread--request-log-sources nil)
   (setq proofread--mode-buffers nil)
-  (setq proofread--window-hooks-installed nil)
-  (remove-variable-watcher
-   'proofread-echo-area-messages
-   #'proofread--echo-area-option-watcher)
   nil)
-
-(add-variable-watcher
- 'proofread-echo-area-messages
- #'proofread--echo-area-option-watcher)
 
 (provide 'proofread)
 ;;; proofread.el ends here

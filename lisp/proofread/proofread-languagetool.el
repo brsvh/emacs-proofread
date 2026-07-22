@@ -172,6 +172,18 @@ rule or category may be disabled."
 (defconst proofread-languagetool--contract-version 1
   "Version of the LanguageTool backend request contract.")
 
+(defconst proofread-languagetool--checker-option-keys
+  '( :language
+     :level
+     :preferred-variants
+     :mother-tongue
+     :enabled-rules
+     :disabled-rules
+     :enabled-categories
+     :disabled-categories
+     :enabled-only)
+  "Property keys accepted in LanguageTool checker options.")
+
 (defconst proofread-languagetool--probe-delay 0.1
   "Seconds between managed server health probes.")
 
@@ -334,7 +346,7 @@ When BASE-URL is nil, validate and use the configured server URL."
 
 (defun proofread-languagetool--normalized-identifiers (values option)
   "Return sorted LanguageTool identifiers from VALUES for OPTION."
-  (unless (listp values)
+  (unless (integerp (proper-list-p values))
     (error "%s must be a list of strings" option))
   (let (result)
     (dolist (value values)
@@ -356,7 +368,7 @@ When BASE-URL is nil, validate and use the configured server URL."
 
 (defun proofread-languagetool--normalized-preferred-variants (values)
   "Return preferred language variant VALUES in user order."
-  (unless (listp values)
+  (unless (integerp (proper-list-p values))
     (error (concat "LanguageTool preferred variants must be a list "
                    "of strings")))
   (let ((bases (make-hash-table :test #'equal))
@@ -388,6 +400,171 @@ When BASE-URL is nil, validate and use the configured server URL."
       (proofread-languagetool--normalized-preferred-variants values)
     (error (format "%S" values))))
 
+(defun proofread-languagetool--snapshot-string-option
+    (value option &optional allow-nil)
+  "Return a detached normalized string VALUE for OPTION.
+When ALLOW-NIL is non-nil, preserve nil as an explicit option value."
+  (when (and (null value) (not allow-nil))
+    (error "%s must be a nonempty string" option))
+  (when value
+    (unless (stringp value)
+      (error "%s must be a nonempty string or nil" option))
+    (let ((normalized (string-trim value)))
+      (when (string-empty-p normalized)
+        (error "%s must be a nonempty string or nil" option))
+      (substring-no-properties normalized))))
+
+(defun proofread-languagetool--snapshot-string-list-option
+    (value option)
+  "Return detached normalized identifier list VALUE for OPTION."
+  (mapcar #'substring-no-properties
+          (proofread-languagetool--normalized-identifiers value option)))
+
+(defun proofread-languagetool--validate-checker-options (raw-options)
+  "Return checker RAW-OPTIONS after validating their shape.
+Signal an error for a malformed plist, duplicate key, or unsupported
+LanguageTool checker option."
+  (let ((length (proper-list-p raw-options))
+        (tail raw-options)
+        keys)
+    (unless (and (integerp length) (zerop (% length 2)))
+      (error "LanguageTool checker options must be a property list"))
+    (while tail
+      (let ((key (pop tail)))
+        (unless (keywordp key)
+          (error "LanguageTool checker option must be a keyword: %S"
+                 key))
+        (when (memq key keys)
+          (error "Duplicate LanguageTool checker option: %S" key))
+        (unless (memq key proofread-languagetool--checker-option-keys)
+          (error "Unknown LanguageTool checker option: %S" key))
+        (push key keys)
+        (pop tail)))
+    raw-options))
+
+(defun proofread-languagetool--checker-option-value
+    (options key fallback)
+  "Return OPTIONS value for KEY, or FALLBACK when KEY is absent."
+  (if (plist-member options key)
+      (plist-get options key)
+    fallback))
+
+(defun proofread-languagetool--snapshot-checker-option (key value)
+  "Return the detached normalized VALUE for checker option KEY."
+  (pcase key
+    (:language
+     (proofread-languagetool--snapshot-string-option
+      value 'language t))
+    (:level
+     (unless (memq value '( default picky))
+       (error "Invalid LanguageTool checking level: %S" value))
+     value)
+    (:preferred-variants
+     (mapcar
+      #'substring-no-properties
+      (proofread-languagetool--normalized-preferred-variants value)))
+    (:mother-tongue
+     (proofread-languagetool--snapshot-string-option
+      value 'mother-tongue t))
+    ((or :enabled-rules :disabled-rules
+         :enabled-categories :disabled-categories)
+     (proofread-languagetool--snapshot-string-list-option value key))
+    (:enabled-only
+     (unless (memq value '( nil t))
+       (error "LanguageTool enabled-only must be nil or t"))
+     value)
+    (_
+     (error "Unknown LanguageTool checker option: %S" key))))
+
+(defun proofread-languagetool--validate-rule-selection
+    (enabled-only enabled disabled enabled-categories
+                  disabled-categories)
+  "Validate effective LanguageTool rule-selection options.
+ENABLED-ONLY controls whether ENABLED and ENABLED-CATEGORIES are
+required and whether DISABLED and DISABLED-CATEGORIES are forbidden."
+  (when (and enabled-only (or disabled disabled-categories))
+    (error (concat "LanguageTool enabled-only mode cannot include "
+                   "disabled rules or categories")))
+  (when (and enabled-only
+             (null enabled)
+             (null enabled-categories))
+    (error (concat "LanguageTool enabled-only mode requires an "
+                   "enabled rule or category"))))
+
+(defun proofread-languagetool--snapshot-checker-options (raw-options)
+  "Return detached normalized LanguageTool checker RAW-OPTIONS.
+RAW-OPTIONS must be a plist containing only supported checker options.
+Missing request-option properties capture the corresponding
+buffer-local LanguageTool option.  Keep an absent `:language' property
+absent so each request can use its profile language; preserve an
+explicitly nil `:language' property as automatic detection."
+  (proofread-languagetool--validate-checker-options raw-options)
+  (let* ((language-present (plist-member raw-options :language))
+         (language
+          (and language-present
+               (proofread-languagetool--snapshot-checker-option
+                :language (plist-get raw-options :language))))
+         (level
+          (proofread-languagetool--snapshot-checker-option
+           :level
+           (proofread-languagetool--checker-option-value
+            raw-options :level proofread-languagetool-level)))
+         (preferred-variants
+          (proofread-languagetool--snapshot-checker-option
+           :preferred-variants
+           (proofread-languagetool--checker-option-value
+            raw-options :preferred-variants
+            proofread-languagetool-preferred-variants)))
+         (mother-tongue
+          (proofread-languagetool--snapshot-checker-option
+           :mother-tongue
+           (proofread-languagetool--checker-option-value
+            raw-options :mother-tongue
+            proofread-languagetool-mother-tongue)))
+         (enabled-rules
+          (proofread-languagetool--snapshot-checker-option
+           :enabled-rules
+           (proofread-languagetool--checker-option-value
+            raw-options :enabled-rules
+            proofread-languagetool-enabled-rules)))
+         (disabled-rules
+          (proofread-languagetool--snapshot-checker-option
+           :disabled-rules
+           (proofread-languagetool--checker-option-value
+            raw-options :disabled-rules
+            proofread-languagetool-disabled-rules)))
+         (enabled-categories
+          (proofread-languagetool--snapshot-checker-option
+           :enabled-categories
+           (proofread-languagetool--checker-option-value
+            raw-options :enabled-categories
+            proofread-languagetool-enabled-categories)))
+         (disabled-categories
+          (proofread-languagetool--snapshot-checker-option
+           :disabled-categories
+           (proofread-languagetool--checker-option-value
+            raw-options :disabled-categories
+            proofread-languagetool-disabled-categories)))
+         (enabled-only
+          (proofread-languagetool--snapshot-checker-option
+           :enabled-only
+           (proofread-languagetool--checker-option-value
+            raw-options :enabled-only
+            proofread-languagetool-enabled-only))))
+    (proofread-languagetool--validate-rule-selection
+     enabled-only enabled-rules disabled-rules enabled-categories
+     disabled-categories)
+    (append
+     (when language-present (list :language language))
+     (list :level level
+           :preferred-variants preferred-variants
+           :mother-tongue mother-tongue
+           :enabled-rules enabled-rules
+           :disabled-rules disabled-rules
+           :enabled-categories enabled-categories
+           :disabled-categories disabled-categories
+           :enabled-only enabled-only))))
+
 (defun proofread-languagetool--source-options (source)
   "Return checker-local options from SOURCE, or nil.
 SOURCE may be a backend request or a normalized profile checker."
@@ -396,10 +573,8 @@ SOURCE may be a backend request or a normalized profile checker."
 
 (defun proofread-languagetool--option (source key fallback)
   "Return SOURCE checker option KEY, or FALLBACK when absent."
-  (let ((options (proofread-languagetool--source-options source)))
-    (if (plist-member options key)
-        (plist-get options key)
-      fallback)))
+  (proofread-languagetool--checker-option-value
+   (proofread-languagetool--source-options source) key fallback))
 
 (defun proofread-languagetool--effective-language (request)
   "Return the LanguageTool language option effective for REQUEST."
@@ -826,15 +1001,9 @@ startup even when automatic startup is disabled."
     (unless (memq level '( default picky))
       (error "Invalid LanguageTool checking level: %S"
              level))
-    (when (and enabled-only
-               (or disabled disabled-categories))
-      (error (concat "LanguageTool enabled-only mode cannot include "
-                     "disabled rules or categories")))
-    (when (and enabled-only
-               (null enabled)
-               (null enabled-categories))
-      (error (concat "LanguageTool enabled-only mode requires an "
-                     "enabled rule or category")))
+    (proofread-languagetool--validate-rule-selection
+     enabled-only enabled disabled enabled-categories
+     disabled-categories)
     (setq parameters
           (list (cons "language" language)
                 (cons "text" (concat before text after))
@@ -1954,7 +2123,7 @@ An external server reused by this backend is never stopped."
 (defun proofread-languagetool-unload-function ()
   "Unload the LanguageTool backend and release its resources."
   (remove-hook 'kill-emacs-hook #'proofread-languagetool--kill-emacs)
-  (proofread--unregister-backend 'languagetool)
+  (proofread-unregister-backend 'languagetool)
   (proofread-languagetool--teardown
    'languagetool-unloaded "LanguageTool backend was unloaded")
   (proofread-languagetool--kill-url-buffer
@@ -1966,10 +2135,12 @@ An external server reused by this backend is never stopped."
 (progn
   (add-hook 'kill-emacs-hook
             #'proofread-languagetool--kill-emacs)
-  (proofread--register-backend
+  (proofread-register-backend
    'languagetool
    :check #'proofread-languagetool--check
    :identity #'proofread-languagetool--identity
+   :snapshot-options
+   #'proofread-languagetool--snapshot-checker-options
    :checker-identity #'proofread-languagetool--checker-identity
    :source-label #'proofread-languagetool--checker-source-label
    :cancel #'proofread-languagetool--cancel))

@@ -30,6 +30,16 @@
 ;; in a child frame.  Loading it integrates `proofread-popup-mode'
 ;; with `proofread-mode' in each buffer.  The core Proofread package
 ;; does not require this package or Posframe.
+;;
+;; The frontend observes `proofread-diagnostics-changed-hook' and uses
+;; only public Proofread diagnostic APIs:
+;; `proofread-diagnostic-at-point', `proofread-diagnostic-range', and
+;; `proofread-format-diagnostic-message'.  Other point-oriented
+;; frontends can use the same interface without reading Flymake or
+;; Proofread private state.
+;; This popup supplements Flymake; it neither replaces Flymake's
+;; annotations and ElDoc integration nor displays diagnostics owned by
+;; other Flymake backends.
 
 ;;; Code:
 
@@ -45,7 +55,9 @@
   :prefix "proofread-popup-")
 
 (defcustom proofread-popup-enabled t
-  "Whether to show a child-frame message at point."
+  "Whether `proofread-popup-mode' may show a child-frame message.
+This controls only popup rendering; it does not disable the popup
+mode, Proofread, Flymake annotations, or ElDoc."
   :type 'boolean
   :group 'proofread-popup)
 
@@ -538,7 +550,16 @@ SELECTED-WINDOW, when non-nil, is the already captured selected window."
 This mode is enabled and disabled automatically with
 `proofread-mode' after the optional `proofread-popup' library has
 been loaded.  To opt one buffer out of popup messages, disable this
-mode locally."
+mode interactively; the opt-out persists when `proofread-mode' is
+disabled and re-enabled.  Enabling this mode interactively clears the
+opt-out.
+
+The popup displays only the live Proofread diagnostic returned by the
+public diagnostic API, never diagnostics from other Flymake backends.
+It supplements rather than replaces Flymake annotations and ElDoc.
+When the public logical range start is accessible and visible, the
+child frame is anchored there; otherwise it is anchored at point.  A
+visible zero-width diagnostic uses its exact logical position."
   :lighter nil
   :group 'proofread-popup
   (when (called-interactively-p 'interactive)

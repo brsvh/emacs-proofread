@@ -15,6 +15,8 @@
 (require 'ert)
 (require 'proofread)
 
+(setq flymake-no-changes-timeout nil)
+
 (declare-function proofread-popup--delete "proofread-popup")
 
 (defconst proofread-popup-v0.1.0-test--directory

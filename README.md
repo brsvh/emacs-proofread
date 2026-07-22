@@ -15,9 +15,9 @@ Free Documentation License".
 Proofread provides asynchronous, context-aware proofreading for GNU Emacs. It
 extracts prose from ordinary text, comments, or docstrings, splits it into
 bounded chunks, and sends those chunks to an LLM or local LanguageTool backend.
-Spelling, grammar, style, and other issues appear as diagnostics that can be
-reviewed, ignored, or corrected in place. Requests run asynchronously, so
-proofreading does not block editing.
+Spelling, grammar, style, and other issues appear through Emacs's built-in
+Flymake as diagnostics that can be reviewed, ignored, or corrected in place.
+Requests run asynchronously, so proofreading does not block editing.
 
 <div align="center">
 
@@ -34,6 +34,9 @@ backends. It depends on:
 
 - GNU Emacs 30.1 or later
 - [emacs-llm](https://github.com/ahyatt/llm) `0.31.1`
+
+Flymake ships with Emacs and is the required diagnostic presentation layer; no
+separate Flymake package is required.
 
 The backends currently supported by `proofread` include:
 
@@ -152,6 +155,13 @@ the provider advertises that capability, and otherwise falls back to prompt-only
 JSON. If you provide `:instructions-function`, also provide a stable
 `:instructions-identity` so cache identity changes when your instructions
 change.
+
+Provider objects and provider identities form a pair. When a checker explicitly
+overrides `:provider` but omits `:provider-identity`, it receives a
+session-local identity for that object instead of inheriting the identity of the
+default provider. Likewise, an explicit non-`nil` `:instructions-function` must
+have a checker-local `:instructions-identity`; the default instructions identity
+is used only with the default instructions function.
 
 `proofread-llm-request-timeout` is a Proofread-owned request watchdog. It
 defaults to `120` seconds. Every non-`nil` value must be a positive number; set
@@ -330,28 +340,30 @@ Do not mark arbitrary values of `proofread-profile` as safe. A profile may
 select a remote checker, and automatic checking may then send buffer contents to
 that provider.
 
-During compatibility with version 0.1 configurations, `nil` means that the
-obsolete single-backend settings remain active when configured; it does not
-unconditionally disable dispatch. To disable dispatch explicitly, select a named
-profile whose `:checkers` list is empty:
+Setting `proofread-profile` to `nil` disables backend dispatch. A named profile
+whose `:checkers` list is empty also disables dispatch and can serve as an
+explicitly selectable off state:
 
 ```elisp
 (add-to-list 'proofread-profiles '(disabled :checkers nil))
 (setq-local proofread-profile 'disabled)
 ```
 
-An explicit check with this profile removes profile-owned diagnostics from the
-checked range without dispatching backend requests. Diagnostics outside that
-range remain unchanged. This profile-owner retirement does not affect
-otherwise-valid ad-hoc diagnostics added through the low-level API.
+An explicit check while dispatch is disabled in either way removes profile-owned
+diagnostics from the checked range without dispatching backend requests.
+Diagnostics outside that range remain unchanged. This profile-owner retirement
+does not affect otherwise-valid ad-hoc diagnostics added through the low-level
+API.
 
-#### Migrating from version 0.1
+#### Migrating single-backend configurations from versions 0.1 and 0.2
 
-`proofread-backend` and `proofread-language` are obsolete in version 0.2. Move
+`proofread-backend` and `proofread-language` became obsolete in version 0.2 and
+are no longer read in version 0.3.0. An init file may still use `setq` to create
+or set either old variable, but its value has no effect on Proofread. Move
 backend selection into each checker's `:backend`, move the language hint into
-the profile's `:language`, and select that profile with `proofread-profile`. The
-old variables remain temporarily functional for compatibility when
-`proofread-profile` is `nil`, but new configurations should not set them.
+the profile's `:language`, and select that profile with `proofread-profile`. See
+the complete [minimal `llm` profile](#minimal-configuration-llm) above for a
+profile-and-checker configuration.
 
 `proofread-targets` controls which text is checked in each buffer:
 
@@ -379,27 +391,42 @@ window configuration schedules a check. URLs, email addresses, invisible text,
 and text selected by `proofread-ignored-faces` or `proofread-ignored-properties`
 are not sent to the backend.
 
+The mode uses Flymake as its required presentation layer. Enabling it installs a
+buffer-local Proofread backend, enables `flymake-mode` when necessary, and
+starts every configured Flymake backend. Existing backends remain installed.
+Disabling `proofread-mode` removes only the Proofread backend and its
+diagnostics, leaving Flymake and other backends active. Disabling `flymake-mode`
+while Proofread is active disables `proofread-mode`; enable Proofread again to
+resume it.
+
 Automatic checks cover visible text only. To check another scope explicitly, use
 `proofread-check-at-point`, `proofread-check-region`, `proofread-check-buffer`,
 or `proofread-check-visible-range`. All four commands require `proofread-mode`
 to be enabled. The buffer command respects narrowing; the point command checks
 the request-ready chunk at point, not merely one word.
 
-Accepted diagnostics use `proofread-face`. Navigate with `proofread-next` and
-`proofread-previous`, inspect full details with `proofread-describe`, or open a
-list below the source window with `proofread-show-buffer-diagnostics`. In that
-list, `RET` visits a diagnostic, `SPC` or `C-o` previews it in another window,
-and `n` or `p` moves through the list.
+Accepted diagnostics are Flymake warning diagnostics displayed with
+`proofread-face`. Flymake's standard commands, including
+`flymake-show-buffer-diagnostics`, provide the primary all-backend interface.
+Navigate Proofread diagnostics with `proofread-next` and `proofread-previous`,
+inspect full details with `proofread-describe`, or open the supplementary
+Proofread-only list below the source window with
+`proofread-show-buffer-diagnostics`. In that list, `RET` visits a diagnostic,
+`SPC` or `C-o` previews it in another window, and `n` or `p` moves through the
+list.
 
-When point is on a diagnostic, `proofread-mode` also shows its message in the
-echo area through ElDoc. The format is `Source: message`; messages from multiple
-checkers retain profile order and are separated by semicolons on one line.
-`proofread-echo-area-messages` controls this behavior and defaults to `t`. It
-becomes buffer-local when set. Source prefixes inherit `font-lock-keyword-face`
-through `proofread-echo-area-source-face`, while message text inherits
-`font-lock-comment-face` through `proofread-echo-area-message-face`. If ElDoc
-was disabled, Proofread enables it for this integration and restores that state
-when `proofread-mode` is disabled.
+When `eldoc-mode` is enabled, Flymake shows Proofread and other backend
+diagnostics at point in the echo area. Proofread does not enable, disable, or
+customize ElDoc; configure `eldoc-mode` and Flymake directly. Proofread messages
+use the format `Source: message`; messages from multiple checkers retain profile
+order and are separated by semicolons on one line.
+
+A zero-width diagnostic represents an insertion point. In a nonempty buffer,
+Proofread gives Flymake the following character to underline when possible, or
+the preceding character at the end of the buffer. Its public queries,
+navigation, correction commands, and supplementary list retain the exact
+zero-width logical position. An empty buffer has no character to underline, but
+Proofread commands and its list still retain the logical diagnostic.
 
 ### Correcting errors
 
@@ -436,12 +463,13 @@ buffer:
 ```
 
 When point is on a diagnostic, the frontend displays each diagnostic message in
-a child frame above the start of its range and hides the frame when point moves
-away. The frame is also hidden immediately when its source buffer or window
-loses selection, so switching buffers or windows cannot leave a stale popup
-behind. By default, it waits until point has been idle for `0.5` seconds, then
-creates or updates the child frame from the diagnostic at that time. Movement
-and diagnostic notifications during the wait are coalesced. Set
+a child frame above the visible, accessible start of its range, falling back to
+point when that start is unavailable. It hides the frame when point moves away.
+The frame is also hidden immediately when its source buffer or window loses
+selection, so switching buffers or windows cannot leave a stale popup behind. By
+default, it waits until point has been idle for `0.5` seconds, then creates or
+updates the child frame from the diagnostic at that time. Movement and
+diagnostic notifications during the wait are coalesced. Set
 `proofread-popup-delay` to `0` to restore immediate updates, for example with
 `(setq proofread-popup-delay 0)` or Customize. Every message is prefixed with
 its backend source: LLM checkers use their effective source label, while
@@ -454,9 +482,22 @@ of or back into the automatic integration. Its display can also be controlled
 with `proofread-popup-enabled`, `proofread-popup-delay`, and
 `proofread-popup-max-width`.
 
-Third-party frontends can use `proofread-format-diagnostic-message` for the same
-source-aware fallback and aggregation rules while selecting their own separator
-and faces.
+#### Public frontend API
+
+The bundled popup uses only the public frontend contract. Point-oriented
+third-party frontends can read the current value with
+`proofread-diagnostic-at-point`, then use `proofread-diagnostic-range`,
+`proofread-diagnostic-message`, `proofread-diagnostic-text`, and
+`proofread-diagnostic-message-entries` to read it.
+`proofread-format-diagnostic-message` supplies the same source-aware fallback
+and aggregation rules while allowing a custom separator and faces.
+
+Add a buffer-local function to `proofread-diagnostics-changed-hook` to refresh
+after publication changes. An aggregate diagnostic may be newly allocated on
+each lookup, so compare accessor values rather than object identity. The range
+accessor returns Flymake-backed live logical positions, including zero-width
+positions. Frontends should not inspect Flymake objects or private Proofread
+state.
 
 ### Batch correction
 
@@ -492,30 +533,32 @@ https://github.com/user-attachments/assets/621e7e66-b7ed-4345-8a15-1e4aa08dfad9
 The core mode defines no default key bindings. These commands can be invoked
 with `M-x` or bound by the user:
 
-| Command                             | Description                                                  |
-| ----------------------------------- | ------------------------------------------------------------ |
-| `proofread-mode`                    | Toggle the Proofread minor mode in the current buffer        |
-| `proofread-check-at-point`          | Check the request-ready text chunk at point                  |
-| `proofread-check-region`            | Check the active region                                      |
-| `proofread-check-buffer`            | Check the accessible portion of the current buffer           |
-| `proofread-check-visible-range`     | Check all live-window ranges displaying the current buffer   |
-| `proofread-show-buffer-diagnostics` | Open a list of diagnostics for the current buffer            |
-| `proofread-next`                    | Move to the next diagnostic without wrapping                 |
-| `proofread-previous`                | Move to the previous diagnostic without wrapping             |
-| `proofread-describe`                | Describe the diagnostic at point in a help buffer            |
-| `proofread-correct-at-point`        | Apply a suggestion for the diagnostic at point               |
-| `proofread-correct-region`          | Correct diagnostics contained in the active region           |
-| `proofread-correct-buffer`          | Correct diagnostics in the accessible buffer                 |
-| `proofread-correct-visible-range`   | Correct diagnostics contained in visible ranges              |
-| `proofread-ignore`                  | Ignore the diagnostic at point for this Emacs session        |
-| `proofread-clear`                   | Clear diagnostics and their overlays from the current buffer |
-| `proofread-clear-cache`             | Clear the diagnostic cache for the current buffer            |
-| `proofread-show-buffer-requests`    | Start recording and display backend requests for a buffer    |
+| Command                             | Description                                                |
+| ----------------------------------- | ---------------------------------------------------------- |
+| `proofread-mode`                    | Toggle the Proofread minor mode in the current buffer      |
+| `proofread-check-at-point`          | Check the request-ready text chunk at point                |
+| `proofread-check-region`            | Check the active region                                    |
+| `proofread-check-buffer`            | Check the accessible portion of the current buffer         |
+| `proofread-check-visible-range`     | Check all live-window ranges displaying the current buffer |
+| `proofread-show-buffer-diagnostics` | Open the supplementary Proofread-only diagnostic list      |
+| `proofread-next`                    | Move to the next diagnostic without wrapping               |
+| `proofread-previous`                | Move to the previous diagnostic without wrapping           |
+| `proofread-describe`                | Describe the diagnostic at point in a help buffer          |
+| `proofread-correct-at-point`        | Apply a suggestion for the diagnostic at point             |
+| `proofread-correct-region`          | Correct diagnostics contained in the active region         |
+| `proofread-correct-buffer`          | Correct diagnostics in the accessible buffer               |
+| `proofread-correct-visible-range`   | Correct diagnostics contained in visible ranges            |
+| `proofread-ignore`                  | Ignore the diagnostic at point for this Emacs session      |
+| `proofread-clear`                   | Clear Proofread diagnostics from the current buffer        |
+| `proofread-clear-cache`             | Clear the diagnostic cache for the current buffer          |
+| `proofread-show-buffer-requests`    | Start recording and display backend requests for a buffer  |
 
 In a request list, `RET` or `C-m` invokes `proofread-show-request` to display
 the complete request lifecycle. In a diagnostic list, `RET` or `C-m` invokes
 `proofread-goto-diagnostic`, while `SPC` or `C-o` invokes
-`proofread-show-diagnostic`.
+`proofread-show-diagnostic`. In both lists, `Col` is the zero-based Emacs
+display column, so tabs, wide characters, and combining characters are
+reflected.
 
 ## Customization options
 
@@ -528,22 +571,21 @@ Run `M-x customize-group RET proofread RET` to edit the core options:
 | `proofread-docstring-predicate-functions` | `nil`   | Add predicate functions for recognizing docstrings; buffer-local when set         |
 | `proofread-idle-delay`                    | `1.0`   | Wait this many idle seconds before an automatic check                             |
 | `proofread-inhibit-progress-messages`     | `t`     | Suppress background progress, but not errors or explicit command feedback         |
-| `proofread-echo-area-messages`            | `t`     | Show the diagnostic at point through ElDoc; buffer-local when set                 |
 | `proofread-max-chunk-size`                | `2000`  | Limit the number of characters in each proofreading chunk                         |
 | `proofread-context-size`                  | `300`   | Limit context characters sent on each side of a chunk                             |
 | `proofread-context-sentences-before`      | `1`     | Limit logical context sentences before a chunk                                    |
 | `proofread-context-sentences-after`       | `1`     | Limit logical context sentences after a chunk                                     |
 | `proofread-max-concurrent-requests`       | `8`     | Limit active backend requests per buffer                                          |
 | `proofread-profiles`                      | `nil`   | Define named multi-backend profiles                                               |
-| `proofread-profile`                       | `nil`   | Select a named profile                                                            |
+| `proofread-profile`                       | `nil`   | Select a named profile; `nil` disables backend dispatch                           |
 | `proofread-llm-provider`                  | `nil`   | Default provider when an LLM checker omits `:provider`                            |
 | `proofread-llm-response-strategy`         | `auto`  | Default response strategy when an LLM checker omits `:response-strategy`          |
 | `proofread-llm-request-timeout`           | `120`   | Set the LLM watchdog and mode-local plz connect timeout; `nil` disables both      |
-| `proofread-llm-provider-identity`         | `nil`   | Default stable provider identity when an LLM checker omits `:provider-identity`   |
+| `proofread-llm-provider-identity`         | `nil`   | Stable identity used when an LLM checker inherits the default provider            |
 | `proofread-llm-source-label`              | `nil`   | Default diagnostic source label; `nil` uses the effective provider name           |
 | `proofread-llm-max-diagnostic-passes`     | `3`     | Default pass limit when an LLM checker omits `:diagnostic-passes`                 |
 | `proofread-llm-instructions-function`     | `nil`   | Default extra instructions when an LLM checker omits `:instructions-function`     |
-| `proofread-llm-instructions-identity`     | `nil`   | Default stable instructions identity when an LLM checker omits it                 |
+| `proofread-llm-instructions-identity`     | `nil`   | Stable identity used when an LLM checker inherits the default instructions        |
 | `proofread-cache-max-entries`             | `128`   | Limit per-buffer LRU cache entries; `0` disables caching                          |
 | `proofread-request-log-max-records`       | `100`   | Limit records retained for each monitored buffer                                  |
 | `proofread-ignored-faces`                 | `nil`   | Exclude text whose `face` property matches one of these faces                     |
@@ -579,10 +621,9 @@ different checking policy.
 The optional frontend also defines `proofread-popup-enabled` (default `t`),
 `proofread-popup-delay` (default `0.5` seconds, with `0` meaning immediate
 updates), and `proofread-popup-max-width` (default `80`). Customize diagnostic
-appearance with `proofread-face`, `proofread-current-face`,
-`proofread-echo-area-source-face`, `proofread-echo-area-message-face`,
-`proofread-popup-face`, `proofread-popup-source-face`, and
-`proofread-popup-border-face`.
+appearance with `proofread-face`, `proofread-popup-face`,
+`proofread-popup-source-face`, and `proofread-popup-border-face`. Configure
+Flymake and ElDoc presentation with their own options and faces.
 
 ### Tuning concurrency
 
@@ -618,10 +659,12 @@ default of `3` to `1`.
 - `proofread-show-buffer-requests` starts recording future requests and seeds
   the log with requests that are active or queued at that moment. It cannot
   recover requests that have already finished.
-- `proofread-clear` clears current diagnostics but neither the cache nor
-  in-flight requests, so later results may make diagnostics reappear.
+- `proofread-clear` clears only Proofread-owned Flymake diagnostics; diagnostics
+  from other Flymake backends remain. It clears neither the cache nor in-flight
+  requests, so later results may make diagnostics reappear.
   `proofread-clear-cache` clears only the cache. Disable `proofread-mode` to
-  stop all work and clear its state.
+  stop Proofread work and clear its state; Flymake and other backends remain
+  active. Disabling Flymake instead also disables Proofread.
 - The cache cannot detect an upgrade or model change in an externally managed
   LanguageTool server that keeps the same URL. Run `proofread-clear-cache` after
   such a change.
@@ -651,6 +694,86 @@ autoloads, byte-compiled files, and ELPA-compatible source archives. Individual
 stage targets such as `make proofread-compile` or `make proofread-archive`
 remain available for release work, but the summary targets above are normally
 enough.
+
+## Writing a backend
+
+The planned public backend API for 0.3.0 consists of
+`proofread-register-backend` and `proofread-unregister-backend`. A third-party
+backend registers a symbol with a descriptor and must not call or depend on any
+`proofread--*` symbol.
+
+```elisp
+(proofread-register-backend
+ 'example
+ :check #'example-check
+ :identity #'example-identity
+ :snapshot-options #'example-snapshot-options)
+```
+
+| Descriptor property | Presence | Operation contract                                                                                              |
+| ------------------- | -------- | --------------------------------------------------------------------------------------------------------------- |
+| `:check`            | Required | `(REQUEST CALLBACK)` starts nonblocking work, settles `CALLBACK` at most once, and returns an opaque handle     |
+| `:identity`         | Required | `()` returns the complete stable, non-secret identity shared by the backend's checkers                          |
+| `:snapshot-options` | Required | `(RAW-OPTIONS)` validates and normalizes options, then returns the backend-owned snapshot described below       |
+| `:checker-identity` | Optional | `(CHECKER)` returns the complete effective identity for that checker instead of using the backend-wide identity |
+| `:source-label`     | Optional | `(CHECKER)` returns `nil` or a nonempty, non-secret display label                                               |
+| `:cancel`           | Optional | `(HANDLE)` idempotently cancels work using the opaque handle returned by `:check`                               |
+
+Both identity operations return a property list containing `:backend`, whose
+value is the registered backend symbol, and `:contract-version`. A
+`:checker-identity` result is not merged with `:identity`; it must be a complete
+effective backend identity for that checker. When `:checker-identity` is absent,
+Proofread combines the backend-wide identity with the backend-owned options
+snapshot. When it is present, Proofread does not add the options snapshot, so
+that operation must itself represent every backend-local option that affects
+identity.
+
+`:snapshot-options` is the ownership boundary for backend-local data. It
+receives raw checker options as either `nil` or a keyword property list. The
+backend itself validates and normalizes that input and returns a detached,
+proper keyword property list; `nil` is a valid empty result. Mutable collections
+that the backend treats as value data must not alias the raw input. The returned
+snapshot is immutable by convention, and the same snapshot object is shared with
+checker identity, source-label, and request construction. Opaque provider,
+record, or identity objects may retain `eq` identity when that is part of the
+backend's semantics. Proofread invokes the operation again for freshness checks,
+so it must resolve current backend defaults deterministically: configurations
+with the same effective meaning must produce `equal` snapshots.
+
+Every backend-local value that can affect reusable diagnostic content must be
+represented in the effective checker identity and therefore in the diagnostic
+cache identity. Core-owned dimensions such as profile language are encoded
+separately, while lifecycle-only settings such as a timeout need not affect
+cache compatibility. Identities must be stable, complete for cache
+compatibility, and free of credentials or other secrets.
+
+`:check` must submit without blocking Emacs and must settle its callback at most
+once. `REQUEST` is a read-only property list whose backend-facing payload
+includes the buffer, absolute range, text, surrounding context, languages, major
+mode, target kind, source label, checker identity, and the exact options
+snapshot as `:checker-options`. The backend returns that same request object. A
+terminal success has the shape
+`(:status ok :request REQUEST :diagnostics LIST)`. A success may additionally
+contain `:partial t`; Proofread then merges its diagnostics without replacing
+existing diagnostics or writing them to the cache. An error has the shape
+`(:status error :request REQUEST :error VALUE)`. Either form may include a safe
+`:message`.
+
+Each diagnostic is a property list with absolute, half-open `:beg` and `:end`
+positions inside the request range. Its `:text` is the text in that range, and
+it also contains `:kind`, `:message`, a proper list of string `:suggestions`,
+`:source`, and `:target-kind`. Equal `:beg` and `:end` positions are valid and
+represent an insertion-point diagnostic; the core's Flymake bridge supplies any
+adjacent display anchor. The handle returned by `:check` is opaque to the core.
+When `:cancel` is present, Proofread captures that operation at submission time
+and later passes the handle to it unchanged. Submission, callback, cancellation,
+identity, and option-snapshot failures are isolated to the owning checker so
+that other checkers can continue.
+
+Request logging retains only safe projections. It does not expose raw checker
+options, snapshotted backend-local objects, or opaque handles. Backends should
+put only safe summaries in identities and source labels rather than relying on
+logging to redact secrets embedded there.
 
 ## Guide for Nix users
 

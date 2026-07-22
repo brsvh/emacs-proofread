@@ -58,9 +58,8 @@ Signal an error unless a non-nil value is a nonempty string."
     (unless (stringp value)
       (error "Proofread LLM source label must be nil or a string"))
     (let ((label
-           (replace-regexp-in-string
-            "[[:space:]]+" " "
-            (string-trim (substring-no-properties value)))))
+           (string-clean-whitespace
+            (substring-no-properties value))))
       (when (string-empty-p label)
         (error "Proofread LLM source label must not be empty"))
       label)))
@@ -96,7 +95,9 @@ When nil, proofread combines `llm-name' with a non-secret identity
 local to the current provider object and `proofread-llm' feature load.
 Set this to a stable, non-secret value to reuse compatible cache
 entries across equivalent provider objects and feature reloads in the
-same buffer."
+same buffer.  A checker-local `:provider' override does not inherit
+this identity; pair it with a checker-local `:provider-identity' or
+let Proofread assign that provider object a session-local identity."
   :type 'sexp
   :group 'proofread)
 
@@ -154,9 +155,24 @@ that changes whenever this function's effective instructions change."
 (defcustom proofread-llm-instructions-identity nil
   "Stable cache identity for `proofread-llm-instructions-function'.
 This value is required whenever `proofread-llm-instructions-function'
-is non-nil, because extra instructions can change LLM diagnostics."
+is non-nil, because extra instructions can change LLM diagnostics.  A
+checker-local `:instructions-function' override must provide its own
+`:instructions-identity' and does not inherit this value."
   :type 'sexp
   :group 'proofread)
+
+(defconst proofread-llm--checker-option-keys
+  '( :provider :provider-identity :source-label
+     :response-strategy :diagnostic-passes :request-timeout
+     :instructions-function :instructions-identity)
+  "Property keys accepted in LLM checker options.")
+
+(cl-defstruct
+    (proofread-llm--hash-identity
+     (:constructor proofread-llm--make-hash-identity (test entries)))
+  "Comparable value representation of an identity hash table."
+  test
+  entries)
 
 ;;;; Provider state
 
@@ -965,6 +981,187 @@ capability fallback."
     (user-error "Proofread diagnostic pass count must be positive"))
   passes)
 
+(defun proofread-llm--validate-response-strategy (strategy)
+  "Return configured response STRATEGY after validating it."
+  (unless (memq strategy '(auto provider-json prompt-json))
+    (error "Invalid Proofread LLM response strategy: %S" strategy))
+  strategy)
+
+(defun proofread-llm--validate-checker-options (options)
+  "Return raw LLM checker OPTIONS after validating their shape."
+  (let ((raw-options options)
+        (length (proper-list-p options))
+        seen)
+    (unless (and (integerp length) (zerop (% length 2)))
+      (error "Proofread LLM checker options must be a property list"))
+    (while options
+      (let ((key (pop options)))
+        (unless (keywordp key)
+          (error "Proofread LLM checker option is not a keyword: %S"
+                 key))
+        (unless (memq key proofread-llm--checker-option-keys)
+          (error "Unknown Proofread LLM checker option: %S" key))
+        (when (memq key seen)
+          (error "Duplicate Proofread LLM checker option: %S" key))
+        (push key seen)
+        (pop options)))
+    raw-options))
+
+(defun proofread-llm--checker-option (options key fallback)
+  "Return OPTIONS value for KEY, or FALLBACK when KEY is absent."
+  (if (plist-member options key)
+      (plist-get options key)
+    fallback))
+
+(defun proofread-llm--identity-entry-less-p (left right)
+  "Return non-nil when identity entry LEFT precedes RIGHT."
+  (string< (prin1-to-string left)
+           (prin1-to-string right)))
+
+(defun proofread-llm--stable-identity-hash-key-p (value)
+  "Return non-nil when VALUE is stable as an identity hash key."
+  (cond
+   ((or (null value) (symbolp value) (numberp value)
+        (stringp value) (bool-vector-p value))
+    t)
+   ((consp value)
+    (and (proofread-llm--stable-identity-hash-key-p (car value))
+         (proofread-llm--stable-identity-hash-key-p (cdr value))))
+   ((and (vectorp value) (not (recordp value)))
+    (cl-loop for item across value
+             always
+             (proofread-llm--stable-identity-hash-key-p item)))
+   ((proofread-llm--hash-identity-p value) t)
+   (t nil)))
+
+(defun proofread-llm--snapshot-identity-value (value &optional active)
+  "Return a stable snapshot of identity VALUE.
+ACTIVE is an eq hash table of containers currently being copied.
+Functions, records, and EIEIO objects retain their object identity.
+Hash tables become ordered value representations so separate
+snapshots remain comparable with `equal'."
+  (setq active (or active (make-hash-table :test #'eq)))
+  (cond
+   ((or (null value) (symbolp value) (numberp value)) value)
+   ((functionp value) value)
+   ((or (recordp value)
+        (and (fboundp 'eieio-object-p)
+             (eieio-object-p value)))
+    value)
+   ((stringp value) (substring-no-properties value))
+   ((bool-vector-p value) (copy-sequence value))
+   ((consp value)
+    (when (gethash value active)
+      (error "Cyclic Proofread LLM identity value"))
+    (puthash value t active)
+    (unwind-protect
+        (cons
+         (proofread-llm--snapshot-identity-value (car value) active)
+         (proofread-llm--snapshot-identity-value (cdr value) active))
+      (remhash value active)))
+   ((vectorp value)
+    (when (gethash value active)
+      (error "Cyclic Proofread LLM identity value"))
+    (puthash value t active)
+    (unwind-protect
+        (let ((copy (copy-sequence value)))
+          (dotimes (index (length copy))
+            (aset copy index
+                  (proofread-llm--snapshot-identity-value
+                   (aref copy index) active)))
+          copy)
+      (remhash value active)))
+   ((hash-table-p value)
+    (when (gethash value active)
+      (error "Cyclic Proofread LLM identity value"))
+    (puthash value t active)
+    (unwind-protect
+        (let (entries)
+          (maphash
+           (lambda (key item)
+             (let ((key
+                    (proofread-llm--snapshot-identity-value
+                     key active)))
+               (unless
+                   (proofread-llm--stable-identity-hash-key-p key)
+                 (error "Unstable Proofread LLM identity hash key"))
+               (push
+                (list
+                 key
+                 (proofread-llm--snapshot-identity-value item active))
+                entries)))
+           value)
+          (proofread-llm--make-hash-identity
+           (hash-table-test value)
+           (sort entries #'proofread-llm--identity-entry-less-p)))
+      (remhash value active)))
+   (t
+    (error "Unsupported Proofread LLM identity value: %S" value))))
+
+(defun proofread-llm--snapshot-checker-options (raw-options)
+  "Return detached, normalized LLM checker RAW-OPTIONS.
+Missing properties capture the corresponding buffer-local or global
+LLM option.  Provider and instruction function objects retain their
+identity; mutable data used as an explicit cache identity is copied.
+An explicit provider or instructions function starts a new identity
+pair instead of inheriting the identity for the default object."
+  (proofread-llm--validate-checker-options raw-options)
+  (let* ((provider-present (plist-member raw-options :provider))
+         (provider
+          (proofread-llm--checker-option
+           raw-options :provider proofread-llm-provider))
+         (provider-identity
+          (proofread-llm--snapshot-identity-value
+           (cond
+            ((plist-member raw-options :provider-identity)
+             (plist-get raw-options :provider-identity))
+            (provider-present nil)
+            (t proofread-llm-provider-identity))))
+         (source-label
+          (proofread-llm--validate-source-label
+           (proofread-llm--checker-option
+            raw-options :source-label proofread-llm-source-label)))
+         (response-strategy
+          (proofread-llm--validate-response-strategy
+           (proofread-llm--checker-option
+            raw-options :response-strategy
+            proofread-llm-response-strategy)))
+         (diagnostic-passes
+          (proofread-llm--diagnostic-passes
+           (proofread-llm--checker-option
+            raw-options :diagnostic-passes
+            proofread-llm-max-diagnostic-passes)))
+         (request-timeout
+          (proofread-llm--validate-request-timeout
+           (proofread-llm--checker-option
+            raw-options :request-timeout
+            proofread-llm-request-timeout)))
+         (instructions-function
+          (proofread-llm--checker-option
+           raw-options :instructions-function
+           proofread-llm-instructions-function))
+         (instructions-identity
+          (proofread-llm--snapshot-identity-value
+           (cond
+            ((plist-member raw-options :instructions-identity)
+             (plist-get raw-options :instructions-identity))
+            ((plist-member raw-options :instructions-function) nil)
+            (t proofread-llm-instructions-identity)))))
+    (unless (or (null instructions-function)
+                (functionp instructions-function))
+      (error "Invalid Proofread LLM instructions function: %S"
+             instructions-function))
+    (proofread-llm--validate-instructions-identity
+     instructions-function instructions-identity)
+    (list :provider provider
+          :provider-identity provider-identity
+          :source-label source-label
+          :response-strategy response-strategy
+          :diagnostic-passes diagnostic-passes
+          :request-timeout request-timeout
+          :instructions-function instructions-function
+          :instructions-identity instructions-identity)))
+
 (defun proofread-llm--provider-session-identity (provider)
   "Return a non-secret session-local identity for PROVIDER."
   (or (gethash provider proofread-llm--provider-session-identities)
@@ -1442,17 +1639,18 @@ MAX-PASSES is the request-local diagnostic pass limit."
 (defun proofread-llm-unload-function ()
   "Unregister the LLM backend and settle its live requests."
   (proofread-llm--remove-connect-timeout-integration)
-  (proofread--unregister-backend 'llm)
+  (proofread-unregister-backend 'llm)
   (proofread-llm--settle-live-handles)
   nil)
 
 ;;;; Runtime registration
 
 (progn
-  (proofread--register-backend
+  (proofread-register-backend
    'llm
    :check #'proofread-llm--backend-check
    :identity #'proofread-llm--provider-identity
+   :snapshot-options #'proofread-llm--snapshot-checker-options
    :checker-identity #'proofread-llm--checker-identity
    :source-label #'proofread-llm--checker-source-label
    :cancel #'proofread-llm--cancel-request-handle)
