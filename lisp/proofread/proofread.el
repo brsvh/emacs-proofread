@@ -36,7 +36,6 @@
 
 (require 'button)
 (require 'cl-lib)
-(require 'eldoc)
 (require 'flymake)
 (require 'lisp-mode)
 (require 'pp)
@@ -131,14 +130,6 @@ It does not suppress errors or explicit command feedback."
   :type 'boolean
   :group 'proofread)
 
-(defcustom proofread-echo-area-messages t
-  "Show the Proofread diagnostic at point in the echo area.
-When non-nil, `proofread-mode' uses ElDoc to show diagnostic messages
-at point.  This option becomes buffer-local when set."
-  :type 'boolean
-  :local t
-  :group 'proofread)
-
 (defcustom proofread-max-chunk-size 2000
   "Maximum number of characters in a proofreading chunk."
   :type 'natnum
@@ -218,6 +209,11 @@ buffers should use different profiles."
  "use the selected profile's `:language' property"
  "0.2.0")
 
+(make-obsolete-variable
+ 'proofread-echo-area-messages
+ "configure `eldoc-mode' directly; Flymake provides diagnostic messages"
+ "0.3.0")
+
 (defcustom proofread-cache-max-entries 128
   "Maximum diagnostic cache entries retained in each buffer.
 A value of 0 disables diagnostic caching."
@@ -250,21 +246,6 @@ request-ready chunks."
 (defface proofread-face
   '((t :inherit font-lock-warning-face :underline ( :style wave)))
   "Face for proofreading diagnostics."
-  :group 'proofread)
-
-(defface proofread-current-face
-  '((t :inherit proofread-face))
-  "Face for the current proofreading diagnostic."
-  :group 'proofread)
-
-(defface proofread-echo-area-source-face
-  '((t :inherit font-lock-keyword-face))
-  "Face for Proofread diagnostic sources in the echo area."
-  :group 'proofread)
-
-(defface proofread-echo-area-message-face
-  '((t :inherit font-lock-comment-face))
-  "Face for Proofread diagnostic messages in the echo area."
   :group 'proofread)
 
 ;;;; Flymake diagnostic type
@@ -536,9 +517,6 @@ also receive the safe fields collected so far; every sanitizer returns
   '( :events :backend-requests :backend-responses :backend-results)
   "Record properties stored internally in newest-first order.")
 
-(defconst proofread--overlay-category 'proofread-overlay
-  "Overlay category used for proofread-owned overlays.")
-
 (defconst proofread--description-buffer-name "*Proofread Diagnostic*"
   "Buffer name used to display proofread diagnostic descriptions.")
 
@@ -604,26 +582,11 @@ also receive the safe fields collected so far; every sanitizer returns
 (defvar-local proofread--flymake-report-function nil
   "Latest Flymake report function for the Proofread bridge.")
 
-(defvar-local proofread--overlays nil
-  "Proofread-owned overlays for the current buffer.")
-
-(defvar-local proofread--diagnostic-overlays nil
-  "Map diagnostics to their proofread-owned overlays.")
-
-(defvar-local proofread--next-diagnostic-insertion-ordinal 0
-  "Next insertion ordinal for a proofread diagnostic overlay.")
-
 (defvar-local proofread--diagnostic-request-ranges nil
   "Map diagnostics to their originating request marker ranges.")
 
 (defvar-local proofread--current-diagnostic nil
   "Currently selected proofread diagnostic in the current buffer.")
-
-(defvar-local proofread--eldoc-mode-owned-p nil
-  "Non-nil when Proofread enabled ElDoc in the current buffer.")
-
-(defvar-local proofread--echo-area-refresh-pending-p nil
-  "Non-nil when a guarded Proofread echo-area refresh is pending.")
 
 (defvar-local proofread--diagnostics-current-line 0
   "Current line in a proofread diagnostics listing buffer.")
@@ -5145,13 +5108,11 @@ range.  Do not notify diagnostic observers."
        diagnostics request-range))
     (setq proofread--diagnostics
           (nconc proofread--diagnostics diagnostics))
-    (dolist (diagnostic diagnostics)
-      (proofread--create-overlay diagnostic))
     diagnostics))
 
 (defun proofread--apply-backend-diagnostics
     (diagnostics &optional request-range)
-  "Record DIAGNOSTICS and create overlays for them.
+  "Record DIAGNOSTICS in the current buffer model.
 When REQUEST-RANGE is non-nil, record it as their owning request
 range."
   (proofread--commit-diagnostic-state
@@ -5793,64 +5754,11 @@ BEG and END delimit the changed text."
 (defun proofread--kill-buffer ()
   "Clean up Proofread state before killing this buffer."
   (proofread--disable-flymake-bridge)
-  (proofread--disable-echo-area)
   (proofread--close-source-list-buffers (current-buffer))
   (proofread--clear-request-work)
   (proofread--unregister-mode-buffer))
 
 ;;;; Diagnostics and navigation
-
-(defun proofread--overlay-p (overlay)
-  "Return non-nil if OVERLAY is a live proofread-owned overlay."
-  (and (overlayp overlay)
-       (overlay-buffer overlay)
-       (eq (overlay-get overlay 'category)
-           proofread--overlay-category)))
-
-(defun proofread--current-buffer-overlay-p (overlay)
-  "Return non-nil if this buffer owns proofread OVERLAY."
-  (and (proofread--overlay-p overlay)
-       (eq (overlay-buffer overlay) (current-buffer))))
-
-(defun proofread--current-buffer-overlays ()
-  "Return all live proofread-owned overlays in the current buffer."
-  (let ((seen (make-hash-table :test #'eq))
-        overlays)
-    (save-restriction
-      (widen)
-      (dolist (overlay (append proofread--overlays
-                               (overlays-in (point-min) (point-max))))
-        (when (and (proofread--current-buffer-overlay-p overlay)
-                   (not (gethash overlay seen)))
-          (puthash overlay t seen)
-          (push overlay overlays))))
-    (nreverse overlays)))
-
-(defun proofread--prune-overlays ()
-  "Remove dead or foreign entries from `proofread--overlays'."
-  (let (retained)
-    (dolist (overlay proofread--overlays)
-      (if (proofread--current-buffer-overlay-p overlay)
-          (push overlay retained)
-        (when (and (overlayp overlay)
-                   (hash-table-p proofread--diagnostic-overlays))
-          (let ((diagnostic
-                 (overlay-get overlay 'proofread-diagnostic)))
-            (when (eq (gethash
-                       diagnostic proofread--diagnostic-overlays)
-                      overlay)
-              (remhash diagnostic proofread--diagnostic-overlays))))))
-    (setq proofread--overlays (nreverse retained))))
-
-(defun proofread--delete-overlay (overlay)
-  "Delete proofread-owned OVERLAY when it is live."
-  (when (proofread--overlay-p overlay)
-    (when (hash-table-p proofread--diagnostic-overlays)
-      (let ((diagnostic (overlay-get overlay 'proofread-diagnostic)))
-        (when (eq (gethash diagnostic proofread--diagnostic-overlays)
-                  overlay)
-          (remhash diagnostic proofread--diagnostic-overlays))))
-    (delete-overlay overlay)))
 
 (defun proofread--diagnostic-range (diagnostic)
   "Return DIAGNOSTIC's valid range as a cons cell, or nil."
@@ -6860,26 +6768,6 @@ By default, query the whole buffer regardless of narrowing."
   "Clear the current navigation diagnostic."
   (setq proofread--current-diagnostic nil))
 
-(defun proofread--overlay-for-diagnostic (diagnostic)
-  "Return this buffer's proofread overlay for DIAGNOSTIC."
-  (let ((overlay
-         (and (hash-table-p proofread--diagnostic-overlays)
-              (gethash diagnostic proofread--diagnostic-overlays))))
-    (if (and (proofread--current-buffer-overlay-p overlay)
-             (eq (overlay-get overlay 'proofread-diagnostic)
-                 diagnostic))
-        overlay
-      (when (and overlay
-                 (hash-table-p proofread--diagnostic-overlays))
-        (remhash diagnostic proofread--diagnostic-overlays))
-      nil)))
-
-(defun proofread--overlays-for-diagnostic (diagnostic)
-  "Return this buffer's proofread overlays for DIAGNOSTIC."
-  (delq nil
-        (mapcar #'proofread--overlay-for-diagnostic
-                (proofread--diagnostic-members diagnostic))))
-
 (defun proofread--owned-flymake-diagnostics-at
     (position model-orders)
   "Return unique owned Flymake diagnostics relevant to POSITION.
@@ -6996,183 +6884,6 @@ and `proofread-diagnostic-text' instead."
                             fallback)))))
           (proofread--aggregate-local-navigation-entry
            (car entries) entries))))))
-
-(defun proofread--echo-area-message (diagnostic)
-  "Return the echo-area message for DIAGNOSTIC."
-  (let ((message
-         (proofread-format-diagnostic-message
-          diagnostic
-          :separator "; "
-          :source-face 'proofread-echo-area-source-face
-          :message-face 'proofread-echo-area-message-face
-          :single-line t)))
-    (add-text-properties
-     0 (length message)
-     (list 'proofread--echo-area-message (current-buffer))
-     message)
-    message))
-
-(defun proofread--eldoc-function (callback &rest _ignored)
-  "Report the Proofread diagnostic at point through CALLBACK."
-  (when (and proofread-mode proofread-echo-area-messages)
-    (when-let* ((diagnostic (proofread-diagnostic-at-point))
-                (message (proofread--echo-area-message diagnostic)))
-      (funcall callback message :echo message))))
-
-(defun proofread--echo-area-owned-message-p (message)
-  "Return non-nil when this buffer owns Proofread MESSAGE."
-  (and (stringp message)
-       (> (length message) 0)
-       (text-property-any
-        0 (length message)
-        'proofread--echo-area-message (current-buffer) message)))
-
-(defun proofread--echo-area-refresh-permitted-p (&optional after-command)
-  "Return non-nil when Proofread may refresh the echo area now.
-When AFTER-COMMAND is non-nil, do not treat `this-command' as an
-in-progress command."
-  (and eldoc-mode
-       (or after-command (null this-command))
-       (eq (window-buffer (selected-window)) (current-buffer))
-       (not (active-minibuffer-window))
-       (eldoc-display-message-no-interference-p)
-       (let ((current (current-message)))
-         (or (null current)
-             (proofread--echo-area-owned-message-p current)))))
-
-(defun proofread--echo-area-clear-current-message ()
-  "Forget ElDoc state owned by Proofread in the current buffer."
-  (when (proofread--echo-area-owned-message-p (current-message))
-    (eldoc-display-in-echo-area nil t))
-  (when (proofread--echo-area-owned-message-p eldoc-last-message)
-    (setq eldoc-last-message nil)))
-
-(defun proofread--configure-echo-area (enabled)
-  "Configure Proofread's echo-area integration for ENABLED."
-  (if enabled
-      (unless eldoc-mode
-        (eldoc-mode 1)
-        (setq proofread--eldoc-mode-owned-p (and eldoc-mode t)))
-    (proofread--cancel-echo-area-refresh)
-    (proofread--echo-area-clear-current-message)
-    (when proofread--eldoc-mode-owned-p
-      (setq proofread--eldoc-mode-owned-p nil)
-      (when eldoc-mode
-        (eldoc-mode -1)))))
-
-(defun proofread--display-echo-area-message (message)
-  "Display Proofread MESSAGE through ElDoc's echo-area frontend."
-  (eldoc-display-in-echo-area
-   (list
-    (list message
-          :origin #'proofread--eldoc-function
-          :echo message))
-   t))
-
-(defun proofread--refresh-echo-area-now (&optional after-command)
-  "Refresh Proofread's echo-area message when permitted.
-When AFTER-COMMAND is non-nil, the command has finished and may no
-longer be treated as in progress.  Return non-nil when the refresh
-gate permitted an update."
-  (when (proofread--echo-area-refresh-permitted-p after-command)
-    (if-let* ((diagnostic
-               (and proofread-mode
-                    proofread-echo-area-messages
-                    (proofread-diagnostic-at-point)))
-              (message (proofread--echo-area-message diagnostic)))
-        (proofread--display-echo-area-message message)
-      (proofread--echo-area-clear-current-message))
-    t))
-
-(defun proofread--cancel-echo-area-refresh ()
-  "Cancel a pending Proofread echo-area refresh."
-  (setq proofread--echo-area-refresh-pending-p nil)
-  (remove-hook 'post-command-hook
-               #'proofread--retry-echo-area-refresh t))
-
-(defun proofread--retry-echo-area-refresh ()
-  "Retry a guarded Proofread echo-area refresh after a command."
-  (cond
-   ((not (and proofread-mode
-              proofread-echo-area-messages
-              eldoc-mode))
-    (proofread--cancel-echo-area-refresh))
-   ((proofread--refresh-echo-area-now t)
-    (proofread--cancel-echo-area-refresh))))
-
-(defun proofread--queue-echo-area-refresh ()
-  "Retry Proofread's echo-area refresh after the next safe command."
-  (setq proofread--echo-area-refresh-pending-p t)
-  (add-hook 'post-command-hook
-            #'proofread--retry-echo-area-refresh nil t))
-
-(defun proofread--refresh-echo-area ()
-  "Refresh Proofread's ElDoc message after diagnostics change."
-  (cond
-   ((not (and proofread-mode
-              proofread-echo-area-messages
-              eldoc-mode))
-    (proofread--cancel-echo-area-refresh))
-   ((proofread--refresh-echo-area-now)
-    (proofread--cancel-echo-area-refresh))
-   (t
-    (proofread--queue-echo-area-refresh))))
-
-(defun proofread--enable-echo-area ()
-  "Enable Proofread's echo-area integration in the current buffer."
-  ;; Flymake owns the one generic diagnostic provider.  Keep only the
-  ;; transitional option-driven ElDoc mode ownership until the legacy
-  ;; echo-area adapter is removed.
-  (proofread--configure-echo-area proofread-echo-area-messages))
-
-(defun proofread--disable-echo-area ()
-  "Disable Proofread's echo-area integration in the current buffer."
-  (proofread--cancel-echo-area-refresh)
-  (remove-hook 'proofread-diagnostics-changed-hook
-               #'proofread--refresh-echo-area t)
-  (remove-hook 'eldoc-documentation-functions
-               #'proofread--eldoc-function t)
-  (proofread--echo-area-clear-current-message)
-  (when proofread--eldoc-mode-owned-p
-    (setq proofread--eldoc-mode-owned-p nil)
-    (when eldoc-mode
-      (eldoc-mode -1))))
-
-(defun proofread--configure-echo-area-in-buffer (buffer enabled)
-  "Configure Proofread echo display in BUFFER for ENABLED."
-  (when (buffer-live-p buffer)
-    (with-current-buffer buffer
-      (when proofread-mode
-        (proofread--configure-echo-area enabled)))))
-
-(defun proofread--configure-default-echo-area (symbol enabled)
-  "Configure non-local SYMBOL users for default value ENABLED."
-  (dolist (buffer (copy-sequence proofread--mode-buffers))
-    (when (and (buffer-live-p buffer)
-               (not (local-variable-p symbol buffer)))
-      (proofread--configure-echo-area-in-buffer buffer enabled))))
-
-(defun proofread--echo-area-option-watcher
-    (symbol value operation where)
-  "Synchronize echo display when SYMBOL receives VALUE.
-OPERATION describes the variable change, and WHERE is its buffer or
-nil for a change to the default."
-  (pcase operation
-    ((or 'set 'let 'unlet)
-     (if (and (buffer-live-p where)
-              (or (eq operation 'set)
-                  (local-variable-p symbol where)))
-         (proofread--configure-echo-area-in-buffer where value)
-       ;; A dynamic binding of the default may report the buffer that
-       ;; initiated it even though that buffer has no local value.
-       (unless (equal value (default-value symbol))
-         (proofread--configure-default-echo-area symbol value))))
-    ('makunbound
-     (when (buffer-live-p where)
-       ;; `kill-local-variable' reports nil as VALUE before exposing
-       ;; the default value, so synchronize to that default directly.
-       (proofread--configure-echo-area-in-buffer
-        where (default-value symbol))))))
 
 (defun proofread--mark-current-diagnostic (diagnostic)
   "Mark DIAGNOSTIC as the current navigation diagnostic."
@@ -8187,9 +7898,7 @@ length change."
 
 (defun proofread--remove-diagnostics (diagnostics)
   "Remove identities in DIAGNOSTICS from current buffer state.
-Return the identities actually removed, in their model order.  Legacy
-overlay cleanup remains encapsulated here until the overlay adapter is
-deleted."
+Return the identities actually removed, in their model order."
   (let ((remove-set (make-hash-table :test #'eq))
         removed
         retained)
@@ -8202,11 +7911,6 @@ deleted."
     (setq removed (nreverse removed))
     (setq proofread--diagnostics (nreverse retained))
     (dolist (diagnostic removed)
-      (when-let* ((overlay
-                   (proofread--overlay-for-diagnostic diagnostic)))
-        (proofread--delete-overlay overlay))
-      (when (hash-table-p proofread--diagnostic-overlays)
-        (remhash diagnostic proofread--diagnostic-overlays))
       (when (hash-table-p proofread--diagnostic-request-ranges)
         (remhash diagnostic proofread--diagnostic-request-ranges)))
     (when (and proofread--current-diagnostic
@@ -8215,29 +7919,7 @@ deleted."
                         (proofread--diagnostic-members
                          proofread--current-diagnostic)))
       (setq proofread--current-diagnostic nil))
-    (proofread--prune-overlays)
     removed))
-
-(defun proofread--synchronize-live-diagnostic-ranges ()
-  "Synchronize stored diagnostic ranges with their live overlays."
-  (let (overlays)
-    (dolist (overlay proofread--overlays)
-      (when (proofread--current-buffer-overlay-p overlay)
-        (push overlay overlays)
-        (let ((diagnostic (overlay-get overlay 'proofread-diagnostic))
-              (beg (overlay-start overlay))
-              (end (overlay-end overlay)))
-          (when (and (eq overlay
-                         (and
-                          (hash-table-p
-                           proofread--diagnostic-overlays)
-                          (gethash
-                           diagnostic
-                           proofread--diagnostic-overlays)))
-                     beg end)
-            (setf (plist-get diagnostic :beg) beg)
-            (setf (plist-get diagnostic :end) end)))))
-    (setq proofread--overlays (nreverse overlays))))
 
 (defun proofread--mode-buffer-change-state ()
   "Return character ticks and live ranges for Proofread buffers."
@@ -8656,42 +8338,6 @@ DIAGNOSTICS must be in navigation order.  Return `applied'."
   (with-help-window proofread--description-buffer-name
     (princ (proofread--format-diagnostic-description diagnostic))))
 
-(defun proofread--create-overlay (diagnostic)
-  "Create and return a proofread overlay for DIAGNOSTIC."
-  (let ((beg (plist-get diagnostic :beg))
-        (end (plist-get diagnostic :end)))
-    (unless (and (integer-or-marker-p beg)
-                 (integer-or-marker-p end)
-                 (<= beg end))
-      (error "Invalid proofread diagnostic range: %S" diagnostic))
-    (proofread--prune-overlays)
-    (let ((overlay (make-overlay beg end nil t nil)))
-      (overlay-put overlay 'category proofread--overlay-category)
-      (overlay-put overlay 'face 'proofread-face)
-      (overlay-put overlay 'proofread-diagnostic diagnostic)
-      (overlay-put
-       overlay 'proofread-diagnostic-insertion-ordinal
-       proofread--next-diagnostic-insertion-ordinal)
-      (setq proofread--next-diagnostic-insertion-ordinal
-            (1+ proofread--next-diagnostic-insertion-ordinal))
-      (unless (hash-table-p proofread--diagnostic-overlays)
-        (setq proofread--diagnostic-overlays
-              (make-hash-table :test #'eq)))
-      (puthash diagnostic overlay proofread--diagnostic-overlays)
-      (push overlay proofread--overlays)
-      overlay)))
-
-(defun proofread--clear-transitional-diagnostic-state ()
-  "Clear legacy display and lookup state in the current buffer."
-  (dolist (overlay (proofread--current-buffer-overlays))
-    (delete-overlay overlay))
-  (setq proofread--overlays nil)
-  (when (hash-table-p proofread--diagnostic-overlays)
-    (clrhash proofread--diagnostic-overlays))
-  (when (hash-table-p proofread--diagnostic-request-ranges)
-    (clrhash proofread--diagnostic-request-ranges))
-  (setq proofread--current-diagnostic nil))
-
 (defun proofread--clear-diagnostics ()
   "Clear this buffer's diagnostic model in one commit."
   (save-restriction
@@ -8704,16 +8350,15 @@ DIAGNOSTICS must be in navigation order.  Return `applied'."
          (lambda ()
            (let ((removed
                   (proofread--remove-diagnostics diagnostics)))
-             ;; Clear every transitional adapter object before report
-             ;; and hook callbacks can install fresh diagnostics.
-             (proofread--clear-transitional-diagnostic-state)
-             (when removed
-               (force-window-update (current-buffer)))
+             (when (hash-table-p
+                    proofread--diagnostic-request-ranges)
+               (clrhash proofread--diagnostic-request-ranges))
+             (setq proofread--current-diagnostic nil)
              removed))))
-      ;; Keep teardown compatible with orphaned legacy overlays while
-      ;; preserving clear as a no-op for diagnostic observers.
       (unless diagnostics
-        (proofread--clear-transitional-diagnostic-state)))))
+        (when (hash-table-p proofread--diagnostic-request-ranges)
+          (clrhash proofread--diagnostic-request-ranges))
+        (setq proofread--current-diagnostic nil)))))
 
 ;;;; Mode lifecycle
 
@@ -8723,15 +8368,9 @@ DIAGNOSTICS must be in navigation order.  Return `applied'."
         (cl-incf proofread--generation-sequence))
   (setq-local proofread--diagnostics nil)
   (setq-local proofread--flymake-report-function nil)
-  (setq-local proofread--overlays nil)
-  (setq-local proofread--diagnostic-overlays
-              (make-hash-table :test #'eq))
-  (setq-local proofread--next-diagnostic-insertion-ordinal 0)
   (setq-local proofread--diagnostic-request-ranges
               (make-hash-table :test #'eq))
   (setq-local proofread--current-diagnostic nil)
-  (setq-local proofread--eldoc-mode-owned-p nil)
-  (setq-local proofread--echo-area-refresh-pending-p nil)
   (setq-local proofread--active-requests nil)
   (setq-local proofread--queue-state
               (proofread--make-queue-state))
@@ -8753,6 +8392,7 @@ DIAGNOSTICS must be in navigation order.  Return `applied'."
   "Clear proofread-owned state for the current buffer."
   (proofread--clear-request-work)
   (proofread--clear-diagnostics)
+  (setq proofread--diagnostics nil)
   (setq proofread--flymake-report-function nil)
   (setq proofread--queue-state nil)
   (setq proofread--claimed-requests nil)
@@ -8763,11 +8403,8 @@ DIAGNOSTICS must be in navigation order.  Return `applied'."
   (setq proofread--next-request-id 0)
   (setq proofread--cache nil)
   (setq proofread--cache-order nil)
-  (setq proofread--diagnostic-overlays nil)
-  (setq proofread--next-diagnostic-insertion-ordinal nil)
   (setq proofread--diagnostic-request-ranges nil)
-  (setq proofread--eldoc-mode-owned-p nil)
-  (setq proofread--echo-area-refresh-pending-p nil)
+  (setq proofread--current-diagnostic nil)
   (setq proofread--pending-invalidated-diagnostics nil)
   (setq proofread--pending-diagnostic-ranges nil))
 
@@ -8787,10 +8424,6 @@ DIAGNOSTICS must be in navigation order.  Return `applied'."
     ;; Flymake's deferred activation start behind.
     (let ((flymake-start-on-flymake-mode nil))
       (flymake-mode 1)))
-  ;; Flymake installs its generic ElDoc provider when its mode starts.
-  ;; Configure the transitional ElDoc ownership only after that provider
-  ;; makes ElDoc supported in the buffer.
-  (proofread--enable-echo-area)
   (flymake-start))
 
 (defun proofread--disable-flymake-bridge ()
@@ -8847,7 +8480,6 @@ all other Flymake backends active."
   (remove-hook 'window-scroll-functions #'proofread--window-scroll t)
   (remove-hook 'window-configuration-change-hook
                #'proofread--mark-pending-work t)
-  (proofread--disable-echo-area)
   (proofread--clear-buffer-state)
   (proofread--unregister-mode-buffer))
 
@@ -9151,9 +8783,8 @@ schedules an initial visible-buffer check when enabled, and further
 checks after editing or window activity.  It then dispatches
 request-ready visible chunks through the configured backend.  The
 option `proofread-targets' controls which kinds of text are selected.
-When point is on a diagnostic and `proofread-echo-area-messages' is
-non-nil, its source and message are also shown through ElDoc in the
-echo area.
+Diagnostics are published through Flymake.  When ElDoc is enabled,
+Flymake also shows the diagnostic at point in the echo area.
 When automatic checking is disabled, use
 `proofread-check-at-point', `proofread-check-region',
 `proofread-check-buffer', or `proofread-check-visible-range' manually.
@@ -9459,14 +9090,7 @@ buffer."
   (clrhash proofread--request-log-owner-ids)
   (setq proofread--request-log-sources nil)
   (setq proofread--mode-buffers nil)
-  (remove-variable-watcher
-   'proofread-echo-area-messages
-   #'proofread--echo-area-option-watcher)
   nil)
-
-(add-variable-watcher
- 'proofread-echo-area-messages
- #'proofread--echo-area-option-watcher)
 
 (provide 'proofread)
 ;;; proofread.el ends here

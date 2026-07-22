@@ -2505,7 +2505,7 @@ When PROFILE is nil, use the current profile."
           hook-range
           hook-flymake-range)
       (proofread-mode 1)
-      (proofread-test--install-diagnostics (list diagnostic))
+      (proofread-test--publish-diagnostics (list diagnostic))
       (let ((original-report-function
              proofread--flymake-report-function))
         (setq proofread--flymake-report-function
@@ -2635,14 +2635,11 @@ When PROFILE is nil, use the current profile."
         (should (= report-count 1))
         (should (= hook-count 1))))))
 
-;;;; Overlay and mode tests
+;;;; Flymake face and mode tests
 
 (ert-deftest proofread-test-face-defaults-avoid-fixed-colors ()
   "Proofread faces are defined without fixed color attributes."
-  (dolist (face '( proofread-face
-                   proofread-current-face
-                   proofread-echo-area-source-face
-                   proofread-echo-area-message-face))
+  (dolist (face '( proofread-face))
     (should (facep face))
     (let ((spec (face-default-spec face)))
       (should-not (proofread-test--tree-member-p :foreground spec))
@@ -2656,15 +2653,6 @@ When PROFILE is nil, use the current profile."
       (should-not (proofread-test--tree-member-p 'flycheck-error
                                                  spec)))))
 
-(ert-deftest proofread-test-echo-area-faces-have-package-defaults ()
-  "Proofread echo-area faces inherit theme-aware font-lock faces."
-  (should
-   (equal (face-default-spec 'proofread-echo-area-source-face)
-          '((t :inherit font-lock-keyword-face))))
-  (should
-   (equal (face-default-spec 'proofread-echo-area-message-face)
-          '((t :inherit font-lock-comment-face)))))
-
 (ert-deftest proofread-test-face-uses-font-lock-warning-face ()
   "Diagnostic text uses the theme's font-lock warning face."
   (let ((spec (face-default-spec 'proofread-face)))
@@ -2672,88 +2660,30 @@ When PROFILE is nil, use the current profile."
      (proofread-test--tree-member-p 'font-lock-warning-face spec))
     (should (proofread-test--tree-member-p :underline spec))))
 
-(ert-deftest proofread-test-overlay-stores-diagnostic ()
-  "Store ownership and metadata on created proofread overlays."
-  (with-temp-buffer
-    (insert "hello world")
-    (proofread-mode 1)
-    (let ((diagnostic (proofread-test--diagnostic)))
-      (setq proofread--diagnostics (list diagnostic))
-      (let ((overlay (proofread--create-overlay diagnostic)))
-        (should (eq (overlay-get overlay 'category)
-                    'proofread-overlay))
-        (should (eq (overlay-get overlay 'face) 'proofread-face))
-        (should (equal (overlay-get overlay 'proofread-diagnostic)
-                       diagnostic))
-        (should
-         (= (overlay-get
-             overlay 'proofread-diagnostic-insertion-ordinal)
-            0))
-        (should (memq overlay proofread--overlays))
-        (should (equal proofread--diagnostics (list diagnostic)))))))
-
-(ert-deftest proofread-test-diagnostic-overlay-ordinals-are-monotonic
-    ()
-  "Do not reuse diagnostic overlay ordinals after deletion or clear."
-  (with-temp-buffer
-    (insert "abcdef")
-    (let ((proofread-auto-check nil)
-          (first (proofread-test--diagnostic-for-range 1 2 "a"))
-          (second (proofread-test--diagnostic-for-range 3 4 "c"))
-          (third (proofread-test--diagnostic-for-range 5 6 "e")))
-      (proofread-mode 1)
-      (let ((overlays
-             (proofread-test--install-diagnostics
-              (list first second))))
-        (should
-         (equal
-          (mapcar
-           (lambda (overlay)
-             (overlay-get
-              overlay 'proofread-diagnostic-insertion-ordinal))
-           overlays)
-          '( 0 1)))
-        (proofread--remove-diagnostics (list first))
-        (proofread-clear)
-        (setq proofread--diagnostics (list third))
-        (let ((overlay (proofread--create-overlay third)))
-          (should
-           (= (overlay-get
-               overlay 'proofread-diagnostic-insertion-ordinal)
-              2))
-          (should (= proofread--next-diagnostic-insertion-ordinal
-                     3)))))))
-
 (ert-deftest proofread-test-clear-preserves-unrelated-overlays ()
   "Clearing diagnostics preserves unrelated overlays."
   (with-temp-buffer
     (insert "hello world")
     (proofread-mode 1)
     (let* ((diagnostic (proofread-test--diagnostic))
-           (proofread-overlay (proofread--create-overlay diagnostic))
            (foreign-overlay (make-overlay 1 6)))
-      (setq proofread--diagnostics (list diagnostic))
       (overlay-put foreign-overlay 'category 'foreign-overlay)
+      (proofread-test--publish-diagnostics (list diagnostic))
       (proofread-clear)
-      (should-not (overlay-buffer proofread-overlay))
       (should (overlay-buffer foreign-overlay))
-      (should-not proofread--overlays)
       (should-not proofread--diagnostics))))
 
-(ert-deftest proofread-test-edit-invalidates-proofread-overlay ()
-  "Editing covered text deletes only the proofread-owned overlay."
+(ert-deftest proofread-test-edit-invalidates-proofread-diagnostic ()
+  "Editing covered text removes only the Proofread diagnostic."
   (with-temp-buffer
     (insert "hello world")
     (proofread-mode 1)
     (let* ((diagnostic (proofread-test--diagnostic))
-           (proofread-overlay
-            (car (proofread-test--install-diagnostics
-                  (list diagnostic))))
            (foreign-overlay (make-overlay 1 6)))
       (overlay-put foreign-overlay 'category 'foreign-overlay)
+      (proofread-test--publish-diagnostics (list diagnostic))
       (goto-char 3)
       (insert "x")
-      (should-not (overlay-buffer proofread-overlay))
       (should (overlay-buffer foreign-overlay))
       (should-not proofread--diagnostics))))
 
@@ -2789,42 +2719,18 @@ When PROFILE is nil, use the current profile."
              (memq diagnostic
                    proofread--deferred-correction-diagnostics))))))))
 
-(ert-deftest proofread-test-disable-mode-clears-proofread-overlays ()
-  "Disabling `proofread-mode' deletes proofread overlays only."
+(ert-deftest proofread-test-disable-mode-clears-proofread-diagnostics ()
+  "Disabling `proofread-mode' clears its Flymake diagnostics only."
   (with-temp-buffer
     (insert "hello world")
     (proofread-mode 1)
     (let* ((diagnostic (proofread-test--diagnostic))
-           (proofread-overlay (proofread--create-overlay diagnostic))
            (foreign-overlay (make-overlay 1 6)))
-      (setq proofread--diagnostics (list diagnostic))
       (overlay-put foreign-overlay 'category 'foreign-overlay)
+      (proofread-test--publish-diagnostics (list diagnostic))
       (proofread-mode -1)
-      (should-not (overlay-buffer proofread-overlay))
       (should (overlay-buffer foreign-overlay))
-      (should-not proofread--diagnostics)
-      (should-not proofread--overlays))))
-
-(ert-deftest proofread-test-disable-mode-clears-untracked-overlays ()
-  "Disabling `proofread-mode' deletes untracked proofread overlays."
-  (with-temp-buffer
-    (insert "hello world again")
-    (proofread-mode 1)
-    (let* ((diagnostic (proofread-test--diagnostic))
-           (tracked-overlay (proofread--create-overlay diagnostic))
-           (orphan-overlay (make-overlay 8 13))
-           (foreign-overlay (make-overlay 8 13)))
-      (overlay-put orphan-overlay 'category
-                   proofread--overlay-category)
-      (overlay-put orphan-overlay 'face 'proofread-face)
-      (overlay-put foreign-overlay 'category 'foreign-overlay)
-      (setq proofread--overlays (list tracked-overlay))
-      (narrow-to-region 1 6)
-      (proofread-mode -1)
-      (should-not (overlay-buffer tracked-overlay))
-      (should-not (overlay-buffer orphan-overlay))
-      (should (overlay-buffer foreign-overlay))
-      (should-not proofread--overlays))))
+      (should-not proofread--diagnostics))))
 
 (ert-deftest
     proofread-test-check-visible-range-collects-single-window-range ()
@@ -3695,19 +3601,6 @@ range; no available backend"))))))
       (should proofread-auto-check))))
 
 (ert-deftest
-    proofread-test-echo-area-messages-default-enabled-and-local ()
-  "The echo-area option defaults to enabled and localizes when set."
-  (should (custom-variable-p 'proofread-echo-area-messages))
-  (should (default-value 'proofread-echo-area-messages))
-  (should (local-variable-if-set-p 'proofread-echo-area-messages))
-  (with-temp-buffer
-    (setq proofread-echo-area-messages nil)
-    (should (local-variable-p 'proofread-echo-area-messages))
-    (should-not proofread-echo-area-messages)
-    (with-temp-buffer
-      (should proofread-echo-area-messages))))
-
-(ert-deftest
     proofread-test-mode-enable-schedules-initial-idle-work ()
   "Enabling automatic checking schedules initial idle work."
   (with-temp-buffer
@@ -4355,7 +4248,9 @@ range; no available backend"))))))
           (cl-letf (((symbol-function 'buffer-list)
                      (lambda (&optional _frame) buffers))
                     ((symbol-function 'remove-variable-watcher)
-                     (lambda (_symbol _function))))
+                     (lambda (&rest _arguments)
+                       (ert-fail
+                        "Proofread unload removed a variable watcher"))))
             (proofread-unload-function))
           (dolist (buffer buffers)
             (with-current-buffer buffer
@@ -5988,13 +5883,16 @@ This covers URLs, email, invisible text, faces, and properties."
                      (list replacement nil "0.2.0"))))))
 
 (ert-deftest proofread-test-removed-options-retain-obsolete-metadata ()
-  "Retain migration metadata for the removed pre-profile options."
+  "Retain compiler-facing migration metadata for removed options."
   (dolist (case
            '((proofread-backend
-              "proofread-profiles" "proofread-profile")
-             (proofread-language ":language")))
+              "0.2.0" "proofread-profiles" "proofread-profile")
+             (proofread-language "0.2.0" ":language")
+             (proofread-echo-area-messages
+              "0.3.0" "eldoc-mode" "Flymake")))
     (let* ((variable (car case))
-           (required-fragments (cdr case))
+           (expected-version (cadr case))
+           (required-fragments (cddr case))
            (metadata (get variable 'byte-obsolete-variable)))
       (should-not (boundp variable))
       (should-not (custom-variable-p variable))
@@ -6007,7 +5905,7 @@ This covers URLs, email, invisible text, faces, and properties."
           (should (string-match-p (regexp-quote fragment)
                                   replacement)))
         (should-not access-type)
-        (should (equal version "0.2.0"))))))
+        (should (equal version expected-version))))))
 
 (ert-deftest proofread-test-profile-normalizes-checkers ()
   "Normalize an explicitly selected profile and its checkers."
@@ -13371,19 +13269,19 @@ This covers URLs, email, invisible text, faces, and properties."
          (message
           (proofread-format-diagnostic-message
            diagnostic
-           :source-face 'proofread-echo-area-source-face
-           :message-face 'proofread-echo-area-message-face)))
+           :source-face 'font-lock-keyword-face
+           :message-face 'font-lock-comment-face)))
     (should (equal message "test: Possible misspelling"))
     (should
      (eq (get-text-property 0 'face message)
-         'proofread-echo-area-source-face))
+         'font-lock-keyword-face))
     (should
      (eq (get-text-property 4 'face message)
-         'proofread-echo-area-source-face))
+         'font-lock-keyword-face))
     (should-not (get-text-property 5 'face message))
     (should
      (eq (get-text-property 6 'face message)
-         'proofread-echo-area-message-face))
+         'font-lock-comment-face))
     (dolist (property '( font-lock-face
                          help-echo
                          proofread-test-property))
@@ -13412,8 +13310,8 @@ This covers URLs, email, invisible text, faces, and properties."
           (proofread-format-diagnostic-message
            diagnostic
            :separator "; "
-           :source-face 'proofread-echo-area-source-face
-           :message-face 'proofread-echo-area-message-face
+           :source-face 'font-lock-keyword-face
+           :message-face 'font-lock-comment-face
            :single-line t))
          (separator (string-match-p "; " message))
          (second-source (string-match-p "languagetool" message)))
@@ -13426,10 +13324,10 @@ This covers URLs, email, invisible text, faces, and properties."
     (should second-source)
     (should
      (eq (get-text-property second-source 'face message)
-         'proofread-echo-area-source-face))
+         'font-lock-keyword-face))
     (should
      (eq (get-text-property (+ second-source 14) 'face message)
-         'proofread-echo-area-message-face))))
+         'font-lock-comment-face))))
 
 (ert-deftest proofread-test-public-diagnostic-message-fallbacks ()
   "The shared message formatter handles blank and non-string fields."
@@ -13439,11 +13337,11 @@ This covers URLs, email, invisible text, faces, and properties."
             (list :source " "
                   :message raw-message
                   :text (propertize "helo" 'face 'error))
-            :message-face 'proofread-echo-area-message-face)))
+            :message-face 'font-lock-comment-face)))
       (should (equal message "Proofread: helo"))
       (should
        (eq (get-text-property 0 'face message)
-           'proofread-echo-area-message-face))))
+           'font-lock-comment-face))))
   (should
    (equal
     (proofread-format-diagnostic-message
@@ -13502,12 +13400,6 @@ This covers URLs, email, invisible text, faces, and properties."
       (should (= (cl-count #'flymake-eldoc-function
                            eldoc-documentation-functions)
                  1))
-      (should-not
-       (memq #'proofread--eldoc-function
-             eldoc-documentation-functions))
-      (should-not
-       (memq #'proofread--refresh-echo-area
-             proofread-diagnostics-changed-hook))
       (proofread-mode 1)
       (should (= (cl-count #'flymake-eldoc-function
                            eldoc-documentation-functions)
@@ -13582,37 +13474,24 @@ This covers URLs, email, invisible text, faces, and properties."
            (= (cl-count "Foreign diagnostic" lines :test #'equal)
               1)))))))
 
-(ert-deftest proofread-test-eldoc-mode-lifecycle-restores-state ()
-  "Proofread restores only ElDoc mode state that it enabled."
+(ert-deftest proofread-test-eldoc-mode-lifecycle-is-flymake-owned ()
+  "Leave ElDoc state unchanged while Flymake owns its provider."
   (with-temp-buffer
     (text-mode)
     (setq-local eldoc-documentation-functions nil)
     (eldoc-mode -1)
     (let ((proofread-auto-check nil))
       (proofread-mode 1)
-      (should eldoc-mode)
-      (should proofread--eldoc-mode-owned-p)
+      (should-not eldoc-mode)
       (should (= (cl-count #'flymake-eldoc-function
                            eldoc-documentation-functions)
                  1))
-      (should-not
-       (memq #'proofread--eldoc-function
-             eldoc-documentation-functions))
-      (should-not
-       (memq #'proofread--refresh-echo-area
-             proofread-diagnostics-changed-hook))
-      (should-not (memq #'proofread--retry-echo-area-refresh
-                        post-command-hook))
       (proofread-mode -1)
       (should-not eldoc-mode)
-      (should-not proofread--eldoc-mode-owned-p)
       (should flymake-mode)
       (should (= (cl-count #'flymake-eldoc-function
                            eldoc-documentation-functions)
-                 1))
-      (should-not
-       (memq #'proofread--eldoc-function
-             eldoc-documentation-functions))))
+                 1))))
   (with-temp-buffer
     (text-mode)
     (add-hook 'eldoc-documentation-functions #'ignore nil t)
@@ -13620,255 +13499,16 @@ This covers URLs, email, invisible text, faces, and properties."
     (should eldoc-mode)
     (let ((proofread-auto-check nil))
       (proofread-mode 1)
-      (should-not proofread--eldoc-mode-owned-p)
       (should (= (cl-count #'flymake-eldoc-function
                            eldoc-documentation-functions)
                  1))
-      (should-not
-       (memq #'proofread--eldoc-function
-             eldoc-documentation-functions))
-      (setq-local proofread-echo-area-messages nil)
-      (should eldoc-mode)
-      (should-not proofread--eldoc-mode-owned-p)
-      (setq-local proofread-echo-area-messages t)
-      (should eldoc-mode)
       (proofread-mode -1)
       (should eldoc-mode)
       (should (memq #'ignore eldoc-documentation-functions))
       (should (= (cl-count #'flymake-eldoc-function
                            eldoc-documentation-functions)
-                 1))
-      (should-not
-       (memq #'proofread--eldoc-function
-             eldoc-documentation-functions)))
+                 1)))
     (eldoc-mode -1)))
-
-(ert-deftest proofread-test-echo-option-controls-owned-eldoc ()
-  "The echo option dynamically owns and restores a disabled ElDoc mode."
-  (with-temp-buffer
-    (text-mode)
-    (setq-local eldoc-documentation-functions nil)
-    (eldoc-mode -1)
-    (setq-local proofread-echo-area-messages nil)
-    (let ((proofread-auto-check nil)
-          (eldoc-last-message nil))
-      (proofread-mode 1)
-      (should-not eldoc-mode)
-      (should-not proofread--eldoc-mode-owned-p)
-      (should (= (cl-count #'flymake-eldoc-function
-                           eldoc-documentation-functions)
-                 1))
-      (should-not
-       (memq #'proofread--eldoc-function
-             eldoc-documentation-functions))
-      (setq-local proofread-echo-area-messages t)
-      (should eldoc-mode)
-      (should proofread--eldoc-mode-owned-p)
-      (let ((message
-             (proofread--echo-area-message
-              (proofread-test--diagnostic)))
-            displays)
-        (setq eldoc-last-message message)
-        (cl-letf
-            (((symbol-function 'current-message)
-              (lambda () message))
-             ((symbol-function 'eldoc-display-in-echo-area)
-              (lambda (documents interactive)
-                (push (list documents interactive) displays))))
-          (setq-local proofread-echo-area-messages nil))
-        (should (equal displays '((nil t))))
-        (should-not eldoc-last-message))
-      (should-not eldoc-mode)
-      (should-not proofread--eldoc-mode-owned-p))))
-
-(ert-deftest proofread-test-echo-option-local-let-restores-eldoc ()
-  "A temporary local echo option restores Proofread-owned ElDoc."
-  (with-temp-buffer
-    (text-mode)
-    (setq-local eldoc-documentation-functions nil)
-    (eldoc-mode -1)
-    (setq-local proofread-echo-area-messages nil)
-    (let ((proofread-auto-check nil))
-      (proofread-mode 1)
-      (should-not eldoc-mode)
-      (let ((proofread-echo-area-messages t))
-        (should eldoc-mode)
-        (should proofread--eldoc-mode-owned-p))
-      (should-not proofread-echo-area-messages)
-      (should-not eldoc-mode)
-      (should-not proofread--eldoc-mode-owned-p))))
-
-(ert-deftest proofread-test-echo-option-default-let-restores-eldoc ()
-  "A temporary default echo option restores non-local users."
-  (with-temp-buffer
-    (text-mode)
-    (setq-local eldoc-documentation-functions nil)
-    (eldoc-mode -1)
-    (let ((proofread-auto-check nil))
-      (proofread-mode 1)
-      (should-not
-       (local-variable-p 'proofread-echo-area-messages))
-      (should eldoc-mode)
-      (should proofread--eldoc-mode-owned-p)
-      (let ((proofread-echo-area-messages nil))
-        (should-not proofread-echo-area-messages)
-        (should-not eldoc-mode)
-        (should-not proofread--eldoc-mode-owned-p))
-      (should proofread-echo-area-messages)
-      (should eldoc-mode)
-      (should proofread--eldoc-mode-owned-p))))
-
-(ert-deftest proofread-test-echo-option-kill-local-uses-default ()
-  "Killing a local echo option synchronizes to its default value."
-  (with-temp-buffer
-    (text-mode)
-    (setq-local eldoc-documentation-functions nil)
-    (eldoc-mode -1)
-    (setq-local proofread-echo-area-messages nil)
-    (let ((proofread-auto-check nil))
-      (proofread-mode 1)
-      (should-not eldoc-mode)
-      (kill-local-variable 'proofread-echo-area-messages)
-      (should proofread-echo-area-messages)
-      (should-not
-       (local-variable-p 'proofread-echo-area-messages))
-      (should eldoc-mode)
-      (should proofread--eldoc-mode-owned-p))))
-
-(ert-deftest proofread-test-echo-option-default-set-is-local-aware ()
-  "A new echo default updates only buffers without a local value."
-  (let ((default-buffer
-         (generate-new-buffer " *proofread-echo-default*"))
-        (local-buffer
-         (generate-new-buffer " *proofread-echo-local*"))
-        (original-default
-         (default-value 'proofread-echo-area-messages)))
-    (unwind-protect
-        (progn
-          (set-default 'proofread-echo-area-messages t)
-          (dolist (buffer (list default-buffer local-buffer))
-            (with-current-buffer buffer
-              (text-mode)
-              (setq-local eldoc-documentation-functions nil)
-              (eldoc-mode -1)))
-          (with-current-buffer local-buffer
-            (setq-local proofread-echo-area-messages t))
-          (dolist (buffer (list default-buffer local-buffer))
-            (with-current-buffer buffer
-              (let ((proofread-auto-check nil))
-                (proofread-mode 1))
-              (should eldoc-mode)
-              (should proofread--eldoc-mode-owned-p)))
-          (set-default 'proofread-echo-area-messages nil)
-          (with-current-buffer default-buffer
-            (should-not proofread-echo-area-messages)
-            (should-not eldoc-mode)
-            (should-not proofread--eldoc-mode-owned-p))
-          (with-current-buffer local-buffer
-            (should proofread-echo-area-messages)
-            (should eldoc-mode)
-            (should proofread--eldoc-mode-owned-p))
-          (set-default 'proofread-echo-area-messages t)
-          (with-current-buffer default-buffer
-            (should proofread-echo-area-messages)
-            (should eldoc-mode)
-            (should proofread--eldoc-mode-owned-p)))
-      (dolist (buffer (list default-buffer local-buffer))
-        (when (buffer-live-p buffer)
-          (kill-buffer buffer)))
-      (set-default 'proofread-echo-area-messages original-default))))
-
-(ert-deftest proofread-test-echo-area-refresh-is-guarded-and-retried
-    ()
-  "Do not overwrite foreign messages; retry only after a safe command."
-  (save-window-excursion
-    (let ((buffer (generate-new-buffer " *proofread-echo-refresh*")))
-      (unwind-protect
-          (progn
-            (switch-to-buffer buffer)
-            (insert "helo")
-            (let ((proofread-auto-check nil)
-                  (this-command nil)
-                  current-message-value
-                  displays)
-              (proofread-mode 1)
-              (proofread-test--install-diagnostics
-               (list
-                (proofread-test--diagnostic-for-range 1 5 "helo")))
-              (goto-char 2)
-              (cl-letf
-                  (((symbol-function 'active-minibuffer-window)
-                    (lambda () nil))
-                   ((symbol-function
-                     'eldoc-display-message-no-interference-p)
-                    (lambda () t))
-                   ((symbol-function 'current-message)
-                    (lambda () current-message-value))
-                   ((symbol-function 'eldoc-display-in-echo-area)
-                    (lambda (documents interactive)
-                      (push (list documents interactive) displays)
-                      (setq current-message-value
-                            (and documents (caar documents))))))
-                (proofread--refresh-echo-area)
-                (should (= (length displays) 1))
-                (let ((message (caaaar displays)))
-                  (should
-                   (equal message "test: Possible misspelling")))
-                (should-not proofread--echo-area-refresh-pending-p)
-                (should-not
-                 (memq #'proofread--retry-echo-area-refresh
-                       post-command-hook))
-                (setq displays nil)
-                (setq current-message-value "foreign command output")
-                (proofread--refresh-echo-area)
-                (should-not displays)
-                (should proofread--echo-area-refresh-pending-p)
-                (should
-                 (memq #'proofread--retry-echo-area-refresh
-                       post-command-hook))
-                (setq current-message-value nil)
-                (let ((this-command 'next-line))
-                  (proofread--retry-echo-area-refresh))
-                (should (= (length displays) 1))
-                (should-not proofread--echo-area-refresh-pending-p)
-                (should-not
-                 (memq #'proofread--retry-echo-area-refresh
-                       post-command-hook)))))
-        (when (buffer-live-p buffer)
-          (kill-buffer buffer))))))
-
-(ert-deftest proofread-test-echo-area-ownership-is-buffer-specific ()
-  "One Proofread buffer cannot clear another buffer's echo message."
-  (let ((first (generate-new-buffer " *proofread-echo-first*"))
-        (second (generate-new-buffer " *proofread-echo-second*"))
-        (eldoc-last-message nil)
-        displays
-        message)
-    (unwind-protect
-        (progn
-          (with-current-buffer first
-            (setq message
-                  (proofread--echo-area-message
-                   (proofread-test--diagnostic))))
-          (setq eldoc-last-message message)
-          (cl-letf
-              (((symbol-function 'current-message)
-                (lambda () message))
-               ((symbol-function 'eldoc-display-in-echo-area)
-                (lambda (documents interactive)
-                  (push (list documents interactive) displays))))
-            (with-current-buffer second
-              (proofread--echo-area-clear-current-message))
-            (should-not displays)
-            (should (eq eldoc-last-message message))
-            (with-current-buffer first
-              (proofread--echo-area-clear-current-message))
-            (should (equal displays '((nil t))))
-            (should-not eldoc-last-message)))
-      (when (buffer-live-p first)
-        (kill-buffer first))
-      (when (buffer-live-p second)
-        (kill-buffer second)))))
 
 (ert-deftest proofread-test-diagnostics-changed-hook-runs-after-clear
     ()
@@ -13883,7 +13523,7 @@ This covers URLs, email, invisible text, faces, and properties."
                 (lambda ()
                   (setq calls (1+ calls)))
                 nil t)
-      (proofread-test--install-diagnostics (list diagnostic))
+      (proofread-test--publish-diagnostics (list diagnostic))
       (proofread-clear)
       (should (= calls 1))
       (should-not (proofread-diagnostic-at-point 4)))))
@@ -13900,7 +13540,7 @@ This covers URLs, email, invisible text, faces, and properties."
           (reentered-p nil)
           (report-count 0)
           (hook-count 0))
-      (proofread-test--install-diagnostics (list old))
+      (proofread-test--publish-diagnostics (list old))
       (let ((original-report-function
              proofread--flymake-report-function))
         (setq proofread--flymake-report-function
@@ -13922,8 +13562,6 @@ This covers URLs, email, invisible text, faces, and properties."
       (should (= (length proofread--diagnostics) 1))
       (let ((installed (car proofread--diagnostics)))
         (should (equal installed replacement))
-        (should (overlay-buffer
-                 (proofread--overlay-for-diagnostic installed)))
         (should (gethash installed
                          proofread--diagnostic-request-ranges))
         (should (eq (proofread-diagnostic-at-point 6) installed))))))
@@ -14186,27 +13824,6 @@ This covers URLs, email, invisible text, faces, and properties."
                        faces-before))
         (dolist (overlay overlays)
           (should (overlay-buffer overlay)))))))
-
-(ert-deftest proofread-test-apply-target-overlay-lookup ()
-  "Apply suggestions through owned diagnostic and overlay state."
-  (with-temp-buffer
-    (insert "helo")
-    (proofread-mode 1)
-    (let* ((diagnostic
-            (proofread-test--diagnostic-for-range 1 5 "helo"))
-           (proofread-overlay
-            (car (proofread-test--install-diagnostics
-                  (list diagnostic))))
-           (foreign-overlay (make-overlay 1 5)))
-      (overlay-put foreign-overlay 'category 'foreign-overlay)
-      (overlay-put foreign-overlay 'proofread-diagnostic diagnostic)
-      (goto-char 2)
-      (should (eq (proofread-diagnostic-at-point) diagnostic))
-      (should (eq (proofread--overlay-for-diagnostic diagnostic)
-                  proofread-overlay))
-      (delete-overlay proofread-overlay)
-      (should-not (proofread--overlay-for-diagnostic diagnostic))
-      (should (overlay-buffer foreign-overlay)))))
 
 (ert-deftest proofread-test-apply-suggestion-helper-returns-strings ()
   "Suggestion extraction returns strings in stored order."
