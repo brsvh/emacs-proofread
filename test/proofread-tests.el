@@ -13902,6 +13902,154 @@ This covers URLs, email, invisible text, faces, and properties."
         (proofread-correct-buffer)))
     (should (equal (nreverse calls) '( single batch)))))
 
+(ert-deftest proofread-test-correction-plan-uses-explicit-records ()
+  "Represent validated correction and repair state with records."
+  (with-temp-buffer
+    (insert "helo")
+    (proofread-mode 1)
+    (let ((diagnostic
+           (proofread-test--diagnostic-with-suggestions
+            1 5 "helo" '( "hello"))))
+      (proofread-test--publish-diagnostics (list diagnostic))
+      (let* ((plan
+              (proofread--prepare-correction-plan
+               (list (cons diagnostic "hello")) nil))
+             (entries (proofread--correction-plan-entries plan))
+             (entry (car entries))
+             (source-state
+              (cl-find
+               (current-buffer)
+               (proofread--correction-plan-buffer-states plan)
+               :key #'proofread--correction-buffer-state-buffer
+               :test #'eq)))
+        (should (proofread--correction-plan-p plan))
+        (should (= (length entries) 1))
+        (should (proofread--correction-entry-p entry))
+        (should (eq (proofread--correction-entry-diagnostic entry)
+                    diagnostic))
+        (should (equal (proofread--correction-entry-suggestion entry)
+                       "hello"))
+        (should (equal (proofread--correction-entry-range entry)
+                       '( 1 . 5)))
+        (should
+         (proofread--correction-entry-container-snapshotted-p
+          entry))
+        (should-not (proofread--correction-entry-container entry))
+        (should (equal (proofread--correction-plan-region plan)
+                       '( 1 . 5)))
+        (should
+         (equal (proofread--correction-plan-affected-diagnostics
+                 plan)
+                (list diagnostic)))
+        (should (eq (proofread--correction-plan-source plan)
+                    (current-buffer)))
+        (should-not
+         (proofread--correction-plan-preserve-excursion-p plan))
+        (should (proofread--correction-buffer-state-p source-state))
+        (should
+         (equal
+          (proofread--correction-buffer-state-range-snapshot
+           source-state)
+          (proofread--correction-plan-source-range-snapshot
+           plan)))))))
+
+(ert-deftest
+    proofread-test-correction-transaction-orchestrates-plan-stages ()
+  "Run the named correction-plan stages once and in order."
+  (with-temp-buffer
+    (let ((plan
+           (proofread--make-correction-plan
+            nil nil nil nil (current-buffer) nil nil))
+          (corrections '( (diagnostic . "replacement")))
+          events)
+      (cl-letf
+          (((symbol-function 'proofread--prepare-correction-plan)
+            (lambda (actual-corrections preserve-excursion-p)
+              (should (equal actual-corrections corrections))
+              (should-not preserve-excursion-p)
+              (push 'prepare events)
+              plan))
+           ((symbol-function 'proofread--apply-correction-plan)
+            (lambda (actual-plan)
+              (should (eq actual-plan plan))
+              (push 'apply events)
+              '( deferred)))
+           ((symbol-function 'proofread--commit-correction-plan)
+            (lambda (actual-plan deferred-diagnostics)
+              (should (eq actual-plan plan))
+              (should (equal deferred-diagnostics '( deferred)))
+              (push 'commit events)))
+           ((symbol-function 'proofread--repair-correction-plan)
+            (lambda (actual-plan)
+              (should (eq actual-plan plan))
+              (push 'repair events)))
+           ((symbol-function
+             'proofread--restore-correction-plan-after-rollback)
+            (lambda (&rest _arguments)
+              (ert-fail "Unexpected correction rollback"))))
+        (proofread--run-correction-transaction corrections))
+      (should (equal (nreverse events)
+                     '( prepare apply commit repair))))))
+
+(ert-deftest
+    proofread-test-correction-transaction-repairs-after-rollback ()
+  "Restore and repair a plan when its application fails."
+  (with-temp-buffer
+    (let ((plan
+           (proofread--make-correction-plan
+            nil nil nil nil (current-buffer) nil nil))
+          (corrections '( (diagnostic . "replacement")))
+          events)
+      (cl-letf
+          (((symbol-function 'proofread--prepare-correction-plan)
+            (lambda (&rest _arguments)
+              (push 'prepare events)
+              plan))
+           ((symbol-function 'proofread--apply-correction-plan)
+            (lambda (actual-plan)
+              (should (eq actual-plan plan))
+              (push 'apply events)
+              (error "Correction application failed")))
+           ((symbol-function 'proofread--commit-correction-plan)
+            (lambda (&rest _arguments)
+              (ert-fail "Unexpected correction commit")))
+           ((symbol-function
+             'proofread--restore-correction-plan-after-rollback)
+            (lambda (actual-plan)
+              (should (eq actual-plan plan))
+              (push 'rollback events)))
+           ((symbol-function 'proofread--repair-correction-plan)
+            (lambda (actual-plan)
+              (should (eq actual-plan plan))
+              (push 'repair events))))
+        (should-error
+         (proofread--run-correction-transaction corrections)
+         :type 'error))
+      (should (equal (nreverse events)
+                     '( prepare apply rollback repair))))))
+
+(ert-deftest
+    proofread-test-correction-plan-applies-entries-in-reverse-order ()
+  "Route each batch entry through apply-one in reverse order."
+  (with-temp-buffer
+    (let* ((first
+            (proofread--make-correction-entry
+             'first "first" '( 1 . 2) nil nil))
+           (second
+            (proofread--make-correction-entry
+             'second "second" '( 3 . 4) nil nil))
+           (plan
+            (proofread--make-correction-plan
+             (list first second) nil nil nil (current-buffer) nil t))
+           calls)
+      (cl-letf
+          (((symbol-function 'proofread--apply-correction-entry)
+            (lambda (entry preserve-excursion-p)
+              (push (list entry preserve-excursion-p) calls))))
+        (should-not (proofread--apply-correction-plan plan)))
+      (should (equal (nreverse calls)
+                     (list (list second t) (list first t)))))))
+
 (ert-deftest
     proofread-test-single-correction-preserves-transaction-order ()
   "Keep single-correction point, mark, hook, and undo ordering."
@@ -14272,10 +14420,13 @@ This covers URLs, email, invisible text, faces, and properties."
             (proofread-test--publish-diagnostics diagnostics))
            (expected-diagnostics
             (list zero-correction zero-right main overlap contains))
-           (affected-diagnostics
-            (proofread--corrections-affected-diagnostics
+           (plan
+            (proofread--prepare-correction-plan
              (list (cons zero-correction "X")
-                   (cons main "Y")))))
+                   (cons main "Y"))
+             t))
+           (affected-diagnostics
+            (proofread--correction-plan-affected-diagnostics plan)))
       (should (equal affected-diagnostics expected-diagnostics))
       (should (cl-every #'eq affected-diagnostics
                         expected-diagnostics)))))

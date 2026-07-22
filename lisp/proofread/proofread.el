@@ -7838,6 +7838,57 @@ When RESET is non-nil, move from the beginning of the buffer."
 
 ;;;; Corrections
 
+(cl-defstruct
+    (proofread--correction-entry
+     (:constructor
+      proofread--make-correction-entry
+      (diagnostic suggestion range container-snapshotted-p
+                  container)))
+  "One validated replacement in a correction plan.
+DIAGNOSTIC is the live diagnostic being replaced.  SUGGESTION is the
+replacement string and RANGE is its validated live range.
+CONTAINER-SNAPSHOTTED-P distinguishes a deliberately captured nil
+CONTAINER from one that must be captured immediately before a batch
+edit."
+  diagnostic
+  suggestion
+  range
+  container-snapshotted-p
+  container)
+
+(cl-defstruct
+    (proofread--correction-buffer-state
+     (:constructor
+      proofread--make-correction-buffer-state
+      (buffer tick range-snapshot)))
+  "State used to repair one Proofread buffer after correction hooks.
+BUFFER is the observed buffer, TICK is its character modification
+tick, and RANGE-SNAPSHOT contains its pre-edit live diagnostic ranges."
+  buffer
+  tick
+  range-snapshot)
+
+(cl-defstruct
+    (proofread--correction-plan
+     (:constructor
+      proofread--make-correction-plan
+      (entries region affected-diagnostics buffer-states source
+               source-range-snapshot preserve-excursion-p)))
+  "Prepared state for one atomic correction transaction.
+ENTRIES are validated `proofread--correction-entry' records in
+navigation order.  REGION bounds their logical ranges.
+AFFECTED-DIAGNOSTICS are invalidated when the transaction commits.
+BUFFER-STATES support repair of reentrant edits, while SOURCE and
+SOURCE-RANGE-SNAPSHOT identify the source buffer state.
+PRESERVE-EXCURSION-P is non-nil for batch commands."
+  entries
+  region
+  affected-diagnostics
+  buffer-states
+  source
+  source-range-snapshot
+  preserve-excursion-p)
+
 (defun proofread--select-diagnostic-suggestion (diagnostic)
   "Return the selected suggestion string for DIAGNOSTIC."
   (let ((suggestions (proofread--diagnostic-suggestions diagnostic)))
@@ -7950,14 +8001,15 @@ Return the identities actually removed, in their model order."
       (setq proofread--current-diagnostic nil))
     removed))
 
-(defun proofread--mode-buffer-change-state ()
-  "Return character ticks and live ranges for Proofread buffers."
+(defun proofread--correction-buffer-states ()
+  "Return correction repair state for every Proofread buffer."
   (proofread--prune-mode-buffers)
   (mapcar (lambda (buffer)
             (with-current-buffer buffer
-              (list buffer
-                    (buffer-chars-modified-tick)
-                    (proofread--snapshot-live-diagnostic-ranges))))
+              (proofread--make-correction-buffer-state
+               buffer
+               (buffer-chars-modified-tick)
+               (proofread--snapshot-live-diagnostic-ranges))))
           proofread--mode-buffers))
 
 (defun proofread--diagnostic-text-current-p
@@ -7975,57 +8027,60 @@ LIVE-RANGES is an optional strict live-range table."
          (equal (buffer-substring-no-properties beg end)
                 (plist-get diagnostic :text)))))
 
-(defun proofread--repair-correction-time-buffer-changes
-    (states source)
-  "Repair Proofread buffers in STATES changed while correcting SOURCE.
+(defun proofread--repair-correction-plan (plan)
+  "Repair other Proofread buffers changed while executing PLAN.
 Modification hooks suppress recursively triggered hooks, even in
 another buffer.  Revalidate every proofread buffer whose character
-tick changed.  SOURCE is committed separately by the correction
-transaction and is never repaired here."
-  (dolist (state states)
-    (let ((buffer (nth 0 state))
-          (tick (nth 1 state))
-          (range-snapshot (nth 2 state)))
-      (when (and (not (eq buffer source))
-                 (buffer-live-p buffer)
-                 (with-current-buffer buffer
-                   (and proofread-mode
-                        (/= tick (buffer-chars-modified-tick)))))
-        (with-current-buffer buffer
-          ;; A suppressed nested edit may have shifted any pending
-          ;; request.
-          (proofread--clear-request-work)
-          (save-restriction
-            (widen)
-            (let* ((live-ranges
-                    (proofread--flymake-live-range-table))
-                   (stale
-                    (cl-remove-if
-                     (lambda (diagnostic)
-                       (proofread--diagnostic-text-current-p
-                        diagnostic live-ranges))
-                     proofread--diagnostics))
-                   (moved
-                    (proofread--diagnostics-with-changed-live-ranges
-                     range-snapshot live-ranges))
-                   (changed
-                    (cl-delete-duplicates
-                     (append stale moved) :test #'eq)))
-              (when changed
-                (proofread--commit-diagnostic-state
-                 (cons (point-min) (point-max))
-                 (lambda ()
-                   (let ((removed
-                          (proofread--remove-diagnostics stale)))
-                     (append
-                      removed
-                      (cl-remove-if-not
+tick changed.  PLAN's source is committed separately and is never
+repaired here."
+  (let ((source (proofread--correction-plan-source plan)))
+    (dolist (state (proofread--correction-plan-buffer-states plan))
+      (let ((buffer
+             (proofread--correction-buffer-state-buffer state))
+            (tick (proofread--correction-buffer-state-tick state))
+            (range-snapshot
+             (proofread--correction-buffer-state-range-snapshot
+              state)))
+        (when (and (not (eq buffer source))
+                   (buffer-live-p buffer)
+                   (with-current-buffer buffer
+                     (and proofread-mode
+                          (/= tick (buffer-chars-modified-tick)))))
+          (with-current-buffer buffer
+            ;; A suppressed nested edit may have shifted any pending
+            ;; request.
+            (proofread--clear-request-work)
+            (save-restriction
+              (widen)
+              (let* ((live-ranges
+                      (proofread--flymake-live-range-table))
+                     (stale
+                      (cl-remove-if
                        (lambda (diagnostic)
-                         (memq diagnostic proofread--diagnostics))
-                       moved))))))))
-          (proofread--mark-pending-work))))))
+                         (proofread--diagnostic-text-current-p
+                          diagnostic live-ranges))
+                       proofread--diagnostics))
+                     (moved
+                      (proofread--diagnostics-with-changed-live-ranges
+                       range-snapshot live-ranges))
+                     (changed
+                      (cl-delete-duplicates
+                       (append stale moved) :test #'eq)))
+                (when changed
+                  (proofread--commit-diagnostic-state
+                   (cons (point-min) (point-max))
+                   (lambda ()
+                     (let ((removed
+                            (proofread--remove-diagnostics stale)))
+                       (append
+                        removed
+                        (cl-remove-if-not
+                         (lambda (diagnostic)
+                           (memq diagnostic proofread--diagnostics))
+                         moved))))))))
+            (proofread--mark-pending-work)))))))
 
-(defun proofread--prepare-diagnostic-corrections (diagnostics)
+(defun proofread--select-diagnostic-corrections (diagnostics)
   "Return selected nonconflicting corrections for DIAGNOSTICS.
 Each returned element is a cons cell of the form (DIAGNOSTIC
 . SUGGESTION).  DIAGNOSTICS must be in navigation order.  An earlier
@@ -8047,19 +8102,29 @@ ranges."
             (push (cons diagnostic suggestion) corrections)))))
     (nreverse corrections)))
 
-(defun proofread--corrections-affected-diagnostics
-    (corrections &optional correction-ranges)
-  "Return diagnostic identities affected by CORRECTIONS.
-When CORRECTION-RANGES is non-nil, use those validated live ranges."
+(defun proofread--prepare-correction-entry
+    (correction snapshot-container-p)
+  "Return a validated entry for CORRECTION.
+CORRECTION has the form (DIAGNOSTIC . SUGGESTION).  When
+SNAPSHOT-CONTAINER-P is non-nil, capture the diagnostic's source
+container now, including an explicit nil result."
+  (let* ((diagnostic (car correction))
+         (suggestion (cdr correction))
+         (range
+          (proofread--validate-suggestion-application diagnostic))
+         (container
+          (and snapshot-container-p
+               (proofread--diagnostic-correction-container
+                diagnostic range))))
+    (proofread--make-correction-entry
+     diagnostic suggestion range snapshot-container-p container)))
+
+(defun proofread--corrections-affected-diagnostics (entries)
+  "Return diagnostic identities affected by correction ENTRIES."
   (let* ((live-ranges (proofread--flymake-live-range-table))
          (ranges
-          (or correction-ranges
-              (mapcar
-               (lambda (correction)
-                 (proofread--current-diagnostic-live-range
-                  (car correction) live-ranges))
-               corrections)))
-         (entries
+          (mapcar #'proofread--correction-entry-range entries))
+         (diagnostic-entries
           (delq nil
                 (mapcar
                  (lambda (diagnostic)
@@ -8068,19 +8133,60 @@ When CORRECTION-RANGES is non-nil, use those validated live ranges."
                  proofread--diagnostics)))
          diagnostics)
     (dolist (entry
-             (proofread--range-conflicting-entries ranges entries))
+             (proofread--range-conflicting-entries
+              ranges diagnostic-entries))
       (push (car entry) diagnostics))
     diagnostics))
 
-(defun proofread--restore-flymake-after-correction-rollback
-    (range-snapshot)
-  "Restore diagnostics lost from Flymake after a correction rollback.
-RANGE-SNAPSHOT is the pre-edit live-range snapshot.  Buffer text and
-the core model have already been rolled back.  Report the unchanged
-snapshot only when an owned Flymake diagnostic disappeared; do not run
-the diagnostic change hook because no logical state changed."
+(defun proofread--prepare-correction-plan
+    (corrections preserve-excursion-p)
+  "Return a validated correction plan for CORRECTIONS.
+CORRECTIONS contains (DIAGNOSTIC . SUGGESTION) pairs.
+PRESERVE-EXCURSION-P is non-nil for a batch transaction.  Batch
+containers are captured immediately before their reverse-order edits;
+a point correction captures its container before opening an undo
+transaction."
+  (let* ((entries
+          (mapcar
+           (lambda (correction)
+             (proofread--prepare-correction-entry
+              correction (not preserve-excursion-p)))
+           corrections))
+         (ranges
+          (mapcar #'proofread--correction-entry-range entries)))
+    (unless entries
+      (error "Cannot prepare an empty correction plan"))
+    (let* ((region
+            (cons (apply #'min (mapcar #'car ranges))
+                  (apply #'max (mapcar #'cdr ranges))))
+           (affected-diagnostics
+            (proofread--corrections-affected-diagnostics entries))
+           (buffer-states (proofread--correction-buffer-states))
+           (source (current-buffer))
+           (source-state
+            (cl-find
+             source buffer-states
+             :key #'proofread--correction-buffer-state-buffer
+             :test #'eq))
+           (source-range-snapshot
+            (if source-state
+                (proofread--correction-buffer-state-range-snapshot
+                 source-state)
+              (proofread--snapshot-live-diagnostic-ranges))))
+      (proofread--make-correction-plan
+       entries region affected-diagnostics buffer-states source
+       source-range-snapshot preserve-excursion-p))))
+
+(defun proofread--restore-correction-plan-after-rollback (plan)
+  "Restore Flymake diagnostics lost while rolling back PLAN.
+Buffer text and the core model have already been rolled back.  Report
+the unchanged pre-edit snapshot only when an owned Flymake diagnostic
+disappeared; do not run the diagnostic change hook because no logical
+state changed."
   (when proofread--flymake-report-function
-    (let ((live-ranges (proofread--flymake-live-range-table))
+    (let ((range-snapshot
+           (proofread--correction-plan-source-range-snapshot plan))
+          (live-ranges (proofread--flymake-live-range-table))
           (fallback-ranges (make-hash-table :test #'eq)))
       (dolist (entry range-snapshot)
         (puthash (car entry) (cdr entry) fallback-ranges))
@@ -8096,149 +8202,132 @@ the diagnostic change hook because no logical state changed."
            (proofread--report-flymake-warning
             "rollback report" error-data)))))))
 
+(defun proofread--apply-correction-entry
+    (entry preserve-excursion-p)
+  "Apply correction ENTRY and validate its source container.
+When PRESERVE-EXCURSION-P is non-nil, move point before deleting the
+entry's range."
+  (let* ((diagnostic
+          (proofread--correction-entry-diagnostic entry))
+         (suggestion
+          (proofread--correction-entry-suggestion entry))
+         (range (proofread--correction-entry-range entry))
+         (beg (car range))
+         (end (cdr range))
+         (container
+          (if (proofread--correction-entry-container-snapshotted-p
+               entry)
+              (proofread--correction-entry-container entry)
+            (proofread--diagnostic-correction-container
+             diagnostic range))))
+    (if preserve-excursion-p
+        (progn
+          (goto-char beg)
+          (delete-region beg end))
+      (delete-region beg end)
+      (goto-char beg))
+    (insert suggestion)
+    (proofread--validate-correction-container
+     container beg (point)
+     (- (length suggestion) (- end beg)))))
+
+(defun proofread--apply-correction-plan-atomically (plan)
+  "Apply PLAN entries atomically and return deferred diagnostics."
+  (let ((proofread--inhibit-diagnostic-invalidation
+         (current-buffer))
+        (proofread--deferred-correction-diagnostics nil)
+        (preserve-excursion-p
+         (proofread--correction-plan-preserve-excursion-p plan)))
+    (atomic-change-group
+      (dolist (entry
+               (reverse
+                (copy-sequence
+                 (proofread--correction-plan-entries plan))))
+        (proofread--apply-correction-entry
+         entry preserve-excursion-p)))
+    (copy-sequence proofread--deferred-correction-diagnostics)))
+
+(defun proofread--apply-correction-plan (plan)
+  "Apply PLAN and return diagnostics invalidated by reentrant edits.
+For a batch plan, restore point, mark, and mark activation before
+returning, and close its undo unit before later notification hooks."
+  (if (proofread--correction-plan-preserve-excursion-p plan)
+      (save-mark-and-excursion
+        (prog1 (proofread--apply-correction-plan-atomically plan)
+          (undo-boundary)))
+    (proofread--apply-correction-plan-atomically plan)))
+
+(defun proofread--commit-correction-plan
+    (plan deferred-diagnostics)
+  "Commit PLAN after edits and invalidate DEFERRED-DIAGNOSTICS."
+  (proofread--clear-request-work)
+  (save-restriction
+    (widen)
+    (let* ((live-ranges (proofread--flymake-live-range-table))
+           (stale
+            (cl-remove-if
+             (lambda (diagnostic)
+               (proofread--diagnostic-text-current-p
+                diagnostic live-ranges))
+             proofread--diagnostics))
+           (moved
+            (proofread--diagnostics-with-changed-live-ranges
+             (proofread--correction-plan-source-range-snapshot plan)
+             live-ranges))
+           (invalidated
+            (cl-delete-duplicates
+             (append
+              (proofread--correction-plan-affected-diagnostics plan)
+              deferred-diagnostics
+              stale)
+             :test #'eq))
+           (changed
+            (cl-delete-duplicates
+             (append invalidated moved) :test #'eq)))
+      (when changed
+        (proofread--commit-diagnostic-state
+         (proofread--correction-plan-region plan)
+         (lambda ()
+           (let ((removed
+                  (proofread--remove-diagnostics invalidated)))
+             (append
+              removed
+              (cl-remove-if-not
+               (lambda (diagnostic)
+                 (memq diagnostic proofread--diagnostics))
+               moved))))))))
+  (proofread--mark-pending-work))
+
 (defun proofread--run-correction-transaction
     (corrections &optional preserve-excursion)
   "Apply CORRECTIONS in one atomic correction transaction.
 Each element of CORRECTIONS has the form (DIAGNOSTIC . SUGGESTION).
-Validate every diagnostic before editing, then apply the corrections
-from end to beginning.  When PRESERVE-EXCURSION is non-nil, restore
-point, mark, and mark activation before notifying diagnostics hooks."
-  (let* ((validated-corrections
-          (mapcar
-           (lambda (correction)
-             (let* ((diagnostic (car correction))
-                    (range
-                     (proofread--validate-suggestion-application
-                      diagnostic)))
-               (list
-                correction
-                range
-                ;; A single correction validates its container before
-                ;; opening an undo transaction.  A batch must instead
-                ;; snapshot each updated container immediately before
-                ;; its reverse-order edit.
-                (unless preserve-excursion
-                  (cons
-                   t
-                   (proofread--diagnostic-correction-container
-                    diagnostic range))))))
-           corrections))
-         (correction-ranges
-          (mapcar (lambda (validated-correction)
-                    (nth 1 validated-correction))
-                  validated-corrections))
-         (correction-region
-          (cons (apply #'min (mapcar #'car correction-ranges))
-                (apply #'max (mapcar #'cdr correction-ranges))))
-         (affected-diagnostics
-          (proofread--corrections-affected-diagnostics
-           corrections
-           correction-ranges))
-         (buffer-states (proofread--mode-buffer-change-state))
-         (source (current-buffer))
-         (source-state
-          (cl-find source buffer-states :key #'car :test #'eq))
-         (source-range-snapshot
-          (or (nth 2 source-state)
-              (proofread--snapshot-live-diagnostic-ranges)))
-         deferred-diagnostics
-         edits-completed-p
-         repairs-completed-p)
-    (cl-labels
-        ((apply-edits
-           ()
-           (let ((proofread--inhibit-diagnostic-invalidation
-                  (current-buffer))
-                 (proofread--deferred-correction-diagnostics nil))
-             (atomic-change-group
-               (dolist (validated-correction
-                        (reverse validated-corrections))
-                 (let* ((correction (car validated-correction))
-                        (diagnostic (car correction))
-                        (suggestion (cdr correction))
-                        (range (nth 1 validated-correction))
-                        (beg (car range))
-                        (end (cdr range))
-                        (container-state
-                         (nth 2 validated-correction))
-                        (container
-                         (if container-state
-                             (cdr container-state)
-                           (proofread--diagnostic-correction-container
-                            diagnostic range))))
-                   (if preserve-excursion
-                       (progn
-                         (goto-char beg)
-                         (delete-region beg end))
-                     (delete-region beg end)
-                     (goto-char beg))
-                   (insert suggestion)
-                   (proofread--validate-correction-container
-                    container beg (point)
-                    (- (length suggestion) (- end beg))))))
-             (setq deferred-diagnostics
-                   (copy-sequence
-                    proofread--deferred-correction-diagnostics))))
-         (commit-source
-           ()
-           (proofread--clear-request-work)
-           (save-restriction
-             (widen)
-             (let* ((live-ranges
-                     (proofread--flymake-live-range-table))
-                    (stale
-                     (cl-remove-if
-                      (lambda (diagnostic)
-                        (proofread--diagnostic-text-current-p
-                         diagnostic live-ranges))
-                      proofread--diagnostics))
-                    (moved
-                     (proofread--diagnostics-with-changed-live-ranges
-                      source-range-snapshot live-ranges))
-                    (invalidated
-                     (cl-delete-duplicates
-                      (append affected-diagnostics
-                              deferred-diagnostics
-                              stale)
-                      :test #'eq))
-                    (changed
-                     (cl-delete-duplicates
-                      (append invalidated moved) :test #'eq)))
-               (when changed
-                 (proofread--commit-diagnostic-state
-                  correction-region
-                  (lambda ()
-                    (let ((removed
-                           (proofread--remove-diagnostics
-                            invalidated)))
-                      (append
-                       removed
-                       (cl-remove-if-not
-                        (lambda (diagnostic)
-                          (memq diagnostic proofread--diagnostics))
-                        moved))))))))
-           (proofread--mark-pending-work)))
-      (undo-boundary)
-      (unwind-protect
-          (progn
-            (if preserve-excursion
-                (save-mark-and-excursion
-                  (apply-edits)
-                  (undo-boundary))
-              (apply-edits))
-            (setq edits-completed-p t)
-            (commit-source)
-            (proofread--repair-correction-time-buffer-changes
-             buffer-states source)
-            (setq repairs-completed-p t))
-        (unless repairs-completed-p
-          (unless edits-completed-p
-            (proofread--restore-flymake-after-correction-rollback
-             source-range-snapshot))
-          (proofread--repair-correction-time-buffer-changes
-           buffer-states source)))
-      (unless preserve-excursion
-        (undo-boundary)))))
+Prepare and validate a plan, apply it from end to beginning, commit
+diagnostic invalidation, and repair reentrant cross-buffer edits.  When
+PRESERVE-EXCURSION is non-nil, restore point, mark, and mark activation
+before notifying diagnostic hooks."
+  (let ((plan
+         (proofread--prepare-correction-plan
+          corrections preserve-excursion))
+        deferred-diagnostics
+        edits-completed-p
+        repairs-completed-p)
+    (undo-boundary)
+    (unwind-protect
+        (progn
+          (setq deferred-diagnostics
+                (proofread--apply-correction-plan plan))
+          (setq edits-completed-p t)
+          (proofread--commit-correction-plan
+           plan deferred-diagnostics)
+          (proofread--repair-correction-plan plan)
+          (setq repairs-completed-p t))
+      (unless repairs-completed-p
+        (unless edits-completed-p
+          (proofread--restore-correction-plan-after-rollback plan))
+        (proofread--repair-correction-plan plan)))
+    (unless (proofread--correction-plan-preserve-excursion-p plan)
+      (undo-boundary))))
 
 (defun proofread--apply-suggestion-to-diagnostic
     (diagnostic suggestion)
@@ -8263,7 +8352,7 @@ DIAGNOSTICS must be in navigation order.  Return `applied'."
     (unless actionable
       (user-error "No proofread suggestions available"))
     (let* ((corrections
-            (proofread--prepare-diagnostic-corrections actionable))
+            (proofread--select-diagnostic-corrections actionable))
            (count (length corrections))
            (skipped (- (length diagnostics) count)))
       (proofread--apply-diagnostic-corrections corrections)
