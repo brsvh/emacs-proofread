@@ -6020,9 +6020,18 @@ DIAGNOSTICS must be in navigation order."
 
 (defun proofread--diagnostic-ui-equivalent-p (left right)
   "Return non-nil when LEFT and RIGHT represent the same UI diagnostic."
-  (or (eq left right)
-      (memq left (proofread--diagnostic-members right))
-      (memq right (proofread--diagnostic-members left))))
+  (cond
+   ((eq left right) t)
+   ((and (proofread--aggregate-diagnostic-p left)
+         (proofread--aggregate-diagnostic-p right))
+    (let ((left-members (proofread--diagnostic-members left))
+          (right-members (proofread--diagnostic-members right)))
+      (and (= (length left-members) (length right-members))
+           (cl-every #'eq left-members right-members))))
+   ((proofread--aggregate-diagnostic-p left)
+    (memq right (proofread--diagnostic-members left)))
+   ((proofread--aggregate-diagnostic-p right)
+    (memq left (proofread--diagnostic-members right)))))
 
 (defun proofread-format-diagnostic-field (value)
   "Return VALUE formatted as a Proofread diagnostic field.
@@ -6252,6 +6261,31 @@ raw diagnostic in MODEL-ORDERS."
                    (proofread--range-contains-p
                     (cons (point-min) (point-max)) range))
           range)))))
+
+(defun proofread--flymake-ui-range (flymake-diagnostic data)
+  "Return the logical UI range for FLYMAKE-DIAGNOSTIC and DATA.
+Read the annotation range through Flymake's public accessors, then
+restore the logical position of a zero-width Proofread diagnostic."
+  (let* ((anchor-beg
+          (proofread--position-integer
+           (flymake-diagnostic-beg flymake-diagnostic)))
+         (anchor-end
+          (proofread--position-integer
+           (flymake-diagnostic-end flymake-diagnostic)))
+         (edge (proofread--flymake-data-anchor-edge data))
+         (range
+          (pcase edge
+            (:beg (and anchor-beg (cons anchor-beg anchor-beg)))
+            (:end (and anchor-end (cons anchor-end anchor-end)))
+            (:empty
+             (let ((original (proofread--flymake-data-range data)))
+               (cons (car original) (cdr original))))
+            (_ (and anchor-beg anchor-end
+                    (cons anchor-beg anchor-end))))))
+    (when (and (proofread--range-valid-p range)
+               (proofread--range-contains-p
+                (cons (point-min) (point-max)) range))
+      range)))
 
 (defun proofread--flymake-data-current-member-orders
     (data model-orders)
@@ -6600,7 +6634,8 @@ restriction."
                 (proofread--owned-flymake-data
                  flymake-diagnostic model-orders))
                (range
-                (proofread--flymake-live-range-from-data data))
+                (proofread--flymake-ui-range
+                 flymake-diagnostic data))
                (member-orders
                 (proofread--flymake-data-current-member-orders
                  data model-orders)))
@@ -6681,6 +6716,17 @@ restriction."
      (proofread--diagnostic-ui-equivalent-p
       (car entry) diagnostic))
    entries))
+
+(defun proofread--navigation-range-for-diagnostic
+    (diagnostic &optional entries)
+  "Return DIAGNOSTIC's current Flymake-backed UI range, or nil.
+ENTRIES is an optional result from `proofread--navigation-entries'.
+By default, query the whole buffer regardless of narrowing."
+  (when-let* ((entry
+               (proofread--navigation-entry-for-diagnostic
+                diagnostic
+                (or entries (proofread--navigation-entries)))))
+    (cons (nth 1 entry) (nth 2 entry))))
 
 (defun proofread--diagnostic-ignore-key (diagnostic)
   "Return the session ignore key for DIAGNOSTIC."
@@ -6765,10 +6811,9 @@ restriction."
           (setq removed (nconc removed local-removed)))))
     removed))
 
-(defun proofread--next-diagnostic-after (position)
-  "Return the nearest diagnostic strictly after POSITION."
-  (let* ((entries (proofread--navigation-entries t))
-         (point-position (proofread--position-integer position))
+(defun proofread--next-navigation-entry-after (position entries)
+  "Return the nearest navigation entry after POSITION in ENTRIES."
+  (let* ((point-position (proofread--position-integer position))
          (candidate
           (and proofread--current-diagnostic
                (proofread--navigation-entry-for-diagnostic
@@ -6779,16 +6824,15 @@ restriction."
                         point-position)
                        candidate)))
     (if current
-        (car (cadr (memq current entries)))
+        (cadr (memq current entries))
       (when point-position
-        (car (cl-find-if (lambda (entry)
-                           (> (nth 1 entry) point-position))
-                         entries))))))
+        (cl-find-if (lambda (entry)
+                      (> (nth 1 entry) point-position))
+                    entries)))))
 
-(defun proofread--previous-diagnostic-before (position)
-  "Return the nearest diagnostic strictly before POSITION."
-  (let* ((entries (proofread--navigation-entries t))
-         (point-position (proofread--position-integer position))
+(defun proofread--previous-navigation-entry-before (position entries)
+  "Return the nearest navigation entry before POSITION in ENTRIES."
+  (let* ((point-position (proofread--position-integer position))
          (candidate
           (and proofread--current-diagnostic
                (proofread--navigation-entry-for-diagnostic
@@ -6804,21 +6848,16 @@ restriction."
           (dolist (entry entries)
             (when (eq entry current)
               (throw 'current previous))
-            (setq previous (car entry)))
+            (setq previous entry))
           previous)
       (when point-position
         (dolist (entry entries)
           (when (< (nth 1 entry) point-position)
-            (setq previous (car entry))))
+            (setq previous entry)))
         previous))))
 
 (defun proofread--clear-current-diagnostic ()
-  "Clear the current diagnostic and its highlight face."
-  (when proofread--current-diagnostic
-    (dolist (overlay
-             (proofread--overlays-for-diagnostic
-              proofread--current-diagnostic))
-      (overlay-put overlay 'face 'proofread-face)))
+  "Clear the current navigation diagnostic."
   (setq proofread--current-diagnostic nil))
 
 (defun proofread--overlay-for-diagnostic (diagnostic)
@@ -6872,7 +6911,8 @@ MODEL-ORDERS is the current diagnostic order table."
               (proofread--owned-flymake-data
                flymake-diagnostic model-orders))
              (range
-              (proofread--flymake-live-range-from-data data))
+              (proofread--flymake-ui-range
+               flymake-diagnostic data))
              (member-orders
               (proofread--flymake-data-current-member-orders
                data model-orders)))
@@ -7080,10 +7120,9 @@ gate permitted an update."
 
 (defun proofread--enable-echo-area ()
   "Enable Proofread's echo-area integration in the current buffer."
-  (add-hook 'eldoc-documentation-functions
-            #'proofread--eldoc-function nil t)
-  (add-hook 'proofread-diagnostics-changed-hook
-            #'proofread--refresh-echo-area nil t)
+  ;; Flymake owns the one generic diagnostic provider.  Keep only the
+  ;; transitional option-driven ElDoc mode ownership until the legacy
+  ;; echo-area adapter is removed.
   (proofread--configure-echo-area proofread-echo-area-messages))
 
 (defun proofread--disable-echo-area ()
@@ -7136,11 +7175,9 @@ nil for a change to the default."
         where (default-value symbol))))))
 
 (defun proofread--mark-current-diagnostic (diagnostic)
-  "Mark DIAGNOSTIC current and update its overlay face."
+  "Mark DIAGNOSTIC as the current navigation diagnostic."
   (proofread--clear-current-diagnostic)
   (setq proofread--current-diagnostic diagnostic)
-  (dolist (overlay (proofread--overlays-for-diagnostic diagnostic))
-    (overlay-put overlay 'face 'proofread-current-face))
   diagnostic)
 
 ;;;; Request listings
@@ -7864,25 +7901,12 @@ events."
     ('style 2)
     (_ 3)))
 
-(defun proofread--diagnostic-live-range (diagnostic)
-  "Return DIAGNOSTIC's current live range, or nil."
-  (if (proofread--aggregate-diagnostic-p diagnostic)
-      (let (range)
-        (dolist (member (proofread--diagnostic-members diagnostic))
-          (unless range
-            (setq range
-                  (proofread--diagnostic-live-range member))))
-        range)
-    (let ((overlay (proofread--overlay-for-diagnostic diagnostic)))
-      (when (and overlay
-                 (overlay-start overlay)
-                 (overlay-end overlay))
-        (cons (overlay-start overlay)
-              (overlay-end overlay))))))
-
-(defun proofread--diagnostic-line-column (diagnostic)
-  "Return DIAGNOSTIC's current line and zero-based display column."
-  (let ((range (proofread--diagnostic-live-range diagnostic)))
+(defun proofread--diagnostic-line-column (diagnostic &optional range)
+  "Return DIAGNOSTIC's current line and zero-based display column.
+RANGE is an optional live range already read from Flymake."
+  (let ((range
+         (or range
+             (proofread--navigation-range-for-diagnostic diagnostic))))
     (when range
       (save-excursion
         (save-restriction
@@ -7896,19 +7920,18 @@ events."
 This includes zero-width diagnostics on either boundary."
   (let ((selected-range (cons beg end))
         diagnostics)
-    (dolist (diagnostic (proofread--navigation-diagnostics))
-      (let ((range (proofread--diagnostic-live-range diagnostic)))
-        (when (and range
-                   (proofread--range-conflicts-p
-                    selected-range range))
-          (push diagnostic diagnostics))))
+    (dolist (entry (proofread--navigation-entries))
+      (let ((range (cons (nth 1 entry) (nth 2 entry))))
+        (when (proofread--range-conflicts-p selected-range range)
+          (push (car entry) diagnostics))))
     (nreverse diagnostics)))
 
-(defun proofread--diagnostics-list-entry (diagnostic)
-  "Return a tabulated list entry for live DIAGNOSTIC, or nil."
+(defun proofread--diagnostics-list-entry (diagnostic &optional range)
+  "Return a tabulated list entry for live DIAGNOSTIC, or nil.
+RANGE is an optional live range already read from Flymake."
   (when-let*
       ((line-column
-        (proofread--diagnostic-line-column diagnostic)))
+        (proofread--diagnostic-line-column diagnostic range)))
     (let* ((line (car line-column))
            (column (cdr line-column))
            (kind (plist-get diagnostic :kind))
@@ -7942,8 +7965,11 @@ This includes zero-width diagnostics on either boundary."
 (defun proofread--diagnostics-list-entries ()
   "Return tabulated list entries for the current buffer diagnostics."
   (delq nil
-        (mapcar #'proofread--diagnostics-list-entry
-                (proofread--navigation-diagnostics))))
+        (mapcar
+         (lambda (entry)
+           (proofread--diagnostics-list-entry
+            (car entry) (cons (nth 1 entry) (nth 2 entry))))
+         (proofread--navigation-entries))))
 
 (defun proofread--diagnostics-buffer-refresh ()
   "Refresh entries in the current proofread diagnostics buffer."
@@ -8003,7 +8029,7 @@ window."
          (range (and diagnostic
                      (buffer-live-p source)
                      (with-current-buffer source
-                       (proofread--diagnostic-live-range
+                       (proofread--navigation-range-for-diagnostic
                         diagnostic)))))
     (unless (and (buffer-live-p source) range)
       (user-error "Proofread diagnostic is stale"))
@@ -8761,6 +8787,10 @@ DIAGNOSTICS must be in navigation order.  Return `applied'."
     ;; Flymake's deferred activation start behind.
     (let ((flymake-start-on-flymake-mode nil))
       (flymake-mode 1)))
+  ;; Flymake installs its generic ElDoc provider when its mode starts.
+  ;; Configure the transitional ElDoc ownership only after that provider
+  ;; makes ElDoc supported in the buffer.
+  (proofread--enable-echo-area)
   (flymake-start))
 
 (defun proofread--disable-flymake-bridge ()
@@ -8799,7 +8829,6 @@ all other Flymake backends active."
   (add-hook 'window-scroll-functions #'proofread--window-scroll nil t)
   (add-hook 'window-configuration-change-hook
             #'proofread--mark-pending-work nil t)
-  (proofread--enable-echo-area)
   (proofread--register-mode-buffer)
   (proofread--mark-pending-work)
   ;; This runs every configured Flymake backend synchronously.  Keep
@@ -9266,13 +9295,16 @@ This function does not move point in the source buffer."
 (defun proofread-next ()
   "Move point to the next proofreading diagnostic."
   (interactive)
-  (let ((diagnostic (proofread--next-diagnostic-after (point))))
+  (let* ((entries (proofread--navigation-entries t))
+         (entry
+          (proofread--next-navigation-entry-after
+           (point) entries)))
     (cond
-     (diagnostic
-      (goto-char (car (proofread--diagnostic-live-range diagnostic)))
-      (proofread--mark-current-diagnostic diagnostic)
+     (entry
+      (goto-char (nth 1 entry))
+      (proofread--mark-current-diagnostic (car entry))
       (message "proofread: moved to next diagnostic"))
-     ((proofread--navigation-diagnostics)
+     (entries
       (user-error "No next proofread diagnostic"))
      (t
       (user-error "No proofread diagnostics")))))
@@ -9281,13 +9313,16 @@ This function does not move point in the source buffer."
 (defun proofread-previous ()
   "Move point to the previous proofreading diagnostic."
   (interactive)
-  (let ((diagnostic (proofread--previous-diagnostic-before (point))))
+  (let* ((entries (proofread--navigation-entries t))
+         (entry
+          (proofread--previous-navigation-entry-before
+           (point) entries)))
     (cond
-     (diagnostic
-      (goto-char (car (proofread--diagnostic-live-range diagnostic)))
-      (proofread--mark-current-diagnostic diagnostic)
+     (entry
+      (goto-char (nth 1 entry))
+      (proofread--mark-current-diagnostic (car entry))
       (message "proofread: moved to previous diagnostic"))
-     ((proofread--navigation-diagnostics)
+     (entries
       (user-error "No previous proofread diagnostic"))
      (t
       (user-error "No proofread diagnostics")))))
