@@ -21,6 +21,20 @@ whose ':backend' property selects it, and select the profile with
 'proofread-profile'.
 
 ---
+*** Flymake is now the required diagnostic presentation layer.
+Enabling 'proofread-mode' installs a buffer-local Flymake backend, enables
+'flymake-mode' when necessary, and starts every configured Flymake backend.
+Existing backends continue to coexist with Proofread.  Disabling Proofread
+removes only its backend and diagnostics and leaves Flymake active; disabling
+Flymake while Proofread is active disables Proofread.
+
+The legacy overlay and private ElDoc presentation implementations have been
+removed.  The obsolete 'proofread-echo-area-messages' variable has no effect,
+and the 'proofread-current-face', 'proofread-echo-area-source-face', and
+'proofread-echo-area-message-face' faces no longer exist.  Configure ElDoc and
+Flymake directly instead.
+
+---
 *** Third-party backend descriptors now require ':snapshot-options'.
 The public 'proofread-register-backend' and 'proofread-unregister-backend'
 functions are now the supported registration interface; third-party backends
@@ -32,6 +46,25 @@ immutable.  Existing third-party registrations that omit ':snapshot-options'
 are rejected.
 
 ** User interface
+
+---
+*** Flymake now owns the primary diagnostic interface.
+Standard Flymake commands and ElDoc can show Proofread diagnostics alongside
+diagnostics from other Flymake backends.  'proofread-show-buffer-diagnostics'
+remains as a supplementary Proofread-only list.  Proofread navigation,
+correction, ignore, clear, and popup operations affect only Proofread-owned
+diagnostics.
+
+Zero-width diagnostics keep their logical insertion position.  In a nonempty
+buffer, Flymake displays them on an adjacent character; in an empty buffer no
+underline is possible.  Proofread's public queries, navigation, list,
+correction commands, and popup retain the logical zero-width position in both
+cases.
+
+The optional popup and point-oriented third-party frontends can use the public
+'proofread-diagnostic-at-point', diagnostic accessor and formatter functions,
+and 'proofread-diagnostics-changed-hook' without reading private Proofread or
+Flymake state.
 
 ---
 *** Request and diagnostic lists now report display columns.

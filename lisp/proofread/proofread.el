@@ -28,9 +28,27 @@
 
 ;; Proofread provides asynchronous, context-aware proofreading for
 ;; Emacs buffers.  It selects prose from ordinary text, comments, or
-;; docstrings; sends bounded chunks to a configured backend; and
-;; displays diagnostics that can be reviewed, ignored, or corrected in
-;; place.
+;; docstrings; sends bounded chunks through the selected profile's
+;; ordered checkers; and displays diagnostics that can be reviewed,
+;; ignored, or corrected in place.
+;;
+;; Diagnostics are published through a buffer-local Flymake backend.
+;; Enabling `proofread-mode' enables Flymake when necessary and starts
+;; every configured Flymake backend; disabling Proofread removes only
+;; its own backend and diagnostics.  Disabling Flymake while Proofread
+;; is active disables Proofread as well.  Flymake supplies its normal
+;; user interface, including echo-area messages when ElDoc is enabled.
+;; `proofread-show-buffer-diagnostics' provides an additional
+;; Proofread-only list.  Proofread-specific commands ignore diagnostics
+;; owned by other Flymake backends.  Zero-width diagnostics use an
+;; adjacent Flymake presentation anchor when possible while the public
+;; API retains their logical insertion position.
+;;
+;; Optional point-oriented frontends should obtain diagnostics with
+;; `proofread-diagnostic-at-point', read their logical ranges with
+;; `proofread-diagnostic-range', format messages with
+;; `proofread-format-diagnostic-message', and observe
+;; `proofread-diagnostics-changed-hook'.
 
 ;;; Code:
 
@@ -245,7 +263,7 @@ request-ready chunks."
 
 (defface proofread-face
   '((t :inherit font-lock-warning-face :underline ( :style wave)))
-  "Face for proofreading diagnostics."
+  "Face used by Flymake for Proofread buffer annotations."
   :group 'proofread)
 
 ;;;; Flymake diagnostic type
@@ -680,9 +698,12 @@ other consumers or recorded state.  Consumers must not signal errors
 that interrupt proofreading.")
 
 (defvar-local proofread-diagnostics-changed-hook nil
-  "Hook run after displayed diagnostics change in the current buffer.
-Functions are called without arguments.  Errors are reported without
-interrupting proofreading.")
+  "Hook run after a Proofread diagnostic model change is committed.
+Any corresponding Flymake publication is attempted before this
+buffer-local hook runs.  Public frontends may use it to refresh values
+read through the Proofread diagnostic accessors.  It does not report
+changes from other Flymake backends.  Functions are called without
+arguments.  Errors are reported without interrupting proofreading.")
 
 (defvar proofread--mode-buffers nil
   "Live buffers where `proofread-mode' has installed local hooks.")
@@ -5773,7 +5794,9 @@ BEG and END delimit the changed text."
 (defun proofread-diagnostic-range (diagnostic)
   "Return DIAGNOSTIC's current well-formed range, or nil.
 Prefer the range tracked by a current Flymake diagnostic in the
-current buffer; otherwise return the diagnostic's stored range."
+current buffer; otherwise return the diagnostic's stored range.  For
+a zero-width diagnostic, return its logical insertion position even
+when Flymake displays an adjacent character."
   (or (proofread--flymake-live-range-for-diagnostic diagnostic)
       (proofread--diagnostic-range diagnostic)))
 
@@ -6859,9 +6882,15 @@ buffer, so its public query cannot enumerate the bridge report."
 
 (defun proofread-diagnostic-at-point (&optional position)
   "Return the live proofreading diagnostic at POSITION or point.
-A diagnostic is live only while the current Proofread Flymake bridge
-reports it in this buffer.  An aggregate may be freshly allocated on
-every call, so callers must not rely on `eq' identity across calls.
+A diagnostic normally is live only while the current Proofread
+Flymake bridge reports it in this buffer.  A zero-width diagnostic in
+an empty buffer remains queryable while the bridge is active because
+Flymake has no character on which to display it.  Diagnostics from
+other Flymake backends are ignored.  An aggregate may be freshly
+allocated on every call, so callers must not rely on `eq' identity
+across calls.  Zero-width diagnostics match their logical insertion
+position rather than the adjacent character used for Flymake
+presentation.
 Compare values from `proofread-diagnostic-range',
 `proofread-diagnostic-message', `proofread-diagnostic-message-entries',
 and `proofread-diagnostic-text' instead."
@@ -7785,7 +7814,7 @@ When RESET is non-nil, move from the beginning of the buffer."
 (define-derived-mode proofread-diagnostics-buffer-mode
   tabulated-list-mode
   "Proofread diagnostics"
-  "A mode for listing Proofread diagnostics."
+  "A mode for listing live Proofread-only diagnostics."
   :interactive nil
   (proofread--diagnostics-buffer-setup))
 
@@ -8778,13 +8807,20 @@ whose cdr contains its one filtered request span record."
 (define-minor-mode proofread-mode
   "Toggle context-aware proofreading in the current buffer.
 
+Enabling installs a buffer-local Flymake backend, enables
+`flymake-mode' when necessary, and starts all configured Flymake
+backends.  Disabling removes only Proofread's backend and diagnostics;
+it leaves Flymake and other backends active.  Disabling `flymake-mode'
+while Proofread is active disables this mode.
+
 When enabled and `proofread-auto-check' is non-nil, proofread
 schedules an initial visible-buffer check when enabled, and further
 checks after editing or window activity.  It then dispatches
-request-ready visible chunks through the configured backend.  The
-option `proofread-targets' controls which kinds of text are selected.
-Diagnostics are published through Flymake.  When ElDoc is enabled,
-Flymake also shows the diagnostic at point in the echo area.
+request-ready visible chunks through the selected profile's ordered
+checkers.  The option `proofread-targets' controls which kinds of text
+are selected.  Diagnostics are published through Flymake.  When
+`eldoc-mode' is enabled, Flymake shows diagnostics at point from
+Proofread and other backends; Proofread does not manage ElDoc itself.
 When automatic checking is disabled, use
 `proofread-check-at-point', `proofread-check-region',
 `proofread-check-buffer', or `proofread-check-visible-range' manually.
@@ -8851,9 +8887,12 @@ routine progress messages are inhibited."
 
 ;;;###autoload
 (defun proofread-show-buffer-diagnostics (&optional diagnostic)
-  "Show a listing of Proofread diagnostics for the current buffer.
+  "Show a supplemental Proofread-only diagnostic listing.
 With optional DIAGNOSTIC, find and highlight this diagnostic in the
-listing.
+listing.  Flymake's standard listing remains the primary view of all
+Flymake backends in the current buffer.  This list omits other
+backends, aggregates Proofread diagnostics with the same live range
+and text, and retains logical zero-width positions.
 
 Interactively, use the diagnostic at point.  For mouse events in
 margins and fringes, use the first diagnostic in the corresponding
@@ -8924,7 +8963,7 @@ This function does not move point in the source buffer."
 
 ;;;###autoload
 (defun proofread-next ()
-  "Move point to the next proofreading diagnostic."
+  "Move point to the next live Proofread diagnostic without wrapping."
   (interactive)
   (let* ((entries (proofread--navigation-entries t))
          (entry
@@ -8942,7 +8981,7 @@ This function does not move point in the source buffer."
 
 ;;;###autoload
 (defun proofread-previous ()
-  "Move point to the previous proofreading diagnostic."
+  "Move point to the previous live Proofread diagnostic without wrapping."
   (interactive)
   (let* ((entries (proofread--navigation-entries t))
          (entry
@@ -9049,7 +9088,9 @@ buffer."
 
 ;;;###autoload
 (defun proofread-clear ()
-  "Clear proofreading diagnostics from the current buffer."
+  "Clear the current buffer's Proofread model and publication.
+Leave `flymake-mode' and diagnostics reported by other Flymake
+backends unchanged."
   (interactive)
   (proofread--clear-diagnostics))
 
