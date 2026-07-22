@@ -25,26 +25,24 @@
     (beg end text &optional suggestions message source)
   "Return a sample diagnostic for BEG, END, and TEXT.
 SUGGESTIONS, MESSAGE, and SOURCE supply the optional field values."
-  (proofread--make-diagnostic
-   :beg beg
-   :end end
-   :text text
-   :kind 'spelling
-   :message (or message "Possible misspelling")
-   :suggestions suggestions
-   :source (or source 'test)))
+  (list :beg beg
+        :end end
+        :text text
+        :kind 'spelling
+        :message (or message "Possible misspelling")
+        :suggestions suggestions
+        :source (or source 'test)))
 
-(defun proofread-popup-test--install-diagnostics (diagnostics)
-  "Install DIAGNOSTICS and return their proofread overlays."
+(defun proofread-popup-test--publish-diagnostics
+    (diagnostics &optional notify)
+  "Publish DIAGNOSTICS through the core Flymake bridge.
+When NOTIFY is non-nil, run `proofread-diagnostics-changed-hook'
+after Flymake has received the new snapshot."
   (setq proofread--diagnostics diagnostics)
-  (let ((overlays
-         (mapcar #'proofread--create-overlay diagnostics)))
-    (when (and proofread-mode
-               flymake-mode
-               (memq #'proofread--flymake-backend
-                     flymake-diagnostic-functions))
-      (flymake-start))
-    overlays))
+  (flymake-start)
+  (when notify
+    (run-hooks 'proofread-diagnostics-changed-hook))
+  diagnostics)
 
 (defun proofread-popup-test--diagnostic-with-checker
     (diagnostic checker)
@@ -251,7 +249,7 @@ SUGGESTIONS, MESSAGE, and SOURCE supply the optional field values."
             (proofread-popup-test--diagnostic
              1 5 "helo" '( "hello") "Second message" 'languagetool)
             'second)))
-      (proofread-popup-test--install-diagnostics
+      (proofread-popup-test--publish-diagnostics
        (list first second))
       (goto-char 2)
       (let ((message
@@ -338,7 +336,8 @@ SUGGESTIONS, MESSAGE, and SOURCE supply the optional field values."
                      proofread-popup-test--idle-timer-calls))))
               (proofread-popup-test--fire-idle-timer startup-call))
             (should-not proofread-popup-test--shows)
-            (proofread--apply-backend-diagnostics (list diagnostic))
+            (proofread-popup-test--publish-diagnostics
+             (list diagnostic) t)
             (let ((calls
                    (proofread-popup-test--popup-idle-timer-calls
                     proofread-popup-test--idle-timer-calls)))
@@ -347,7 +346,9 @@ SUGGESTIONS, MESSAGE, and SOURCE supply the optional field values."
               (proofread-popup-test--fire-idle-timer (cadr calls)))
             (should (= (length proofread-popup-test--shows) 1))
             (should proofread-popup--render-signature)
-            (should (equal diagnostic (car proofread--diagnostics)))))))))
+            (should
+             (equal diagnostic
+                    (proofread-diagnostic-at-point)))))))))
 
 ;;;; Delayed scheduling
 
@@ -363,8 +364,9 @@ SUGGESTIONS, MESSAGE, and SOURCE supply the optional field values."
               (proofread-popup-delay 0.5))
           (proofread-popup-test--with-idle-timer-recorder
             (proofread-mode 1)
-            (proofread--apply-backend-diagnostics
-             (list (proofread-popup-test--diagnostic 1 5 "helo")))
+            (proofread-popup-test--publish-diagnostics
+             (list (proofread-popup-test--diagnostic 1 5 "helo"))
+             t)
             (let ((calls
                    (proofread-popup-test--popup-idle-timer-calls
                     proofread-popup-test--idle-timer-calls)))
@@ -398,7 +400,7 @@ SUGGESTIONS, MESSAGE, and SOURCE supply the optional field values."
 		(split-window first-window nil 'below))
                (proofread-popup-max-width 80)
                (proofread-popup-delay 0.5))
-          (proofread-popup-test--install-diagnostics
+          (proofread-popup-test--publish-diagnostics
            (list first second))
           (goto-char 2)
           (proofread-popup-test--with-idle-timer-recorder
@@ -445,7 +447,7 @@ SUGGESTIONS, MESSAGE, and SOURCE supply the optional field values."
 	(switch-to-buffer (current-buffer))
 	(insert "helo")
 	(proofread-mode 1)
-	(proofread-popup-test--install-diagnostics
+	(proofread-popup-test--publish-diagnostics
          (list (proofread-popup-test--diagnostic
 		1 5 "helo" nil "Old message")))
 	(goto-char 2)
@@ -453,7 +455,7 @@ SUGGESTIONS, MESSAGE, and SOURCE supply the optional field values."
           (proofread-popup-test--with-idle-timer-recorder
             (proofread-popup--update)
             (proofread-clear)
-            (proofread-popup-test--install-diagnostics
+            (proofread-popup-test--publish-diagnostics
              (list (proofread-popup-test--diagnostic
                     1 5 "helo" nil "Replacement message")))
             (let ((calls
@@ -475,7 +477,7 @@ SUGGESTIONS, MESSAGE, and SOURCE supply the optional field values."
 	(switch-to-buffer (current-buffer))
 	(insert "helo")
 	(proofread-mode 1)
-	(proofread-popup-test--install-diagnostics
+	(proofread-popup-test--publish-diagnostics
          (list (proofread-popup-test--diagnostic 1 5 "helo")))
 	(goto-char 2)
 	(let ((proofread-popup-delay 0.5))
@@ -528,7 +530,7 @@ SUGGESTIONS, MESSAGE, and SOURCE supply the optional field values."
                    (old-timer (plist-get old-call :timer)))
               (text-mode)
               (proofread-mode 1)
-              (proofread-popup-test--install-diagnostics
+              (proofread-popup-test--publish-diagnostics
                (list (proofread-popup-test--diagnostic 1 5 "helo")))
               (let* ((calls
                       (proofread-popup-test--popup-idle-timer-calls
@@ -553,7 +555,7 @@ SUGGESTIONS, MESSAGE, and SOURCE supply the optional field values."
 	(switch-to-buffer (current-buffer))
 	(insert "helo")
 	(proofread-mode 1)
-	(proofread-popup-test--install-diagnostics
+	(proofread-popup-test--publish-diagnostics
          (list (proofread-popup-test--diagnostic 1 5 "helo")))
 	(goto-char 2)
 	(let ((proofread-popup-delay 0.5))
@@ -670,7 +672,7 @@ SUGGESTIONS, MESSAGE, and SOURCE supply the optional field values."
               (should-not proofread-popup--owners)
               (should-not proofread-popup--owner-window)
               (should-not proofread-popup--owner-frame)))
-          (proofread-popup-test--install-diagnostics
+          (proofread-popup-test--publish-diagnostics
            (list (proofread-popup-test--diagnostic 1 5 "helo")))
           (let ((proofread-popup-delay 0))
             (proofread-popup--update))
@@ -751,7 +753,7 @@ SUGGESTIONS, MESSAGE, and SOURCE supply the optional field values."
                anchor-window
                snapshot-window
                snapshot)
-          (proofread-popup-test--install-diagnostics (list diagnostic))
+          (proofread-popup-test--publish-diagnostics (list diagnostic))
           (goto-char 2)
           (cl-letf (((symbol-function 'selected-window)
                      (lambda ()
@@ -826,7 +828,7 @@ SUGGESTIONS, MESSAGE, and SOURCE supply the optional field values."
                (diagnostic
 		(proofread-popup-test--diagnostic
                  4 8 "helo" '( "hello") raw-message)))
-          (proofread-popup-test--install-diagnostics (list diagnostic))
+          (proofread-popup-test--publish-diagnostics (list diagnostic))
           (goto-char 5)
           (proofread-popup--update)
           (should (= (length proofread-popup-test--shows) 1))
@@ -892,7 +894,7 @@ SUGGESTIONS, MESSAGE, and SOURCE supply the optional field values."
 	(let ((diagnostic
                (proofread-popup-test--diagnostic 1 5 "helo"))
               face-attributes)
-          (proofread-popup-test--install-diagnostics (list diagnostic))
+          (proofread-popup-test--publish-diagnostics (list diagnostic))
           (goto-char 2)
           (cl-letf (((symbol-function 'face-attribute)
                      (lambda (face attribute &rest _args)
@@ -931,7 +933,7 @@ SUGGESTIONS, MESSAGE, and SOURCE supply the optional field values."
 	(proofread-mode 1)
 	(let ((diagnostic
                (proofread-popup-test--diagnostic 4 8 "helo")))
-          (proofread-popup-test--install-diagnostics (list diagnostic))
+          (proofread-popup-test--publish-diagnostics (list diagnostic))
           (goto-char 5)
           (proofread-popup--update)
           (goto-char 7)
@@ -958,7 +960,7 @@ SUGGESTIONS, MESSAGE, and SOURCE supply the optional field values."
                  1 5 "helo" '( "hello") "Second message"
                  'languagetool)
 		'second)))
-          (proofread-popup-test--install-diagnostics
+          (proofread-popup-test--publish-diagnostics
            (list first second))
           (goto-char 2)
           (let ((first-value (proofread-diagnostic-at-point))
@@ -989,7 +991,7 @@ SUGGESTIONS, MESSAGE, and SOURCE supply the optional field values."
 	(let ((diagnostic
                (proofread-popup-test--diagnostic
 		1 5 "helo" nil "First message")))
-          (proofread-popup-test--install-diagnostics (list diagnostic))
+          (proofread-popup-test--publish-diagnostics (list diagnostic))
           (goto-char 2)
           (proofread-popup--update)
           (setf (plist-get diagnostic :message) "Changed message")
@@ -1013,7 +1015,7 @@ SUGGESTIONS, MESSAGE, and SOURCE supply the optional field values."
                (proofread-popup-test--diagnostic
 		1 5 "helo" nil "First message" 'llm)))
           (setf (plist-get diagnostic :source-label) "gpt-5.4")
-          (proofread-popup-test--install-diagnostics (list diagnostic))
+          (proofread-popup-test--publish-diagnostics (list diagnostic))
           (goto-char 2)
           (proofread-popup--update)
           (setf (plist-get diagnostic :source-label) "languagetool")
@@ -1035,7 +1037,7 @@ SUGGESTIONS, MESSAGE, and SOURCE supply the optional field values."
 	(proofread-mode 1)
 	(let ((diagnostic
 	       (proofread-popup-test--diagnostic 4 8 "helo")))
-          (proofread-popup-test--install-diagnostics
+          (proofread-popup-test--publish-diagnostics
            (list diagnostic))
           (goto-char 6)
           (proofread-popup--update)
@@ -1061,7 +1063,7 @@ SUGGESTIONS, MESSAGE, and SOURCE supply the optional field values."
                (first-window (selected-window))
                (second-window (split-window first-window nil 'below))
                (snapshot '( :max-width 80)))
-          (proofread-popup-test--install-diagnostics (list diagnostic))
+          (proofread-popup-test--publish-diagnostics (list diagnostic))
           (goto-char 2)
           (cl-letf
               (((symbol-function 'proofread-popup--render-snapshot)
@@ -1085,7 +1087,7 @@ SUGGESTIONS, MESSAGE, and SOURCE supply the optional field values."
 	(let ((diagnostic
                (proofread-popup-test--diagnostic 4 8 "helo"))
               (window-start-position 1))
-          (proofread-popup-test--install-diagnostics (list diagnostic))
+          (proofread-popup-test--publish-diagnostics (list diagnostic))
           (goto-char 5)
           (cl-letf (((symbol-function 'window-start)
                      (lambda (&optional _window)
@@ -1108,7 +1110,7 @@ SUGGESTIONS, MESSAGE, and SOURCE supply the optional field values."
 	(proofread-mode 1)
 	(let ((diagnostic
                (proofread-popup-test--diagnostic 1 8 "aa helo")))
-          (proofread-popup-test--install-diagnostics (list diagnostic))
+          (proofread-popup-test--publish-diagnostics (list diagnostic))
           (narrow-to-region 4 (point-max))
           (goto-char 5)
           (proofread-popup--update)
@@ -1128,7 +1130,7 @@ SUGGESTIONS, MESSAGE, and SOURCE supply the optional field values."
 	(proofread-mode 1)
 	(let ((diagnostic
                (proofread-popup-test--diagnostic 4 8 "helo")))
-          (proofread-popup-test--install-diagnostics (list diagnostic))
+          (proofread-popup-test--publish-diagnostics (list diagnostic))
           (goto-char 5)
           (proofread-popup--update)
           (goto-char 10)
@@ -1147,7 +1149,7 @@ SUGGESTIONS, MESSAGE, and SOURCE supply the optional field values."
 	(proofread-mode 1)
 	(let ((diagnostic
                (proofread-popup-test--diagnostic 1 5 "helo")))
-          (proofread-popup-test--install-diagnostics (list diagnostic))
+          (proofread-popup-test--publish-diagnostics (list diagnostic))
           (goto-char 2)
           (proofread-popup--update)
           (let ((popup-buffer-name proofread-popup--buffer-name))
@@ -1193,7 +1195,7 @@ SUGGESTIONS, MESSAGE, and SOURCE supply the optional field values."
               (switch-to-buffer source)
               (insert "helo")
               (proofread-mode 1)
-              (proofread-popup-test--install-diagnostics
+              (proofread-popup-test--publish-diagnostics
                (list (proofread-popup-test--diagnostic 1 5 "helo")))
               (goto-char 2)
               (proofread-popup--update)
@@ -1256,7 +1258,7 @@ SUGGESTIONS, MESSAGE, and SOURCE supply the optional field values."
               (switch-to-buffer source)
               (insert "helo")
               (proofread-mode 1)
-              (proofread-popup-test--install-diagnostics
+              (proofread-popup-test--publish-diagnostics
                (list (proofread-popup-test--diagnostic 1 5 "helo")))
               (goto-char 2)
               (proofread-popup--update)
@@ -1310,7 +1312,7 @@ SUGGESTIONS, MESSAGE, and SOURCE supply the optional field values."
               (switch-to-buffer source)
               (insert "helo")
               (proofread-mode 1)
-              (proofread-popup-test--install-diagnostics
+              (proofread-popup-test--publish-diagnostics
                (list (proofread-popup-test--diagnostic 1 5 "helo")))
               (goto-char 2)
               (proofread-popup--update)
@@ -1356,7 +1358,7 @@ SUGGESTIONS, MESSAGE, and SOURCE supply the optional field values."
 	(switch-to-buffer (current-buffer))
 	(insert "helo")
 	(proofread-mode 1)
-	(proofread-popup-test--install-diagnostics
+	(proofread-popup-test--publish-diagnostics
          (list (proofread-popup-test--diagnostic 1 5 "helo")))
 	(goto-char 2)
 	(let* ((first-window (selected-window))
@@ -1406,7 +1408,7 @@ SUGGESTIONS, MESSAGE, and SOURCE supply the optional field values."
               (with-current-buffer source
 		(insert "helo")
 		(proofread-mode 1)
-		(proofread-popup-test--install-diagnostics
+		(proofread-popup-test--publish-diagnostics
                  (list (proofread-popup-test--diagnostic 1 5 "helo")))
 		(goto-char 2)
 		(proofread-popup--update)
@@ -1447,7 +1449,7 @@ SUGGESTIONS, MESSAGE, and SOURCE supply the optional field values."
 	(switch-to-buffer (current-buffer))
 	(insert "helo")
 	(proofread-mode 1)
-	(proofread-popup-test--install-diagnostics
+	(proofread-popup-test--publish-diagnostics
          (list (proofread-popup-test--diagnostic 1 5 "helo")))
 	(goto-char 2)
 	(proofread-popup--update)
@@ -1491,7 +1493,7 @@ SUGGESTIONS, MESSAGE, and SOURCE supply the optional field values."
               (with-current-buffer source
 		(insert "helo")
 		(proofread-mode 1)
-		(proofread-popup-test--install-diagnostics
+		(proofread-popup-test--publish-diagnostics
                  (list (proofread-popup-test--diagnostic 1 5 "helo")))
 		(goto-char 2)
 		(proofread-popup--update)
@@ -1530,7 +1532,7 @@ SUGGESTIONS, MESSAGE, and SOURCE supply the optional field values."
 	(switch-to-buffer (current-buffer))
 	(insert "helo")
 	(proofread-mode 1)
-	(proofread-popup-test--install-diagnostics
+	(proofread-popup-test--publish-diagnostics
          (list (proofread-popup-test--diagnostic 1 5 "helo")))
 	(goto-char 2)
 	(proofread-popup--update)
@@ -1567,7 +1569,7 @@ SUGGESTIONS, MESSAGE, and SOURCE supply the optional field values."
 	(switch-to-buffer (current-buffer))
 	(insert "helo")
 	(proofread-mode 1)
-	(proofread-popup-test--install-diagnostics
+	(proofread-popup-test--publish-diagnostics
          (list (proofread-popup-test--diagnostic 1 5 "helo")))
 	(goto-char 2)
 	(proofread-popup--update)
@@ -1589,7 +1591,7 @@ SUGGESTIONS, MESSAGE, and SOURCE supply the optional field values."
 	(switch-to-buffer (current-buffer))
 	(insert "helo")
 	(proofread-mode 1)
-	(proofread-popup-test--install-diagnostics
+	(proofread-popup-test--publish-diagnostics
          (list (proofread-popup-test--diagnostic 1 5 "helo")))
 	(goto-char 2)
 	(proofread-popup--update)
@@ -1744,7 +1746,7 @@ SUGGESTIONS, MESSAGE, and SOURCE supply the optional field values."
 	(let ((proofread-popup-enabled nil)
               (diagnostic
                (proofread-popup-test--diagnostic 1 5 "helo")))
-          (proofread-popup-test--install-diagnostics (list diagnostic))
+          (proofread-popup-test--publish-diagnostics (list diagnostic))
           (goto-char 2)
           (proofread-popup--update)
           (should-not proofread-popup-test--shows))))))
@@ -1759,7 +1761,7 @@ SUGGESTIONS, MESSAGE, and SOURCE supply the optional field values."
 	(proofread-mode 1)
 	(let ((diagnostic
                (proofread-popup-test--diagnostic 1 5 "helo")))
-          (proofread-popup-test--install-diagnostics (list diagnostic))
+          (proofread-popup-test--publish-diagnostics (list diagnostic))
           (goto-char 2)
           (proofread-popup--update)
           (let ((proofread-popup-max-width
@@ -1808,7 +1810,7 @@ SUGGESTIONS, MESSAGE, and SOURCE supply the optional field values."
 	(proofread-mode 1)
 	(let ((diagnostic
                (proofread-popup-test--diagnostic 1 5 "helo")))
-          (proofread-popup-test--install-diagnostics (list diagnostic))
+          (proofread-popup-test--publish-diagnostics (list diagnostic))
           (goto-char 2)
           (proofread-popup--update)
           (proofread-mode -1)
@@ -1831,7 +1833,7 @@ SUGGESTIONS, MESSAGE, and SOURCE supply the optional field values."
 	(proofread-mode 1)
 	(let ((diagnostic
                (proofread-popup-test--diagnostic 1 5 "helo")))
-          (proofread-popup-test--install-diagnostics (list diagnostic))
+          (proofread-popup-test--publish-diagnostics (list diagnostic))
           (goto-char 2)
           (proofread-popup--update)
           (text-mode)
@@ -1855,7 +1857,7 @@ SUGGESTIONS, MESSAGE, and SOURCE supply the optional field values."
               (proofread-mode 1)
               (let ((diagnostic
                      (proofread-popup-test--diagnostic 1 5 "helo")))
-		(proofread-popup-test--install-diagnostics
+		(proofread-popup-test--publish-diagnostics
                  (list diagnostic))
 		(goto-char 2)
 		(proofread-popup--update)
@@ -1876,7 +1878,7 @@ SUGGESTIONS, MESSAGE, and SOURCE supply the optional field values."
 	(let ((diagnostic
                (proofread-popup-test--diagnostic
 		4 8 "helo" '( "hello"))))
-          (proofread-popup-test--install-diagnostics (list diagnostic))
+          (proofread-popup-test--publish-diagnostics (list diagnostic))
           (goto-char 5)
           (proofread-popup--update)
           (should proofread-popup--render-signature)
@@ -1897,7 +1899,7 @@ SUGGESTIONS, MESSAGE, and SOURCE supply the optional field values."
               (proofread-mode 1)
               (let ((diagnostic
                      (proofread-popup-test--diagnostic 1 5 "helo")))
-		(proofread-popup-test--install-diagnostics
+		(proofread-popup-test--publish-diagnostics
                  (list diagnostic))
 		(goto-char 2)
 		(proofread-popup--update))

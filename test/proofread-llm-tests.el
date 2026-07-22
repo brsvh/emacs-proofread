@@ -1971,7 +1971,7 @@ When PROFILE is nil, use the current profile."
             (proofread-llm--cancel-request-handle handle)
             (should-not proofread-llm--live-handles)))))))
 
-(ert-deftest proofread-llm-test-success-enters-overlay-pipeline ()
+(ert-deftest proofread-llm-test-success-enters-diagnostic-pipeline ()
   "Send fresh LLM diagnostics through the normal result path."
   (with-temp-buffer
     (insert "helo")
@@ -2017,7 +2017,7 @@ When PROFILE is nil, use the current profile."
           (should (equal (plist-get repair :range) '( 0 . 4))))
         (should-not proofread--active-requests)
         (should (= (length proofread--diagnostics) 1))
-        (should (= (length proofread--overlays) 1))
+        (should (= (length (flymake-diagnostics)) 1))
         (should (= (hash-table-count proofread--cache) 1))))))
 
 (ert-deftest proofread-llm-test-collects-additional-diagnostic-passes
@@ -2256,7 +2256,7 @@ When PROFILE is nil, use the current profile."
             (should (eq (proofread--handle-backend-result work result)
                         'applied))
             (should (= (length proofread--diagnostics) 1))
-            (should (= (length proofread--overlays) 1))
+            (should (= (length (flymake-diagnostics)) 1))
             (should (= (hash-table-count proofread--cache) 0))))))))
 
 (ert-deftest
@@ -2334,7 +2334,7 @@ When PROFILE is nil, use the current profile."
           (should (eq (plist-get result :error) 'llm-error))
           (should (equal (buffer-string) before-text))
           (should-not proofread--active-requests)
-          (should-not proofread--overlays))))))
+          (should-not (flymake-diagnostics)))))))
 
 (ert-deftest proofread-llm-test-invalid-success-response-is-error ()
   "Turn malformed and non-string LLM success responses into errors."
@@ -2369,7 +2369,7 @@ When PROFILE is nil, use the current profile."
             (should (eq (plist-get result :error)
                         'llm-invalid-response))
             (should-not proofread--active-requests)
-            (should-not proofread--overlays)
+            (should-not (flymake-diagnostics))
             (should (= (hash-table-count proofread--cache) 0))))))))
 
 (ert-deftest proofread-llm-test-stale-results-are-dropped ()
@@ -2438,7 +2438,7 @@ When PROFILE is nil, use the current profile."
             (when (buffer-live-p buffer)
               (with-current-buffer buffer
                 (should-not proofread--diagnostics)
-                (should-not proofread--overlays))))
+                (should-not (flymake-diagnostics)))))
         (when (buffer-live-p buffer)
           (kill-buffer buffer))))))
 
@@ -3177,7 +3177,7 @@ When PROFILE is nil, use the current profile."
                     request diagnostics))
                   'stale))
       (should-not proofread--diagnostics)
-      (should-not proofread--overlays)
+      (should-not (flymake-diagnostics))
       (should (equal (buffer-string) "helo!")))))
 
 ;;;; Cache, callbacks, and logging
@@ -3326,7 +3326,7 @@ When PROFILE is nil, use the current profile."
                     request diagnostics))
                   'stale))
       (should-not proofread--diagnostics)
-      (should-not proofread--overlays))))
+      (should-not (flymake-diagnostics)))))
 
 (ert-deftest proofread-llm-test-backend-success-is-asynchronous ()
   "LLM backend success callbacks happen after dispatch returns."

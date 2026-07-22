@@ -55,8 +55,7 @@
       (setq proofread--diagnostics (nreverse diagnostics))
       (flymake-start)
       (cl-assert
-       (= (length (proofread--owned-flymake-diagnostics))
-          diagnostic-count))
+       (= (length (flymake-diagnostics)) diagnostic-count))
       (proofread-diagnostic-at-point 1)
       (dotimes (_ 5)
         (garbage-collect)
