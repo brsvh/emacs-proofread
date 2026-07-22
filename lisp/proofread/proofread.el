@@ -4598,16 +4598,15 @@ Do not scan unrelated requests."
                         (eq proofread--queue-dispatch-active-p
                             transaction))
               (setq proofread--queue-dispatch-requested-p nil)
-              (setq dispatched
-                    (nconc dispatched
-                           (proofread--drain-request-queue)))
+              (dolist (request (proofread--drain-request-queue))
+                (push request dispatched))
               (let ((cache-claims
                      (proofread--drain-cache-woken-requests)))
                 (setq continue
                       (or proofread--queue-dispatch-requested-p
                           (proofread--cache-wakeup-pending-p)
                           (> cache-claims 0)))))
-            dispatched)
+            (nreverse dispatched))
         ;; Mode teardown and reinitialization replace transaction state.
         ;; An old unwind must not clear a newer generation's dispatcher.
         (when (eq proofread--queue-dispatch-active-p transaction)
@@ -5889,30 +5888,35 @@ nil.  Callers may safely modify the returned records and values."
 (defun proofread--diagnostic-suggestion-records (diagnostic)
   "Return deduplicated suggestion records for DIAGNOSTIC.
 Each record has the keys `:text', `:sources', and `:diagnostics'."
-  (let (records)
+  (let ((records-by-text (make-hash-table :test #'equal))
+        (source-tables (make-hash-table :test #'eq))
+        records)
     (dolist (member (proofread--diagnostic-members diagnostic))
       (let ((source (proofread--diagnostic-source-label member)))
         (dolist (suggestion (proofread--diagnostic-suggestions member))
-          (let ((record
-                 (cl-find suggestion records
-                          :key (lambda (entry)
-                                 (plist-get entry :text))
-                          :test #'equal)))
-            (if record
-                (progn
-                  (when (and source
-                             (not (member source
-                                          (plist-get record :sources))))
-                    (setf (plist-get record :sources)
-                          (append (plist-get record :sources)
-                                  (list source))))
-                  (setf (plist-get record :diagnostics)
-                        (append (plist-get record :diagnostics)
-                                (list member))))
-              (push (list :text suggestion
-                          :sources (and source (list source))
-                          :diagnostics (list member))
-                    records))))))
+          (let ((record (gethash suggestion records-by-text)))
+            (unless record
+              (setq record (list :text suggestion
+                                 :sources nil
+                                 :diagnostics nil))
+              (puthash suggestion record records-by-text)
+              (puthash record (make-hash-table :test #'equal)
+                       source-tables)
+              (push record records))
+            (when source
+              (let ((source-table (gethash record source-tables)))
+                (unless (gethash source source-table)
+                  (puthash source t source-table)
+                  (setf (plist-get record :sources)
+                        (cons source
+                              (plist-get record :sources))))))
+            (setf (plist-get record :diagnostics)
+                  (cons member (plist-get record :diagnostics)))))))
+    (dolist (record records)
+      (setf (plist-get record :sources)
+            (nreverse (plist-get record :sources)))
+      (setf (plist-get record :diagnostics)
+            (nreverse (plist-get record :diagnostics))))
     (nreverse records)))
 
 (defun proofread--diagnostic-aggregate-key (diagnostic beg end)
@@ -6601,14 +6605,14 @@ restriction."
                             :index index
                             :diagnostics nil))
           (puthash key group groups)
-          (setq ordered-groups (append ordered-groups
-                                       (list group))))
+          (push group ordered-groups))
         (setf (plist-get group :diagnostics)
-              (append (plist-get group :diagnostics)
-                      (list diagnostic)))))
+              (cons diagnostic
+                    (plist-get group :diagnostics)))))
     (mapcar
      (lambda (group)
-       (let* ((diagnostics (plist-get group :diagnostics))
+       (let* ((diagnostics
+               (nreverse (plist-get group :diagnostics)))
               (diagnostic
                (if (cdr diagnostics)
                    (proofread--make-aggregate-diagnostic
@@ -6620,7 +6624,7 @@ restriction."
                (plist-get group :beg)
                (plist-get group :end)
                (plist-get group :index))))
-     ordered-groups)))
+     (nreverse ordered-groups))))
 
 (defun proofread--navigation-entries (&optional accessible-only)
   "Return sorted UI diagnostics for navigation.
@@ -6727,7 +6731,8 @@ By default, query the whole buffer regardless of narrowing."
            (proofread--remove-diagnostics diagnostics)))))))
 
 (defun proofread--remove-diagnostics-matching-ignore-keys (keys)
-  "Remove diagnostics matching ignore KEYS from all Proofread buffers."
+  "Remove diagnostics matching ignore KEYS from all Proofread buffers.
+Return removed diagnostics in mode-buffer and model order."
   (let (removed)
     (proofread--prune-mode-buffers)
     (dolist (buffer (copy-sequence proofread--mode-buffers))
@@ -6736,8 +6741,9 @@ By default, query the whole buffer regardless of narrowing."
                (with-current-buffer buffer
                  (proofread--remove-local-diagnostics-matching-ignore-keys
                   keys))))
-          (setq removed (nconc removed local-removed)))))
-    removed))
+          (dolist (diagnostic local-removed)
+            (push diagnostic removed)))))
+    (nreverse removed)))
 
 (defun proofread--next-navigation-entry-after (position entries)
   "Return the nearest navigation entry after POSITION in ENTRIES."
@@ -8369,84 +8375,70 @@ DIAGNOSTICS must be in navigation order.  Return `applied'."
         (kind (plist-get diagnostic :kind))
         (text (plist-get diagnostic :text))
         (suggestions (proofread--diagnostic-suggestions diagnostic))
-        (lines '( "Proofread diagnostic")))
+        lines)
+    (push "Proofread diagnostic" lines)
     (when kind
-      (setq lines
-            (append lines
-                    (list ""
-                          (format "Kind: %s"
-                                  (proofread-format-diagnostic-field
-                                   kind))))))
+      (push "" lines)
+      (push (format "Kind: %s"
+                    (proofread-format-diagnostic-field kind))
+            lines))
     (if aggregate
         (when-let* ((entries
                      (proofread--diagnostic-message-entries
                       diagnostic)))
-          (setq lines (append lines (list "" "Messages:")))
+          (push "" lines)
+          (push "Messages:" lines)
           (dolist (entry entries)
             (let ((source (plist-get entry :source))
                   (message
                    (proofread-format-diagnostic-field
                     (plist-get entry :message))))
-              (setq lines
-                    (append
-                     lines
-                     (list (if source
-                               (format "%s: %s" source message)
-                             message)))))))
+              (push (if source
+                        (format "%s: %s" source message)
+                      message)
+                    lines))))
       (when-let* ((message (plist-get diagnostic :message)))
-        (setq lines
-              (append lines
-                      (list (format "Message: %s"
-                                    (proofread-format-diagnostic-field
-                                     message)))))))
+        (push (format "Message: %s"
+                      (proofread-format-diagnostic-field message))
+              lines)))
     (when text
-      (setq lines
-            (append lines
-                    (list ""
-                          "Original text:"
-                          (proofread-format-diagnostic-field
-                           text)))))
+      (push "" lines)
+      (push "Original text:" lines)
+      (push (proofread-format-diagnostic-field text) lines))
     (when suggestions
-      (setq lines (append lines (list "" "Suggestions:")))
+      (push "" lines)
+      (push "Suggestions:" lines)
       (let ((index 1))
         (if aggregate
             (dolist (record
                      (proofread--diagnostic-suggestion-records
                       diagnostic))
               (let ((sources (plist-get record :sources)))
-                (setq lines
-                      (append
-                       lines
-                       (list
-                        (format
-                         "%d. %s%s"
-                         index
-                         (proofread-format-diagnostic-field
-                          (plist-get record :text))
-                         (if sources
-                             (format " (from %s)"
-                                     (string-join sources ", "))
-                           ""))))))
+                (push
+                 (format
+                  "%d. %s%s"
+                  index
+                  (proofread-format-diagnostic-field
+                   (plist-get record :text))
+                  (if sources
+                      (format " (from %s)"
+                              (string-join sources ", "))
+                    ""))
+                 lines))
               (setq index (1+ index)))
           (dolist (suggestion suggestions)
-            (setq lines
-                  (append
-                   lines
-                   (list
-                    (format
-                     "%d. %s"
-                     index
-                     (proofread-format-diagnostic-field
-                      suggestion)))))
+            (push (format "%d. %s"
+                          index
+                          (proofread-format-diagnostic-field suggestion))
+                  lines)
             (setq index (1+ index))))))
     (when-let* ((source
                  (proofread--diagnostic-source-summary diagnostic)))
-      (setq lines
-            (append lines
-                    (list (format "%s: %s"
-                                  (if aggregate "Sources" "Source")
-                                  source)))))
-    (mapconcat #'identity lines "\n")))
+      (push (format "%s: %s"
+                    (if aggregate "Sources" "Source")
+                    source)
+            lines))
+    (mapconcat #'identity (nreverse lines) "\n")))
 
 (defun proofread--display-diagnostic-description (diagnostic)
   "Display formatted details for DIAGNOSTIC in a help buffer."

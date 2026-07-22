@@ -13,6 +13,12 @@
 ;;   -l ./test/proofread-benchmarks.el \
 ;;   -f proofread-benchmark-diagnostic-at-point
 ;;
+;; Benchmark retained diagnostic aggregation and formatting with:
+;;
+;; nix run .#emacs31-with-proofread -- --batch \
+;;   -l ./test/proofread-benchmarks.el \
+;;   -f proofread-benchmark-diagnostic-aggregation
+;;
 ;; Count the sorts used by request conflict detection with:
 ;;
 ;; nix run .#emacs31-with-proofread -- --batch \
@@ -78,6 +84,115 @@
     (dolist (diagnostic-count '( 500 2000))
       (let ((result
              (proofread-benchmark--diagnostic-at-point-case
+              diagnostic-count)))
+        (push result results)
+        (princ (format "%S\n" result))))
+    (nreverse results)))
+
+(defun proofread-benchmark--diagnostic-aggregation-case
+    (diagnostic-count)
+  "Benchmark retained list construction for DIAGNOSTIC-COUNT items."
+  (let (shared-diagnostics
+        shared-entries
+        source-aggregate
+        source-diagnostics
+        unique-entries
+        measurements)
+    (dotimes (index diagnostic-count)
+      (let* ((diagnostic
+              (list :beg 1 :end 2 :text "x" :kind 'style
+                    :message "Issue" :suggestions '( "fixed")
+                    :checker-name 'benchmark
+                    :checker-ordinal index))
+             (source-diagnostic
+              (list :suggestions '( "fixed")
+                    :checker-name
+                    (format "benchmark-%d" index)))
+             (unique (copy-sequence diagnostic))
+             (unique-beg (1+ (* index 2))))
+        (setq unique (plist-put unique :beg unique-beg))
+        (setq unique (plist-put unique :end (1+ unique-beg)))
+        (push diagnostic shared-diagnostics)
+        (push (list diagnostic 1 2 index) shared-entries)
+        (push source-diagnostic source-diagnostics)
+        (push (list unique unique-beg (1+ unique-beg) index)
+              unique-entries)))
+    (setq shared-diagnostics (nreverse shared-diagnostics))
+    (setq shared-entries (nreverse shared-entries))
+    (setq source-diagnostics (nreverse source-diagnostics))
+    (setq unique-entries (nreverse unique-entries))
+    (setq source-aggregate
+          (list :proofread-aggregate t
+                :diagnostics source-diagnostics))
+    (let* ((unique-result
+            (proofread--aggregate-navigation-entries unique-entries))
+           (shared-result
+            (proofread--aggregate-navigation-entries shared-entries))
+           (aggregate (caar shared-result))
+           (description
+            (proofread--format-diagnostic-description aggregate))
+           (lines (split-string description "\n"))
+           (source-records
+            (proofread--diagnostic-suggestion-records source-aggregate))
+           (sources (plist-get (car source-records) :sources)))
+      (cl-assert (= (length unique-result) diagnostic-count))
+      (cl-assert
+       (equal (mapcar (lambda (entry)
+                        (nth 3 entry))
+                      unique-result)
+              (number-sequence 0 (1- diagnostic-count))))
+      (cl-assert (= (length shared-result) 1))
+      (cl-assert
+       (= (length (proofread--diagnostic-members aggregate))
+          (length shared-diagnostics)))
+      (cl-assert
+       (cl-every
+        #'identity
+        (cl-mapcar #'eq
+                   (proofread--diagnostic-members aggregate)
+                   shared-diagnostics)))
+      (cl-assert
+       (equal (proofread--diagnostic-suggestions aggregate)
+              '( "fixed")))
+      (cl-assert
+       (equal (proofread--diagnostic-source-labels aggregate)
+              '( "benchmark")))
+      (cl-assert (= (length lines) (+ diagnostic-count 12)))
+      (cl-assert (equal (car lines) "Proofread diagnostic"))
+      (cl-assert (equal (car (last lines)) "Sources: benchmark"))
+      (cl-assert (= (length source-records) 1))
+      (cl-assert (= (length sources) diagnostic-count))
+      (cl-assert (equal (car sources) "benchmark-0"))
+      (cl-assert
+       (equal (car (last sources))
+              (format "benchmark-%d" (1- diagnostic-count)))))
+    (dotimes (_ 5)
+      (garbage-collect)
+      (push
+       (benchmark-run 1
+         (proofread--aggregate-navigation-entries unique-entries)
+         (let ((aggregate
+                (caar
+                 (proofread--aggregate-navigation-entries
+                  shared-entries))))
+           (proofread--format-diagnostic-description aggregate))
+         (proofread--diagnostic-suggestion-records source-aggregate))
+       measurements))
+    (setq measurements (nreverse measurements))
+    (list :diagnostics diagnostic-count
+          :operations 1
+          :measurements measurements
+          :median-elapsed
+          (proofread-benchmark--median
+           (mapcar #'car measurements)))))
+
+(defun proofread-benchmark-diagnostic-aggregation ()
+  "Benchmark retained construction with 500 and 2,000 diagnostics."
+  (interactive)
+  (let (results)
+    (dolist (diagnostic-count '( 500 2000))
+      (let ((result
+             (proofread-benchmark--diagnostic-aggregation-case
               diagnostic-count)))
         (push result results)
         (princ (format "%S\n" result))))

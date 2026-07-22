@@ -13,6 +13,7 @@
 (require 'cl-lib)
 (require 'ert)
 (require 'proofread)
+(require 'subr-x)
 
 ;; Keep Proofread's scheduler tests independent of Flymake's own idle
 ;; timer and of asynchronous backends installed by major modes.
@@ -1129,6 +1130,58 @@ When PROFILE is nil, use the current profile."
          (labels (proofread--diagnostic-source-labels diagnostic)))
     (should (equal labels '( "first" "second" "fallback")))
     (should (eq (car labels) first))))
+
+(ert-deftest
+    proofread-test-diagnostic-suggestion-records-preserve-first-occurrence
+    ()
+  "Keep suggestion occurrences and unique sources in encounter order."
+  (let* ((shared (copy-sequence "shared"))
+         (shared-copy (copy-sequence shared))
+         (third-shared-copy (copy-sequence shared))
+         (fourth-shared-copy (copy-sequence shared))
+         (first-source (copy-sequence "first"))
+         (first-source-copy (copy-sequence first-source))
+         (second-source (copy-sequence "second"))
+         (first-suggestions (list shared "first-only" shared))
+         (second-suggestions (list shared-copy "second-only"))
+         (third-suggestions (list third-shared-copy))
+         (fourth-suggestions (list fourth-shared-copy))
+         (first (list :checker-name first-source
+                      :suggestions first-suggestions))
+         (second (list :checker-name second-source
+                       :suggestions second-suggestions))
+         (third (list :checker-name first-source-copy
+                      :suggestions third-suggestions))
+         (fourth (list :suggestions fourth-suggestions))
+         (diagnostic
+          (list :proofread-aggregate t
+                :diagnostics (list first second third fourth)))
+         (records
+          (proofread--diagnostic-suggestion-records diagnostic))
+         (shared-record (car records)))
+    (should
+     (equal (mapcar (lambda (record)
+                      (plist-get record :text))
+                    records)
+            '( "shared" "first-only" "second-only")))
+    (should (eq (plist-get shared-record :text) shared))
+    (should (equal (plist-get shared-record :sources)
+                   '( "first" "second")))
+    (should (eq (car (plist-get shared-record :sources))
+                first-source))
+    (should (= (length (plist-get shared-record :diagnostics)) 5))
+    (should
+     (cl-every
+      #'identity
+      (cl-mapcar
+       #'eq
+       (plist-get shared-record :diagnostics)
+       (list first first second third fourth))))
+    (should (eq (plist-get first :suggestions) first-suggestions))
+    (should (eq (plist-get second :suggestions) second-suggestions))
+    (should (eq (plist-get third :suggestions) third-suggestions))
+    (should (eq (plist-get fourth :suggestions)
+                fourth-suggestions))))
 
 (ert-deftest
     proofread-test-range-conflicting-entries-orders-and-preserves-items
@@ -12207,6 +12260,50 @@ This covers URLs, email, invisible text, faces, and properties."
          (proofread-diagnostic-at-point))
         (list first second))))))
 
+(ert-deftest
+    proofread-test-navigation-grouping-preserves-first-occurrence-order
+    ()
+  "Keep interleaved groups and their members in navigation order."
+  (let* ((first
+          (proofread-test--diagnostic-with-checker
+           (proofread-test--diagnostic-with-kind
+            1 5 "helo" 'grammar)
+           'first))
+         (different-text
+          (proofread-test--diagnostic-with-checker
+           (proofread-test--diagnostic-with-kind
+            1 5 "help" 'style)
+           'middle))
+         (second
+          (proofread-test--diagnostic-with-checker
+           (proofread-test--diagnostic-with-kind
+            1 5 "helo" 'spelling)
+           'second)))
+    (setq first (plist-put first :checker-ordinal 0))
+    (setq different-text
+          (plist-put different-text :checker-ordinal 1))
+    (setq second (plist-put second :checker-ordinal 2))
+    (let* ((entries
+            (proofread--aggregate-navigation-entries
+             (list (list first 1 5 10)
+                   (list different-text 1 5 11)
+                   (list second 1 5 12))))
+           (first-entry (car entries))
+           (second-entry (cadr entries))
+           (aggregate (car first-entry)))
+      (should (= (length entries) 2))
+      (should (proofread--aggregate-diagnostic-p aggregate))
+      (let ((members (proofread--diagnostic-members aggregate))
+            (expected (list first second)))
+        (should (= (length members) (length expected)))
+        (should
+         (cl-every #'identity
+                   (cl-mapcar #'eq members expected))))
+      (should (eq (plist-get aggregate :kind) 'grammar))
+      (should (equal (cdr first-entry) '( 1 5 10)))
+      (should (eq (car second-entry) different-text))
+      (should (equal (cdr second-entry) '( 1 5 11))))))
+
 (ert-deftest proofread-test-navigation-sorts-and-filters-diagnostics
     ()
   "Sort valid navigation diagnostics by start and end."
@@ -13706,7 +13803,7 @@ This covers URLs, email, invisible text, faces, and properties."
       (should (equal proofread--diagnostics (list new))))))
 
 (ert-deftest proofread-test-format-diagnostic-description-details ()
-  "Diagnostic description includes stable package-level fields."
+  "Keep the exact singleton diagnostic description layout."
   (let* ((diagnostic
           (proofread--make-diagnostic
            :beg 1
@@ -13718,13 +13815,64 @@ This covers URLs, email, invisible text, faces, and properties."
            :source proofread-test--backend))
          (description
           (proofread--format-diagnostic-description diagnostic)))
-    (should (string-match-p "Kind: spelling" description))
-    (should (string-match-p "Message: Possible misspelling"
-                            description))
-    (should (string-match-p "Original text:\nhelo" description))
-    (should (string-match-p "1\\. hello" description))
-    (should (string-match-p "Source: proofread-test-backend"
-                            description))))
+    (should
+     (equal
+      description
+      (string-join
+       '( "Proofread diagnostic"
+          ""
+          "Kind: spelling"
+          "Message: Possible misspelling"
+          ""
+          "Original text:"
+          "helo"
+          ""
+          "Suggestions:"
+          "1. hello"
+          "Source: proofread-test-backend")
+       "\n")))))
+
+(ert-deftest
+    proofread-test-format-aggregate-diagnostic-description-details
+    ()
+  "Keep the exact aggregate diagnostic description layout."
+  (let* ((first
+          (proofread-test--diagnostic-with-checker
+           (proofread--make-diagnostic
+            :beg 1 :end 5 :text "helo" :kind 'spelling
+            :message "First message" :suggestions '( "hello" "hullo")
+            :source 'test)
+           'first))
+         (second
+          (proofread-test--diagnostic-with-checker
+           (proofread--make-diagnostic
+            :beg 1 :end 5 :text "helo" :kind 'spelling
+            :message "Second message" :suggestions '( "hello")
+            :source 'test)
+           'second))
+         (aggregate
+          (proofread--make-aggregate-diagnostic
+           (list first second) 1 5)))
+    (should
+     (equal
+      (proofread--format-diagnostic-description aggregate)
+      (string-join
+       '( "Proofread diagnostic"
+          ""
+          "Kind: spelling"
+          ""
+          "Messages:"
+          "first: First message"
+          "second: Second message"
+          ""
+          "Original text:"
+          "helo"
+          ""
+          "Suggestions:"
+          "1. hello (from first, second)"
+          "2. hullo (from first)"
+          "Sources: first, second")
+       "\n")))))
 
 (ert-deftest proofread-test-describe-displays-diagnostic-details ()
   "`proofread-describe' displays diagnostic details at point."
@@ -15270,6 +15418,51 @@ This covers URLs, email, invisible text, faces, and properties."
         (should-not (proofread-diagnostic-at-point 2))
         (should (eq (proofread-diagnostic-at-point 7) unrelated))
         (should (equal (buffer-string) text))))))
+
+(ert-deftest
+    proofread-test-ignore-removal-preserves-buffer-and-model-order
+    ()
+  "Return removed diagnostics in registry and local model order."
+  (let ((first-buffer
+         (generate-new-buffer " *proofread-ignore-order-first*"))
+        (second-buffer
+         (generate-new-buffer " *proofread-ignore-order-second*"))
+        (proofread--mode-buffers nil)
+        (first-a (list 'first-a))
+        (first-b (list 'first-b))
+        (second-a (list 'second-a))
+        (second-b (list 'second-b))
+        visited)
+    (unwind-protect
+        (progn
+          (dolist (buffer (list first-buffer second-buffer))
+            (with-current-buffer buffer
+              (setq-local proofread-mode t)))
+          (setq proofread--mode-buffers
+                (list first-buffer second-buffer))
+          (cl-letf
+              (((symbol-function
+                 'proofread--remove-local-diagnostics-matching-ignore-keys)
+                (lambda (keys)
+                  (should (eq keys 'ignored-key))
+                  (push (current-buffer) visited)
+                  (if (eq (current-buffer) first-buffer)
+                      (list first-a first-b)
+                    (list second-a second-b)))))
+            (let* ((removed
+                    (proofread--remove-diagnostics-matching-ignore-keys
+                     'ignored-key))
+                   (expected
+                    (list first-a first-b second-a second-b)))
+              (should (= (length removed) (length expected)))
+              (should
+               (cl-every #'identity
+                         (cl-mapcar #'eq removed expected)))))
+          (should (equal (nreverse visited)
+                         (list first-buffer second-buffer))))
+      (dolist (buffer (list first-buffer second-buffer))
+        (when (buffer-live-p buffer)
+          (kill-buffer buffer))))))
 
 (ert-deftest proofread-test-ignore-command-removes-aggregate-members
     ()
@@ -20595,6 +20788,35 @@ This covers URLs, email, invisible text, faces, and properties."
       (should-not
        (proofread--queue-state-tail proofread--queue-state))
       (should (proofread--active-request-p ready)))))
+
+(ert-deftest
+    proofread-test-queue-dispatch-preserves-multiple-drain-rounds
+    ()
+  "Return requests in FIFO order across repeated drain rounds."
+  (with-temp-buffer
+    (let ((proofread--queue-dispatch-active-p nil)
+          (proofread--queue-dispatch-requested-p nil)
+          (batches '( (first second) (third) (fourth fifth)))
+          (drain-count 0))
+      (cl-letf
+          (((symbol-function 'proofread--drain-request-queue)
+            (lambda ()
+              (setq drain-count (1+ drain-count))
+              (let ((batch (pop batches)))
+                (when batches
+                  (setq proofread--queue-dispatch-requested-p t))
+                batch)))
+           ((symbol-function 'proofread--drain-cache-woken-requests)
+            (lambda () 0))
+           ((symbol-function 'proofread--cache-wakeup-pending-p)
+            (lambda () nil)))
+        (should
+         (equal (proofread--dispatch-queued-requests)
+                '( first second third fourth fifth))))
+      (should (= drain-count 3))
+      (should-not batches)
+      (should-not proofread--queue-dispatch-active-p)
+      (should-not proofread--queue-dispatch-requested-p))))
 
 (ert-deftest proofread-test-reentrant-queue-dispatch-submits-once ()
   "A freshness predicate cannot submit the queue head twice."
