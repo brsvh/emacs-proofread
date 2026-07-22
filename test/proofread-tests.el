@@ -821,6 +821,56 @@ When PROFILE is nil, use the current profile."
   (should
    (zerop (hash-table-count proofread--pending-request-keys))))
 
+(defun proofread-test--assert-fresh-buffer-state ()
+  "Assert that the current buffer owns fresh state without pending work."
+  (should (natnump proofread--generation))
+  (should (> proofread--generation 0))
+  (should-not proofread--diagnostics)
+  (should (hash-table-p proofread--diagnostic-request-ranges))
+  (should (eq (hash-table-test
+               proofread--diagnostic-request-ranges)
+              #'eq))
+  (should (proofread--queue-state-p proofread--queue-state))
+  (should-not (proofread--request-queue-entries))
+  (should (hash-table-p proofread--pending-request-keys))
+  (should (eq (hash-table-test proofread--pending-request-keys)
+              #'equal))
+  (should (hash-table-p proofread--cache))
+  (should (eq (hash-table-test proofread--cache) #'equal))
+  (should-not proofread--current-diagnostic)
+  (should-not proofread--active-requests)
+  (should-not proofread--claimed-requests)
+  (should-not proofread--queue-dispatch-active-p)
+  (should-not proofread--queue-dispatch-requested-p)
+  (should-not proofread--queue-dispatch-timer)
+  (should (= proofread--next-request-id 0))
+  (should-not proofread--pending-invalidated-diagnostics)
+  (should-not proofread--pending-diagnostic-ranges)
+  (should-not proofread--cache-order)
+  (should-not proofread--pending-work)
+  (should-not proofread--idle-timer))
+
+(defun proofread-test--assert-inactive-buffer-state ()
+  "Assert that the current buffer owns no active Proofread state."
+  (should (= proofread--generation 0))
+  (should-not proofread--diagnostics)
+  (should-not proofread--diagnostic-request-ranges)
+  (should-not proofread--current-diagnostic)
+  (should-not proofread--active-requests)
+  (should-not proofread--queue-state)
+  (should-not proofread--claimed-requests)
+  (should-not proofread--queue-dispatch-active-p)
+  (should-not proofread--queue-dispatch-requested-p)
+  (should-not proofread--queue-dispatch-timer)
+  (should-not proofread--pending-request-keys)
+  (should (= proofread--next-request-id 0))
+  (should-not proofread--pending-invalidated-diagnostics)
+  (should-not proofread--pending-diagnostic-ranges)
+  (should-not proofread--cache)
+  (should-not proofread--cache-order)
+  (should-not proofread--pending-work)
+  (should-not proofread--idle-timer))
+
 (defun proofread-test--terminal-request-events (events work)
   "Return terminal EVENTS belonging to WORK."
   (let ((log-id (proofread--scheduled-work-log-id work)))
@@ -2029,6 +2079,58 @@ When PROFILE is nil, use the current profile."
         (when flymake-mode
           (funcall original-mode -1))))))
 
+(ert-deftest proofread-test-mode-enable-rolls-back-after-start-error ()
+  "Roll back mode-owned state when the final Flymake start fails."
+  (with-temp-buffer
+    (insert "Alpha")
+    (setq-local proofread-auto-check nil)
+    (setq-local flymake-diagnostic-functions
+                (list #'proofread-test--flymake-foreign-backend))
+    (let ((original-mode (symbol-function 'flymake-mode))
+          mode-hook-values)
+      (unwind-protect
+          (progn
+            (add-hook 'proofread-mode-hook
+                      (lambda ()
+                        (push proofread-mode mode-hook-values))
+                      nil t)
+            (cl-letf (((symbol-function 'flymake-start)
+                       (lambda (&rest _arguments)
+                         (error "Simulated Flymake start failure"))))
+              (let ((condition
+                     (should-error
+                      (proofread-mode 1)
+                      :type 'error)))
+                (should
+                 (equal (error-message-string condition)
+                        "Simulated Flymake start failure"))))
+            (should-not proofread-mode)
+            (should flymake-mode)
+            (should (equal mode-hook-values '( nil)))
+            (should-not
+             (memq (current-buffer) proofread--mode-buffers))
+            (should-not
+             (memq #'proofread--flymake-backend
+                   flymake-diagnostic-functions))
+            (should
+             (memq #'proofread-test--flymake-foreign-backend
+                   flymake-diagnostic-functions))
+            (should-not
+             (memq #'proofread--before-change
+                   before-change-functions))
+            (should-not
+             (memq #'proofread--window-scroll
+                   window-scroll-functions))
+            (should-not
+             (memq #'proofread--flymake-mode-changed
+                   flymake-mode-hook))
+            (should-not proofread--flymake-report-function)
+            (proofread-test--assert-inactive-buffer-state))
+        (when proofread-mode
+          (proofread-mode -1))
+        (when flymake-mode
+          (funcall original-mode -1))))))
+
 (ert-deftest proofread-test-disabling-flymake-disables-proofread ()
   "Synchronously tear Proofread down when Flymake is disabled."
   (with-temp-buffer
@@ -2070,6 +2172,8 @@ When PROFILE is nil, use the current profile."
            (generate-new-buffer
             (format " *proofread-flymake-kill-%s*"
                     flymake-preexisting)))
+          cleanup-observed
+          mode-hook-values
           report-calls)
       (unwind-protect
           (progn
@@ -2082,6 +2186,17 @@ When PROFILE is nil, use the current profile."
               (when flymake-preexisting
                 (let ((flymake-start-on-flymake-mode nil))
                   (flymake-mode 1)))
+              (add-hook 'proofread-mode-hook
+                        (lambda ()
+                          (push proofread-mode mode-hook-values))
+                        nil t)
+              (add-hook
+               'kill-buffer-hook
+               (lambda ()
+                 (should-not proofread--flymake-report-function)
+                 (proofread-test--assert-inactive-buffer-state)
+                 (setq cleanup-observed t))
+               90 t)
               (proofread-mode 1)
               (should (eq (car kill-buffer-hook)
                           #'proofread--kill-buffer))
@@ -2095,6 +2210,8 @@ When PROFILE is nil, use the current profile."
             (should-not (buffer-live-p buffer))
             (should (equal report-calls
                            '((nil :region (1 . 6)))))
+            (should cleanup-observed)
+            (should (equal mode-hook-values '(t)))
             (should-not (memq buffer proofread--mode-buffers)))
         (when (buffer-live-p buffer)
           (kill-buffer buffer))))))
@@ -4259,6 +4376,7 @@ range; no available backend"))))))
               (should
                (memq #'proofread-test--flymake-foreign-backend
                      flymake-diagnostic-functions))
+              (proofread-test--assert-inactive-buffer-state)
               (should-not
                (memq #'proofread--flymake-mode-changed
                      flymake-mode-hook))
@@ -4286,6 +4404,7 @@ range; no available backend"))))))
       (proofread-mode -1)
       (should-not proofread--pending-work)
       (should-not proofread--idle-timer)
+      (proofread-test--assert-inactive-buffer-state)
       (should-not (memq #'proofread--after-change
                         after-change-functions))
       (should-not (memq #'proofread--window-scroll
@@ -7013,7 +7132,7 @@ This covers URLs, email, invisible text, faces, and properties."
            (setq reentered t)
            (setq old-generation proofread--generation)
            (setq old-queue-state proofread--queue-state)
-           (proofread--initialize-buffer-state)
+           (proofread--reset-buffer-state t)
            (setq new-generation proofread--generation)
            (setq new-queue-state proofread--queue-state)
            (proofread--dispatch-profile-request-ready-chunks-result
@@ -18610,19 +18729,36 @@ This covers URLs, email, invisible text, faces, and properties."
   "Explicitly enabling an enabled mode starts a clean generation."
   (with-temp-buffer
     (insert "helo")
+    (setq-local proofread-auto-check nil)
     (proofread-mode 1)
+    (proofread-test--assert-fresh-buffer-state)
     (let ((generation proofread--generation)
+          (range-table proofread--diagnostic-request-ranges)
+          (queue-state proofread--queue-state)
+          (pending-keys proofread--pending-request-keys)
+          (cache proofread--cache)
           (diagnostic (proofread-test--diagnostic-for-range 1 5
                                                             "helo")))
       (proofread-test--publish-diagnostics (list diagnostic))
       (proofread--cache-write 'old-cache 'old-value)
+      (setq proofread--queue-dispatch-active-p 'old-dispatch)
+      (setq proofread--queue-dispatch-requested-p t)
+      (setq proofread--next-request-id 7)
+      (setq proofread--pending-invalidated-diagnostics
+            (list diagnostic))
+      (setq proofread--pending-diagnostic-ranges '((1 . 5)))
+      (setq proofread--pending-work t)
       (proofread-mode 1)
       (should proofread-mode)
+      (proofread-test--assert-fresh-buffer-state)
       (should-not (= proofread--generation generation))
+      (should-not (eq proofread--diagnostic-request-ranges
+                      range-table))
+      (should-not (eq proofread--queue-state queue-state))
+      (should-not (eq proofread--pending-request-keys pending-keys))
+      (should-not (eq proofread--cache cache))
       (should-not proofread--diagnostics)
       (should-not (proofread-test--flymake-proofread-diagnostics))
-      (should-not proofread--active-requests)
-      (should (proofread--request-queue-empty-p))
       (should (= (hash-table-count proofread--cache) 0))
       (should (= (cl-count #'proofread--window-scroll
                            window-scroll-functions)
@@ -18630,7 +18766,164 @@ This covers URLs, email, invisible text, faces, and properties."
       (should
        (= (cl-count #'proofread--mark-pending-work
                     window-configuration-change-hook)
-          1)))))
+          1))
+      (proofread-mode -1)
+      (should-not proofread--flymake-report-function)
+      (proofread-test--assert-inactive-buffer-state)
+      (proofread--disable-buffer)
+      (proofread-test--assert-inactive-buffer-state))))
+
+(ert-deftest
+    proofread-test-mode-reenable-rejects-diagnostic-hook-work ()
+  "Do not leak work dispatched by observers during mode re-enable."
+  (with-temp-buffer
+    (insert "helo")
+    (setq-local proofread-auto-check nil)
+    (proofread-test--with-profile
+      (let ((diagnostic
+             (proofread-test--diagnostic-for-range 1 5 "helo"))
+            reentered-p
+            submitted-handles)
+        (let ((proofread-test--backend-check-function
+               (lambda (_request _callback)
+                 (let ((handle
+                        (list :backend proofread-test--backend
+                              :cancelled nil
+                              :timer nil)))
+                   (push handle submitted-handles)
+                   handle))))
+          (proofread-mode 1)
+          (proofread-test--publish-diagnostics (list diagnostic))
+          (add-hook
+           'proofread-diagnostics-changed-hook
+           (lambda ()
+             (unless reentered-p
+               (setq reentered-p t)
+               (proofread-mode 1)
+               (proofread-test--dispatch-profile-chunks
+                (proofread-test--request-ready-chunks-for-ranges
+                 '((1 . 5))))))
+           nil t)
+          (proofread-mode 1)
+          (should reentered-p)
+          (should-not submitted-handles)
+          (should proofread-mode)
+          (proofread-test--assert-fresh-buffer-state))))))
+
+(ert-deftest proofread-test-mode-disable-rejects-reentrant-enable ()
+  "Keep teardown complete when a diagnostic observer enables the mode."
+  (with-temp-buffer
+    (insert "helo")
+    (setq-local proofread-auto-check nil)
+    (proofread-mode 1)
+    (proofread-test--publish-diagnostics
+     (list (proofread-test--diagnostic-for-range 1 5 "helo")))
+    (let ((replacement
+           (proofread-test--diagnostic-for-range 1 5 "helo"))
+          reentered-p)
+      (add-hook
+       'proofread-diagnostics-changed-hook
+       (lambda ()
+         (unless reentered-p
+           (setq reentered-p t)
+           (proofread--apply-backend-diagnostics
+            (list replacement) '(1 . 5))
+           (proofread-mode 1)))
+       nil t)
+      (proofread-mode -1)
+      (should reentered-p)
+      (should-not proofread-mode)
+      (should-not proofread--flymake-report-function)
+      (should-not
+       (memq #'proofread--flymake-backend
+             flymake-diagnostic-functions))
+      (should-not
+       (memq #'proofread--flymake-mode-changed flymake-mode-hook))
+      (should-not
+       (memq #'proofread--before-change before-change-functions))
+      (should-not
+       (memq #'proofread--window-scroll window-scroll-functions))
+      (should-not (memq (current-buffer) proofread--mode-buffers))
+      (proofread-test--assert-inactive-buffer-state))))
+
+(ert-deftest proofread-test-mode-cleanup-guard-nests-across-buffers ()
+  "Keep an outer buffer guarded during another buffer's nested cleanup."
+  (let ((first (generate-new-buffer " *proofread-cleanup-first*"))
+        (second (generate-new-buffer " *proofread-cleanup-second*"))
+        first-hook-ran-p
+        second-hook-ran-p)
+    (unwind-protect
+        (progn
+          (dolist (buffer (list first second))
+            (with-current-buffer buffer
+              (insert "helo")
+              (setq-local proofread-auto-check nil)
+              (proofread-mode 1)
+              (proofread-test--publish-diagnostics
+               (list
+                (proofread-test--diagnostic-for-range 1 5 "helo")))))
+          (with-current-buffer second
+            (add-hook
+             'proofread-diagnostics-changed-hook
+             (lambda ()
+               (unless second-hook-ran-p
+                 (setq second-hook-ran-p t)
+                 (with-current-buffer first
+                   (proofread-mode 1))))
+             nil t))
+          (with-current-buffer first
+            (add-hook
+             'proofread-diagnostics-changed-hook
+             (lambda ()
+               (unless first-hook-ran-p
+                 (setq first-hook-ran-p t)
+                 (with-current-buffer second
+                   (proofread-mode -1))))
+             nil t)
+            (proofread-mode -1))
+          (should first-hook-ran-p)
+          (should second-hook-ran-p)
+          (dolist (buffer (list first second))
+            (with-current-buffer buffer
+              (should-not proofread-mode)
+              (should-not proofread--flymake-report-function)
+              (should-not
+               (memq #'proofread--flymake-backend
+                     flymake-diagnostic-functions))
+              (should-not
+               (memq #'proofread--before-change
+                     before-change-functions))
+              (should-not (memq buffer proofread--mode-buffers))
+              (proofread-test--assert-inactive-buffer-state))))
+      (dolist (buffer (list first second))
+        (when (buffer-live-p buffer)
+          (kill-buffer buffer))))))
+
+(ert-deftest proofread-test-mode-reset-preserves-external-local-state ()
+  "Keep user options and public hooks outside mode-owned state resets."
+  (with-temp-buffer
+    (insert "helo")
+    (setq-local proofread-auto-check nil)
+    (setq-local proofread-targets 'comments)
+    (setq-local proofread-docstring-predicate-functions
+                (list #'ignore))
+    (setq-local proofread-profile proofread-test--profile)
+    (add-hook 'proofread-diagnostics-changed-hook #'ignore nil t)
+    (proofread-mode 1)
+    (proofread-mode 1)
+    (proofread-mode -1)
+    (dolist (option
+             '(proofread-auto-check
+               proofread-targets
+               proofread-docstring-predicate-functions
+               proofread-profile))
+      (should (local-variable-p option)))
+    (should-not proofread-auto-check)
+    (should (eq proofread-targets 'comments))
+    (should (equal proofread-docstring-predicate-functions
+                   (list #'ignore)))
+    (should (eq proofread-profile proofread-test--profile))
+    (should (memq #'ignore proofread-diagnostics-changed-hook))))
 
 (ert-deftest
     proofread-test-major-mode-change-tears-down-proofread-mode ()
@@ -18655,6 +18948,7 @@ This covers URLs, email, invisible text, faces, and properties."
       (should-not proofread--diagnostics)
       (should-not (memq (current-buffer) proofread--mode-buffers))
       (should-not proofread--flymake-report-function)
+      (proofread-test--assert-inactive-buffer-state)
       (should-not
        (memq #'proofread--flymake-backend
              flymake-diagnostic-functions))

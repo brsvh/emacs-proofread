@@ -651,6 +651,9 @@ buffer generation and request queue.")
 (defvar proofread--clearing-scheduled-work nil
   "Buffer whose queued and scheduled work is being cleared.")
 
+(defvar proofread--buffer-state-cleanup nil
+  "Dynamically nested buffers whose mode-owned state is being cleared.")
+
 (defvar proofread--recording-clear-rejection-p nil
   "Non-nil while reporting work rejected during cleanup.")
 
@@ -1309,6 +1312,10 @@ OMIT-SOURCE-LABEL is non-nil, skip the presentation-only operation."
 (defun proofread--clearing-scheduled-work-p ()
   "Return non-nil when the current buffer is clearing scheduled work."
   (eq proofread--clearing-scheduled-work (current-buffer)))
+
+(defun proofread--buffer-state-cleanup-p ()
+  "Return non-nil when the current buffer is tearing down mode state."
+  (memq (current-buffer) proofread--buffer-state-cleanup))
 
 (defun proofread--diagnostic-invalidation-inhibited-p ()
   "Return non-nil if this buffer owns correction-time inhibition."
@@ -4873,13 +4880,6 @@ contain both snapshots."
           :contract-version proofread--contract-version
           :context (proofread--context-cache-identity chunk))))
 
-(defun proofread--ensure-cache ()
-  "Return this buffer's cache table when Proofread is active."
-  (when proofread-mode
-    (unless (hash-table-p proofread--cache)
-      (setq proofread--cache (make-hash-table :test #'equal)))
-    proofread--cache))
-
 (defun proofread--cache-key-present-p (key)
   "Return non-nil when the enabled cache has KEY."
   (and (> proofread-cache-max-entries 0)
@@ -4917,7 +4917,10 @@ contain both snapshots."
 
 (defun proofread--cache-read (key)
   "Return diagnostic cache entry for KEY in the current buffer."
-  (let ((cache (proofread--ensure-cache)))
+  (let ((cache
+         (and proofread-mode
+              (hash-table-p proofread--cache)
+              proofread--cache)))
     (when-let* ((value (and cache
                             (> proofread-cache-max-entries 0)
                             (gethash key cache))))
@@ -4927,7 +4930,10 @@ contain both snapshots."
 
 (defun proofread--cache-write (key value)
   "Store VALUE under KEY in the current buffer diagnostic cache."
-  (let ((cache (proofread--ensure-cache)))
+  (let ((cache
+         (and proofread-mode
+              (hash-table-p proofread--cache)
+              proofread--cache)))
     (when (and cache (> proofread-cache-max-entries 0))
       (puthash key value cache)
       (setq proofread--cache-order
@@ -5023,13 +5029,6 @@ contain both snapshots."
 
 ;;;; Backend results
 
-(defun proofread--ensure-diagnostic-request-ranges ()
-  "Return the current buffer's diagnostic request range table."
-  (unless (hash-table-p proofread--diagnostic-request-ranges)
-    (setq proofread--diagnostic-request-ranges
-          (make-hash-table :test #'eq)))
-  proofread--diagnostic-request-ranges)
-
 (defun proofread--diagnostic-request-range (diagnostic)
   "Return the current request range that produced DIAGNOSTIC, or nil."
   (when (hash-table-p proofread--diagnostic-request-ranges)
@@ -5084,11 +5083,12 @@ requests or by requests that also have no checker owner."
 (defun proofread--record-diagnostic-request-ranges
     (diagnostics request-range)
   "Record REQUEST-RANGE as the owner of DIAGNOSTICS."
-  (let ((range (cons (copy-marker (car request-range) t)
-                     (copy-marker (cdr request-range) nil)))
-        (table (proofread--ensure-diagnostic-request-ranges)))
-    (dolist (diagnostic diagnostics)
-      (puthash diagnostic range table))))
+  (when (hash-table-p proofread--diagnostic-request-ranges)
+    (let ((range (cons (copy-marker (car request-range) t)
+                       (copy-marker (cdr request-range) nil))))
+      (dolist (diagnostic diagnostics)
+        (puthash diagnostic range
+                 proofread--diagnostic-request-ranges)))))
 
 (defun proofread--commit-diagnostic-state (region mutate-function)
   "Commit one diagnostic state change made by MUTATE-FUNCTION.
@@ -5774,10 +5774,7 @@ BEG and END delimit the changed text."
 
 (defun proofread--kill-buffer ()
   "Clean up Proofread state before killing this buffer."
-  (proofread--disable-flymake-bridge)
-  (proofread--close-source-list-buffers (current-buffer))
-  (proofread--clear-request-work)
-  (proofread--unregister-mode-buffer))
+  (proofread--disable-buffer t))
 
 ;;;; Diagnostics and navigation
 
@@ -8480,51 +8477,48 @@ DIAGNOSTICS must be in navigation order.  Return `applied'."
 
 ;;;; Mode lifecycle
 
-(defun proofread--initialize-buffer-state ()
-  "Initialize proofread-owned state for the current buffer."
+(defun proofread--reset-buffer-state (active-p)
+  "Replace proofread-owned state for the current buffer.
+When ACTIVE-P is non-nil, allocate fresh maps and structured queue
+state for a new generation.  Otherwise install the inactive scalar
+state.  Callers must settle requests, timers, diagnostics, and Flymake
+publication before replacing active state."
   (setq proofread--generation
-        (cl-incf proofread--generation-sequence))
-  (setq-local proofread--diagnostics nil)
-  (setq-local proofread--flymake-report-function nil)
-  (setq-local proofread--diagnostic-request-ranges
-              (make-hash-table :test #'eq))
-  (setq-local proofread--current-diagnostic nil)
-  (setq-local proofread--active-requests nil)
-  (setq-local proofread--queue-state
-              (proofread--make-queue-state))
-  (setq-local proofread--claimed-requests nil)
-  (setq-local proofread--queue-dispatch-active-p nil)
-  (setq-local proofread--queue-dispatch-requested-p nil)
-  (setq-local proofread--queue-dispatch-timer nil)
-  (setq-local proofread--pending-request-keys
-              (make-hash-table :test #'equal))
-  (setq-local proofread--next-request-id 0)
-  (setq-local proofread--cache (make-hash-table :test #'equal))
-  (setq-local proofread--cache-order nil)
-  (setq-local proofread--pending-work nil)
-  (setq-local proofread--idle-timer nil)
-  (setq-local proofread--pending-invalidated-diagnostics nil)
-  (setq-local proofread--pending-diagnostic-ranges nil))
+        (if active-p
+            (cl-incf proofread--generation-sequence)
+          0)
+        proofread--diagnostics nil
+        proofread--diagnostic-request-ranges
+        (and active-p (make-hash-table :test #'eq))
+        proofread--current-diagnostic nil
+        proofread--active-requests nil
+        proofread--queue-state
+        (and active-p (proofread--make-queue-state))
+        proofread--claimed-requests nil
+        proofread--queue-dispatch-active-p nil
+        proofread--queue-dispatch-requested-p nil
+        proofread--queue-dispatch-timer nil
+        proofread--pending-request-keys
+        (and active-p (make-hash-table :test #'equal))
+        proofread--next-request-id 0
+        proofread--pending-invalidated-diagnostics nil
+        proofread--pending-diagnostic-ranges nil
+        proofread--cache
+        (and active-p (make-hash-table :test #'equal))
+        proofread--cache-order nil
+        proofread--pending-work nil
+        proofread--idle-timer nil))
 
 (defun proofread--clear-buffer-state ()
-  "Clear proofread-owned state for the current buffer."
-  (proofread--clear-request-work)
-  (proofread--clear-diagnostics)
-  (setq proofread--diagnostics nil)
-  (setq proofread--flymake-report-function nil)
-  (setq proofread--queue-state nil)
-  (setq proofread--claimed-requests nil)
-  (setq proofread--queue-dispatch-active-p nil)
-  (setq proofread--queue-dispatch-requested-p nil)
-  (setq proofread--queue-dispatch-timer nil)
-  (setq proofread--pending-request-keys nil)
-  (setq proofread--next-request-id 0)
-  (setq proofread--cache nil)
-  (setq proofread--cache-order nil)
-  (setq proofread--diagnostic-request-ranges nil)
-  (setq proofread--current-diagnostic nil)
-  (setq proofread--pending-invalidated-diagnostics nil)
-  (setq proofread--pending-diagnostic-ranges nil))
+  "Settle and clear proofread-owned state in the current buffer.
+This cleanup is idempotent.  The second request cleanup rejects and
+settles work scheduled reentrantly by the diagnostic notification."
+  (let ((proofread-mode nil)
+        (proofread--clearing-scheduled-work (current-buffer)))
+    (proofread--clear-request-work)
+    (proofread--clear-diagnostics)
+    (proofread--clear-request-work))
+  (proofread--reset-buffer-state nil))
 
 (defun proofread--flymake-mode-changed ()
   "Disable Proofread when its required Flymake layer is disabled."
@@ -8562,14 +8556,8 @@ all other Flymake backends active."
                      :region (cons (point-min) (point-max))))
         (error nil)))))
 
-(defun proofread--enable-buffer ()
-  "Enable this buffer's local Proofread hooks and state."
-  (when (memq (current-buffer) proofread--mode-buffers)
-    (proofread--disable-buffer)
-    ;; Teardown hooks can schedule work while the mode variable still
-    ;; remains non-nil during an explicit re-enable.
-    (proofread--clear-scheduled-work))
-  (proofread--initialize-buffer-state)
+(defun proofread--install-buffer-hooks ()
+  "Install Proofread's mode-owned hooks in the current buffer."
   (add-hook 'before-change-functions #'proofread--before-change nil t)
   (add-hook 'after-change-functions #'proofread--after-change nil t)
   ;; Run before Flymake's ordinary-depth kill hook so source-list and
@@ -8579,17 +8567,10 @@ all other Flymake backends active."
             #'proofread--change-major-mode nil t)
   (add-hook 'window-scroll-functions #'proofread--window-scroll nil t)
   (add-hook 'window-configuration-change-hook
-            #'proofread--mark-pending-work nil t)
-  (proofread--register-mode-buffer)
-  (proofread--mark-pending-work)
-  ;; This runs every configured Flymake backend synchronously.  Keep
-  ;; it last so a backend that disables Flymake can tear Proofread
-  ;; down without later enable steps reinstalling state.
-  (proofread--enable-flymake-bridge))
+            #'proofread--mark-pending-work nil t))
 
-(defun proofread--disable-buffer ()
-  "Disable this buffer's local Proofread hooks and state."
-  (proofread--disable-flymake-bridge)
+(defun proofread--remove-buffer-hooks ()
+  "Remove Proofread's mode-owned hooks from the current buffer."
   (remove-hook 'before-change-functions #'proofread--before-change t)
   (remove-hook 'after-change-functions #'proofread--after-change t)
   (remove-hook 'kill-buffer-hook #'proofread--kill-buffer t)
@@ -8597,9 +8578,51 @@ all other Flymake backends active."
                #'proofread--change-major-mode t)
   (remove-hook 'window-scroll-functions #'proofread--window-scroll t)
   (remove-hook 'window-configuration-change-hook
-               #'proofread--mark-pending-work t)
-  (proofread--clear-buffer-state)
-  (proofread--unregister-mode-buffer))
+               #'proofread--mark-pending-work t))
+
+(defun proofread--enable-buffer ()
+  "Enable this buffer's local Proofread hooks and state."
+  (if (proofread--buffer-state-cleanup-p)
+      ;; A lifecycle observer can invoke the mode command recursively.
+      ;; Keep the dynamic mode binding disabled so the outer cleanup wins.
+      (setq proofread-mode nil)
+    (let (completed-p)
+      (unwind-protect
+          (progn
+            ;; Always start from the same idempotent teardown path.  This
+            ;; also repairs state left by an interrupted earlier enable.
+            (proofread--disable-buffer)
+            (proofread--reset-buffer-state t)
+            (proofread--install-buffer-hooks)
+            (proofread--register-mode-buffer)
+            (proofread--mark-pending-work)
+            ;; This runs every configured Flymake backend synchronously.
+            ;; Keep it last so a backend that disables Flymake can tear
+            ;; Proofread down without later steps reinstalling state.
+            (proofread--enable-flymake-bridge)
+            (setq completed-p t))
+        (unless completed-p
+          ;; Use the minor-mode entry point so standard mode hooks and an
+          ;; optional frontend observe the failed enable as disabled.
+          (if proofread-mode
+              (proofread-mode -1)
+            (proofread--disable-buffer)))))))
+
+(defun proofread--disable-buffer (&optional close-source-lists-p)
+  "Disable this buffer's local Proofread hooks and state.
+When CLOSE-SOURCE-LISTS-P is non-nil, close auxiliary buffers and stop
+their request-log monitor before cancelling request work."
+  (if (proofread--buffer-state-cleanup-p)
+      (setq proofread-mode nil)
+    (let ((proofread--buffer-state-cleanup
+           (cons (current-buffer) proofread--buffer-state-cleanup))
+          (proofread-mode nil))
+      (proofread--disable-flymake-bridge)
+      (when close-source-lists-p
+        (proofread--close-source-list-buffers (current-buffer)))
+      (proofread--remove-buffer-hooks)
+      (proofread--clear-buffer-state)
+      (proofread--unregister-mode-buffer))))
 
 (defun proofread--change-major-mode ()
   "Disable `proofread-mode' before changing the current major mode."
